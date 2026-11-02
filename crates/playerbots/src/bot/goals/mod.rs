@@ -1,9 +1,9 @@
 //! Goals: what a bot does for a few minutes at a time.
 //!
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
-//! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`] and [`Grind`] are
-//! implemented; [`Quest`], [`Duel`], [`Trade`], [`TradeRun`] and [`Housing`] are stubs that report
-//! [`FailReason::NotImplemented`] on their first tick so the brain stops considering them.
+//! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
+//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`] and [`Housing`]. A goal that reports
+//! [`FailReason::NotImplemented`] is switched off for good by the brain.
 //!
 //! # Writing a goal
 //!
@@ -47,7 +47,7 @@ use super::motion::SWIM_THRESHOLD;
 /// Why a goal gave up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailReason {
-    /// The goal is a stub; the brain never picks it again.
+    /// The goal cannot run in this build; the brain never picks it again.
     NotImplemented,
     /// Nothing to work on (no monster, no quest giver, no partner).
     NoTarget,
@@ -79,15 +79,15 @@ pub enum Goal {
     Rest(Rest),
     /// Kill monsters.
     Grind(Grind),
-    /// Do quests (stub).
+    /// Do quests.
     Quest(Quest),
-    /// Duel another bot (stub).
+    /// Duel another bot.
     Duel(Duel),
-    /// Trade with another bot (stub).
+    /// Trade with another bot.
     Trade(Trade),
-    /// Craft, carry and sell trade packs (stub).
+    /// Craft, carry and sell trade packs.
     TradeRun(TradeRun),
-    /// Build and use a house (stub).
+    /// Build and use a house.
     Housing(Housing),
 }
 

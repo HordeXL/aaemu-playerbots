@@ -182,6 +182,12 @@ shows the resident memory of the process and the bytes per online bot; the desig
 256 KiB of bot-side state per bot. Ticks are adaptive with jitter (250 ms while moving or
 fighting, longer when idle) so hundreds of bots do not wake up together.
 
+Measured against a local AAEmu Rust server (debug build, 100 bots, mixed goals, 25 minutes):
+about 82 KiB of private memory and 0.22 % of one CPU core per bot (the whole process stayed
+around 54 MB at 100 bots, world data included), about 1.2 packets/s sent and 90–100 received per
+bot in crowded start areas, no disconnects. Server side, each bot costs about the same as a real
+player (≈0.5 MB and 0.5–0.6 % CPU in the game server).
+
 ## Repository
 
 | Crate | Role |
