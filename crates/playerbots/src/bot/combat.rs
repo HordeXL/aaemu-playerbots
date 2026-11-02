@@ -1,8 +1,14 @@
-//! The basic combat controller: engage a target, get into range, face it, cast the archetype's
-//! starter skill or the auto attack, and loot what dies.
+//! The combat controller: engage a target, get into range, face it, cast the archetype's
+//! rotation (or, without learned skills, its starter skill and the auto attack), and loot what
+//! dies.
 //!
-//! The API is **stable on purpose** so the rotation engine can replace the skill choice later
-//! without touching the goals:
+//! The skill choice is the rotation engine's ([`super::rotation`]): once the bot knows skills,
+//! [`Combat::tick`] asks the archetype's compiled rotation what to cast, falling back to the
+//! starter skill and the basic attack when the rotation has nothing castable. The controller
+//! also learns skills and unlocks abilities as the level grows ([`super::rotation::learn`]) and
+//! keeps the bot engaged with its opponent during a duel ([`DuelWatch`]).
+//!
+//! The API is **stable on purpose** so the goals never had to change when the rotation arrived:
 //!
 //! * [`Combat::engage`] / [`Combat::disengage`] set or clear the target,
 //! * [`Combat::tick`] runs one step and returns a [`CombatStatus`],
@@ -20,7 +26,11 @@ use aa_world::{NpcTemplate, Relation, World};
 use smallvec::SmallVec;
 
 use super::ctx::Ctx;
+use super::goals::duel::{Answer, DuelPhase, DuelWatch};
 use super::motion::{MotionStatus, Pace};
+use super::rotation::{
+    self, CastKind, Decision, Inputs, LearnCtx, Learner, RotState, Rotation, SkillBook, TargetView,
+};
 use super::state::{dist2d, Unit, UnitKind};
 
 /// Distance within which a corpse can be looted.
@@ -31,6 +41,27 @@ const LOOT_WALK_RADIUS: f32 = 2.5;
 const LOOT_AWAIT_MS: u64 = 3000;
 /// How long an opened loot window may take.
 const LOOT_OPEN_TIMEOUT_MS: u64 = 4000;
+/// Margin added to a skill's cooldown, which the server starts when the skill fires.
+const COOLDOWN_SLACK_MS: u64 = 60;
+/// `SkillResult::CooldownTime`: a cooldown or the global cooldown refused the cast.
+const COOLDOWN_REFUSED: u8 = 8;
+/// `SkillResult::LackMana`.
+const MANA_REFUSED: u8 = 0xB;
+/// `SkillResult::TooFarRange`, and the step and limit of the distance penalty it causes.
+const TOO_FAR_REFUSED: u8 = 0xF;
+const RANGE_PEN_STEP_M: f32 = 1.0;
+const RANGE_PEN_MAX_M: f32 = 4.0;
+/// Bounds and step of the adaptive global cooldown estimate, and how many accepted casts in a
+/// row narrow it again.
+const GCD_MIN_MS: u16 = rotation::GCD_MS as u16;
+const GCD_MAX_MS: u16 = 2400;
+const GCD_STEP_MS: u16 = 300;
+const GCD_RELAX_AFTER: u8 = 8;
+/// The global cooldown the server starts with an auto attack (`default_gcd`).
+const AUTO_GCD_MS: u64 = 1000;
+/// With a rotation, an auto attack goes out only this long after the rotation's last cast and
+/// its global cooldown.
+const AUTO_QUIET_MS: u64 = 300;
 /// Global cooldown between two skills.
 pub const GCD_MS: u64 = 1000;
 /// Time between two auto attacks.
@@ -53,6 +84,16 @@ const DAMAGE_WINDOW_MS: u64 = 3_000;
 const REACT_RANGE: f32 = 12.0;
 /// Slack on a skill's range.
 const RANGE_SLACK: f32 = 0.25;
+/// A duel opponent is only lost beyond this distance (the server ends a duel at 75 m).
+const DUEL_LOST_DISTANCE: f32 = 150.0;
+/// A ranged bot backs away from a player closer than this share of its fighting range.
+const KITE_CLOSE: f32 = 0.35;
+/// A kiting step lasts at most this long.
+const KITE_MS: u64 = 2_500;
+/// Pause between two kiting steps.
+const KITE_GAP_MS: u64 = 7_000;
+/// Hit points (percent) below which an unexpected duel challenge is declined.
+const DUEL_MIN_HP_PCT: u8 = 50;
 
 /// What one combat step came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +325,30 @@ pub struct Combat {
     loot: Option<LootJob>,
     kills: u32,
     casts: u32,
+    cast_failed: u32,
+    /// Estimate of the global cooldown after a rotation cast; widened when the server refuses a
+    /// cast for the cooldown (plot skills start further cooldowns of their own).
+    gcd_ms: u16,
+    /// Accepted casts in a row since the last cooldown refusal.
+    gcd_ok: u8,
+    /// Metres the bot pretends to be farther from its target: grows when the server says a cast
+    /// was too far (its distance differs from the bot's), shrinks with accepted casts.
+    range_pen: f32,
+    /// A cast the server refused for lack of mana, until [`Combat::tick`] notes the bot's mana.
+    mana_refused: u32,
+    rot: RotState,
+    learner: Learner,
+    /// The duel watch: the duel goal reads it, the controller answers challenges through it.
+    pub duel: DuelWatch,
+    /// Object id of the opponent of the duel the controller engaged for (0 = none).
+    duel_opponent: u32,
+    me_obj: u32,
+    /// The last unit seen casting at the target `(caster, skill, bot clock)`.
+    target_cast: Option<(u32, u32, u64)>,
+    /// The last refusal of a cast of the bot `(skill, result)`, to log.
+    last_refusal: Option<(u32, u8)>,
+    kite_until_ms: u64,
+    next_kite_ms: u64,
 }
 
 impl Default for Combat {
@@ -309,6 +374,20 @@ impl Combat {
             loot: None,
             kills: 0,
             casts: 0,
+            cast_failed: 0,
+            gcd_ms: rotation::GCD_MS as u16,
+            gcd_ok: 0,
+            range_pen: 0.0,
+            mana_refused: 0,
+            rot: RotState::default(),
+            learner: Learner::default(),
+            duel: DuelWatch::default(),
+            duel_opponent: 0,
+            me_obj: 0,
+            target_cast: None,
+            last_refusal: None,
+            kite_until_ms: 0,
+            next_kite_ms: 0,
         }
     }
 
@@ -321,6 +400,8 @@ impl Combat {
         self.announced = false;
         self.last_goto = None;
         self.engaged_at_ms = None;
+        self.rot.reset_fight(self.me_obj);
+        self.target_cast = None;
     }
 
     /// Stops fighting (a running loot job continues).
@@ -333,10 +414,11 @@ impl Combat {
 
     /// Forgets everything (death, reconnect).
     pub fn reset(&mut self) {
-        let (kills, casts) = (self.kills, self.casts);
+        let (kills, casts, failed) = (self.kills, self.casts, self.cast_failed);
         *self = Combat::new();
         self.kills = kills;
         self.casts = casts;
+        self.cast_failed = failed;
     }
 
     /// The current target.
@@ -344,9 +426,12 @@ impl Combat {
         self.target
     }
 
-    /// Whether a fight or a loot job is under way.
+    /// Whether a fight or a loot job is under way. The end of a duel counts until the duel goal
+    /// has taken it, so that no other goal (resting after the fight) pushes the goal aside first.
     pub fn busy(&self) -> bool {
-        self.target.is_some() || self.loot.is_some()
+        self.target.is_some()
+            || self.loot.is_some()
+            || (self.duel.attended() && self.duel.peek_end().is_some())
     }
 
     /// The result of the last [`Combat::tick`].
@@ -364,13 +449,26 @@ impl Combat {
         self.casts
     }
 
+    /// Casts the server refused so far (this process).
+    pub fn casts_refused(&self) -> u32 {
+        self.cast_failed
+    }
+
+    /// Skills learned and learn requests the server ignored.
+    pub fn learned(&self) -> (u16, u16) {
+        self.learner.counts()
+    }
+
     /// The loot job, if any.
     pub fn loot_job(&self) -> Option<&LootJob> {
         self.loot.as_ref()
     }
 
-    /// Feeds the controller the server's answers: skill failures and the loot window.
+    /// Feeds the controller the server's answers: skill results, buffs, duel packets and the
+    /// loot window.
     pub fn on_event(&mut self, ev: &ServerEvent, me_obj: u32, now_ms: u64, out: &mut Vec<cs::Out>) {
+        self.me_obj = me_obj;
+        self.duel.on_event(ev, me_obj, now_ms);
         let ServerEvent::World(w) = ev else { return };
         match w {
             WorldEvent::SkillStarted {
@@ -379,12 +477,60 @@ impl Combat {
                 result,
                 ..
             } if *caster_obj == me_obj && me_obj != 0 => {
-                if *result != 0 {
+                if *result == COOLDOWN_REFUSED {
+                    // The global cooldown, or one the bot did not know of: a short wait, and a
+                    // wider estimate so the next casts are spaced better.
+                    self.backoffs.fail_short(*skill, now_ms);
+                    self.cast_failed += 1;
+                    self.last_refusal = Some((*skill, *result));
+                    self.gcd_ms = (self.gcd_ms + GCD_STEP_MS).min(GCD_MAX_MS);
+                    self.gcd_ok = 0;
+                    self.gcd_until_ms = self.gcd_until_ms.max(now_ms + u64::from(GCD_STEP_MS));
+                } else if *result != 0 {
+                    if *result == MANA_REFUSED {
+                        self.mana_refused = *skill;
+                    } else if *result == TOO_FAR_REFUSED {
+                        self.range_pen = (self.range_pen + RANGE_PEN_STEP_M).min(RANGE_PEN_MAX_M);
+                    }
                     self.backoffs.fail(*skill, now_ms);
+                    self.cast_failed += 1;
+                    self.last_refusal = Some((*skill, *result));
                 } else {
                     self.backoffs.succeed(*skill);
+                    self.range_pen = (self.range_pen - RANGE_PEN_STEP_M / 4.0).max(0.0);
+                    self.gcd_ok += 1;
+                    if self.gcd_ok >= GCD_RELAX_AFTER {
+                        self.gcd_ok = 0;
+                        self.gcd_ms = self.gcd_ms.saturating_sub(GCD_STEP_MS).max(GCD_MIN_MS);
+                    }
                 }
+                self.rot.on_cast_result(*skill, *result, now_ms);
             }
+            WorldEvent::SkillStarted {
+                caster_obj,
+                skill,
+                result: 0,
+                ..
+            } if Some(*caster_obj) == self.target => {
+                self.target_cast = Some((*caster_obj, *skill, now_ms));
+            }
+            WorldEvent::BuffCreated {
+                obj,
+                index,
+                caster_obj,
+                skill_id,
+                duration_ms,
+                ..
+            } => self.rot.on_buff_created(
+                now_ms,
+                me_obj,
+                *obj,
+                *index,
+                *caster_obj,
+                *skill_id,
+                *duration_ms,
+            ),
+            WorldEvent::BuffRemoved { obj, index } => self.rot.on_buff_removed(*obj, *index),
             WorldEvent::ErrorMsg { .. } => {
                 if let Some((skill, at)) = self.last_cast {
                     if now_ms.saturating_sub(at) <= ERROR_BLAME_MS {
@@ -410,14 +556,91 @@ impl Combat {
 
     /// One combat step. See the module docs.
     pub fn tick(ctx: &mut Ctx<'_>) -> CombatStatus {
+        ctx.combat.me_obj = ctx.state.me.obj;
+        if ctx.combat.mana_refused != 0 {
+            let skill = std::mem::take(&mut ctx.combat.mana_refused);
+            ctx.combat.rot.learn_mana_floor(skill, ctx.state.me.mp);
+        }
         let status = if ctx.state.me.dead || ctx.state.me.obj == 0 {
             ctx.combat.reset();
             CombatStatus::Idle
         } else {
+            Self::duel_step(ctx);
+            Self::learn_step(ctx);
             Self::step(ctx)
         };
+        if let Some((skill, result)) = ctx.combat.last_refusal.take() {
+            ctx.log
+                .debug(format!("skill {skill} was refused (result {result})"));
+        }
         ctx.combat.status = status;
         status
+    }
+
+    /// Answers duel challenges, keeps the bot engaged with its duel opponent and reports a duel
+    /// that ended while no duel goal was watching.
+    fn duel_step(ctx: &mut Ctx<'_>) {
+        let now = ctx.now_ms;
+        let idle = !ctx.combat.busy()
+            && ctx.state.me.hp_pct() >= DUEL_MIN_HP_PCT
+            && ctx.cfg.behavior.duel > 0.0;
+        match ctx.combat.duel.answer(now, idle, ctx.rng) {
+            Answer::Accept(challenger) => {
+                ctx.log.say(format!(
+                    "accepting a duel from {}",
+                    char_name(ctx, challenger)
+                ));
+                ctx.out.push(cs::start_duel(challenger, cs::DUEL_ACCEPT));
+            }
+            Answer::Decline(challenger) => {
+                ctx.log.say(format!(
+                    "declining a duel from {}",
+                    char_name(ctx, challenger)
+                ));
+                ctx.out.push(cs::start_duel(challenger, cs::DUEL_DECLINE));
+            }
+            Answer::Wait | Answer::Drop => {}
+        }
+        match ctx.combat.duel.phase() {
+            DuelPhase::Active { opponent, .. } => {
+                ctx.combat.duel_opponent = opponent;
+                if ctx.combat.target != Some(opponent) {
+                    ctx.combat.engage(opponent);
+                }
+            }
+            _ => {
+                let opp = std::mem::take(&mut ctx.combat.duel_opponent);
+                if opp != 0 && ctx.combat.target == Some(opp) {
+                    ctx.combat.disengage();
+                }
+            }
+        }
+        if !ctx.combat.duel.attended() {
+            if let Some(end) = ctx.combat.duel.take_end() {
+                ctx.log.say(format!("duel ended: {}", end.outcome.word()));
+            }
+        }
+    }
+
+    /// Learns skills and adds abilities as the level grows (out of combat only).
+    fn learn_step(ctx: &mut Ctx<'_>) {
+        if ctx.combat.busy() || ctx.combat.duel.in_duel() {
+            return;
+        }
+        let c = LearnCtx {
+            now_ms: ctx.now_ms,
+            level: ctx.state.me.level,
+            me_obj: ctx.state.me.obj,
+            abilities: ctx.state.me.abilities,
+            known: &ctx.state.skills,
+            book: ctx.world,
+            arch: &ctx.persona.archetype,
+        };
+        if let Some(out) = ctx.combat.learner.tick(&c) {
+            ctx.log
+                .debug(format!("skills: sent opcode {:#x}", out.opcode));
+            ctx.out.push(out);
+        }
     }
 
     fn step(ctx: &mut Ctx<'_>) -> CombatStatus {
@@ -434,14 +657,21 @@ impl Combat {
         };
         let engaged_at = *ctx.combat.engaged_at_ms.get_or_insert(now);
 
-        let Some((upos, dead)) = ctx.state.units.get(&obj).map(|u| (u.pos, u.dead())) else {
+        let Some((upos, dead, is_char)) = ctx
+            .state
+            .units
+            .get(&obj)
+            .map(|u| (u.pos, u.dead(), u.kind == UnitKind::Character))
+        else {
             ctx.combat.disengage();
             return CombatStatus::Lost;
         };
         if dead {
-            let ours = ctx.state.kills.iter().any(|k| k.0 == obj);
+            let ours = !is_char && ctx.state.kills.iter().any(|k| k.0 == obj);
             ctx.combat.disengage();
-            ctx.combat.kills += 1;
+            if !is_char {
+                ctx.combat.kills += 1;
+            }
             if ours {
                 ctx.combat.loot = Some(LootJob::new(obj, now));
             }
@@ -450,13 +680,70 @@ impl Combat {
 
         let me = ctx.state.me.pos;
         let dist = dist2d(me, upos);
-        if dist > LOST_DISTANCE || now.saturating_sub(engaged_at) > FIGHT_TIMEOUT_MS {
+        let (lost_at, timeout) = if is_char {
+            (DUEL_LOST_DISTANCE, u64::MAX)
+        } else {
+            (LOST_DISTANCE, FIGHT_TIMEOUT_MS)
+        };
+        if dist > lost_at || now.saturating_sub(engaged_at) > timeout {
             ctx.combat.disengage();
             return CombatStatus::Lost;
         }
-        let preferred = ctx.persona.archetype.preferred_range;
 
-        if must_approach(dist, preferred) {
+        // What the rotation wants this tick.
+        let persona = ctx.persona;
+        let rotation = rotation_of(ctx);
+        let mut preferred = hold_range(ctx.world, persona, rotation);
+        let decision = match rotation {
+            Some(rot) => Self::rotate(ctx, rot, obj, upos, dist + ctx.combat.range_pen, is_char),
+            None => Decision::default(),
+        };
+        if let Some(r) = decision.reach {
+            preferred = preferred.min(r).max(1.5);
+        }
+        // The server judged a cast too far: stand closer than the data says.
+        let range_pen = ctx.combat.range_pen;
+        if range_pen > 0.0 {
+            preferred = (preferred - range_pen).max(1.5);
+        }
+
+        // Cast first: a gap closer or a buff can go while the bot is still walking.
+        let mut cast_now = false;
+        if let Some(c) = decision.cast {
+            let instant = ctx.world.facts(c.skill).is_none_or(|f| f.cast_ms == 0);
+            if ctx.motion.is_moving() && !instant {
+                // A spell with a cast time needs the bot standing: stop and cast next tick.
+                ctx.motion.stop();
+                ctx.combat.last_goto = None;
+                return CombatStatus::Fighting;
+            }
+            if !ctx.combat.announced {
+                ctx.out.push(cs::change_target(obj));
+                ctx.combat.announced = true;
+            }
+            Self::send_rotation_cast(ctx, c.skill, c.kind);
+            cast_now = true;
+        }
+
+        let casting = now < ctx.combat.casting_until_ms;
+        // A retreat in progress is not interrupted by the approach logic.
+        if now < ctx.combat.kite_until_ms && ctx.motion.is_moving() {
+            ctx.motion.face(upos[0], upos[1]);
+            return CombatStatus::Fighting;
+        }
+        let want_retreat = decision.retreat
+            || (is_char
+                && persona.archetype.range == crate::archetype::RangeKind::Ranged
+                && dist < preferred * KITE_CLOSE);
+        if want_retreat
+            && !casting
+            && now >= ctx.combat.next_kite_ms
+            && Self::retreat(ctx, upos, preferred)
+        {
+            return CombatStatus::Fighting;
+        }
+
+        if !casting && must_approach(dist, preferred) {
             if ctx.combat.last_goto.is_some()
                 && matches!(ctx.motion.status(), MotionStatus::Failed(_))
             {
@@ -486,19 +773,151 @@ impl Combat {
             ctx.out.push(cs::change_target(obj));
             ctx.combat.announced = true;
         }
-        Self::cast(ctx, obj, dist, preferred);
+        if !cast_now {
+            // With a rotation only the auto attack is left, and only when the rotation has been
+            // quiet: the server starts a global cooldown with it, which would refuse the next cast.
+            let quiet = ctx
+                .combat
+                .last_cast
+                .is_none_or(|(_, at)| now.saturating_sub(at) >= rotation::GCD_MS + AUTO_QUIET_MS);
+            if rotation.is_none() || quiet {
+                Self::cast_basic(ctx, obj, dist + range_pen, preferred, rotation.is_some());
+            }
+        }
         CombatStatus::Fighting
     }
 
+    /// Asks the rotation what to do against `target` at `dist` metres.
+    fn rotate(
+        ctx: &mut Ctx<'_>,
+        rot: &Rotation,
+        target: u32,
+        upos: [f32; 3],
+        dist: f32,
+        is_char: bool,
+    ) -> Decision {
+        let now = ctx.now_ms;
+        let world = ctx.world;
+        let faction = ctx.state.me.faction;
+        let me = ctx.state.me.pos;
+        // Distances to the hostile units around, only when the rotation counts enemies.
+        let mut enemies: SmallVec<[f32; 16]> = SmallVec::new();
+        let radius = rot.max_enemy_radius();
+        if radius > 0.0 {
+            for u in ctx.state.units.values() {
+                let d = u.dist2d(me);
+                if d <= radius && enemies.len() < 16 && attackable(world, faction, u).is_some() {
+                    enemies.push(d);
+                }
+            }
+            if is_char && dist <= radius {
+                enemies.push(dist);
+            }
+        }
+        let c = &mut *ctx.combat;
+        let casting = c
+            .target_cast
+            .filter(|(obj, _, _)| *obj == target)
+            .is_some_and(|(_, skill, at)| {
+                let cast_ms = world
+                    .facts(skill)
+                    .map_or(1500, |f| u64::from(f.cast_ms).max(500));
+                now.saturating_sub(at) < cast_ms
+            });
+        let me_state = &ctx.state.me;
+        let inp = Inputs {
+            now_ms: now,
+            book: world,
+            known: &ctx.state.skills,
+            abilities: c.learner.abilities().unwrap_or(me_state.abilities),
+            level: me_state.level,
+            cooldowns: &ctx.state.cooldowns,
+            backoffs: &c.backoffs,
+            me_obj: me_state.obj,
+            hp: me_state.hp,
+            hp_pct: me_state.hp_pct(),
+            mp: me_state.mp,
+            labor: me_state.labor,
+            target: Some(TargetView {
+                obj: target,
+                pos: upos,
+                dist,
+                character: is_char,
+                casting,
+            }),
+            enemies: &enemies,
+            gcd_until_ms: c.gcd_until_ms,
+            casting_until_ms: c.casting_until_ms,
+        };
+        rotation::decide(rot, &mut c.rot, &inp, ctx.rng)
+    }
+
+    /// Sends a rotation cast and books its timers.
+    fn send_rotation_cast(ctx: &mut Ctx<'_>, skill: u32, kind: CastKind) {
+        let now = ctx.now_ms;
+        let me_obj = ctx.state.me.obj;
+        let (cooldown, cast_time) = ctx.world.skill(skill).map_or((0, 0), |s| {
+            (u64::from(s.cooldown_time), u64::from(s.casting_time))
+        });
+        let c = &mut *ctx.combat;
+        c.casting_until_ms = now + cast_time + 100;
+        c.gcd_until_ms = now + u64::from(c.gcd_ms);
+        c.last_cast = Some((skill, now));
+        c.casts += 1;
+        if cooldown > 0 {
+            // the server starts the cooldown when the skill fires, after the cast time
+            ctx.state
+                .set_cooldown(skill, now + cast_time + cooldown + COOLDOWN_SLACK_MS);
+        }
+        ctx.out.push(match kind {
+            CastKind::SelfCast => cs::start_skill_unit(skill, me_obj, me_obj),
+            CastKind::Unit(t) => cs::start_skill_unit(skill, me_obj, t),
+            CastKind::Position(p) => {
+                cs::start_skill_position(skill, me_obj, (p[0], p[1], p[2]), ctx.state.me.yaw)
+            }
+        });
+        ctx.log.debug(format!(
+            "cast {skill} ({}) {kind:?}",
+            ctx.world.skill(skill).map_or("?", |s| &*s.name)
+        ));
+    }
+
+    /// Backs away from the target to its fighting range; false when there is no place to go.
+    fn retreat(ctx: &mut Ctx<'_>, upos: [f32; 3], preferred: f32) -> bool {
+        let me = ctx.state.me.pos;
+        let (dx, dy) = (me[0] - upos[0], me[1] - upos[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = if len < 0.1 {
+            let a = ctx.rng.f32() * std::f32::consts::TAU;
+            (a.cos(), a.sin())
+        } else {
+            (dx / len, dy / len)
+        };
+        let (x, y) = (upos[0] + ux * preferred, upos[1] + uy * preferred);
+        if !super::goals::walkable(ctx.world, x, y) {
+            return false;
+        }
+        let now = ctx.now_ms;
+        ctx.motion.go_to(x, y, 1.0, Pace::Run, now);
+        let c = &mut *ctx.combat;
+        c.last_goto = None;
+        c.kite_until_ms = now + KITE_MS;
+        c.next_kite_ms = now + KITE_GAP_MS;
+        true
+    }
+
     /// Casts the starter skill or the auto attack if the timers and the facts allow it.
-    fn cast(ctx: &mut Ctx<'_>, target: u32, dist: f32, preferred: f32) {
+    fn cast_basic(ctx: &mut Ctx<'_>, target: u32, dist: f32, preferred: f32, auto_only: bool) {
         let now = ctx.now_ms;
         let arch = &ctx.persona.archetype;
         let auto = arch.auto_attack_skill();
-        let cands = [
+        let mut cands = [
             Self::candidate(ctx, arch.starter_skill, false, dist, preferred),
             Self::candidate(ctx, auto, true, dist, preferred),
         ];
+        if auto_only {
+            cands[0].ready = false;
+        }
         let c = &mut *ctx.combat;
         let Some(skill) = pick_skill(
             &cands,
@@ -516,12 +935,16 @@ impl Combat {
         c.casting_until_ms = now + cast_time + 100;
         if is_auto {
             c.next_auto_ms = now + AUTO_ATTACK_GAP_MS.max(cooldown);
+            c.gcd_until_ms = c.gcd_until_ms.max(now + AUTO_GCD_MS);
         } else {
             c.gcd_until_ms = now + GCD_MS;
         }
         c.last_cast = Some((skill, now));
         c.casts += 1;
-        ctx.state.set_cooldown(skill, now + cooldown);
+        if cooldown > 0 {
+            ctx.state
+                .set_cooldown(skill, now + cast_time + cooldown + COOLDOWN_SLACK_MS);
+        }
         let me_obj = ctx.state.me.obj;
         ctx.out.push(cs::start_skill_unit(skill, me_obj, target));
     }
@@ -613,6 +1036,41 @@ pub fn attackable<'w>(world: &'w World, own_faction: u32, unit: &Unit) -> Option
     (world.relation(own_faction, faction) == Relation::Hostile).then_some(template)
 }
 
+/// The compiled rotation of the bot's build, once the bot knows skills.
+fn rotation_of<'a>(ctx: &Ctx<'a>) -> Option<&'a Rotation> {
+    if ctx.state.skills.is_empty() {
+        return None;
+    }
+    let persona: &'a super::ctx::Persona = ctx.persona;
+    persona.archetype.rotation().map(|r| &**r)
+}
+
+/// The distance a bot fights from: the archetype's, but never beyond the reach of the
+/// rotation's anchor skill.
+fn hold_range(world: &World, persona: &super::ctx::Persona, rot: Option<&Rotation>) -> f32 {
+    let base = persona.archetype.preferred_range;
+    let anchor = rot
+        .and_then(Rotation::anchor)
+        .and_then(|s| world.facts(s))
+        .map(|f| rotation::reach_of(&f));
+    match anchor {
+        Some(r) if persona.archetype.range == crate::archetype::RangeKind::Ranged && r > 4.0 => {
+            base.min(r - 1.0)
+        }
+        _ => base,
+    }
+}
+
+/// The name of the character with id `char_id` if it is in view.
+fn char_name(ctx: &Ctx<'_>, char_id: u32) -> String {
+    ctx.state
+        .units
+        .values()
+        .find(|u| u.kind == UnitKind::Character && u.id == char_id)
+        .and_then(|u| u.name.as_deref())
+        .map_or_else(|| format!("character {char_id}"), str::to_owned)
+}
+
 /// The unit to defend against: one that targets the bot, else (when the bot is losing hit
 /// points) the nearest monster close by.
 fn pick_threat(ctx: &Ctx<'_>) -> Option<u32> {
@@ -657,6 +1115,7 @@ fn pick_threat(ctx: &Ctx<'_>) -> Option<u32> {
 mod tests {
     use super::*;
     use aa_proto::opcodes::cs as op;
+    use aa_proto::sc_activity::{duel_det, ActivityEvent};
     use aa_proto::sc_world::LootItem;
 
     fn cand(id: u32, is_auto: bool, ready: bool, in_range: bool) -> SkillCand {
@@ -801,6 +1260,87 @@ mod tests {
         c.on_event(&started(0x400, 0), 0x400, 1600, &mut out);
         assert!(!c.backoffs.blocked(18132, 1600));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cooldown_refusals_widen_the_global_cooldown_estimate_and_accepted_casts_narrow_it() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        let started = |result: u8| {
+            ServerEvent::World(WorldEvent::SkillStarted {
+                caster_obj: 0x400,
+                skill: 18132,
+                tl: 1,
+                target_obj: 5,
+                result,
+            })
+        };
+        let base = c.gcd_ms;
+        c.on_event(&started(COOLDOWN_REFUSED), 0x400, 1000, &mut out);
+        assert_eq!(c.gcd_ms, base + GCD_STEP_MS);
+        assert!(c.gcd_until_ms >= 1000 + u64::from(GCD_STEP_MS));
+        assert!(
+            !c.backoffs.blocked(18132, 1000 + SHORT_BACKOFF_MS + 1),
+            "only a short pause, no escalation"
+        );
+        for _ in 0..20 {
+            c.on_event(&started(COOLDOWN_REFUSED), 0x400, 1000, &mut out);
+        }
+        assert_eq!(c.gcd_ms, GCD_MAX_MS, "bounded");
+        for _ in 0..(8 * GCD_RELAX_AFTER) {
+            c.on_event(&started(0), 0x400, 2000, &mut out);
+        }
+        assert_eq!(c.gcd_ms, GCD_MIN_MS, "relaxes back to the minimum");
+        // another refusal (not a cooldown) leaves the estimate alone
+        c.on_event(&started(0x13), 0x400, 3000, &mut out);
+        assert_eq!(c.gcd_ms, GCD_MIN_MS);
+    }
+
+    #[test]
+    fn too_far_refusals_make_the_bot_stand_closer_and_accepted_casts_undo_it() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        let started = |result: u8| {
+            ServerEvent::World(WorldEvent::SkillStarted {
+                caster_obj: 0x400,
+                skill: 10752,
+                tl: 1,
+                target_obj: 5,
+                result,
+            })
+        };
+        assert_eq!(c.range_pen, 0.0);
+        for _ in 0..10 {
+            c.on_event(&started(TOO_FAR_REFUSED), 0x400, 1000, &mut out);
+        }
+        assert_eq!(c.range_pen, RANGE_PEN_MAX_M, "bounded");
+        for _ in 0..40 {
+            c.on_event(&started(0), 0x400, 2000, &mut out);
+        }
+        assert_eq!(c.range_pen, 0.0);
+    }
+
+    #[test]
+    fn the_end_of_a_duel_keeps_the_controller_busy_until_the_goal_takes_it() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        assert!(!c.busy());
+        c.duel.set_attended(true);
+        let ended = ServerEvent::Activity(ActivityEvent::DuelEnded {
+            winner_id: 1,
+            loser_id: 2,
+            winner_obj: 0x400,
+            loser_obj: 0x500,
+            det: duel_det::WIN,
+        });
+        c.on_event(&ended, 0x400, 1000, &mut out);
+        assert!(c.busy(), "the goal has not taken the end yet");
+        assert!(c.duel.take_end().is_some());
+        assert!(!c.busy());
+        // without a duel goal nobody is waiting for the end
+        c.duel.set_attended(false);
+        c.on_event(&ended, 0x400, 2000, &mut out);
+        assert!(!c.busy());
     }
 
     #[test]

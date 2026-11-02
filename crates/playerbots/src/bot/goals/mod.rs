@@ -123,7 +123,7 @@ impl Goal {
     /// Whether the goal drives the combat controller itself. For every other goal the brain lets
     /// the controller defend the bot and pauses the goal while a fight or a loot job is on.
     pub fn owns_combat(&self) -> bool {
-        matches!(self, Goal::Grind(_))
+        matches!(self, Goal::Grind(_) | Goal::Quest(_) | Goal::Duel(_))
     }
 
     /// Called once when the brain picks the goal.
@@ -196,14 +196,15 @@ impl Goal {
 
     /// Appends a one-line description of what the goal is doing to `out`.
     pub fn describe(&self, out: &mut String) {
-        use std::fmt::Write;
         match self {
             Goal::Wander(g) => g.describe(out),
             Goal::Rest(_) => out.push_str("resting"),
             Goal::Grind(g) => g.describe(out),
-            other => {
-                let _ = write!(out, "{}", other.kind().name());
-            }
+            Goal::Quest(g) => g.describe(out),
+            Goal::Duel(g) => g.describe(out),
+            Goal::Trade(g) => g.describe(out),
+            Goal::Housing(g) => g.describe(out),
+            Goal::TradeRun(g) => g.describe(out),
         }
     }
 }

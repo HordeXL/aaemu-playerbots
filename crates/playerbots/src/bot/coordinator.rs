@@ -1,10 +1,24 @@
 //! The coordinator: pairs bots that need a partner (duels, player trade).
 //!
 //! A goal that needs a partner calls [`CoordHandle::request_partner`]; the coordinator task
-//! (one for the whole process) keeps the waiting bots and, when two bots want the same thing,
-//! sends both a [`BotCmd::Pair`] with their roles. This is the **interface** the duel and trade
-//! workers build on: the pairing here is deliberately minimal (first come, first paired, no
-//! distance or level matching) and is the place to make it smarter.
+//! (one for the whole process) keeps the waiting bots and sends two of them a [`BotCmd::Pair`]
+//! with their roles when they fit together. The bot that has waited longer is the `Initiator`.
+//!
+//! # Who is paired
+//!
+//! For every kind of request the coordinator looks at all pairs of waiting bots and picks the
+//! best one by a score of distance plus level difference. A pair is only allowed when
+//!
+//! * the two were not paired with each other in the last [`REPAIR_COOLDOWN`] (so the same two
+//!   bots do not duel or trade back to back),
+//! * they are not further apart than [`NEAR_M`] plus [`NEAR_GROWTH_M`] for every second the
+//!   longer-waiting one has been waiting, and
+//! * their levels differ by at most [`LEVEL_DIFF`] plus one for every [`LEVEL_GROWTH_SECS`]
+//!   seconds of waiting.
+//!
+//! The limits grow with the waiting time, so a lone bot is eventually paired with anybody; a
+//! request that finds nobody within [`REQUEST_TTL`] is dropped. The sweep that expires requests
+//! also looks for pairs again, because waiting relaxes the limits.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +35,10 @@ pub trait Dispatch: Send + Sync {
     fn send(&self, bot: u32, cmd: BotCmd) -> Result<(), String>;
     /// Character id and name of a bot (0 and empty when unknown).
     fn who(&self, bot: u32) -> (u32, String);
+    /// Level of a bot (0 when unknown); level differences are not held against unknown levels.
+    fn level(&self, _bot: u32) -> u8 {
+        0
+    }
 }
 
 impl Dispatch for Hub {
@@ -39,10 +57,30 @@ impl Dispatch for Hub {
             None => (0, String::new()),
         }
     }
+
+    fn level(&self, bot: u32) -> u8 {
+        self.slot(bot).map_or(0, |s| s.with(|g| g.snap.level))
+    }
 }
 
 /// How long a request waits for a partner before it is dropped.
 pub const REQUEST_TTL: Duration = Duration::from_secs(120);
+/// Two bots that were paired are not paired with each other again for this long.
+pub const REPAIR_COOLDOWN: Duration = Duration::from_secs(90);
+/// Distance (metres) within which a fresh request may be paired.
+pub const NEAR_M: f32 = 150.0;
+/// The distance limit grows by this many metres per second of waiting.
+pub const NEAR_GROWTH_M: f32 = 40.0;
+/// Level difference allowed for a fresh request.
+pub const LEVEL_DIFF: u32 = 4;
+/// The level limit grows by one per this many seconds of waiting.
+pub const LEVEL_GROWTH_SECS: u64 = 8;
+/// A level step weighs this many metres in the score.
+const LEVEL_WEIGHT_M: f32 = 25.0;
+/// Seconds between two sweeps (expiry and another look for pairs).
+const SWEEP_SECS: u64 = 3;
+/// Most remembered pairings.
+const RECENT_MAX: usize = 64;
 /// Capacity of the coordinator's inbox.
 const INBOX: usize = 256;
 
@@ -98,11 +136,19 @@ struct Waiting {
     since: Instant,
 }
 
+/// Two bots that were paired, smaller id first.
+struct Recent {
+    a: u32,
+    b: u32,
+    at: Instant,
+}
+
 /// The coordinator task state.
 pub struct Coordinator {
     rx: mpsc::Receiver<CoordMsg>,
     sink: Arc<dyn Dispatch>,
     waiting: Vec<Waiting>,
+    recent: Vec<Recent>,
 }
 
 /// Creates the coordinator and the handle bots use.
@@ -114,6 +160,7 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
             rx,
             sink,
             waiting: Vec::new(),
+            recent: Vec::new(),
         },
     )
 }
@@ -121,7 +168,7 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
 impl Coordinator {
     /// Runs until `cancel` fires.
     pub async fn run(mut self, cancel: CancellationToken) {
-        let mut sweep = tokio::time::interval(Duration::from_secs(10));
+        let mut sweep = tokio::time::interval(Duration::from_secs(SWEEP_SECS));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -134,41 +181,106 @@ impl Coordinator {
         }
     }
 
-    /// Handles one message; pairs bots when two want the same thing.
+    /// Handles one message; pairs bots when two fit together.
     pub fn handle(&mut self, msg: CoordMsg, now: Instant) {
         match msg {
             CoordMsg::Cancel { bot } => self.waiting.retain(|w| w.bot != bot),
             CoordMsg::Request { kind, bot, at } => {
                 self.waiting.retain(|w| w.bot != bot);
-                let partner = self
-                    .waiting
-                    .iter()
-                    .position(|w| w.kind == kind && w.bot != bot);
-                match partner {
-                    Some(i) => {
-                        let other = self.waiting.remove(i);
-                        let meet = ((other.at.0 + at.0) / 2.0, (other.at.1 + at.1) / 2.0);
-                        self.pair(kind, other.bot, bot, meet);
-                    }
-                    None => self.waiting.push(Waiting {
-                        kind,
-                        bot,
-                        at,
-                        since: now,
-                    }),
-                }
+                self.waiting.push(Waiting {
+                    kind,
+                    bot,
+                    at,
+                    since: now,
+                });
+                self.pair_up(now);
             }
         }
     }
 
+    /// Drops requests that waited too long, then looks for pairs again (the limits relax with
+    /// the waiting time).
     fn expire(&mut self, now: Instant) {
         self.waiting
             .retain(|w| now.saturating_duration_since(w.since) < REQUEST_TTL);
+        self.recent
+            .retain(|r| now.saturating_duration_since(r.at) < REPAIR_COOLDOWN);
+        self.pair_up(now);
     }
 
     /// Number of bots waiting for a partner.
     pub fn waiting(&self) -> usize {
         self.waiting.len()
+    }
+
+    fn recently_paired(&self, a: u32, b: u32, now: Instant) -> bool {
+        let (a, b) = (a.min(b), a.max(b));
+        self.recent
+            .iter()
+            .any(|r| r.a == a && r.b == b && now.saturating_duration_since(r.at) < REPAIR_COOLDOWN)
+    }
+
+    /// Pairs the best-fitting waiting bots until no pair is left.
+    fn pair_up(&mut self, now: Instant) {
+        while self.waiting.len() >= 2 {
+            let Some((i, j)) = self.best_pair(now) else {
+                return;
+            };
+            // `i` waited longer (the list is in request order): it is the initiator.
+            let second = self.waiting.remove(j);
+            let first = self.waiting.remove(i);
+            let meet = (
+                (first.at.0 + second.at.0) / 2.0,
+                (first.at.1 + second.at.1) / 2.0,
+            );
+            self.remember(first.bot, second.bot, now);
+            self.pair(first.kind, first.bot, second.bot, meet);
+        }
+    }
+
+    fn remember(&mut self, a: u32, b: u32, now: Instant) {
+        if self.recent.len() >= RECENT_MAX {
+            self.recent.remove(0);
+        }
+        self.recent.push(Recent {
+            a: a.min(b),
+            b: a.max(b),
+            at: now,
+        });
+    }
+
+    /// The indices `(i, j)`, `i < j`, of the best allowed pair.
+    fn best_pair(&self, now: Instant) -> Option<(usize, usize)> {
+        let mut best: Option<(f32, usize, usize)> = None;
+        for (i, a) in self.waiting.iter().enumerate() {
+            let a_level = self.sink.level(a.bot);
+            for (j, b) in self.waiting.iter().enumerate().skip(i + 1) {
+                if a.kind != b.kind || a.bot == b.bot || self.recently_paired(a.bot, b.bot, now) {
+                    continue;
+                }
+                let waited = now
+                    .saturating_duration_since(a.since.min(b.since))
+                    .as_secs();
+                let dist = ((a.at.0 - b.at.0).powi(2) + (a.at.1 - b.at.1).powi(2)).sqrt();
+                if dist > NEAR_M + NEAR_GROWTH_M * waited as f32 {
+                    continue;
+                }
+                let b_level = self.sink.level(b.bot);
+                let diff = if a_level == 0 || b_level == 0 {
+                    0
+                } else {
+                    u32::from(a_level.abs_diff(b_level))
+                };
+                if diff > LEVEL_DIFF + (waited / LEVEL_GROWTH_SECS) as u32 {
+                    continue;
+                }
+                let score = dist + LEVEL_WEIGHT_M * diff as f32;
+                if best.is_none_or(|x| score < x.0) {
+                    best = Some((score, i, j));
+                }
+            }
+        }
+        best.map(|(_, i, j)| (i, j))
     }
 
     fn pair(&self, kind: PairKind, first: u32, second: u32, meet_at: (f32, f32)) {
@@ -196,17 +308,24 @@ impl Coordinator {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
 
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<(u32, BotCmd)>>);
+    struct Recorder {
+        sent: Mutex<Vec<(u32, BotCmd)>>,
+        levels: Mutex<HashMap<u32, u8>>,
+    }
 
     impl Dispatch for Recorder {
         fn send(&self, bot: u32, cmd: BotCmd) -> Result<(), String> {
-            self.0.lock().push((bot, cmd));
+            self.sent.lock().push((bot, cmd));
             Ok(())
         }
         fn who(&self, bot: u32) -> (u32, String) {
             (bot * 100, format!("Bot{bot}"))
+        }
+        fn level(&self, bot: u32) -> u8 {
+            self.levels.lock().get(&bot).copied().unwrap_or(0)
         }
     }
 
@@ -220,16 +339,28 @@ mod tests {
         CoordMsg::Request { kind, bot, at }
     }
 
+    /// Who was told to pair with whom: `(bot, partner, role)` in sending order.
+    fn pairs(rec: &Recorder) -> Vec<(u32, u32, PairRole)> {
+        rec.sent
+            .lock()
+            .iter()
+            .map(|(bot, cmd)| match cmd {
+                BotCmd::Pair(o) => (*bot, o.partner_bot, o.role),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn two_requests_of_a_kind_make_a_pair_with_opposite_roles() {
         let (rec, _h, mut c) = coordinator();
         let now = Instant::now();
         c.handle(req(PairKind::Duel, 1, (0.0, 0.0)), now);
         assert_eq!(c.waiting(), 1);
-        assert!(rec.0.lock().is_empty());
+        assert!(rec.sent.lock().is_empty());
         c.handle(req(PairKind::Duel, 2, (10.0, 20.0)), now);
         assert_eq!(c.waiting(), 0);
-        let sent = rec.0.lock();
+        let sent = rec.sent.lock();
         assert_eq!(sent.len(), 2);
         let (bot, BotCmd::Pair(first)) = &sent[0] else {
             panic!()
@@ -261,7 +392,7 @@ mod tests {
         // a bot asking twice waits once and is never paired with itself
         c.handle(req(PairKind::Trade, 2, (1.0, 1.0)), now);
         assert_eq!(c.waiting(), 1);
-        assert!(rec.0.lock().is_empty());
+        assert!(rec.sent.lock().is_empty());
     }
 
     #[test]
@@ -288,5 +419,101 @@ mod tests {
         // a detached handle has nobody listening: every request is refused
         let d = CoordHandle::detached();
         assert!(!d.request_partner(PairKind::Duel, 1, (0.0, 0.0)));
+    }
+
+    #[test]
+    fn the_nearest_waiting_bot_is_chosen() {
+        let (rec, _h, mut c) = coordinator();
+        let t = Instant::now();
+        // 1 far away, 2 close to the newcomer 3: 3 pairs with 2
+        c.handle(req(PairKind::Duel, 1, (100.0, 0.0)), t);
+        c.handle(req(PairKind::Duel, 2, (-40.0, 0.0)), t);
+        // 1 and 2 are 140 m apart (allowed), so they were paired at once
+        assert_eq!(c.waiting(), 0);
+        assert_eq!(pairs(&rec)[0], (1, 2, PairRole::Initiator));
+        rec.sent.lock().clear();
+        // a cluster: 4 waits far from 5; 6 arrives next to 5 and takes it
+        c.handle(req(PairKind::Duel, 4, (1000.0, 0.0)), t);
+        c.handle(req(PairKind::Duel, 5, (0.0, 0.0)), t);
+        assert_eq!(c.waiting(), 2, "1000 m apart: not paired yet");
+        c.handle(req(PairKind::Duel, 6, (5.0, 0.0)), t);
+        let p = pairs(&rec);
+        assert_eq!(p[0], (5, 6, PairRole::Initiator));
+        assert_eq!(c.waiting(), 1);
+    }
+
+    #[test]
+    fn levels_must_be_close_until_the_wait_relaxes_the_limit() {
+        let (rec, _h, mut c) = coordinator();
+        rec.levels.lock().extend([(1, 5), (2, 30), (3, 8)]);
+        let t = Instant::now();
+        c.handle(req(PairKind::Duel, 1, (0.0, 0.0)), t);
+        c.handle(req(PairKind::Duel, 2, (0.0, 0.0)), t);
+        assert_eq!(c.waiting(), 2, "25 levels apart");
+        // 3 is three levels from 1 and takes it, though 2 waited longer than 3
+        c.handle(req(PairKind::Duel, 3, (0.0, 0.0)), t);
+        assert_eq!(pairs(&rec)[0], (1, 3, PairRole::Initiator));
+        rec.sent.lock().clear();
+        // 2 stays alone; a later look pairs it with nobody until somebody comes
+        c.expire(t + Duration::from_secs(30));
+        assert_eq!(c.waiting(), 1);
+        // a level 14 newcomer is 16 levels from bot 2: only the waiting time relaxes the limit
+        rec.levels.lock().insert(4, 14);
+        c.handle(
+            req(PairKind::Duel, 4, (0.0, 0.0)),
+            t + Duration::from_secs(40),
+        );
+        assert_eq!(c.waiting(), 2, "bot 2 waited 40 s: limit 4 + 5 levels");
+        c.expire(t + Duration::from_secs(100));
+        assert_eq!(c.waiting(), 0, "bot 2 waited 100 s: limit 4 + 12 levels");
+        assert_eq!(pairs(&rec)[0], (2, 4, PairRole::Initiator));
+    }
+
+    #[test]
+    fn the_same_two_bots_are_not_paired_back_to_back() {
+        let (rec, _h, mut c) = coordinator();
+        let t = Instant::now();
+        c.handle(req(PairKind::Duel, 1, (0.0, 0.0)), t);
+        c.handle(req(PairKind::Duel, 2, (5.0, 0.0)), t);
+        assert_eq!(pairs(&rec).len(), 2);
+        rec.sent.lock().clear();
+        // they ask again right after: nothing, they wait
+        let t1 = t + Duration::from_secs(20);
+        c.handle(req(PairKind::Duel, 1, (0.0, 0.0)), t1);
+        c.handle(req(PairKind::Duel, 2, (5.0, 0.0)), t1);
+        assert!(rec.sent.lock().is_empty());
+        assert_eq!(c.waiting(), 2);
+        // a third bot goes with the one that waited longer
+        c.handle(req(PairKind::Duel, 3, (-30.0, 0.0)), t1);
+        let p = pairs(&rec);
+        assert_eq!(p[0].0, 1, "{p:?}");
+        assert!(p[0].1 == 3, "{p:?}");
+        rec.sent.lock().clear();
+        // and after the cooldown the old pair may meet again
+        let t2 = t + REPAIR_COOLDOWN + Duration::from_secs(5);
+        c.handle(req(PairKind::Duel, 1, (0.0, 0.0)), t2);
+        c.expire(t2);
+        assert_eq!(pairs(&rec)[0], (2, 1, PairRole::Initiator));
+    }
+
+    #[test]
+    fn distance_limit_grows_with_waiting() {
+        let (rec, _h, mut c) = coordinator();
+        let t = Instant::now();
+        c.handle(req(PairKind::Trade, 1, (0.0, 0.0)), t);
+        c.handle(req(PairKind::Trade, 2, (900.0, 0.0)), t);
+        assert_eq!(c.waiting(), 2);
+        c.expire(t + Duration::from_secs(10));
+        assert_eq!(c.waiting(), 2, "150 + 400 m after 10 s");
+        c.expire(t + Duration::from_secs(20));
+        assert_eq!(c.waiting(), 0, "150 + 800 m after 20 s");
+        let p = pairs(&rec);
+        assert_eq!(p[0], (1, 2, PairRole::Initiator));
+        // trade pairing carries the same order shape
+        let sent = rec.sent.lock();
+        let BotCmd::Pair(o) = &sent[0].1 else {
+            panic!()
+        };
+        assert_eq!((o.kind, o.meet_at), (PairKind::Trade, (450.0, 0.0)));
     }
 }

@@ -26,6 +26,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod goals;
 pub mod motion;
+pub mod rotation;
 pub mod session;
 pub mod state;
 
@@ -57,7 +58,7 @@ use coordinator::CoordHandle;
 use ctx::{Ctx, Persona};
 use motion::{Motion, MotionCfg, MotionEnv};
 use session::{SessionError, Wish};
-use state::BotState;
+use state::{BotState, UnitKind};
 
 /// Concurrent logins (login server plus lobby), so a restart does not stampede the servers.
 pub const LOGIN_PERMITS: usize = 4;
@@ -471,6 +472,7 @@ impl Bot {
         let active = self.motion.busy()
             || self.combat.busy()
             || !self.state.threats.is_empty()
+            || self.state.trade.active()
             || !self.state.me.spawned;
         Duration::from_millis(if active { b.tick_ms } else { b.idle_tick_ms })
     }
@@ -488,6 +490,9 @@ impl Bot {
         }
         let now = self.now_ms();
         self.state.now_ms = now;
+        if let Some(tasks) = goals::trade::made_tasks(p) {
+            self.state.apply(&tasks);
+        }
         self.state.apply(&ev);
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
@@ -725,6 +730,8 @@ impl Bot {
                 g.extra
                     .push(("kills".into(), self.combat.kills().to_string()));
                 g.extra.push(("sessions".into(), self.sessions.to_string()));
+                g.extra
+                    .push(("quests".into(), goals::quest::summary(world, &self.state)));
             }
         });
         self.slot.obj_id.store(self.state.me.obj, Ordering::Relaxed);
@@ -738,7 +745,13 @@ impl Bot {
             let _ = write!(self.detail, "dead, can respawn in {left}s");
         } else if self.paused {
             self.detail.push_str("paused");
-        } else if let Some(obj) = self.combat.target() {
+        } else if let Some(obj) = self.combat.target().filter(|o| {
+            self.state
+                .units
+                .get(o)
+                .is_none_or(|u| u.kind != UnitKind::Character)
+        }) {
+            // (a character target is a duel opponent: the goal describes that)
             let name = self
                 .state
                 .units

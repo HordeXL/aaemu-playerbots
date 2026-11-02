@@ -18,6 +18,8 @@ use aa_proto::sc_world::{unit_type, EquipSlot, ItemChange, UnitInfo, WorldEvent}
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use super::goals::trade_run::Ledger;
+
 /// Most units kept in the view.
 pub const MAX_UNITS: usize = 1024;
 /// Most doodads kept in the view.
@@ -366,6 +368,14 @@ pub struct BotState {
     pub reactions: Reactions,
     /// Events dropped because a collection was full.
     pub dropped: u32,
+    /// The trade window and unanswered trade requests (the trade goal and the brain read it).
+    pub trade: super::goals::trade::TradeLog,
+    /// Housing notes: the tax quote, object ids of the bot's houses, the map marker.
+    pub house_log: super::goals::housing::HouseLog,
+    /// Economy notes the trade-run goal reads: refusals, craft casts, payment mails, bad routes.
+    pub econ: Ledger,
+    /// What the quest goal remembers between its runs (failed and quarantined quests).
+    pub quest_mem: Option<Box<super::goals::quest::Memory>>,
 }
 
 impl BotState {
@@ -457,6 +467,7 @@ impl BotState {
 
     /// Updates the state from one server event.
     pub fn apply(&mut self, ev: &ServerEvent) {
+        self.econ.observe(ev, self.now_ms, self.me.obj);
         match ev {
             ServerEvent::World(w) => self.apply_world(w),
             ServerEvent::Activity(a) => self.apply_activity(a),
@@ -930,6 +941,8 @@ impl BotState {
     }
 
     fn apply_activity(&mut self, ev: &ActivityEvent) {
+        self.trade.apply(ev, self.now_ms);
+        self.house_log.apply(ev, self.now_ms, self.me.char_id);
         match ev {
             ActivityEvent::Quests { list } => {
                 for row in list {

@@ -42,4 +42,5 @@ GPL-3.0-or-later (see `LICENSE`). The bot classes and the skill rotation files i
 `crates/playerbots/data/rotations/` come from
 [NulightJens/ArcheAge-PlayerBots](https://github.com/NulightJens/ArcheAge-PlayerBots)
 (GPL-3.0-or-later); the rotation JSONs are copied unchanged (see
-`crates/playerbots/data/rotations/NOTICE`) and are not interpreted by the runtime yet.
+`crates/playerbots/data/rotations/NOTICE`) and are compiled once at start and run by the
+rotation engine in `crates/playerbots/src/bot/rotation/`.

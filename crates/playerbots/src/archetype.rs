@@ -16,6 +16,8 @@ use std::sync::Arc;
 use anyhow::{ensure, Context};
 use serde::Deserialize;
 
+use crate::bot::rotation::Rotation;
+
 /// The shipped archetypes.
 const ARCHETYPES_JSON: &str = include_str!("../data/archetypes.json");
 
@@ -128,6 +130,9 @@ pub struct Archetype {
     /// Passive buffs that belong to the build.
     #[serde(default)]
     pub passive_buff_ids: Vec<u32>,
+    /// The compiled rotation, shared by all bots of the build (filled in by [`Archetypes`]).
+    #[serde(skip)]
+    pub compiled: Option<Arc<Rotation>>,
 }
 
 impl Archetype {
@@ -147,10 +152,33 @@ impl Archetype {
             .map(|(_, text)| *text)
     }
 
+    /// The compiled rotation, if the rotation file exists and parses.
+    pub fn rotation(&self) -> Option<&Arc<Rotation>> {
+        self.compiled.as_ref()
+    }
+
     /// The skills of the starting ability, ordered by required ability level
     /// (`World::ability_skills`).
     pub fn ability_skills<'w>(&self, world: &'w aa_world::World) -> &'w [u32] {
         world.ability_skills(self.ability)
+    }
+}
+
+/// Compiles the rotation file of `a`; problems are logged, a missing or broken file leaves the
+/// build without a rotation (it fights with its starter skill and the basic attack).
+fn compile_rotation(a: &Archetype) -> Option<Arc<Rotation>> {
+    let src = a.rotation_source()?;
+    match Rotation::compile(src) {
+        Ok(r) => {
+            for w in r.warnings() {
+                tracing::warn!(archetype = %a.name, rotation = %a.rotation, "{w}");
+            }
+            Some(Arc::new(r))
+        }
+        Err(e) => {
+            tracing::warn!(archetype = %a.name, rotation = %a.rotation, "rotation file: {e}");
+            None
+        }
     }
 }
 
@@ -168,7 +196,7 @@ impl Archetypes {
 
     /// Parses and checks an archetype list.
     pub fn from_json(text: &str) -> anyhow::Result<Archetypes> {
-        let list: Vec<Archetype> = serde_json::from_str(text)?;
+        let mut list: Vec<Archetype> = serde_json::from_str(text)?;
         ensure!(!list.is_empty(), "no archetypes");
         for a in &list {
             ensure!(
@@ -184,6 +212,9 @@ impl Archetypes {
                 a.preferred_range
             );
             ensure!(a.starter_skill != 0, "{}: no starter skill", a.name);
+        }
+        for a in &mut list {
+            a.compiled = compile_rotation(a);
         }
         Ok(Archetypes {
             list: list.into_iter().map(Arc::new).collect(),
@@ -247,6 +278,24 @@ mod tests {
                 arch.name
             );
             assert_eq!(arch.required_abilities.first(), Some(&arch.ability));
+        }
+    }
+
+    #[test]
+    fn every_shipped_rotation_compiles_without_warnings() {
+        let a = Archetypes::builtin().unwrap();
+        for arch in a.all() {
+            let rot = arch
+                .rotation()
+                .unwrap_or_else(|| panic!("{}: rotation did not compile", arch.name));
+            assert!(
+                rot.warnings().is_empty(),
+                "{}: {:?}",
+                arch.name,
+                rot.warnings()
+            );
+            assert_eq!(rot.id(), arch.rotation.as_str());
+            assert!(!rot.skills().is_empty(), "{}", arch.name);
         }
     }
 

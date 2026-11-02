@@ -335,18 +335,11 @@ fn the_automatic_brain_runs_for_half_an_hour_without_trouble() {
         seen.contains("wander") || seen.contains("grind") || seen.contains("rest"),
         "no implemented goal ever ran: {seen:?}"
     );
-    for stub in [
-        GoalKind::Quest,
-        GoalKind::Duel,
-        GoalKind::Trade,
-        GoalKind::TradeRun,
-        GoalKind::Housing,
-    ] {
-        if seen.contains(stub.name()) {
-            assert!(
-                rig.brain.is_disabled(stub),
-                "{stub:?} ran but was not switched off"
-            );
-        }
+    // Every goal is implemented now: none may be switched off as a stub.
+    for kind in GoalKind::ALL {
+        assert!(
+            !rig.brain.is_disabled(kind),
+            "{kind:?} was switched off as not implemented"
+        );
     }
 }

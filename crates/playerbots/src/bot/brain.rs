@@ -197,12 +197,24 @@ impl Brain {
         if !ctx.state.me.spawned {
             return;
         }
+        // Payment mails of sold trade packs are collected whatever the bot is doing.
+        super::goals::trade_run::collect_payments(ctx);
         let combat = Combat::tick(ctx);
         let now = ctx.now_ms;
 
         if let Some((kind, order)) = self.queued.take() {
             self.start_goal(ctx, kind, order);
         }
+        // Trade requests no goal asked for are answered here; the house marker follows `houses`.
+        if super::goals::trade::unsolicited(
+            ctx,
+            self.goal.as_ref().map(Goal::kind),
+            self.base[GoalKind::Trade.index()],
+            self.is_disabled(GoalKind::Trade),
+        ) {
+            self.start_goal(ctx, GoalKind::Trade, None);
+        }
+        super::goals::housing::sync_marker(ctx);
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
         } else if self.hurt_and_idle(ctx) {
