@@ -11,6 +11,12 @@ use super::format::{
 };
 use crate::geom::Vec3;
 
+/// A triangle whose plane is further than this (metres) above or below a position is not the
+/// ground there: another floor, or one of the world-sized dummy planes some instance worlds
+/// carry. (Plane heights of the big triangles of the open world are off by a few metres, not
+/// tens.)
+pub const MAX_FLOOR_GAP: f32 = 40.0;
+
 /// A node of the mesh (index into the node arrays).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeRef(pub u32);
@@ -521,8 +527,8 @@ impl NavMesh {
 
     /// Finds the node at a world position (multi-floor aware).
     ///
-    /// Among the triangles containing the position's x/y the one whose plane is vertically
-    /// closest to `pos.z` wins; a waypoint within `max_dist` (3D) beats it only if it is closer
+    /// Among the triangles containing the position's x/y (and within [`MAX_FLOOR_GAP`] of
+    /// `pos.z`) the one whose plane is vertically closest to `pos.z` wins; a waypoint within `max_dist` (3D) beats it only if it is closer
     /// than that vertical gap. When no triangle contains the position, the nearest triangle or
     /// waypoint within `max_dist` is used.
     pub fn locate(&self, pos: Vec3, max_dist: f32) -> Option<NodeRef> {
@@ -596,11 +602,15 @@ impl NavMesh {
                     return;
                 };
                 if inside {
+                    let gap = (p.z - pos.z).abs();
+                    if gap > MAX_FLOOR_GAP {
+                        return;
+                    }
                     Located {
                         node: n,
                         point: p,
                         inside: true,
-                        dist: (p.z - pos.z).abs(),
+                        dist: gap,
                     }
                 } else {
                     let d = p.dist(pos);

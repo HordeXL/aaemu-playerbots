@@ -28,14 +28,16 @@ impl NavMesh {
 
         // (point, from a waypoint): `pts` is the result, `corners` the funnel's scratch output
         let mut pts: Vec<(Vec3, bool)> = Vec::with_capacity(corridor.len().min(64) + 4);
-        pts.push((q.from, false));
+        // a start on a waypoint (indoors) makes the way to the first node indoor too
+        let start_wp = self.node_flags(start.node) & flag::WAYPOINT != 0;
+        pts.push((q.from, start_wp));
         let mut apex = if start.inside {
             Vec3::new(q.from.x, q.from.y, start.point.z)
         } else {
             start.point
         };
         if !start.inside && apex.dist2d(q.from) > MERGE_EPS {
-            pts.push((apex, false));
+            pts.push((apex, start_wp));
         }
         let radius = q.agent_radius;
 

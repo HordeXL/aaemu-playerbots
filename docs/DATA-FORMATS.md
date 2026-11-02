@@ -95,7 +95,7 @@ Header (64 bytes), then the section table, then the sections (each 64-byte align
 | 24 | u32 | `components` C |
 | 28 | u32 | `sections` (14) |
 | 32 | f32 ×4 | bounds `min_x, min_y, max_x, max_y` of all nodes and vertices |
-| 48 | f32 | grid cell size in metres (8, 16, 32 or 64) |
+| 48 | f32 | grid cell size in metres (8 .. 256; 32 for `main_world`) |
 | 52 | u32 | grid width in cells |
 | 56 | u32 | grid height in cells |
 | 60 | u8 | `comp_radius`: the pass radius the component tables are exact for, in 0.05 m units (10 = 0.5 m) |

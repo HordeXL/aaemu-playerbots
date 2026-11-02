@@ -151,19 +151,21 @@ fn morton(x: u32, y: u32) -> u32 {
     spread(x) | (spread(y) << 1)
 }
 
-/// Picks a grid cell size: the smallest of 8 / 16 / 32 / 64 m that keeps the grid at or below
-/// 3 million cells.
-fn pick_bucket(bounds: [f32; 4]) -> f32 {
+/// Picks a grid cell size: the smallest of 8 .. 256 m that keeps the grid at or below 3 million
+/// cells and, for small meshes, at or below four cells per node (some instance worlds carry a
+/// few world-sized dummy triangles, which would otherwise fill a million cells).
+fn pick_bucket(bounds: [f32; 4], nodes: usize) -> f32 {
     let (w, h) = (
         f64::from(bounds[2] - bounds[0]),
         f64::from(bounds[3] - bounds[1]),
     );
-    for b in [8.0f32, 16.0, 32.0] {
-        if (w / f64::from(b) + 1.0) * (h / f64::from(b) + 1.0) <= 3.0e6 {
+    let limit = (nodes.saturating_mul(4)).clamp(4096, 3_000_000) as f64;
+    for b in [8.0f32, 16.0, 32.0, 64.0, 128.0] {
+        if (w / f64::from(b) + 1.0) * (h / f64::from(b) + 1.0) <= limit {
             return b;
         }
     }
-    64.0
+    256.0
 }
 
 /// Turns the merged graph into the file's in-memory form.
@@ -429,7 +431,7 @@ pub fn assemble(b: NavBuilder, opts: &AssembleOptions) -> anyhow::Result<(NavDat
     d.compute_costs();
     d.compute_vertex_flags(MIN_LINK_UNITS);
     st.boundary_vertices = d.vertex_flags.iter().filter(|&&f| f != 0).count();
-    let bucket = opts.bucket.unwrap_or_else(|| pick_bucket(d.bounds));
+    let bucket = opts.bucket.unwrap_or_else(|| pick_bucket(d.bounds, m));
     d.build_grid(bucket)?;
     st.bucket = bucket;
     st.grid_cells = d.grid_off.len() - 1;
