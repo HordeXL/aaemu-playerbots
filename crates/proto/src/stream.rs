@@ -8,7 +8,6 @@
 
 use std::fmt;
 
-
 use crate::pos as helpers;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -196,7 +195,6 @@ impl PacketStream {
         Ok(decode_string(bytes))
     }
 
-
     pub fn read<T: Unmarshal>(&mut self) -> Result<T> {
         T::read(self)
     }
@@ -334,7 +332,6 @@ impl PacketStream {
         b.resize(len, 0);
         self.write_raw(&b)
     }
-
 
     pub fn write<T: Marshal + ?Sized>(&mut self, v: &T) -> &mut Self {
         v.write(self);
