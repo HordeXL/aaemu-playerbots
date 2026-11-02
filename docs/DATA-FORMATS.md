@@ -93,7 +93,7 @@ Header (64 bytes), then the section table, then the sections (each 64-byte align
 | 16 | u32 | `vertices` V |
 | 20 | u32 | `links` L |
 | 24 | u32 | `components` C |
-| 28 | u32 | `sections` (14) |
+| 28 | u32 | `sections` (15) |
 | 32 | f32 ×4 | bounds `min_x, min_y, max_x, max_y` of all nodes and vertices |
 | 48 | f32 | grid cell size in metres (8 .. 256; 32 for `main_world`) |
 | 52 | u32 | grid width in cells |
@@ -110,7 +110,7 @@ skipped, missing required ids are an error.
 | --- | --- | --- | --- | --- |
 | 1 | node positions | `[f32; 3]` | N | triangle centroid or waypoint position (world metres, z absolute) |
 | 2 | node triangles | `[u32; 3]` | N | vertex indices of the triangle; `0xFFFFFFFF` ×3 for waypoints and nodes without usable geometry |
-| 3 | node flags | u8 | N | bit 0 waypoint, bit 1 road (near a road polyline) |
+| 3 | node flags | u8 | N | bit 0 waypoint, bit 1 road (the triangle lies under a road prefab or carriage route) |
 | 4 | node components | u32 | N | strongly connected component of the node; 0 is the largest, then by size |
 | 5 | vertices | `[f32; 3]` | V | triangle corners (world metres) |
 | 6 | adjacency offsets | u32 | N + 1 | CSR: the links of node `i` are `off[i] .. off[i+1]` |
@@ -122,6 +122,14 @@ skipped, missing required ids are an error.
 | 12 | component order | u32 | C | completion index of the component in the SCC search; **a link never leads to a component with a higher order**, so a goal whose component has a higher order than the start's is unreachable |
 | 13 | grid offsets | u32 | W·H + 1 | CSR over the grid cells (row-major, `row = y`, `col = x`, origin `min_x, min_y`) |
 | 14 | grid items | u32 | any | node ids per cell: a triangle in every cell it touches (padded, conservative), a waypoint in the cell of its position |
+| 15 | vertex flags | u8 | V | bit 0 border vertex: an end of a triangle edge that no link of at least 0.4 m crosses (obstacle or mesh edge); the path smoother keeps the agent radius away from these only |
+
+Road flags (`main_world` only): the bake reads the road prefabs (object type 13: paired left / right
+edge points, cell-local) of every `cells/<cx>_<cy>/client/object.dat` and the carriage routes of
+`level_design/zone/<id>/client/transfer_path.xml` (zone-local, only routes of which 60 % lies on the
+mesh: the file also holds air and ship routes) and sets bit 1 of every triangle that a road strip
+passes over within 6 m vertically. Path finding multiplies the cost of links between two road nodes
+by `PathQuery::road_bias` (default 0.75).
 
 Derived at run time, not stored: the portal (shared edge) of two linked triangles is the two vertex
 indices they have in common (links between triangles without exactly two common vertices are

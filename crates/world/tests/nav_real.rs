@@ -402,3 +402,94 @@ fn instance_worlds_open_and_deadmine_route() {
         }
     }
 }
+
+/// Share of the walkable path samples that lie on a `ROAD` triangle.
+fn road_share(mesh: &NavMesh, path: &aa_world::nav::Path) -> f64 {
+    let (mut on, mut all) = (0usize, 0usize);
+    for (i, w) in path.points.windows(2).enumerate() {
+        if path.indoor[i] {
+            continue;
+        }
+        let steps = (w[0].dist2d(w[1]) / 2.0).ceil().max(1.0) as usize;
+        for k in 0..=steps {
+            let t = k as f32 / steps as f32;
+            let p = Vec3::new(
+                w[0].x + (w[1].x - w[0].x) * t,
+                w[0].y + (w[1].y - w[0].y) * t,
+                w[0].z + (w[1].z - w[0].z) * t,
+            );
+            if let Some(l) = mesh.locate_detailed(p, 0.5) {
+                all += 1;
+                if mesh.node_flags(l.node) & 2 != 0 {
+                    on += 1;
+                }
+            }
+        }
+    }
+    on as f64 / all.max(1) as f64
+}
+
+#[test]
+#[ignore = "needs AA_BAKED with nav_main_world.bin"]
+fn main_world_roads_are_flagged_and_preferred() {
+    let Some(mesh) = open("nav_main_world.bin") else {
+        return;
+    };
+    let roads = (0..mesh.node_count() as u32)
+        .filter(|&n| mesh.node_flags(NodeRef(n)) & 2 != 0)
+        .count();
+    println!(
+        "road nodes: {roads} of {} ({:.2} %)",
+        mesh.node_count(),
+        roads as f64 * 100.0 / mesh.node_count() as f64
+    );
+    assert!(roads > 10_000, "only {roads} road nodes");
+
+    // pairs of road triangles 300 m .. 1.5 km apart: the biased search should stay on roads
+    // more, at a small cost in length
+    let road_nodes: Vec<u32> = (0..mesh.node_count() as u32)
+        .filter(|&n| mesh.node_flags(NodeRef(n)) & 2 != 0)
+        .collect();
+    let mut rng = Rng(0x5eed_1234_abcd_ef01);
+    let (mut pairs, mut share_off, mut share_on, mut len_off, mut len_on) = (0, 0.0, 0.0, 0.0, 0.0);
+    let (mut exp_off, mut exp_on) = (0u64, 0u64);
+    let mut tries = 0;
+    while pairs < 60 && tries < 5000 {
+        tries += 1;
+        let a = NodeRef(road_nodes[rng.below(road_nodes.len())]);
+        let b = NodeRef(road_nodes[rng.below(road_nodes.len())]);
+        let (pa, pb) = (mesh.node_pos(a), mesh.node_pos(b));
+        let d = pa.dist2d(pb);
+        if !(300.0..=1500.0).contains(&d) || !mesh.same_component(a, b) {
+            continue;
+        }
+        let mut off = PathQuery::new(pa, pb);
+        off.road_bias = 1.0;
+        let (PathResult::Found(x), PathResult::Found(y)) = (
+            mesh.find_path(&off),
+            mesh.find_path(&PathQuery::new(pa, pb)),
+        ) else {
+            continue;
+        };
+        pairs += 1;
+        share_off += road_share(&mesh, &x);
+        share_on += road_share(&mesh, &y);
+        len_off += f64::from(x.length);
+        len_on += f64::from(y.length);
+        exp_off += u64::from(x.expansions);
+        exp_on += u64::from(y.expansions);
+    }
+    assert!(pairs >= 20, "only {pairs} road pairs");
+    let n = f64::from(pairs);
+    println!(
+        "{pairs} road pairs: bias off {:.1} % on roads, {:.0} m, {:.0} exp; bias on {:.1} % on roads, {:.0} m, {:.0} exp",
+        share_off / n * 100.0,
+        len_off / n,
+        exp_off as f64 / n,
+        share_on / n * 100.0,
+        len_on / n,
+        exp_on as f64 / n
+    );
+    assert!(share_on > share_off, "the bias must raise the road share");
+    assert!(len_on <= len_off * 1.2, "detours too long");
+}

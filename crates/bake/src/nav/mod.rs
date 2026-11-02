@@ -11,6 +11,7 @@
 pub mod bai;
 pub mod graph;
 pub mod merge;
+pub mod roads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -68,6 +69,8 @@ pub struct NavReport {
     pub assemble: AssembleStats,
     pub file: String,
     pub bytes: u64,
+    /// The `ROAD` flags (main world only).
+    pub roads: Option<roads::RoadReport>,
     /// Seconds: reading + merging the files, assembling, writing.
     pub secs: (f32, f32, f32),
     pub warnings: Vec<String>,
@@ -140,6 +143,9 @@ impl std::fmt::Display for NavReport {
             self.secs.1,
             self.secs.2
         )?;
+        if let Some(r) = &self.roads {
+            write!(f, "{r}")?;
+        }
         for w in &self.warnings {
             writeln!(f, "  warning: {w}")?;
         }
@@ -338,7 +344,7 @@ pub fn bake_nav_world(
     let read_secs = t0.elapsed().as_secs_f32();
 
     let t1 = Instant::now();
-    let (data, assemble) = assemble(
+    let (mut data, assemble) = assemble(
         builder,
         &AssembleOptions {
             min_component_nodes,
@@ -346,6 +352,8 @@ pub fn bake_nav_world(
         },
     )
     .with_context(|| format!("navigation mesh of {world}"))?;
+    let roads = (layout == NavLayout::Paths)
+        .then(|| roads::flag_roads(pak, world, zone_origins, &mut data));
     let assemble_secs = t1.elapsed().as_secs_f32();
 
     let t2 = Instant::now();
@@ -367,6 +375,7 @@ pub fn bake_nav_world(
         assemble,
         file,
         bytes,
+        roads,
         secs: (read_secs, assemble_secs, write_secs),
         warnings,
     })
