@@ -7,6 +7,7 @@
 //! names and terrain heights. Wrap it in an `Arc` and hand it to every bot.
 
 pub mod baked;
+pub mod nav;
 pub mod terrain;
 
 pub mod chars;
