@@ -22,7 +22,7 @@ and an operator web UI, which the original does not have.
 | Crate | Path | Role |
 | --- | --- | --- |
 | `aa-proto` | `crates/proto` | Wire protocol: framing, `PacketStream`, position codec, opcode tables, login client, game connection, CS packet builders, SC packet parsers → `ServerEvent`. No game logic. |
-| `aa-world` | `crates/world` | Static world knowledge, loaded once and shared read-only (`Arc<World>`): compact.sqlite3 subset (NPCs, factions, quests, skills, crafts, specialty, housing), server spawn files, spatial index, terrain heights (mmap of the baked grid), baked extras (housing areas, quest spheres, zones, map calibration). |
+| `aa-world` | `crates/world` | Static world knowledge, loaded once and shared read-only (`Arc<World>`): compact.sqlite3 subset (NPCs, factions, quests and their start requirements, skills with mana by level, doodad and item use skills, crafts with their requirements, specialty buyers and pack prices, housing with garden radii), server spawn files, spatial index, terrain heights (mmap of the baked grid), baked extras (housing areas, quest spheres, zones, map calibration). |
 | `aa-bake` | `crates/bake` | One-off extraction from the 1.2 client `game_pak` into the data dir: height grid, world map PNG + calibration, housing area polygons, quest sign spheres, zone sector grid. |
 | `pb-web` | `crates/web` | Operator web UI (axum): JSON API + an embedded single-page map UI. Knows nothing about bots except the `BotHub` trait and snapshot types it defines. |
 | `pb-llm` | `crates/llm` | Optional OpenAI-compatible chat client with rate limit, concurrency cap and daily token budget. |
@@ -56,6 +56,11 @@ aa-world` (only for shared baked file types); nothing else depends on anything i
 - Login: Trion ticket (XML, SHA-256 hex password), `AutoAccount` creates unknown accounts.
 - Movement is not validated by the server (no speed clamp or collision check; > 25 m/s is only
   audit-logged). Bots must still move plausibly: run speed ≈ 5.4 m/s, Z from the terrain grid.
+- The server checks distances (loot 5 m, specialty sale 2.5 m, skill range) against the position of
+  the *last* `CSMoveUnit`, and a walking bot sends one only every second when no player is near. So
+  the motion controller sends a final stopped update on arrival and `Motion::pin` puts an exact
+  update in front of every packet the server range-checks (loot, talk, quest steps, craft, sell,
+  casts); loot windows are opened from at most 3.5 m.
 - GM commands are chat lines starting with `/`; the effective access level is
   max(account, character); most useful commands need 100. Bots use them only when
   `gm_bootstrap = true` (see "GM bootstrap").
@@ -84,7 +89,9 @@ Trade runs and housing need materials, labor, tax certificates or gold that a fr
 character does not have. With `gm_bootstrap = true` and access level 100 on the bot accounts, bots
 give themselves exactly what the goal needs (`/item add self …`, `/labor …`, `/gold add self …`)
 and may use `/move` for long travel. Without it those goals are skipped with a visible reason.
-`playerbots grant-gm-sql` prints the SQL that grants access level 100 to the bot accounts.
+`playerbots grant-gm-sql` prints the SQL that grants access level 100 to the bot accounts
+(`--game-db` / `--login-db` name the MySQL databases when the server does not use `aaemu_game` /
+`aaemu_login`).
 
 ## Improvements over the original (from the audit)
 

@@ -21,6 +21,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
 
 use crate::bot::cmd::{BotCmd, GoalChoice};
+use crate::bot::goals::social::gate::ChatHub;
+use crate::bot::goals::social::SlotSocial;
 
 /// Entries of a bot's event log.
 pub const LOG_LINES: usize = 32;
@@ -56,6 +58,8 @@ pub struct SlotInner {
     pub quests: Vec<QuestLine>,
     /// Extra rows of the detail panel.
     pub extra: Vec<(String, String)>,
+    /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
+    pub social: SlotSocial,
 }
 
 /// The public face of one bot.
@@ -155,6 +159,11 @@ impl Logger {
     /// A detail: logged at debug level only.
     pub fn debug(&self, text: impl AsRef<str>) {
         tracing::debug!("{}", text.as_ref());
+    }
+
+    /// Runs `f` on the bot's slot data (the chat rings live there).
+    pub fn with_slot<R>(&self, f: impl FnOnce(&mut SlotInner) -> R) -> R {
+        self.slot.with(f)
     }
 }
 
@@ -273,6 +282,8 @@ pub struct Hub {
     slots: RwLock<FxHashMap<u32, Arc<BotSlot>>>,
     /// Character ids of all our bots, to tell them from real players.
     bot_chars: RwLock<FxHashSet<u32>>,
+    /// Chat limits and the names of our bots.
+    pub chat: ChatHub,
     /// Packet counters; bot tasks add to them.
     pub counters: Counters,
     rates: Mutex<Rates>,
@@ -297,6 +308,7 @@ impl Hub {
         Hub {
             slots: RwLock::new(FxHashMap::default()),
             bot_chars: RwLock::new(FxHashSet::default()),
+            chat: ChatHub::default(),
             counters: Counters::default(),
             rates: Mutex::new(Rates {
                 at: Instant::now(),
@@ -319,6 +331,7 @@ impl Hub {
 
     /// Adds a slot for a bot (or returns the existing one).
     pub fn register(&self, snap: BotSnapshot) -> Arc<BotSlot> {
+        self.chat.names.add(&snap.name);
         let mut slots = self.slots.write();
         slots
             .entry(snap.id)
@@ -336,6 +349,16 @@ impl Hub {
     /// Whether character `char_id` is one of our bots.
     pub fn is_bot_char(&self, char_id: u32) -> bool {
         self.bot_chars.read().contains(&char_id)
+    }
+
+    /// Remembers the character name of one of our bots (also called when a name changes).
+    pub fn mark_bot_name(&self, name: &str) {
+        self.chat.names.add(name);
+    }
+
+    /// The LLM add-on, if it is on.
+    pub fn llm(&self) -> Option<&Arc<pb_llm::Llm>> {
+        self.llm.as_ref()
     }
 
     /// The slot of bot `id`.
@@ -483,6 +506,7 @@ impl BotHub for Hub {
             log: g.log.iter().cloned().collect(),
             quests: g.quests.clone(),
             extra: g.extra.clone(),
+            chat: g.social.chat_lines(),
         }))
     }
 
@@ -511,11 +535,15 @@ impl BotHub for Hub {
             uptime_secs: self.uptime_secs(),
             llm: self.llm.as_ref().map(|l| {
                 let u = l.usage();
+                let s = &self.chat.gate.stats;
                 LlmStats {
                     requests: u.requests,
                     failures: u.failures,
                     tokens_today: u.tokens_today,
                     budget_left: u.budget_left,
+                    rate_limited: u.rate_limited,
+                    chat_replies: s.llm_replies.load(Ordering::Relaxed),
+                    director_picks: s.director_picks.load(Ordering::Relaxed),
                 }
             }),
             activity_counts: Activity::ALL
@@ -589,6 +617,10 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
         Command::DuelWith { other } => BotCmd::DuelWith(other),
         Command::TradeWith { other } => BotCmd::TradeWith(other),
         Command::Say { text } => BotCmd::Say(text.trim().to_string()),
+        Command::Whisper { to, text } => BotCmd::Whisper {
+            to: to.trim().to_string(),
+            text: text.trim().to_string(),
+        },
         Command::Spawn { .. } | Command::Despawn { .. } => {
             return Err("spawn and despawn are global commands".into())
         }
@@ -677,6 +709,24 @@ mod tests {
                 text: "  hi  ".into()
             }),
             Ok(BotCmd::Say("hi".into()))
+        );
+        assert_eq!(
+            to_bot_cmd(Command::Whisper {
+                to: " Bob ".into(),
+                text: " hi ".into()
+            }),
+            Ok(BotCmd::Whisper {
+                to: "Bob".into(),
+                text: "hi".into()
+            })
+        );
+        assert_eq!(
+            to_bot_cmd(Command::Goal {
+                goal: "wander".into()
+            }),
+            Ok(BotCmd::Goal(GoalChoice::Forced(
+                crate::bot::cmd::GoalKind::Wander
+            )))
         );
         assert!(to_bot_cmd(Command::Goal { goal: "fly".into() }).is_err());
         assert!(to_bot_cmd(Command::Spawn { count: 1 }).is_err());

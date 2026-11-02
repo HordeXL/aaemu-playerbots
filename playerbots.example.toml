@@ -77,9 +77,42 @@ bind = "127.0.0.1:8790"
 # With a token, POST requests need the header "x-playerbots-token: <token>".
 # token = "change-me"
 
+[social]
+# How the bots talk. Works without the LLM: replies then come from a table of short, persona-flavoured
+# lines. Whispers are answered with a whisper, local chat with a local line. A line that starts with
+# "/" is never sent (the server would run it as a GM command).
+enabled = true
+# A local line from a real player (not one of our bots) within this many metres may get an answer;
+# a line that names the bot, and every whisper, always may.
+reply_radius_m = 30.0
+# Chance that a bot answers a local line that does not name it. Of all the bots that hear such a
+# line only the first to claim it answers.
+reply_chance = 0.4
+# All bots together answer at most this many lines per minute (0 = none). Each bot also waits at
+# least ~8 s between replies, answers at most 4 times in 2 minutes and 6 times per player in 10.
+replies_per_min = 20
+# Bots greet each other: "gg" after a duel, thanks after a trade, a hello to a bot nearby.
+bot_chatter = true
+# ... but only while a real player is within 150 m, so nobody talks to an empty street.
+chatter_needs_player = true
+# All bots together say at most this many chatter lines per minute (0 = none) ...
+chatter_per_min = 4
+# ... and one bot says one at most this often (seconds).
+chatter_gap_secs = 60
+# Testing only: also answer the whispers and local lines of our own bots.
+reply_to_bots = false
+
 [llm]
 # Optional chat / decision add-on for any OpenAI-compatible endpoint. Off by default; the bots
-# work the same without it. The key is read from the environment variable named below.
+# work the same without it. The key is read from the environment variable named below, never from
+# this file:   export DEEPSEEK_API_KEY=sk-...   (PowerShell: $env:DEEPSEEK_API_KEY = "sk-...")
+#
+# With it on, bots answer players with a line the model writes in character (the canned table
+# stays as the fallback) and, with `director = true`, the model sometimes picks a bot's next goal.
+# Costs are bounded: at most `max_requests_per_minute` requests per minute and `daily_token_budget`
+# tokens per UTC day for all bots together; when either is used up the bots fall back to canned
+# lines and their own scoring. Replies are filtered before they are sent (no commands, links,
+# "I am an AI"; at most 120 characters).
 enabled = false
 base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
@@ -87,6 +120,13 @@ api_key_env = "DEEPSEEK_API_KEY"
 timeout_secs = 20
 max_concurrent = 2
 max_requests_per_minute = 30
+# 0 = no daily limit (not recommended)
 daily_token_budget = 200000
 temperature = 0.8
 max_reply_tokens = 80
+# The director: every `director_interval_secs` (per bot, jittered by +-30 %) a bot asks the model
+# which of the goals it may pick right now to do next. The pick is applied only if the goal is
+# still eligible (never a goal that is switched off, cooling down, or needs gm_bootstrap when that
+# is off); otherwise, or when the request fails, the bot's own scoring decides. Minimum 30.
+director = false
+director_interval_secs = 600

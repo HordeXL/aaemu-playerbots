@@ -132,6 +132,9 @@ pub struct Ledger {
     awaiting: u8,
     /// The mailbox was listed because of unread mail at login.
     listed_for_unread: bool,
+    /// Bot clock at which a trade run that carried a pack was interrupted, see
+    /// [`Ledger::note_interrupted_run`].
+    run_interrupted_ms: Option<u64>,
 }
 
 impl Ledger {
@@ -140,8 +143,17 @@ impl Ledger {
     /// Feeds the ledger one server event; `me_obj` is the bot's object id (0 before the spawn).
     pub fn observe(&mut self, ev: &ServerEvent, now_ms: u64, me_obj: u32) {
         match ev {
-            ServerEvent::World(WorldEvent::ErrorMsg { err, kind, .. }) => {
-                self.last_error = Some((now_ms, *err, *kind));
+            ServerEvent::World(WorldEvent::ErrorMsg {
+                err, err2, kind, ..
+            }) => {
+                // The reason is the second error field when it differs from the first (the craft
+                // stop reason), else the type field.
+                let reason = if err2 != err && *err2 > 0 {
+                    *err2 as u32
+                } else {
+                    *kind
+                };
+                self.last_error = Some((now_ms, *err, reason));
             }
             ServerEvent::World(WorldEvent::SkillStarted {
                 caster_obj, result, ..
@@ -267,6 +279,17 @@ impl Ledger {
     }
 
     // ---- duties -------------------------------------------------------------------------
+
+    /// A trade run that carried a pack was cut short at `now_ms`.
+    pub fn note_interrupted_run(&mut self, now_ms: u64) {
+        self.run_interrupted_ms = Some(now_ms);
+    }
+
+    /// Whether a trade run with a pack was interrupted at this very tick `now_ms` (so by the goal
+    /// that is starting now); the note is used up either way.
+    pub fn take_interrupted_run(&mut self, now_ms: u64) -> bool {
+        self.run_interrupted_ms.take() == Some(now_ms)
+    }
 
     /// A pack was sold: a payment is on its way.
     pub fn note_sale(&mut self) {
@@ -587,7 +610,8 @@ mod tests {
         l.observe(
             &ServerEvent::World(WorldEvent::ErrorMsg {
                 err: ERR_CRAFT_STOPPED,
-                kind: 29,
+                err2: 29,
+                kind: 0,
                 notify: false,
             }),
             500,
@@ -631,5 +655,16 @@ mod tests {
     fn spot_keys_separate_neighbouring_cells() {
         assert_ne!(spot_key(100.0, 100.0), spot_key(110.0, 100.0));
         assert_eq!(spot_key(100.0, 100.0), spot_key(101.0, 103.0));
+    }
+    #[test]
+    fn an_interrupted_run_goes_only_to_the_goal_that_starts_in_the_same_tick() {
+        let mut l = Ledger::default();
+        assert!(!l.take_interrupted_run(10), "nothing was interrupted");
+        l.note_interrupted_run(10);
+        assert!(l.take_interrupted_run(10));
+        assert!(!l.take_interrupted_run(10), "used up");
+        l.note_interrupted_run(10);
+        assert!(!l.take_interrupted_run(11), "a later goal gets nothing");
+        assert!(!l.take_interrupted_run(10), "and the note is gone");
     }
 }

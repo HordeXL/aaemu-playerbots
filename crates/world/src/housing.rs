@@ -13,7 +13,7 @@ use crate::sql::{each_row, RowExt};
 use crate::text::{TextTable, Texts};
 
 /// A house design a character can place with the matching design item.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HousingDesign {
     /// `housings.id` (the design id sent in `CSCreateHouse`).
     pub design: u32,
@@ -28,6 +28,9 @@ pub struct HousingDesign {
     pub standard: bool,
     /// Number of build steps (`housing_build_steps`).
     pub steps: u8,
+    /// Radius in metres of the garden around the house (`housings.garden_radius`): the free
+    /// ground the server's placement check needs, 4.0 for a Scarecrow Garden, 7.5 for a cottage.
+    pub garden_radius: f32,
     /// English name (Korean if there is no translation).
     pub name: Box<str>,
 }
@@ -99,7 +102,7 @@ impl Housing {
         let mut designs = Vec::new();
         each_row(
             conn,
-            "SELECT h.id, h.name, h.category_id, COALESCE(t.tax, 0), COALESCE(t.\"SHOW\", 'f') \n             FROM housings h LEFT JOIN taxations t ON t.id = h.taxation_id",
+            "SELECT h.id, h.name, h.category_id, COALESCE(t.tax, 0), COALESCE(t.\"SHOW\", 'f'), h.garden_radius \n             FROM housings h LEFT JOIN taxations t ON t.id = h.taxation_id",
             |r| {
                 let id = r.u32(0);
                 if !placeable.contains(&r.u32(2)) {
@@ -113,6 +116,7 @@ impl Housing {
                         tax: r.u32(3),
                         standard: r.flag(4),
                         steps: steps.get(&id).copied().unwrap_or(0).min(255) as u8,
+                        garden_radius: r.f32(5),
                         name: texts.name_or(TextTable::Housing, id, r.text(1)),
                     });
                 }
@@ -230,14 +234,14 @@ mod tests {
     fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE housings (id INT, name TEXT, category_id INT, taxation_id INT);
+            "CREATE TABLE housings (id INT, name TEXT, category_id INT, taxation_id INT, garden_radius REAL);
              CREATE TABLE taxations (id INT, tax INT, SHOW NUM);
              CREATE TABLE housing_build_steps (id INT, housing_id INT, step INT);
              CREATE TABLE item_housings (id INT, item_id INT, design_id INT);
              CREATE TABLE housing_areas (id INT, housing_group_id INT);
              CREATE TABLE housing_group_categories (id INT, housing_group_id INT, category_id INT);
              INSERT INTO taxations VALUES (1, 0, 'f'), (2, 100000, 't'), (8, 50000, 't');
-             INSERT INTO housings VALUES (172, 'small house', 1, 2), (267, 'scarecrow', 16, 8), (5, 'no item', 1, 2), (6, 'no tax row', 17, 99), (8, 'siege part', 3, 2), (9, 'free', 1, 1);
+             INSERT INTO housings VALUES (172, 'small house', 1, 2, 7.5), (267, 'scarecrow', 16, 8, 4.0), (5, 'no item', 1, 2, 7.5), (6, 'no tax row', 17, 99, NULL), (8, 'siege part', 3, 2, 12.0), (9, 'free', 1, 1, 9);
              INSERT INTO housing_build_steps VALUES (1, 172, 1), (2, 172, 2), (3, 172, 3), (4, 267, 1);
              INSERT INTO item_housings VALUES (106, 21166, 172), (58, 15596, 267), (59, 999, 5), (60, 7, 6), (61, 8, 8), (62, 9, 9);
              INSERT INTO housing_areas VALUES (52, 1), (60, 14), (61, 11);
@@ -262,6 +266,11 @@ mod tests {
         assert_eq!((d.item, d.category, d.tax, d.steps), (15596, 16, 50000, 1));
         assert_eq!(&*d.name, "Scarecrow Garden");
         assert_eq!(h.design(172).unwrap().steps, 3);
+        // the footprint comes from the data (a missing value reads as 0, an integer as a float)
+        assert_eq!(d.garden_radius, 4.0);
+        assert_eq!(h.design(172).unwrap().garden_radius, 7.5);
+        assert_eq!(h.design(6).unwrap().garden_radius, 0.0);
+        assert_eq!(h.design(9).unwrap().garden_radius, 9.0);
         assert_eq!(h.design(6).unwrap().tax, 0);
     }
 

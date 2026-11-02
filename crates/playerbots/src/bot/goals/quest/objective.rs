@@ -12,7 +12,6 @@
 use aa_proto::sc_activity::QuestRow;
 use aa_world::{ObjKind, Objective, Quest, QuestReport, World};
 
-use super::extras::Extras;
 use super::memory::Failure;
 
 /// Objectives this far above the bot are not attempted (the bot would die).
@@ -38,13 +37,11 @@ pub trait Facts {
     fn item_skill(&self, item: u32) -> u32;
 }
 
-/// The real [`Facts`]: the world plus the compact lookups.
+/// The real [`Facts`]: the static world.
 #[derive(Clone, Copy)]
 pub struct Env<'a> {
     /// The static world.
     pub world: &'a World,
-    /// Skill lookups.
-    pub extras: &'a Extras,
 }
 
 impl Facts for Env<'_> {
@@ -71,11 +68,11 @@ impl Facts for Env<'_> {
     }
 
     fn doodad_skill(&self, doodad: u32) -> u32 {
-        self.extras.doodad_skill(doodad)
+        self.world.doodad_use_skill(doodad)
     }
 
     fn item_skill(&self, item: u32) -> u32 {
-        self.extras.item_skill(item)
+        self.world.item_use_skill(item)
     }
 }
 
@@ -693,17 +690,13 @@ pub(crate) mod tests {
         };
         let compact = PathBuf::from(compact);
         let world = World::load(&WorldPaths {
-            compact: compact.clone(),
+            compact,
             server_data: PathBuf::from(server_data),
             baked: std::env::var_os("AA_BAKED").map(PathBuf::from),
             world: "main_world".into(),
         })
         .unwrap();
-        let extras = Extras::load(&compact, &world).unwrap();
-        let facts = Env {
-            world: &world,
-            extras: &extras,
-        };
+        let facts = Env { world: &world };
         let mut by_band: BTreeMap<u8, (u32, u32)> = BTreeMap::new();
         let mut reasons: BTreeMap<String, u32> = BTreeMap::new();
         for q in world.quests() {

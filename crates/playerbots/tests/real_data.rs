@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 use aa_proto::cs::Out;
 use aa_proto::opcodes::cs as op;
 use aa_proto::sc::ServerEvent;
-use aa_proto::sc_world::{LootItem, WorldEvent};
+use aa_proto::sc_world::{EquipSlot, LootItem, WorldEvent};
 use aa_world::{Relation, World, WorldPaths};
 use playerbots::archetype::Archetypes;
 use playerbots::bot::brain::Brain;
@@ -342,4 +342,154 @@ fn the_automatic_brain_runs_for_half_an_hour_without_trouble() {
             "{kind:?} was switched off as not implemented"
         );
     }
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_rest_that_cut_a_trade_run_short_gives_it_back_while_a_pack_is_carried() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    // a pack that some NPC buys, carried by a bot 150 m from the nearest buyer
+    let pack = world
+        .pack_crafts()
+        .map(|c| c.product.0)
+        .find(|&p| {
+            world
+                .specialty_buyers(p)
+                .iter()
+                .any(|&b| !world.npc_spawns(b).is_empty())
+        })
+        .expect("a pack with a placed buyer");
+    let buyer = *world
+        .specialty_buyers(pack)
+        .iter()
+        .find(|&&b| !world.npc_spawns(b).is_empty())
+        .unwrap();
+    let spawn = world.npc_spawns(buyer)[0];
+    let mut rig = Rig::new(world.clone(), "Darkrunner", 5);
+    let start = [spawn.x + 150.0, spawn.y, spawn.z];
+    rig.state.me.pos = start;
+    rig.motion.enter_world(ME, start, 0.0, rig.now_ms);
+    rig.state.equipment.push(EquipSlot {
+        slot: 26,
+        template: pack,
+        id: 77,
+        grade: 0,
+    });
+
+    rig.brain.queue(GoalKind::TradeRun, None);
+    for _ in 0..8 {
+        rig.tick(250);
+    }
+    assert_eq!(
+        rig.brain.goal_name(),
+        "trade_run",
+        "the run carries the pack"
+    );
+
+    // badly hurt: the brain rests instead
+    rig.state.me.hp = 200;
+    rig.tick(250);
+    assert_eq!(rig.brain.goal_name(), "rest");
+    // recovered: the rest ends after its ten seconds and the run goes on
+    rig.state.me.hp = 1000;
+    let mut resumed_after = None;
+    for i in 0..(100 * 4) {
+        rig.tick(250);
+        if rig.brain.goal_name() == "trade_run" {
+            resumed_after = Some(i * 250);
+            break;
+        }
+    }
+    let ms = resumed_after.expect("the rest gave the trade run back");
+    assert!(ms >= 9_000, "after the minimum rest, not at once: {ms} ms");
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_trade_run_only_fights_back_against_close_attackers() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    // a bot with a pack, 400 m from the nearest buyer
+    let pack = world
+        .pack_crafts()
+        .map(|c| c.product.0)
+        .find(|&p| {
+            world
+                .specialty_buyers(p)
+                .iter()
+                .any(|&b| !world.npc_spawns(b).is_empty())
+        })
+        .expect("a pack with a placed buyer");
+    let buyer = *world
+        .specialty_buyers(pack)
+        .iter()
+        .find(|&&b| !world.npc_spawns(b).is_empty())
+        .unwrap();
+    let spawn = world.npc_spawns(buyer)[0];
+    let mut rig = Rig::new(world.clone(), "Darkrunner", 6);
+    let start = [spawn.x + 400.0, spawn.y, spawn.z];
+    rig.state.me.pos = start;
+    rig.motion.enter_world(ME, start, 0.0, rig.now_ms);
+    rig.state.equipment.push(EquipSlot {
+        slot: 26,
+        template: pack,
+        id: 77,
+        grade: 0,
+    });
+    rig.brain.queue(GoalKind::TradeRun, None);
+    for _ in 0..8 {
+        rig.tick(250);
+    }
+    assert_eq!(rig.brain.goal_name(), "trade_run");
+    assert!(rig.motion.is_moving(), "on the way to the buyer");
+
+    // a monster attacks from far behind: the bot keeps going
+    let template = weak_hostile(&world, rig.state.me.faction);
+    let level = world.npc(template).unwrap().level;
+    let mob = 0x900;
+    let place = |rig: &mut Rig, dx: f32| {
+        let me = rig.state.me.pos;
+        rig.state.units.insert(
+            mob,
+            Unit {
+                kind: UnitKind::Npc,
+                id: template,
+                pos: [me[0] + dx, me[1], me[2]],
+                hp: 100,
+                faction: 0,
+                level,
+                flags: 0,
+                name: None,
+            },
+        );
+        let now = rig.now_ms;
+        rig.state.threats.clear();
+        rig.state.threats.push((mob, now));
+    };
+    for _ in 0..8 {
+        place(&mut rig, 40.0);
+        rig.tick(250);
+        assert_eq!(rig.combat.target(), None, "no detour for a far attacker");
+        assert_eq!(rig.brain.goal_name(), "trade_run");
+    }
+    assert!(rig.motion.is_moving());
+
+    // a close attacker cannot be outrun: the controller fights back
+    place(&mut rig, 8.0);
+    rig.tick(250);
+    assert_eq!(rig.combat.target(), Some(mob));
+
+    // and lets go of it once it falls far behind
+    place(&mut rig, 40.0);
+    rig.tick(250);
+    assert_eq!(
+        rig.combat.target(),
+        None,
+        "a defence is dropped when the attacker is far"
+    );
 }

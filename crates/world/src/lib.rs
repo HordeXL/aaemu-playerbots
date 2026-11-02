@@ -18,11 +18,13 @@ pub mod housing;
 pub mod jsonc;
 pub mod npc;
 pub mod quest;
+pub mod reqs;
 pub mod skill;
 pub mod spatial;
 pub mod spawns;
 mod sql;
 mod text;
+pub mod uses;
 mod world;
 
 pub use chars::CharRow;
@@ -35,6 +37,8 @@ pub use npc::{NpcRoles, NpcTemplate};
 pub use quest::{
     ObjKind, Objective, Quest, QuestReport, QuestStart, QuestStats, QuestStep, CATEGORY_TUTORIAL,
 };
-pub use skill::SkillInfo;
+pub use reqs::{Gate, StartGates, Who};
+pub use skill::{mana_level_scale, SkillInfo};
 pub use spawns::SpawnStats;
+pub use uses::{ItemUses, SkillNeed};
 pub use world::{World, WorldPaths};

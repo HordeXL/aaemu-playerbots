@@ -971,11 +971,32 @@ fn error_message() {
         game(sc::SCErrorMsgPacket, &s),
         WorldEvent::ErrorMsg {
             err: 265,
+            err2: 265,
             kind: 7,
             notify: true
         }
     );
     truncation_is_rejected(sc::SCErrorMsgPacket, s.as_bytes(), 9);
+}
+
+#[test]
+fn error_message_detail_reason() {
+    // systems/economy/craft.rs `error2(148, reason, 0, false)`: the craft-stop reason is the
+    // second error field.
+    let mut s = PacketStream::new();
+    s.write_i16(148)
+        .write_i16(722)
+        .write_u32(0)
+        .write_bool(false);
+    assert_eq!(
+        game(sc::SCErrorMsgPacket, &s),
+        WorldEvent::ErrorMsg {
+            err: 148,
+            err2: 722,
+            kind: 0,
+            notify: false
+        }
+    );
 }
 
 #[test]

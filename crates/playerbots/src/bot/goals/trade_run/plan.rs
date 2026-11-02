@@ -1,15 +1,13 @@
 //! Route planning for trade runs: which pack to craft where, and which specialty NPC buys it.
 //!
 //! A *route* is a specialty workbench spawn (a doodad whose template offers pack crafts), one of
-//! the pack crafts it offers, and the nearest spawn of an NPC that buys the product. Routes are
-//! scored by the way the bot has to go (to the bench, then carrying the pack to the buyer) and the
-//! planner picks among the best few so that many bots do not all queue at the same bench.
+//! the pack crafts it offers, and the spawn of the NPC that buys the product best. Routes are
+//! scored by the way the bot has to go (to the bench, then carrying the pack to the buyer) minus
+//! what the sale pays ([`RouteData::pack_price`]), and the planner picks among the best few so that
+//! many bots do not all queue at the same bench.
 //!
 //! The planner works on [`RouteData`], a narrow view of the static world, so the tests run on a
 //! synthetic world; [`aa_world::World`] implements it.
-//!
-//! The world data has no sale prices (`specialty_bundle_items.profit` is not loaded), so routes are
-//! not scored by profit; see the open issues in the trade-run report.
 
 use aa_world::{Craft, Vec3, World};
 
@@ -19,6 +17,9 @@ const MAX_CANDIDATES: usize = 64;
 const PICK_AMONG: usize = 4;
 /// Carrying the pack counts this much per metre (the way back is free, the way there is not).
 const CARRY_WEIGHT: f32 = 1.25;
+/// Copper of sale price that make up for one metre of the way: a 40 000 copper pack (4 gold)
+/// outweighs 1 600 m, the best packs (24 gold) 9 600 m.
+const COPPER_PER_METRE: f32 = 25.0;
 
 /// The static facts the planner needs. Implemented by [`World`]; tests use a synthetic world.
 pub trait RouteData {
@@ -33,6 +34,8 @@ pub trait RouteData {
     fn buyers(&self, item: u32) -> &[u32];
     /// Spawn positions of an NPC template.
     fn npc_spawns(&self, npc: u32) -> &[Vec3];
+    /// What `buyer` pays for the pack `item` in copper (an estimate, 0 when unknown).
+    fn pack_price(&self, item: u32, buyer: u32) -> u32;
 }
 
 impl RouteData for World {
@@ -59,6 +62,11 @@ impl RouteData for World {
     fn npc_spawns(&self, npc: u32) -> &[Vec3] {
         World::npc_spawns(self, npc)
     }
+
+    fn pack_price(&self, item: u32, buyer: u32) -> u32 {
+        // 0: the origin zone group is not known here and the server's price does not depend on it
+        self.pack_price_estimate(item, buyer, 0).unwrap_or(0)
+    }
 }
 
 /// One planned trade run.
@@ -76,6 +84,8 @@ pub struct Plan {
     pub bench: [f32; 2],
     /// Buyer spawn (x, y).
     pub buyer: [f32; 2],
+    /// What the buyer pays for the pack, in copper (estimate; 0 when unknown).
+    pub price: u32,
     /// Straight-line distance from the bot to the bench.
     pub to_bench_m: f32,
     /// Straight-line distance from the bench to the buyer.
@@ -83,9 +93,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// What the route costs: the way to the bench plus the weighted way with the pack.
+    /// What the route costs, lower is better: the way to the bench plus the weighted way with the
+    /// pack, less the sale price expressed in metres.
     pub fn score(&self) -> f32 {
-        self.to_bench_m + CARRY_WEIGHT * self.carry_m
+        self.to_bench_m + buyer_cost(self.carry_m, self.price)
     }
 
     /// Total straight-line distance of the run.
@@ -115,27 +126,35 @@ fn d2(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
-/// The nearest spawn of any acceptable buyer of `item` to `from`: `(npc template, (x, y))`.
-pub fn nearest_buyer<D: RouteData + ?Sized>(
+/// What carrying a pack `dist` metres to a buyer that pays `price` costs, in metres.
+fn buyer_cost(dist: f32, price: u32) -> f32 {
+    CARRY_WEIGHT * dist - price as f32 / COPPER_PER_METRE
+}
+
+/// The best spawn of any acceptable buyer of `item` seen from `from` (the nearest one when all
+/// pay the same; a farther buyer wins when it pays enough more):
+/// `(npc template, (x, y), price)`.
+pub fn best_buyer<D: RouteData + ?Sized>(
     data: &D,
     item: u32,
     from: [f32; 2],
     buyer_ok: &dyn Fn(u32) -> bool,
-) -> Option<(u32, [f32; 2])> {
-    let mut best: Option<(u32, [f32; 2], f32)> = None;
+) -> Option<(u32, [f32; 2], u32)> {
+    let mut best: Option<(u32, [f32; 2], u32, f32)> = None;
     for &npc in data.buyers(item) {
         if !buyer_ok(npc) {
             continue;
         }
+        let price = data.pack_price(item, npc);
         for sp in data.npc_spawns(npc) {
             let p = [sp.x, sp.y];
-            let d = d2(from, p);
-            if best.is_none_or(|b| d < b.2) {
-                best = Some((npc, p, d));
+            let cost = buyer_cost(d2(from, p), price);
+            if best.is_none_or(|b| cost < b.3) {
+                best = Some((npc, p, price, cost));
             }
         }
     }
-    best.map(|b| (b.0, b.1))
+    best.map(|b| (b.0, b.1, b.2))
 }
 
 /// Every acceptable route for `q`, best first (at most [`MAX_CANDIDATES`]).
@@ -153,7 +172,7 @@ pub fn candidates<D: RouteData + ?Sized>(data: &D, q: &Query<'_>) -> Vec<Plan> {
             if !c.is_pack || c.product.0 == 0 || !(q.craft_ok)(c) {
                 continue;
             }
-            let Some((buyer_tpl, buyer)) = nearest_buyer(data, c.product.0, bench, q.buyer_ok)
+            let Some((buyer_tpl, buyer, price)) = best_buyer(data, c.product.0, bench, q.buyer_ok)
             else {
                 continue;
             };
@@ -164,6 +183,7 @@ pub fn candidates<D: RouteData + ?Sized>(data: &D, q: &Query<'_>) -> Vec<Plan> {
                 buyer_tpl,
                 bench,
                 buyer,
+                price,
                 to_bench_m,
                 carry_m: d2(bench, buyer),
             };
@@ -201,14 +221,14 @@ pub fn pick(cands: &[Plan], rng: &mut fastrand::Rng) -> Option<Plan> {
     }
 }
 
-/// A plan for a bot that already carries pack `item`: only the walk to the nearest buyer.
+/// A plan for a bot that already carries pack `item`: only the walk to the best buyer.
 pub fn carry_only<D: RouteData + ?Sized>(
     data: &D,
     item: u32,
     from: [f32; 2],
     buyer_ok: &dyn Fn(u32) -> bool,
 ) -> Option<Plan> {
-    let (buyer_tpl, buyer) = nearest_buyer(data, item, from, buyer_ok)?;
+    let (buyer_tpl, buyer, price) = best_buyer(data, item, from, buyer_ok)?;
     Some(Plan {
         craft: 0,
         item,
@@ -216,6 +236,7 @@ pub fn carry_only<D: RouteData + ?Sized>(
         buyer_tpl,
         bench: from,
         buyer,
+        price,
         to_bench_m: 0.0,
         carry_m: d2(from, buyer),
     })
@@ -234,6 +255,8 @@ pub(crate) mod tests {
         pub crafts: FxHashMap<u32, Craft>,
         pub buyers: FxHashMap<u32, Vec<u32>>,
         pub spawns: FxHashMap<u32, Vec<Vec3>>,
+        /// `(item, buyer)` -> price in copper.
+        pub prices: FxHashMap<(u32, u32), u32>,
     }
 
     pub fn craft(id: u32, item: u32, labor: u16) -> Craft {
@@ -247,6 +270,9 @@ pub(crate) mod tests {
             is_pack: true,
             req_doodad: 0,
             benches: Box::new([]),
+            req_level: 10,
+            actability_group: 31,
+            actability_limit: 0,
         }
     }
 
@@ -294,6 +320,9 @@ pub(crate) mod tests {
         }
         fn npc_spawns(&self, npc: u32) -> &[Vec3] {
             self.spawns.get(&npc).map_or(&[], |v| &v[..])
+        }
+        fn pack_price(&self, item: u32, buyer: u32) -> u32 {
+            self.prices.get(&(item, buyer)).copied().unwrap_or(0)
         }
     }
 
@@ -449,6 +478,36 @@ pub(crate) mod tests {
                 .or_insert(0u32) += 1;
         }
         assert!(counts[&1] < 1300, "{counts:?}");
+    }
+
+    #[test]
+    fn a_better_price_beats_a_shorter_way() {
+        // two buyers of item 11: 500 is 1500 m from the bench, 502 is 3000 m farther
+        let mut w = Fake::sample();
+        w.buyers.insert(11, vec![500, 502]);
+        w.spawns.insert(502, vec![Vec3::new(4500.0, 0.0, 0.0)]);
+        let all = |_: &Craft| true;
+        let any = |_: u32, _: [f32; 2]| true;
+        let buy = |_: u32| true;
+        let q = open_query([0.0, 0.0], f32::INFINITY, 2000.0, &all, &any, &buy);
+        let near = candidates(&w, &q);
+        assert_eq!(near[0].buyer_tpl, 500, "equal prices: the nearer buyer");
+        // 502 pays 100 000 copper more: 4000 m of credit against 3000 m * 1.25 of extra carrying
+        w.prices.insert((11, 502), 140_000);
+        w.prices.insert((11, 500), 40_000);
+        let rich = candidates(&w, &q);
+        let best = rich.iter().find(|p| p.craft == 1).unwrap();
+        assert_eq!((best.buyer_tpl, best.price), (502, 140_000));
+        // the same price at both buyers: back to the nearest
+        w.prices.insert((11, 500), 140_000);
+        let same = candidates(&w, &q);
+        assert_eq!(same.iter().find(|p| p.craft == 1).unwrap().buyer_tpl, 500);
+        // a price makes a route more attractive than an unpriced one of the same length
+        assert!(best.score() < near.iter().find(|p| p.craft == 1).unwrap().score());
+        // a carried pack goes to the buyer that pays best too
+        w.prices.insert((11, 500), 40_000);
+        let p = carry_only(&w, 11, [1400.0, 0.0], &|_| true).unwrap();
+        assert_eq!((p.buyer_tpl, p.price), (502, 140_000));
     }
 
     #[test]

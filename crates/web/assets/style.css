@@ -352,6 +352,7 @@ h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: 
 .cmd-row { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }
 .cmd-row > select, .cmd-row > input[type="text"], .cmd-row > input[type="password"] { flex: 1; }
 .cmd-row > input[type="number"] { width: 5.5em; }
+.cmd-row > input.who { flex: 0 0 7em; min-width: 0; }
 .status { min-height: 1.3em; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .status.err { color: var(--danger); }
 .status.ok { color: var(--ok); }

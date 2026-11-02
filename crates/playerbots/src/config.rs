@@ -33,6 +33,8 @@ pub struct Config {
     pub web: pb_web::WebConfig,
     /// Optional LLM add-on.
     pub llm: pb_llm::LlmConfig,
+    /// Chat: replies to players and bot-to-bot chatter.
+    pub social: SocialCfg,
 }
 
 /// `[server]`: how to reach the login server and name the accounts.
@@ -201,6 +203,49 @@ impl Default for BehaviorCfg {
     }
 }
 
+/// `[social]`: how the bots talk. Replies come from the LLM when `[llm]` is on and from a table of
+/// canned lines otherwise.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SocialCfg {
+    /// Answer whispers and local chat of players. Off: the bots never say anything on their own.
+    pub enabled: bool,
+    /// A local line from a real player within this many metres may get an answer (a line that
+    /// names the bot, and every whisper, always may).
+    pub reply_radius_m: f32,
+    /// Chance (0..=1) that a bot answers a local line that does not name it.
+    pub reply_chance: f32,
+    /// All bots together answer at most this many lines per minute (0 = none).
+    pub replies_per_min: u32,
+    /// Bots greet each other: "gg" after a duel, thanks after a trade, a hello to a bot nearby.
+    pub bot_chatter: bool,
+    /// Chatter only while a real player is within 150 m, so nobody talks to an empty street.
+    pub chatter_needs_player: bool,
+    /// All bots together say at most this many chatter lines per minute (0 = none).
+    pub chatter_per_min: u32,
+    /// One bot says a chatter line at most this often, in seconds.
+    pub chatter_gap_secs: u64,
+    /// Also answer the whispers and local lines of our own bots. For testing only: two bots can
+    /// answer each other (the limits end it quickly).
+    pub reply_to_bots: bool,
+}
+
+impl Default for SocialCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reply_radius_m: 30.0,
+            reply_chance: 0.4,
+            replies_per_min: 20,
+            bot_chatter: true,
+            chatter_needs_player: true,
+            chatter_per_min: 4,
+            chatter_gap_secs: 60,
+            reply_to_bots: false,
+        }
+    }
+}
+
 impl Config {
     /// Reads, parses and validates `path`.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -305,6 +350,19 @@ impl Config {
             w.persona_spread.is_finite() && (0.0..=1.0).contains(&w.persona_spread),
             "behavior.persona_spread must be in 0..=1"
         );
+        let c = &self.social;
+        ensure!(
+            c.reply_radius_m.is_finite() && c.reply_radius_m >= 0.0,
+            "social.reply_radius_m must be a number >= 0"
+        );
+        ensure!(
+            c.reply_chance.is_finite() && (0.0..=1.0).contains(&c.reply_chance),
+            "social.reply_chance must be in 0..=1"
+        );
+        ensure!(
+            self.llm.director_interval_secs >= 30,
+            "llm.director_interval_secs must be at least 30"
+        );
         Ok(())
     }
 }
@@ -406,6 +464,27 @@ mod tests {
         assert!(Config::parse("[behavior]\ngrind = -1\n").is_err());
         assert!(Config::parse("[behavior]\npersona_spread = 2\n").is_err());
         assert!(Config::parse("[bots]\ncount = 999999\n").is_err());
+        assert!(Config::parse("[social]\nreply_chance = 1.5\n").is_err());
+        assert!(Config::parse("[social]\nreply_radius_m = -1\n").is_err());
+        assert!(Config::parse("[social]\nchater = true\n").is_err());
+        assert!(Config::parse("[llm]\ndirector_interval_secs = 5\n").is_err());
+    }
+
+    #[test]
+    fn the_social_and_director_keys_have_quiet_defaults() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.social.enabled && cfg.social.bot_chatter);
+        assert!(cfg.social.chatter_needs_player && !cfg.social.reply_to_bots);
+        assert_eq!(cfg.social.chatter_per_min, 4);
+        assert_eq!(cfg.social.chatter_gap_secs, 60);
+        assert!(!cfg.llm.director, "the director is opt-in");
+        assert_eq!(cfg.llm.director_interval_secs, 600);
+        let cfg = Config::parse(
+            "[llm]\nenabled = true\ndirector = true\ndirector_interval_secs = 90\n[social]\nbot_chatter = false\n",
+        )
+        .unwrap();
+        assert!(cfg.llm.director && !cfg.social.bot_chatter);
+        assert_eq!(cfg.llm.director_interval_secs, 90);
     }
 
     #[test]

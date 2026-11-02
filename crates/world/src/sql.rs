@@ -41,6 +41,19 @@ pub fn cell_i64(v: ValueRef<'_>) -> i64 {
     }
 }
 
+/// A cell as a float: reals as is, integers converted, text parsed, everything else as 0.
+pub fn cell_f64(v: ValueRef<'_>) -> f64 {
+    match v {
+        ValueRef::Real(f) => f,
+        ValueRef::Integer(i) => i as f64,
+        ValueRef::Text(t) => std::str::from_utf8(t)
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.0),
+        ValueRef::Null | ValueRef::Blob(_) => 0.0,
+    }
+}
+
 /// Typed positional accessors over a result row; never fail.
 pub trait RowExt {
     /// Column `i` as a signed integer (see [`cell_i64`]).
@@ -55,6 +68,8 @@ pub trait RowExt {
     fn flag(&self, i: usize) -> bool;
     /// Column `i` as text (empty for NULL / non-text).
     fn text(&self, i: usize) -> &str;
+    /// Column `i` as a float (see [`cell_f64`]).
+    fn f32(&self, i: usize) -> f32;
 }
 
 impl RowExt for Row<'_> {
@@ -86,6 +101,10 @@ impl RowExt for Row<'_> {
             ValueRef::Text(t) => std::str::from_utf8(t).unwrap_or(""),
             _ => "",
         }
+    }
+
+    fn f32(&self, i: usize) -> f32 {
+        cell_f64(self.get_ref_unwrap(i)) as f32
     }
 }
 

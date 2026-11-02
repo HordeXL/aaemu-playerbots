@@ -162,14 +162,16 @@ pub fn read_answer(
     }
 }
 
-/// Garden radius of a design in metres. `HousingDesign` does not carry it; the two designs the
-/// bots build are known, other designs are guessed from their category.
+/// Garden radius of a design in metres: `housings.garden_radius` from the data (4.0 for the
+/// Scarecrow Garden, 7.5 for the Nuian cottage). A design whose data carries none is guessed from
+/// its category.
 pub fn garden_radius(d: &HousingDesign) -> f32 {
-    match (d.design, d.category) {
-        (267, _) => 4.0,
-        (172, _) => 7.5,
-        (_, 16) => 4.0,
-        (_, 1) => 7.5,
+    if d.garden_radius > 0.0 {
+        return d.garden_radius;
+    }
+    match d.category {
+        16 => 4.0,
+        1 => 7.5,
         _ => 9.0,
     }
 }
@@ -884,6 +886,11 @@ mod tests {
             tax,
             standard,
             steps: 1,
+            garden_radius: match design {
+                267 => 4.0,
+                172 => 7.5,
+                _ => 0.0,
+            },
             name: format!("design {design}").into(),
         }
     }
@@ -1097,6 +1104,19 @@ mod tests {
         let d = designs();
         assert_eq!(cells_for_radius(garden_radius(&d[0])), 2);
         assert_eq!(cells_for_radius(garden_radius(&d[1])), 4);
+    }
+
+    #[test]
+    fn the_footprint_comes_from_the_data_and_is_guessed_without_it() {
+        let mut d = design(900, 1, 16, 0, true);
+        d.garden_radius = 5.5;
+        assert_eq!(garden_radius(&d), 5.5);
+        d.garden_radius = 0.0;
+        assert_eq!(garden_radius(&d), 4.0, "garden category");
+        d.category = 1;
+        assert_eq!(garden_radius(&d), 7.5, "house category");
+        d.category = 3;
+        assert_eq!(garden_radius(&d), 9.0);
     }
 
     #[test]

@@ -12,9 +12,10 @@
 //! Writer citations in the variant docs are `file:line` below `rust/crates/aaemu-game/src/` of
 //! AAEmu-1.2-Rust, abbreviated `G/`.
 //!
+//! The item tasks inside `SCTradeMade` are parsed with the world parser's item task reader
+//! ([`ActivityEvent::TradeMade`]`::items`).
+//!
 //! Not parsed on purpose:
-//! - the item tasks inside `SCTradeMade` (the inventory change reaches the bot as the usual item
-//!   task packets of the world parser; [`ActivityEvent::TradeMade`] only signals completion);
 //! - `SCCraftFailed` (0x1bf): defined in G/systems/economy/craft.rs:1050 but never sent, a craft
 //!   ends with the skill/item-task packets of the world parser and failures are `SCErrorMsg`;
 //! - the specialty sale: `CSSellBackpackGoods` answers with the backpack item task (world
@@ -25,6 +26,7 @@ use smallvec::SmallVec;
 
 use crate::opcodes::sc;
 use crate::pos::convert_long_to_coord;
+use crate::sc_world::ItemTaskInfo;
 use crate::stream::{MarshalError, PacketStream};
 
 /// Game channel level (`LEVEL_PLAIN`): every packet parsed here is sent on it.
@@ -448,13 +450,17 @@ pub enum ActivityEvent {
         /// The partner confirmed.
         other: bool,
     },
-    /// `SCTradeMade`: the trade completed. `u8 action`, `u8 n`, `n` item tasks (not parsed, see
-    /// the module docs), `u8 force-removed count`, ids, `u32`. G/systems/economy/trade.rs:1132-1157.
+    /// `SCTradeMade`: the trade completed. `u8 action`, `u8 n`, `n` item tasks, `u8 force-removed
+    /// count`, ids, `u32`. G/systems/economy/trade.rs:1132-1157.
     TradeMade {
         /// Item task type (`TRADE`).
         action: u8,
         /// Number of item tasks in the packet.
         tasks: u8,
+        /// The item tasks (the bag and the purse change with the trade), in the layout of
+        /// `SCItemTaskSuccess`. Empty when the body after the head does not parse, so the
+        /// completion is still reported.
+        items: Box<ItemTaskInfo>,
     },
 
     // ---- team ---------------------------------------------------------------------------
@@ -906,9 +912,15 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         sc::SCTradeMadePacket => |s| {
+            let start = s.pos();
+            let action = s.read_u8()?;
+            let tasks = s.read_u8()?;
+            s.set_pos(start);
+            let items = crate::sc_world::read_item_task_info(s).unwrap_or_default();
             Ok(E::TradeMade {
-                action: s.read_u8()?,
-                tasks: s.read_u8()?,
+                action,
+                tasks,
+                items: Box::new(items),
             })
         },
         // team

@@ -89,6 +89,11 @@
         <input id="c-say" type="text" maxlength="200" placeholder="Say in local chat&hellip;" aria-label="Chat line">
         <button type="submit">Say</button>
       </form>
+      <form id="c-whisper-form" class="cmd-row" autocomplete="off">
+        <input id="c-whisper-to" class="who" type="text" maxlength="32" placeholder="Name" aria-label="Whisper to character">
+        <input id="c-whisper" type="text" maxlength="200" placeholder="Whisper&hellip;" aria-label="Whisper line">
+        <button type="submit">Whisper</button>
+      </form>
       <div id="c-status" class="status" role="status"></div>
 
       <h3>Quests</h3>
@@ -96,6 +101,10 @@
       <div id="d-extra-wrap" hidden>
         <h3>Details</h3>
         <dl id="d-extra" class="kv"></dl>
+      </div>
+      <div id="d-chat-wrap" hidden>
+        <h3>Chat <span class="muted">(newest first)</span></h3>
+        <ol id="d-chat" class="log"></ol>
       </div>
       <h3>Log <span class="muted">(newest first)</span></h3>
       <ol id="d-log" class="log"></ol>

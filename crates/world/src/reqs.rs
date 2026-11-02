@@ -1,6 +1,6 @@
 //! The unit requirements of a quest's start components (`unit_reqs` rows owned by a component of
 //! the start kind): the server refuses to start a quest whose requirements the character does not
-//! meet and answers nothing, so the bot checks the ones it can judge before it walks to the giver.
+//! meet and answers nothing, so a bot checks the ones it can judge before it walks to the giver.
 //!
 //! Judged: level, maximum level, race, gender, mother faction, "item in the bag" and "quest
 //! completed" / "quest not completed". Everything else (buffs, zones, time of day, ...) is treated
@@ -9,11 +9,14 @@
 //! component must hold, or one of them when the component is flagged `or_unit_reqs`, and every
 //! start component of the quest has to be open.
 
+use anyhow::Result;
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// `unit_reqs.kind_id` values the bot judges.
+use crate::sql::{each_row, RowExt};
+
+/// `unit_reqs.kind_id` values judged here.
 mod kind {
     pub const LEVEL: u16 = 0x01;
     pub const RACE: u16 = 0x03;
@@ -38,7 +41,7 @@ pub struct Req {
     v2: u32,
 }
 
-/// What the bot is, as far as requirements are concerned.
+/// What the character is, as far as requirements are concerned.
 pub struct Who<'a> {
     /// Character level.
     pub level: u8,
@@ -46,7 +49,7 @@ pub struct Who<'a> {
     pub race: u8,
     /// Gender id.
     pub gender: u8,
-    /// `mother_id` of the character's faction (0 for none).
+    /// `mother_id` of the character's faction (0 for none, see `World::mother_faction`).
     pub mother_faction: u32,
     /// Whether a quest is completed.
     pub done: &'a dyn Fn(u32) -> bool,
@@ -55,7 +58,7 @@ pub struct Who<'a> {
 }
 
 impl Req {
-    /// Whether the character meets the requirement; `None` when the bot cannot tell.
+    /// Whether the character meets the requirement; `None` when it cannot be told.
     fn holds(&self, who: &Who<'_>) -> Option<bool> {
         let level = u32::from(who.level);
         Some(match self.kind {
@@ -81,7 +84,7 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Whether the component may run for `who`. Requirements the bot cannot judge count as met
+    /// Whether the component may run for `who`. Requirements that cannot be judged count as met
     /// (for an "or" gate they open it: the server decides).
     pub fn open(&self, who: &Who<'_>) -> bool {
         if self.reqs.is_empty() {
@@ -99,7 +102,6 @@ impl Gate {
 #[derive(Debug, Default)]
 pub struct StartGates {
     by_quest: FxHashMap<u32, Box<[Gate]>>,
-    mother: FxHashMap<u32, u32>,
 }
 
 impl StartGates {
@@ -110,86 +112,67 @@ impl StartGates {
             .is_none_or(|gates| gates.iter().all(|g| g.open(who)))
     }
 
-    /// `mother_id` of `faction`, 0 when it has none.
-    pub fn mother_faction(&self, faction: u32) -> u32 {
-        self.mother.get(&faction).copied().unwrap_or(0)
-    }
-
     /// Number of quests with gates.
     pub fn len(&self) -> usize {
         self.by_quest.len()
     }
 
-    /// Reads the gates and the faction mothers from an open database.
-    pub fn read(conn: &Connection) -> rusqlite::Result<StartGates> {
-        let mut out = StartGates::default();
-        let mut stmt = conn.prepare(
-            "SELECT c.quest_context_id, c.id, COALESCE(c.or_unit_reqs, 'f'), \
-             u.kind_id, COALESCE(u.value1, 0), COALESCE(u.value2, 0) \
-             FROM quest_components c \
-             JOIN unit_reqs u ON u.owner_type = 'QuestComponent' AND u.owner_id = c.id \
-             WHERE c.component_kind_id = ?1 \
-             ORDER BY c.quest_context_id, c.id, u.id",
-        )?;
-        let rows = stmt.query_map([START_KIND], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })?;
+    /// Whether no quest has gates.
+    pub fn is_empty(&self) -> bool {
+        self.by_quest.is_empty()
+    }
+
+    /// Reads the gates from `quest_components` and `unit_reqs`.
+    pub fn load(conn: &Connection) -> Result<StartGates> {
         let mut gates: FxHashMap<u32, Vec<(i64, Gate)>> = FxHashMap::default();
-        for row in rows {
-            let (quest, component, or, kind, v1, v2) = row?;
-            let (Ok(quest), Ok(kind)) = (u32::try_from(quest), u16::try_from(kind)) else {
-                continue;
-            };
-            let req = Req {
-                kind,
-                v1: u32::try_from(v1).unwrap_or(0),
-                v2: u32::try_from(v2).unwrap_or(0),
-            };
-            let list = gates.entry(quest).or_default();
-            match list.last_mut() {
-                Some((id, gate)) if *id == component => gate.reqs.push(req),
-                _ => {
-                    let mut reqs = SmallVec::new();
-                    reqs.push(req);
-                    list.push((
-                        component,
-                        Gate {
-                            or: or == "t",
-                            reqs,
-                        },
-                    ));
+        each_row(
+            conn,
+            &format!(
+                "SELECT c.quest_context_id, c.id, c.or_unit_reqs, u.kind_id, u.value1, u.value2 \
+                 FROM quest_components c \
+                 JOIN unit_reqs u ON u.owner_type = 'QuestComponent' AND u.owner_id = c.id \
+                 WHERE c.component_kind_id = {START_KIND} \
+                 ORDER BY c.quest_context_id, c.id, u.id"
+            ),
+            |r| {
+                let Ok(kind) = u16::try_from(r.int(3)) else {
+                    return;
+                };
+                let (quest, component) = (r.u32(0), r.int(1));
+                let req = Req {
+                    kind,
+                    v1: r.u32(4),
+                    v2: r.u32(5),
+                };
+                let list = gates.entry(quest).or_default();
+                match list.last_mut() {
+                    Some((id, gate)) if *id == component => gate.reqs.push(req),
+                    _ => {
+                        let mut reqs = SmallVec::new();
+                        reqs.push(req);
+                        list.push((
+                            component,
+                            Gate {
+                                or: r.flag(2),
+                                reqs,
+                            },
+                        ));
+                    }
                 }
-            }
-        }
-        out.by_quest = gates
-            .into_iter()
-            .map(|(q, v)| (q, v.into_iter().map(|(_, g)| g).collect()))
-            .collect();
-        let mut stmt = conn.prepare(
-            "SELECT id, COALESCE(mother_id, 0) FROM system_factions WHERE COALESCE(mother_id, 0) != 0",
+            },
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-        for row in rows {
-            let (id, mother) = row?;
-            if let (Ok(id), Ok(mother)) = (u32::try_from(id), u32::try_from(mother)) {
-                out.mother.insert(id, mother);
-            }
-        }
-        Ok(out)
+        Ok(StartGates {
+            by_quest: gates
+                .into_iter()
+                .map(|(q, v)| (q, v.into_iter().map(|(_, g)| g).collect()))
+                .collect(),
+        })
     }
 
     /// Builds gates from literal data (tests): `(quest, or, [(kind, v1, v2)])` per component.
     #[cfg(test)]
     pub fn from_tables(
         gates: impl IntoIterator<Item = (u32, bool, Vec<(u16, u32, u32)>)>,
-        mother: impl IntoIterator<Item = (u32, u32)>,
     ) -> StartGates {
         let mut by_quest: FxHashMap<u32, Vec<Gate>> = FxHashMap::default();
         for (quest, or, reqs) in gates {
@@ -206,8 +189,24 @@ impl StartGates {
                 .into_iter()
                 .map(|(q, v)| (q, v.into_boxed_slice()))
                 .collect(),
-            mother: mother.into_iter().collect(),
         }
+    }
+
+    /// Heap bytes held.
+    pub fn bytes(&self) -> usize {
+        let gate = std::mem::size_of::<Gate>();
+        self.by_quest.capacity() * (4 + std::mem::size_of::<Box<[Gate]>>() + 8)
+            + self
+                .by_quest
+                .values()
+                .map(|g| {
+                    g.len() * gate
+                        + g.iter()
+                            .filter(|g| g.reqs.spilled())
+                            .map(|g| g.reqs.capacity() * std::mem::size_of::<Req>())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 }
 
@@ -236,18 +235,15 @@ mod tests {
     #[test]
     fn requirements_must_all_hold() {
         // quest 6161: level 3, mother faction 148, quest 350 done
-        let g = StartGates::from_tables(
-            [(
-                6161,
-                false,
-                vec![
-                    (kind::LEVEL, 3, 0),
-                    (kind::MOTHER_FACTION, 148, 0),
-                    (kind::COMPLETE_QUEST, 350, 0),
-                ],
-            )],
-            [],
-        );
+        let g = StartGates::from_tables([(
+            6161,
+            false,
+            vec![
+                (kind::LEVEL, 3, 0),
+                (kind::MOTHER_FACTION, 148, 0),
+                (kind::COMPLETE_QUEST, 350, 0),
+            ],
+        )]);
         let none = |_: u32| false;
         let done_350 = |q: u32| q == 350;
         assert!(!g.open(6161, &who(5, &none)));
@@ -260,18 +256,15 @@ mod tests {
 
     #[test]
     fn race_gender_and_level_range() {
-        let g = StartGates::from_tables(
-            [(
-                7,
-                false,
-                vec![
-                    (kind::RACE, 1, 0),
-                    (kind::GENDER, 2, 0),
-                    (kind::LEVEL, 2, 10),
-                ],
-            )],
-            [],
-        );
+        let g = StartGates::from_tables([(
+            7,
+            false,
+            vec![
+                (kind::RACE, 1, 0),
+                (kind::GENDER, 2, 0),
+                (kind::LEVEL, 2, 10),
+            ],
+        )]);
         let none = |_: u32| false;
         assert!(g.open(7, &who(10, &none)));
         assert!(!g.open(7, &who(11, &none)));
@@ -286,8 +279,7 @@ mod tests {
     #[test]
     fn unknown_requirements_count_as_met() {
         // kind 0x0B (trained skill) cannot be judged
-        let g =
-            StartGates::from_tables([(8, false, vec![(0x0B, 1234, 0), (kind::LEVEL, 3, 0)])], []);
+        let g = StartGates::from_tables([(8, false, vec![(0x0B, 1234, 0), (kind::LEVEL, 3, 0)])]);
         let none = |_: u32| false;
         assert!(g.open(8, &who(3, &none)));
         assert!(!g.open(8, &who(2, &none)));
@@ -295,26 +287,22 @@ mod tests {
 
     #[test]
     fn an_or_gate_opens_when_one_holds_or_one_is_unknown() {
-        let g = StartGates::from_tables(
-            [(
-                9,
-                true,
-                vec![(kind::RACE, 4, 0), (kind::COMPLETE_QUEST, 50, 0)],
-            )],
-            [],
-        );
+        let g = StartGates::from_tables([(
+            9,
+            true,
+            vec![(kind::RACE, 4, 0), (kind::COMPLETE_QUEST, 50, 0)],
+        )]);
         let none = |_: u32| false;
         let done_50 = |q: u32| q == 50;
         assert!(!g.open(9, &who(5, &none)));
         assert!(g.open(9, &who(5, &done_50)));
-        let unknown =
-            StartGates::from_tables([(9, true, vec![(kind::RACE, 4, 0), (0x0B, 1, 0)])], []);
+        let unknown = StartGates::from_tables([(9, true, vec![(kind::RACE, 4, 0), (0x0B, 1, 0)])]);
         assert!(unknown.open(9, &who(5, &none)));
     }
 
     #[test]
     fn an_item_requirement_looks_in_the_bag() {
-        let g = StartGates::from_tables([(18, false, vec![(kind::OWN_ITEM, 2142, 0)])], []);
+        let g = StartGates::from_tables([(18, false, vec![(kind::OWN_ITEM, 2142, 0)])]);
         let none = |_: u32| false;
         assert!(g.open(18, &who(5, &none)));
         let w = Who {
@@ -326,13 +314,10 @@ mod tests {
 
     #[test]
     fn every_start_component_must_be_open() {
-        let g = StartGates::from_tables(
-            [
-                (10, false, vec![(kind::LEVEL, 3, 0)]),
-                (10, false, vec![(kind::EXCEPT_COMPLETE_QUEST, 99, 0)]),
-            ],
-            [],
-        );
+        let g = StartGates::from_tables([
+            (10, false, vec![(kind::LEVEL, 3, 0)]),
+            (10, false, vec![(kind::EXCEPT_COMPLETE_QUEST, 99, 0)]),
+        ]);
         let none = |_: u32| false;
         let done_99 = |q: u32| q == 99;
         assert!(g.open(10, &who(4, &none)));
@@ -346,7 +331,6 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE quest_components (id INT, quest_context_id INT, component_kind_id INT, or_unit_reqs TEXT);
              CREATE TABLE unit_reqs (id INT, owner_id INT, owner_type TEXT, kind_id INT, value1 INT, value2 INT);
-             CREATE TABLE system_factions (id INT, mother_id INT);
              INSERT INTO quest_components VALUES (26431, 6161, 2, 'f'), (500, 6161, 3, 'f'), (18735, 4292, 2, 't');
              INSERT INTO unit_reqs VALUES
                (45292, 26431, 'QuestComponent', 1, 3, 0),
@@ -355,14 +339,12 @@ mod tests {
                (1, 500, 'QuestComponent', 1, 40, 0),
                (35800, 18735, 'QuestComponent', 3, 1, 0),
                (45607, 18735, 'QuestComponent', 31, 354, 0),
-               (2, 26431, 'Sphere', 1, 99, 0);
-             INSERT INTO system_factions VALUES (1, 0), (11, 148), (12, NULL);",
+               (2, 26431, 'Sphere', 1, 99, 0);",
         )
         .unwrap();
-        let g = StartGates::read(&conn).unwrap();
+        let g = StartGates::load(&conn).unwrap();
         assert_eq!(g.len(), 2);
-        assert_eq!(g.mother_faction(11), 148);
-        assert_eq!(g.mother_faction(1), 0);
+        assert!(g.bytes() > 0);
         let none = |_: u32| false;
         let done_350 = |q: u32| q == 350;
         // the progress component (kind 3) and the sphere row are ignored

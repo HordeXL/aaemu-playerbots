@@ -142,16 +142,28 @@ impl Goal {
 
     /// One tick; `combat` is the controller's verdict of this tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>, combat: CombatStatus) -> GoalStatus {
-        match self {
-            Goal::Wander(g) => g.tick(ctx),
-            Goal::Rest(g) => g.tick(ctx),
-            Goal::Grind(g) => g.tick(ctx, combat),
-            Goal::Quest(g) => g.tick(ctx),
-            Goal::Duel(g) => g.tick(ctx),
-            Goal::Trade(g) => g.tick(ctx),
-            Goal::TradeRun(g) => g.tick(ctx),
-            Goal::Housing(g) => g.tick(ctx),
+        let resume = match self {
+            Goal::Wander(g) => return g.tick(ctx),
+            Goal::Rest(g) => match g.tick(ctx) {
+                GoalStatus::Done => g.resumes_run(ctx),
+                status => return status,
+            },
+            Goal::Grind(g) => return g.tick(ctx, combat),
+            Goal::Quest(g) => return g.tick(ctx),
+            Goal::Duel(g) => return g.tick(ctx),
+            Goal::Trade(g) => return g.tick(ctx),
+            Goal::TradeRun(g) => return g.tick(ctx),
+            Goal::Housing(g) => return g.tick(ctx),
+        };
+        if !resume {
+            return GoalStatus::Done;
         }
+        // The rest cut a trade run short while the bot carried a pack: the run goes on.
+        ctx.log.say("goal: trade run (the pack is still carried)");
+        let mut run = TradeRun::default();
+        run.start(ctx);
+        *self = Goal::TradeRun(run);
+        GoalStatus::Running
     }
 
     /// Called when the goal ends, fails or is interrupted.

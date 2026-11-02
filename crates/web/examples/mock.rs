@@ -394,6 +394,12 @@ impl BotHub for MockHub {
                 ("Entities in view".into(), format!("{}", 5 + id % 17)),
                 ("Notes".into(), "<b>not html</b> & \"quotes\"".into()),
             ],
+            chat: bot
+                .log
+                .iter()
+                .filter(|l| l.text.starts_with("says:") || l.text.starts_with("whispers"))
+                .cloned()
+                .collect(),
         })
     }
 
@@ -421,6 +427,9 @@ impl BotHub for MockHub {
                 failures: 1,
                 tokens_today: 4_100 + inner.tick * 15,
                 budget_left: 500_000u64.saturating_sub(4_100 + inner.tick * 15),
+                rate_limited: inner.tick / 90,
+                chat_replies: 3 + inner.tick / 40,
+                director_picks: 2 + inner.tick / 120,
             }),
             activity_counts: counts,
         }
@@ -499,6 +508,10 @@ impl BotHub for MockHub {
             Command::Say { text } => {
                 let i = idx.ok_or("needs a bot")?;
                 inner.bots[i].say_log(format!("says: {text}"));
+            }
+            Command::Whisper { to, text } => {
+                let i = idx.ok_or("needs a bot")?;
+                inner.bots[i].say_log(format!("whispers to {to}: {text}"));
             }
             Command::Spawn { count } => {
                 for _ in 0..count {

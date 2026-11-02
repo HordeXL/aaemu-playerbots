@@ -8,12 +8,19 @@
 //! while ([`FAIL_COOLDOWN_MS`]).
 //!
 //! The brain also calls the combat controller on every tick, so a bot defends itself whatever it is
-//! doing, and runs the social hook ([`social::tick`]).
+//! doing, runs the chat duty ([`Social::tick`]) and, when `llm.director` is on, asks the LLM
+//! director for a goal now and then ([`director`]): the model picks among the goals the scoring
+//! itself would allow, and the pick is dropped silently if it is no longer eligible.
+
+use smallvec::SmallVec;
 
 use super::cmd::{BotCmd, GoalChoice, GoalKind, PairKind, PairOrder};
 use super::combat::Combat;
 use super::ctx::Ctx;
-use super::goals::{social, FailReason, Goal, GoalStatus};
+use super::director::{self, Director, Pick, Situation};
+use super::goals::social::{self, ChatEvent, Social};
+use super::goals::{FailReason, Goal, GoalStatus};
+use super::state::UnitKind;
 use crate::config::BehaviorCfg;
 use crate::roster::Temperament;
 
@@ -104,6 +111,14 @@ pub fn choose(scores: &[f32; GoalKind::COUNT], rng: &mut fastrand::Rng) -> Optio
     last_nonzero
 }
 
+/// The chat duty and the director of one bot. Created at the first tick, so a bot that has not
+/// started yet costs a pointer.
+#[derive(Debug)]
+struct Chat {
+    social: Social,
+    director: Director,
+}
+
 /// Chooses and runs goals for one bot. See the module docs.
 #[derive(Debug)]
 pub struct Brain {
@@ -119,6 +134,8 @@ pub struct Brain {
     /// A goal to start at the next tick (operator command, pairing, recovery after death).
     queued: Option<(GoalKind, Option<PairOrder>)>,
     forced_fails: u8,
+    /// Chat and director state, see [`Chat`].
+    ext: Option<Box<Chat>>,
 }
 
 impl Brain {
@@ -134,7 +151,18 @@ impl Brain {
             next_think_ms: 0,
             queued: None,
             forced_fails: 0,
+            ext: None,
         }
+    }
+
+    /// The chat and director state, created on first use.
+    fn chat(&mut self, rng: &mut fastrand::Rng, director_interval_secs: u64) -> &mut Chat {
+        self.ext.get_or_insert_with(|| {
+            Box::new(Chat {
+                social: Social::new(rng),
+                director: Director::new(rng, director_interval_secs),
+            })
+        })
     }
 
     /// The running goal.
@@ -176,7 +204,7 @@ impl Brain {
                 };
                 self.queued = Some((kind, Some(order.clone())));
             }
-            BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) => {}
+            BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) | BotCmd::Whisper { .. } => {}
             BotCmd::DuelWith(_) | BotCmd::TradeWith(_) => {}
         }
     }
@@ -188,7 +216,8 @@ impl Brain {
 
     /// One brain tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>) {
-        social::tick(ctx);
+        let interval = ctx.cfg.llm.director_interval_secs;
+        self.chat(&mut *ctx.rng, interval).social.tick(ctx);
         if ctx.state.me.dead {
             // Dead bots drop their goal; the bot task asks for the resurrection.
             self.end_goal(ctx, None);
@@ -202,6 +231,7 @@ impl Brain {
         let combat = Combat::tick(ctx);
         let now = ctx.now_ms;
 
+        self.director_step(ctx);
         if let Some((kind, order)) = self.queued.take() {
             self.start_goal(ctx, kind, order);
         }
@@ -263,8 +293,23 @@ impl Brain {
             return;
         };
         let kind = goal.kind();
+        let partner = match &goal {
+            Goal::Duel(d) => d.order().map(|o| o.partner_name.clone()),
+            Goal::Trade(t) => t.order().map(|o| o.partner_name.clone()),
+            _ => None,
+        };
         goal.stop(ctx);
         self.last = Some(kind);
+        if let Some(ext) = self.ext.as_mut() {
+            ext.director.note_goal(kind, why.is_none());
+            if why.is_none() {
+                match kind {
+                    GoalKind::Duel => ext.social.note(ChatEvent::DuelDone(partner), ctx.now_ms),
+                    GoalKind::Trade => ext.social.note(ChatEvent::TradeDone(partner), ctx.now_ms),
+                    _ => {}
+                }
+            }
+        }
         self.next_think_ms = ctx.now_ms + super::goals::jitter_ms(ctx.rng, GAP_MS.0, GAP_MS.1);
         let Some(why) = why else { return };
         match why {
@@ -312,23 +357,141 @@ impl Brain {
             self.start_goal(ctx, filler, None);
             return;
         }
+        if let Some(pick) = self.take_held_pick(ctx) {
+            self.apply_pick(ctx, &pick);
+            self.start_goal(ctx, pick.kind, None);
+            return;
+        }
+        let s = self.scores_now(ctx);
+        let kind = choose(&s, ctx.rng).unwrap_or(GoalKind::Wander);
+        self.start_goal(ctx, kind, None);
+    }
+
+    /// The score of every goal for the situation of this tick: the one table both the utility
+    /// choice and the director's eligibility read.
+    fn scores_now(&self, ctx: &Ctx<'_>) -> [f32; GoalKind::COUNT] {
         let mut blocked = self.disabled;
         for g in GoalKind::ALL {
-            if now < self.cooldown_until[g.index()] {
+            if ctx.now_ms < self.cooldown_until[g.index()] {
                 blocked |= 1 << g.index();
             }
         }
-        let monsters_near = monsters_near(ctx);
         let input = ScoreInput {
             hp_pct: ctx.state.me.hp_pct(),
             mp_pct: ctx.state.me.mp_pct(),
-            monsters_near,
+            monsters_near: monsters_near(ctx),
             last: self.last,
             blocked,
         };
-        let s = scores(&self.base, &input);
-        let kind = choose(&s, ctx.rng).unwrap_or(GoalKind::Wander);
-        self.start_goal(ctx, kind, None);
+        scores(&self.base, &input)
+    }
+
+    /// The goals the director may offer or apply right now.
+    fn eligible(&self, ctx: &Ctx<'_>) -> director::Goals {
+        director::eligible_goals(&self.scores_now(ctx), ctx.gm_allowed())
+    }
+
+    // ---- the director ------------------------------------------------------------------
+
+    /// Collects the model's answer and, when it is time, asks again. Never blocks: the request
+    /// runs on its own task.
+    fn director_step(&mut self, ctx: &mut Ctx<'_>) {
+        if !ctx.cfg.llm.director || matches!(self.choice, GoalChoice::Forced(_)) {
+            return;
+        }
+        let Some(llm) = ctx.hub.llm().cloned() else {
+            return;
+        };
+        let now = ctx.now_ms;
+        let interval = ctx.cfg.llm.director_interval_secs;
+        if let Some(pick) = self.chat(&mut *ctx.rng, interval).director.poll(now) {
+            self.on_pick(ctx, pick);
+        }
+        if !self.chat(&mut *ctx.rng, interval).director.due(now) {
+            return;
+        }
+        // Whatever comes of it, the next question is an interval away.
+        self.chat(&mut *ctx.rng, interval)
+            .director
+            .schedule(now, &mut *ctx.rng, interval);
+        let offered = self.eligible(ctx);
+        if offered.len() < 2 {
+            return;
+        }
+        let current = self.goal.as_ref().map(Goal::kind);
+        let recent: SmallVec<[(GoalKind, bool); 3]> =
+            self.chat(&mut *ctx.rng, interval).director.recent().into();
+        let me = &ctx.state.me;
+        let characters_near = ctx
+            .state
+            .units
+            .values()
+            .filter(|u| u.kind == UnitKind::Character && u.dist2d(me.pos) <= 60.0)
+            .count();
+        let facts = social::facts(ctx);
+        let situation = director::describe(&Situation {
+            facts,
+            level: me.level,
+            hp_pct: me.hp_pct(),
+            mp_pct: me.mp_pct(),
+            money: me.money,
+            current,
+            recent: &recent,
+            monsters_near: monsters_near(ctx),
+            characters_near,
+            real_player_near: ctx.real_player_near,
+        });
+        let system = director::system_prompt(&facts);
+        self.chat(&mut *ctx.rng, interval)
+            .director
+            .ask(now, llm, system, situation, offered);
+    }
+
+    /// The model picked `pick`: start it now if the bot is between things, else keep it for the
+    /// next goal change; drop it when the goal is no longer eligible.
+    fn on_pick(&mut self, ctx: &mut Ctx<'_>, pick: Pick) {
+        if !self.eligible(ctx).contains(&pick.kind) {
+            ctx.log.debug(format!(
+                "director: {} is no longer eligible",
+                pick.kind.name()
+            ));
+            return;
+        }
+        let between = self
+            .goal
+            .as_ref()
+            .is_none_or(|g| matches!(g.kind(), GoalKind::Wander | GoalKind::Rest));
+        if between {
+            self.apply_pick(ctx, &pick);
+            if self.goal.as_ref().map(Goal::kind) != Some(pick.kind) {
+                self.queued = Some((pick.kind, None));
+            }
+        } else {
+            let interval = ctx.cfg.llm.director_interval_secs;
+            let now = ctx.now_ms;
+            self.chat(&mut *ctx.rng, interval).director.hold(pick, now);
+        }
+    }
+
+    fn apply_pick(&self, ctx: &Ctx<'_>, pick: &Pick) {
+        ctx.hub
+            .chat
+            .gate
+            .stats
+            .director_picks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.log
+            .say(format!("director: {} ({})", pick.kind.name(), pick.reason));
+    }
+
+    /// A held pick, if the goal change it waited for has come and it is still eligible.
+    fn take_held_pick(&mut self, ctx: &mut Ctx<'_>) -> Option<Pick> {
+        if !self.ext.as_ref().is_some_and(|e| e.director.has_ready()) {
+            return None;
+        }
+        let eligible = self.eligible(ctx);
+        let now = ctx.now_ms;
+        self.ext.as_mut()?.director.take_ready(now, &eligible)
     }
 }
 

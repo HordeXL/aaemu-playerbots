@@ -31,7 +31,7 @@ ACTIVITIES.forEach((a, i) => { ACT_INDEX[a] = i; });
 const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 
 const GOALS = [['auto', 'Auto'], ['quest', 'Quest'], ['grind', 'Grind'], ['duel', 'Duel'], ['trade', 'Trade'],
-  ['trade_run', 'Trade run'], ['housing', 'Housing'], ['rest', 'Rest']];
+  ['trade_run', 'Trade run'], ['housing', 'Housing'], ['rest', 'Rest'], ['wander', 'Wander']];
 
 const MARKER = {
   house:        { label: 'House',        color: '#a0693a', minScale: 0 },
@@ -280,8 +280,13 @@ function renderStats() {
   $('st-llm-tile').hidden = !l;
   if (l) {
     const unlimited = !(num(l.budget_left) < 1e15);
+    const extra = [];
+    if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' throttled');
+    if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' chat replies');
+    if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' director picks');
     setTile('st-llm', nf.format(l.requests) + ' requests, ' + nf.format(l.failures) + ' failed',
-      fmtCount(l.tokens_today) + ' tokens today, ' + (unlimited ? 'no budget limit' : fmtCount(l.budget_left) + ' left'));
+      fmtCount(l.tokens_today) + ' tokens today, ' + (unlimited ? 'no budget limit' : fmtCount(l.budget_left) + ' left') +
+      (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));
   }
   document.title = 'Playerbots (' + s.bots_online + '/' + s.bots_total + ')';
 }
@@ -408,8 +413,9 @@ function buildDetail() {
   D.panel = $('detail');
   D.name = $('d-name'); D.sub = $('d-sub'); D.hp = $('d-hp'); D.hpText = $('d-hp-text');
   D.quests = $('d-quests'); D.extra = $('d-extra'); D.extraWrap = $('d-extra-wrap'); D.log = $('d-log');
+  D.chat = $('d-chat'); D.chatWrap = $('d-chat-wrap');
   D.status = $('c-status'); D.pause = $('c-pause'); D.goal = $('c-goal'); D.duel = $('c-duel');
-  D.trade = $('c-trade'); D.say = $('c-say');
+  D.trade = $('c-trade'); D.say = $('c-say'); D.whisper = $('c-whisper'); D.whisperTo = $('c-whisper-to');
   D.f = {};
   for (const [key, label] of FIELD_DEFS) {
     const dd = h('dd');
@@ -445,6 +451,14 @@ function buildDetail() {
     if (!text) { setStatus(D.status, 'err', 'Type something to say.'); return; }
     if (await sendCommand(S.sel, { type: 'say', text }, D.status)) D.say.value = '';
   });
+  $('c-whisper-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const to = D.whisperTo.value.trim();
+    const text = D.whisper.value.trim();
+    if (S.sel == null) return;
+    if (!to || !text) { setStatus(D.status, 'err', 'Give a character name and a line to whisper.'); return; }
+    if (await sendCommand(S.sel, { type: 'whisper', to, text }, D.status)) D.whisper.value = '';
+  });
 }
 
 function select(id, opts) {
@@ -455,6 +469,7 @@ function select(id, opts) {
     S.detail = null;
     setStatus(D.status, '', '');
     D.say.value = '';
+    D.whisper.value = '';
     S.partnerSig = '';
     try { history.replaceState(null, '', id == null ? location.pathname + location.search : '#bot=' + id); } catch (_) { /* ignore */ }
   }
@@ -563,6 +578,16 @@ function renderDetail() {
   const ef = document.createDocumentFragment();
   for (const kv of ex) ef.append(h('dt', null, String(kv[0])), h('dd', null, String(kv[1])));
   D.extra.replaceChildren(ef);
+  // chat the bot heard and said, newest first
+  const chat = (d.chat || []).slice().sort((a, b) => b.t - a.t).slice(0, 8);
+  D.chatWrap.hidden = chat.length === 0;
+  const cf = document.createDocumentFragment();
+  for (const ln of chat) {
+    const li = h('li');
+    li.append(h('time', null, fmtClock(ln.t)), h('span', null, ln.text));
+    cf.append(li);
+  }
+  D.chat.replaceChildren(cf);
   // log, newest first
   const log = (d.log || []).slice().sort((a, b) => b.t - a.t).slice(0, 80);
   const lf = document.createDocumentFragment();
@@ -646,6 +671,7 @@ function describe(cmd) {
     case 'goal': return 'goal ' + cmd.goal;
     case 'duel_with': case 'trade_with': return cmd.type.replace('_with', '') + ' with #' + cmd.other;
     case 'say': return 'say';
+    case 'whisper': return 'whisper to ' + cmd.to;
     case 'spawn': case 'despawn': return cmd.type + ' ' + cmd.count;
     default: return cmd.type;
   }

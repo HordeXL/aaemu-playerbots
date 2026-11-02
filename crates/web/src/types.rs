@@ -119,6 +119,9 @@ pub struct BotDetail {
     pub quests: Vec<QuestLine>,
     /// Extra key/value rows (persona, tick rate, …), shown in order.
     pub extra: Vec<(String, String)>,
+    /// The last chat lines the bot heard or said, oldest first (`t` is unix milliseconds).
+    #[serde(default)]
+    pub chat: Vec<LogLine>,
 }
 
 /// Token-budget numbers of the optional LLM.
@@ -129,6 +132,15 @@ pub struct LlmStats {
     pub tokens_today: u64,
     /// Tokens left today; `u64::MAX` (or anything above 10^15) means "no budget".
     pub budget_left: u64,
+    /// Requests refused by a local limit or the endpoint (they cost nothing).
+    #[serde(default)]
+    pub rate_limited: u64,
+    /// Chat replies the model wrote and the bots sent.
+    #[serde(default)]
+    pub chat_replies: u64,
+    /// Goals the model chose and the bots started.
+    #[serde(default)]
+    pub director_picks: u64,
 }
 
 /// Process-wide numbers for the header of the UI.
@@ -212,6 +224,11 @@ pub enum Command {
     Say {
         text: String,
     },
+    /// Make the bot whisper a line to the character `to`.
+    Whisper {
+        to: String,
+        text: String,
+    },
     /// Global: log in `count` more bots.
     Spawn {
         count: u32,
@@ -224,7 +241,7 @@ pub enum Command {
 
 impl Command {
     /// Values accepted by [`Command::Goal`].
-    pub const GOALS: [&'static str; 8] = [
+    pub const GOALS: [&'static str; 9] = [
         "quest",
         "grind",
         "duel",
@@ -232,12 +249,15 @@ impl Command {
         "trade_run",
         "housing",
         "rest",
+        "wander",
         "auto",
     ];
     /// Largest `count` of a spawn or despawn command.
     pub const MAX_COUNT: u32 = 1000;
-    /// Longest `Say` text, in characters.
+    /// Longest `Say` / `Whisper` text, in characters.
     pub const MAX_SAY_CHARS: usize = 200;
+    /// Longest whisper target, in characters.
+    pub const MAX_NAME_CHARS: usize = 32;
 
     /// Cheap sanity checks the web layer applies before the hub sees a command.
     ///
@@ -260,9 +280,24 @@ impl Command {
                 Some(b) if b == *other => Err("a bot cannot pair with itself".into()),
                 Some(_) => Ok(()),
             },
-            Command::Say { text } => {
+            Command::Say { text } | Command::Whisper { text, .. } => {
                 if bot.is_none() {
                     return Err("this command needs a bot: POST /api/bots/<id>/command".into());
+                }
+                if let Command::Whisper { to, .. } = self {
+                    let to = to.trim();
+                    if to.is_empty() || to.chars().count() > Command::MAX_NAME_CHARS {
+                        return Err(format!(
+                            "the whisper target must be a character name of 1..={} characters",
+                            Command::MAX_NAME_CHARS
+                        ));
+                    }
+                    if !to
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    {
+                        return Err("the whisper target is not a plain character name".into());
+                    }
                 }
                 let text = text.trim();
                 if text.is_empty() {
@@ -353,6 +388,13 @@ mod tests {
                     text: "hello".into(),
                 },
             ),
+            (
+                r#"{"type":"whisper","to":"Bob","text":"hello"}"#,
+                Command::Whisper {
+                    to: "Bob".into(),
+                    text: "hello".into(),
+                },
+            ),
             (r#"{"type":"spawn","count":5}"#, Command::Spawn { count: 5 }),
             (
                 r#"{"type":"despawn","count":2}"#,
@@ -390,6 +432,22 @@ mod tests {
         assert!(say(&"x".repeat(201)).validate(Some(1)).is_err());
         assert!(say("hi").validate(None).is_err());
 
+        let whisper = |to: &str, text: &str| Command::Whisper {
+            to: to.into(),
+            text: text.into(),
+        };
+        assert!(whisper("Bob", "hi there").validate(Some(1)).is_ok());
+        assert!(whisper("Bob", "hi there").validate(None).is_err());
+        assert!(whisper("", "hi").validate(Some(1)).is_err());
+        assert!(whisper("Bo b", "hi").validate(Some(1)).is_err());
+        assert!(whisper("/Bob", "hi").validate(Some(1)).is_err());
+        assert!(whisper(&"B".repeat(33), "hi").validate(Some(1)).is_err());
+        assert!(whisper("Bob", "/gold add self 1")
+            .validate(Some(1))
+            .is_err());
+        assert!(whisper("Bob", "  ").validate(Some(1)).is_err());
+        assert!(g("wander").validate(Some(1)).is_ok());
+
         assert!(Command::Spawn { count: 10 }.validate(None).is_ok());
         assert!(Command::Spawn { count: 0 }.validate(None).is_err());
         assert!(Command::Despawn { count: 1001 }.validate(None).is_err());
@@ -407,5 +465,21 @@ mod tests {
         assert_eq!(v["activity_counts"][1][0], "trade_run");
         assert_eq!(v["activity_counts"][1][1], 1);
         assert!(v["llm"].is_null());
+    }
+
+    #[test]
+    fn older_json_without_the_chat_and_llm_extras_still_parses() {
+        let stats: LlmStats =
+            serde_json::from_str(r#"{"requests":1,"failures":0,"tokens_today":5,"budget_left":9}"#)
+                .unwrap();
+        assert_eq!(
+            (stats.rate_limited, stats.chat_replies, stats.director_picks),
+            (0, 0, 0)
+        );
+        let detail: BotDetail = serde_json::from_str(
+            r#"{"snapshot":{"id":1,"name":"A","race":"","class":"","level":1,"hp_pct":1,"x":0,"y":0,"z":0,"zone":null,"activity":"idle","goal":"","detail":"","partner":null,"gold":0,"has_house":false,"online_secs":0,"paused":false},"log":[],"quests":[],"extra":[]}"#,
+        )
+        .unwrap();
+        assert!(detail.chat.is_empty());
     }
 }

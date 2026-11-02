@@ -2,9 +2,13 @@
 //!
 //! The server regenerates a standing character; the goal ends when both are nearly full (after at
 //! least ten seconds) or after at most 90 seconds.
+//!
+//! A rest that cut a trade run short while the bot carried a pack gives the run back when it ends
+//! ([`Rest::resumes_run`], used by [`super::Goal::tick`]); the new run walks the pack to the buyer.
 
 use crate::bot::ctx::Ctx;
 
+use super::trade_run::carried_pack_of;
 use super::{jitter_ms, GoalStatus};
 
 /// Shortest rest in milliseconds.
@@ -20,6 +24,8 @@ const MP_OK: u8 = 80;
 pub struct Rest {
     min_end_ms: u64,
     end_ms: u64,
+    /// The rest replaced a trade run that carried a pack.
+    after_run: bool,
 }
 
 impl Rest {
@@ -28,6 +34,13 @@ impl Rest {
         ctx.motion.stop();
         self.min_end_ms = ctx.now_ms + MIN_MS;
         self.end_ms = ctx.now_ms + jitter_ms(ctx.rng, MAX_MS.0, MAX_MS.1);
+        self.after_run = ctx.state.econ.take_interrupted_run(ctx.now_ms);
+    }
+
+    /// Whether the finished rest goes back to the trade run it interrupted: the bot still
+    /// carries the pack, which only a sale (or the buyer's refusal) gets rid of.
+    pub fn resumes_run(&self, ctx: &Ctx<'_>) -> bool {
+        self.after_run && carried_pack_of(ctx).is_some()
     }
 
     /// One tick.

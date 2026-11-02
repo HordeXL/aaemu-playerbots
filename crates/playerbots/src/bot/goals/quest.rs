@@ -22,17 +22,15 @@
 //! The goal owns the combat controller: while a fight or a loot job is on, the goal waits and
 //! re-issues its walk afterwards. All state of a run is boxed so the goal enum stays small.
 
-mod extras;
 mod memory;
 mod objective;
-mod reqs;
 mod select;
 
 use std::fmt::Write;
 
 use aa_proto::cs;
 use aa_proto::sc_activity::quest_status;
-use aa_world::{ObjKind, Quest as QuestData, QuestReport, Vec3, World};
+use aa_world::{ObjKind, Quest as QuestData, QuestReport, SkillNeed, Vec3, World};
 use smallvec::SmallVec;
 
 use crate::bot::combat::CombatStatus;
@@ -40,7 +38,6 @@ use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, MoveFailure, Pace};
 use crate::bot::state::{dist2d, BotState, StateError, UnitKind};
 
-use extras::Need;
 use objective::{Env, Plan, Slot};
 use select::{Candidate, Giver, Judge};
 
@@ -169,7 +166,13 @@ impl Quest {
 
     /// One tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
-        self.0.tick(ctx)
+        let status = self.0.tick(ctx);
+        if ctx.motion.is_moving() && ctx.combat.target().is_none() {
+            // Walking to an objective: the combat controller only fights back against close
+            // attackers (a monster the quest wants is engaged by the goal itself).
+            ctx.combat.note_travelling(ctx.now_ms);
+        }
+        status
     }
 
     /// Called when the goal ends.
@@ -275,8 +278,6 @@ impl Inner {
         self.end_ms = ctx.now_ms + jitter_ms(ctx.rng, RUN_MS.0, RUN_MS.1);
         self.since_ms = ctx.now_ms;
         mem(ctx.state);
-        // The lookups are read once per process; do it before the first plan needs them.
-        extras::shared(&ctx.cfg.data.compact, ctx.world);
     }
 
     fn stop(&mut self, ctx: &mut Ctx<'_>) {
@@ -354,8 +355,7 @@ impl Inner {
     fn best_active(&mut self, ctx: &mut Ctx<'_>) -> Option<(u32, Mode)> {
         let now = ctx.now_ms;
         let world = ctx.world;
-        let extras = extras::shared(&ctx.cfg.data.compact, world);
-        let facts = Env { world, extras };
+        let facts = Env { world };
         let level = ctx.state.me.level;
         // (rank, chapter, idx, quest) of the best so far; rank 0 = focus, 1 = ready, 2 = other.
         let mut best: Option<((u8, u16, u16, u32), Mode)> = None;
@@ -421,17 +421,16 @@ impl Inner {
     fn find_candidate(&self, ctx: &mut Ctx<'_>, radius: f32) -> Option<Candidate> {
         let now = ctx.now_ms;
         let world = ctx.world;
-        let extras = extras::shared(&ctx.cfg.data.compact, world);
-        let facts = Env { world, extras };
+        let facts = Env { world };
         let state = &*ctx.state;
         let (level, faction) = (state.me.level, state.me.faction);
         let me = state.me.pos;
         let done = |q: u32| state.quests.is_done(q);
-        let who = reqs::Who {
+        let who = aa_world::Who {
             level,
             race: state.me.race,
             gender: state.me.gender,
-            mother_faction: extras.gates().mother_faction(faction),
+            mother_faction: world.mother_faction(faction),
             done: &done,
             owns: &|item| state.find_item(item).is_some(),
         };
@@ -467,7 +466,7 @@ impl Inner {
             {
                 return;
             }
-            if judge.check(quest).is_err() || !extras.gates().open(quest_id, &who) {
+            if judge.check(quest).is_err() || !world.start_gates().open(quest_id, &who) {
                 return;
             }
             if let Giver::Npc(t) = giver {
@@ -635,8 +634,7 @@ impl Inner {
         } else if now.saturating_sub(self.progress_ms) > NO_PROGRESS_MS {
             return self.stall(ctx, quest, &row, &slot);
         }
-        let extras = extras::shared(&ctx.cfg.data.compact, world);
-        let facts = Env { world, extras };
+        let facts = Env { world };
         match objective::plan(&facts, quest, slot.obj, ctx.state.me.level) {
             Ok(plan) => self.exec(ctx, quest, &slot, plan),
             Err(why) => self.fail(ctx, why),
@@ -826,8 +824,7 @@ impl Inner {
         let skill = if skill != 0 {
             skill
         } else {
-            let extras = extras::shared(&ctx.cfg.data.compact, ctx.world);
-            extras.doodad_skill(template)
+            ctx.world.doodad_use_skill(template)
         };
         if skill == 0 {
             return self.fail(ctx, Failure::Unsupported("doodad skill unknown"));
@@ -866,8 +863,7 @@ impl Inner {
         // Some item skills only work at a certain place (a book read to a cat, a firework next
         // to a stand, a spell inside a quest area).
         let mut target = me_obj;
-        let extras = extras::shared(&ctx.cfg.data.compact, ctx.world);
-        for &need in extras.skill_needs(skill) {
+        for &need in ctx.world.skill_needs(skill) {
             match self.meet(ctx, quest, skill, need) {
                 Ok(Some(obj)) => target = obj,
                 Ok(None) => {}
@@ -895,13 +891,13 @@ impl Inner {
         ctx: &mut Ctx<'_>,
         quest: &QuestData,
         skill: u32,
-        need: Need,
+        need: SkillNeed,
     ) -> Result<Option<u32>, GoalStatus> {
         let world = ctx.world;
         let me = ctx.state.me.pos;
         // (x, y), how close the bot has to be, how close it walks.
         let (spot, reach, stop, obj) = match need {
-            Need::Npc(t) => {
+            SkillNeed::Npc(t) => {
                 let Some((obj, pos)) = nearest_unit(ctx.state, t, me) else {
                     return Err(self.search(ctx, |f: &mut dyn FnMut(Vec3)| {
                         for &p in world.npc_spawns(t) {
@@ -914,7 +910,7 @@ impl Inner {
                 });
                 ((pos[0], pos[1]), reach, (reach - 1.5).max(1.0), Some(obj))
             }
-            Need::Doodad(t, range) => {
+            SkillNeed::Doodad(t, range) => {
                 let nearest = world
                     .doodad_spawns(t)
                     .iter()
@@ -927,7 +923,7 @@ impl Inner {
                 let reach = (range * 0.7).clamp(2.0, 30.0);
                 ((p.x, p.y), reach, (reach - 2.0).max(1.0), None)
             }
-            Need::Sphere => {
+            SkillNeed::Sphere => {
                 let sphere = quest
                     .progress
                     .iter()

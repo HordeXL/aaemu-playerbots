@@ -3,6 +3,7 @@
 
 use aa_proto::opcodes::sc;
 use aa_proto::sc_activity::{parse, ActivityEvent, ItemBrief, TeamMemberBrief};
+use aa_proto::sc_world::{ItemChange, ItemTaskInfo};
 use aa_proto::stream::MarshalError;
 use aa_proto::PacketStream;
 
@@ -225,25 +226,53 @@ fn trade_lock_and_ok_updates() {
 }
 
 #[test]
-fn trade_made_signals_completion() {
+fn trade_made_carries_its_item_tasks() {
     // SCTradeMadePacket: u8 action, u8 n, n item tasks, u8 force-remove count, ids, u32 type id
-    // (trade.rs:1144). Only the head is parsed.
+    // (trade.rs:1144); the head layout is that of SCItemTaskSuccess.
     let mut s = PacketStream::new();
     s.write_u8(48).write_u8(0).write_u8(0).write_u32(0);
     assert_eq!(
         event(sc::SCTradeMadePacket, &s),
         ActivityEvent::TradeMade {
             action: 48,
-            tasks: 0
+            tasks: 0,
+            items: ItemTaskInfo {
+                reason: 48,
+                ..ItemTaskInfo::default()
+            }
+            .into(),
         }
     );
+    // one task: money -250 (ItemAction 1), one forced removal, the trailing u32
+    let mut s = PacketStream::new();
+    s.write_u8(48)
+        .write_u8(1)
+        .write_u8(1)
+        .write_i32(-250)
+        .write_u8(1)
+        .write_u64(0x1122_3344_5566_7788)
+        .write_u32(0);
+    let ActivityEvent::TradeMade {
+        action,
+        tasks,
+        items,
+    } = event(sc::SCTradeMadePacket, &s)
+    else {
+        panic!("expected TradeMade");
+    };
+    assert_eq!((action, tasks), (48, 1));
+    assert_eq!(items.reason, 48);
+    assert_eq!(items.changes.as_slice(), [ItemChange::Money(-250)]);
+    assert_eq!(items.force_removed.as_slice(), [0x1122_3344_5566_7788]);
+    // a body the item reader cannot follow still signals the completion
     let mut s = PacketStream::new();
     s.write_u8(48).write_u8(2).write_raw(&[0xAA; 40]);
     assert_eq!(
         event(sc::SCTradeMadePacket, &s),
         ActivityEvent::TradeMade {
             action: 48,
-            tasks: 2
+            tasks: 2,
+            items: Default::default(),
         }
     );
 }

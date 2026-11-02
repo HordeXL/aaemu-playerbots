@@ -47,6 +47,8 @@ fn encode(r: Relation) -> u8 {
 pub struct Factions {
     /// Sorted faction ids; index = row/column of `matrix`.
     ids: Vec<u32>,
+    /// `system_factions.mother_id` per faction (0 = none), parallel to `ids`.
+    mothers: Vec<u32>,
     matrix: Vec<u8>,
 }
 
@@ -107,7 +109,18 @@ impl Factions {
                 matrix[i * n + j] = encode(rel);
             }
         }
-        Factions { ids, matrix }
+        Factions {
+            ids,
+            mothers,
+            matrix,
+        }
+    }
+
+    /// `mother_id` of `faction` (the alliance it belongs to); 0 when it has none or is unknown.
+    pub fn mother_of(&self, faction: u32) -> u32 {
+        self.ids
+            .binary_search(&faction)
+            .map_or(0, |i| self.mothers[i])
     }
 
     /// How faction `a` regards faction `b`; [`Relation::Neutral`] if either is unknown.
@@ -130,7 +143,7 @@ impl Factions {
 
     /// Heap bytes held.
     pub fn bytes(&self) -> usize {
-        self.ids.capacity() * 4 + self.matrix.capacity()
+        self.ids.capacity() * 4 + self.mothers.capacity() * 4 + self.matrix.capacity()
     }
 }
 
@@ -153,6 +166,14 @@ mod tests {
             ],
             &[(20, 30, 1), (30, 40, 3), (40, 30, 1)],
         )
+    }
+
+    #[test]
+    fn the_mother_faction_is_looked_up() {
+        let f = sample();
+        assert_eq!(f.mother_of(10), 20);
+        assert_eq!(f.mother_of(20), 0);
+        assert_eq!(f.mother_of(999), 0);
     }
 
     #[test]

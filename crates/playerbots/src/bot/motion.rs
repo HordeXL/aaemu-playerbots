@@ -7,10 +7,17 @@
 //! [`STUCK_WINDOW_MS`]) inserts side steps and finally reports [`MoveFailure::Stuck`]; every trip
 //! also has a [`TRIP_TIMEOUT_MS`] limit.
 //!
+//! The server only knows the position of the last `CSMoveUnit`, and the update gap grows to a
+//! second when no player is near, so the server can see the bot a run-second (5 m) behind. Before
+//! a packet whose range the server checks (loot, talk, sell, craft, cast) the caller asks
+//! [`Motion::pin`] for an exact update.
+//!
 //! Nothing here reads a clock or talks to a socket: the caller passes the bot clock and an
 //! outbox ([`MotionEnv`]), which keeps the controller testable.
 
 use aa_proto::cs::{self, MoveUnit, Out};
+use aa_proto::game::LEVEL_GAME;
+use aa_proto::opcodes::cs as op;
 use smallvec::SmallVec;
 
 use super::state::{dist2d, dist3d};
@@ -35,6 +42,8 @@ pub const TELEPORT_WAIT_MS: u64 = 10_000;
 const MAX_STEP_MS: u64 = 1000;
 /// A facing change smaller than this (radians) is not worth a packet.
 const FACE_EPSILON: f32 = 0.09;
+/// The server's idea of the position may be this far off before [`Motion::pin`] corrects it.
+const PIN_EPSILON_M: f32 = 0.15;
 
 /// Where the ground is. [`aa_world::World`] answers from the baked height grid.
 pub trait Ground {
@@ -224,6 +233,9 @@ pub struct Motion {
     started_ms: u64,
     stuck: Stuck,
     pending_tp: Option<PendingTeleport>,
+    /// Where the last `CSMoveUnit` (or the server's own placement) put the bot, as the server
+    /// knows it.
+    sent_pos: [f32; 3],
 }
 
 impl Motion {
@@ -246,6 +258,7 @@ impl Motion {
             started_ms: 0,
             stuck: Stuck::default(),
             pending_tp: None,
+            sent_pos: [0.0; 3],
         }
     }
 
@@ -253,6 +266,7 @@ impl Motion {
     pub fn enter_world(&mut self, obj: u32, pos: [f32; 3], yaw: f32, now_ms: u64) {
         self.obj = obj;
         self.pos = pos;
+        self.sent_pos = pos;
         self.yaw = yaw;
         self.path.clear();
         self.status = MotionStatus::Idle;
@@ -397,6 +411,7 @@ impl Motion {
     /// trip unless a GM teleport was what moved it.
     pub fn teleported(&mut self, pos: [f32; 3]) {
         self.pos = pos;
+        self.sent_pos = pos;
         if self.pending_tp.take().is_some() {
             if let Some(&(x, y)) = self.path.last() {
                 if dist2d(pos, [x, y, 0.0]) <= self.radius + 10.0 {
@@ -529,28 +544,107 @@ impl Motion {
 
     /// Queues one `CSMoveUnit` and updates the bookkeeping.
     fn send(&mut self, env: &mut MotionEnv<'_>, moving: bool, vel: (f32, f32)) {
-        env.out.push(cs::move_unit(&MoveUnit {
+        let packet = self.packet(env.now_ms, env.combat, moving, vel);
+        env.out.push(packet);
+    }
+
+    /// Builds one `CSMoveUnit` for the current position and updates the bookkeeping.
+    fn packet(&mut self, now_ms: u64, combat: bool, moving: bool, vel: (f32, f32)) -> Out {
+        let packet = cs::move_unit(&MoveUnit {
             obj: self.obj,
-            time: env.now_ms as u32,
+            time: now_ms as u32,
             pos: (self.pos[0], self.pos[1], self.pos[2]),
             vel: (vel.0, vel.1, 0.0),
             yaw: self.yaw,
             moving,
-            stance: if env.combat {
+            stance: if combat {
                 cs::STANCE_COMBAT
             } else {
                 cs::STANCE_RELAXED
             },
-            alertness: if env.combat {
+            alertness: if combat {
                 cs::ALERT_COMBAT
             } else {
                 cs::ALERT_IDLE
             },
-        }));
+        });
         self.moving_sent = moving;
         self.stop_due = false;
         self.force_send = false;
-        self.last_send_ms = env.now_ms;
+        self.last_send_ms = now_ms;
+        self.sent_pos = self.pos;
+        packet
+    }
+
+    /// An exact `CSMoveUnit` for the position the bot has now, when the server's idea of it is
+    /// off: the bot stands but the server last heard it moving, or the last update is more than
+    /// [`PIN_EPSILON_M`] away. Send it right before a packet the server checks a distance for
+    /// (loot, talk, sell, craft, cast), at the position of the packet in the outbox: the movement
+    /// updates of a walking bot are a second apart when nobody is near, which leaves the server
+    /// metres behind. A standing bot gets a stopped update, a walking one a moving update.
+    pub fn pin(&mut self, now_ms: u64, combat: bool) -> Option<Out> {
+        if self.obj == 0 || self.pending_tp.is_some() {
+            return None;
+        }
+        let moving = self.is_moving();
+        let off = dist3d(self.sent_pos, self.pos) > PIN_EPSILON_M;
+        if !off && self.moving_sent == moving {
+            return None;
+        }
+        let mut vel = (0.0, 0.0);
+        if moving {
+            if let Some(&(tx, ty)) = self.path.first() {
+                let (dx, dy) = (tx - self.pos[0], ty - self.pos[1]);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > 1e-3 {
+                    let speed = self.speed(self.pace);
+                    vel = (dx / len * speed, dy / len * speed);
+                    self.yaw = cs::yaw_towards((0.0, 0.0), (dx / len, dy / len));
+                }
+            }
+        }
+        Some(self.packet(now_ms, combat, moving && vel != (0.0, 0.0), vel))
+    }
+}
+
+/// Whether the server checks the distance between the bot and something for this packet: casts
+/// (`TOO_FAR`), opening and emptying a loot window (5 m), talking to an NPC or doodad, quest
+/// steps, crafting at a bench and selling a trade pack (2.5 m).
+pub fn range_checked(p: &Out) -> bool {
+    p.level == LEVEL_GAME
+        && matches!(
+            p.opcode,
+            op::CSStartSkillPacket
+                | op::CSInteractNPCPacket
+                | op::CSStartInteractionPacket
+                | op::CSLootOpenBagPacket
+                | op::CSLootItemPacket
+                | op::CSStartQuestContextPacket
+                | op::CSQuestTalkMadePacket
+                | op::CSCompleteQuestContextPacket
+                | op::CSExecuteCraft
+                | op::CSSellBackpackGoodsPacket
+        )
+}
+
+/// Puts [`Motion::pin`]'s exact update in `out` right before the first [`range_checked`] packet
+/// at or after index `from` (the packets the caller queued since it looked), when the server's
+/// idea of the position is off.
+pub fn pin_before_range_checked(
+    motion: &mut Motion,
+    out: &mut Vec<Out>,
+    from: usize,
+    now_ms: u64,
+    combat: bool,
+) {
+    let Some(at) = out
+        .get(from..)
+        .and_then(|queued| queued.iter().position(range_checked))
+    else {
+        return;
+    };
+    if let Some(pin) = motion.pin(now_ms, combat) {
+        out.insert(from + at, pin);
     }
 }
 
@@ -562,7 +656,7 @@ pub fn reach(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aa_proto::opcodes::cs as op;
+
     use aa_world::terrain::{HeightGridHeader, Terrain};
 
     const T0: u64 = 1_000;
@@ -680,6 +774,120 @@ mod tests {
         // velocity x is the run speed in mm/s
         let vx = i16::from_le_bytes([first.body[18], first.body[19]]);
         assert_eq!(vx, 5400);
+    }
+
+    /// The exact stopped update the bot would send now.
+    fn stopped_here(rig: &Rig) -> Out {
+        cs::move_unit(&MoveUnit {
+            obj: 0x400,
+            time: rig.now as u32,
+            pos: (
+                rig.motion.pos()[0],
+                rig.motion.pos()[1],
+                rig.motion.pos()[2],
+            ),
+            vel: (0.0, 0.0, 0.0),
+            yaw: rig.motion.yaw(),
+            moving: false,
+            stance: cs::STANCE_RELAXED,
+            alertness: cs::ALERT_IDLE,
+        })
+    }
+
+    #[test]
+    fn pin_stops_the_server_lagging_behind_a_bot_that_halts() {
+        let t = ramp();
+        let mut rig = Rig::new([10.0, 10.0, 121.0]);
+        assert!(
+            rig.motion.pin(rig.now, false).is_none(),
+            "standing where the server put it"
+        );
+        rig.motion.go_to(60.0, 10.0, 0.0, Pace::Run, rig.now);
+        // nobody is near: one update, then a second between them
+        for _ in 0..3 {
+            rig.tick(&t, 250, 1000);
+        }
+        assert_eq!(rig.out.len(), 1, "the gap holds the updates back");
+        // an action is about to be sent: the bot halts and the server must know where
+        rig.motion.stop();
+        let pin = rig
+            .motion
+            .pin(rig.now, false)
+            .expect("the server is behind");
+        assert_eq!(
+            pin,
+            stopped_here(&rig),
+            "a stopped update at the exact position"
+        );
+        assert!(rig.motion.pos()[0] > 14.0, "the bot has run on");
+        // nothing else is owed: no second stopped update, no second pin
+        assert!(rig.motion.pin(rig.now, false).is_none());
+        let n = rig.out.len();
+        rig.tick(&t, 250, 1000);
+        assert_eq!(rig.out.len(), n);
+    }
+
+    #[test]
+    fn pin_of_a_walking_bot_is_a_moving_update_and_a_standing_bot_needs_none() {
+        let t = ramp();
+        let mut rig = Rig::new([10.0, 10.0, 121.0]);
+        rig.motion.go_to(60.0, 10.0, 0.0, Pace::Run, rig.now);
+        for _ in 0..3 {
+            rig.tick(&t, 250, 1000);
+        }
+        let pin = rig.motion.pin(rig.now, true).expect("the server is behind");
+        assert_eq!(flags(&pin), 0x02, "still walking");
+        // the walk goes on from the pinned position; the next update waits for the gap
+        let n = rig.out.len();
+        rig.tick(&t, 250, 1000);
+        assert_eq!(rig.out.len(), n);
+        // arrival sends the stopped update itself: a pin after it has nothing to add
+        rig.motion.go_to(40.0, 10.0, 0.0, Pace::Run, rig.now);
+        while rig.tick(&t, 250, 1000) == MotionStatus::Moving {}
+        assert_eq!(flags(rig.out.last().unwrap()), 0x04);
+        assert!(rig.motion.pin(rig.now, false).is_none());
+        // a teleport is the server's own placement
+        rig.motion.teleported([500.0, 500.0, 130.0]);
+        assert!(rig.motion.pin(rig.now, false).is_none());
+    }
+
+    #[test]
+    fn the_pin_goes_before_the_first_range_checked_packet() {
+        let t = ramp();
+        let mut rig = Rig::new([10.0, 10.0, 121.0]);
+        rig.motion.go_to(60.0, 10.0, 0.0, Pace::Run, rig.now);
+        for _ in 0..3 {
+            rig.tick(&t, 250, 1000);
+        }
+        rig.motion.stop();
+        // a ping, then an unrelated chat, then a loot request and a cast
+        let mut out = vec![cs::ping(1), cs::chat(cs::chat_type::SAY, "", "hi")];
+        let from = out.len();
+        out.push(cs::loot_open_bag(7, true));
+        out.push(cs::start_skill_unit(18132, 0x400, 9));
+        assert!(range_checked(&out[2]) && range_checked(&out[3]));
+        assert!(!range_checked(&out[0]) && !range_checked(&out[1]));
+        pin_before_range_checked(&mut rig.motion, &mut out, from, rig.now, false);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[2], stopped_here(&rig), "right before the loot request");
+        assert_eq!(out[3].opcode, op::CSLootOpenBagPacket);
+        // once is enough: the second packet needs no second pin
+        pin_before_range_checked(&mut rig.motion, &mut out, from, rig.now, false);
+        assert_eq!(out.len(), 5);
+        // packets that are not range checked, or queued before `from`, get none
+        let mut rig = Rig::new([10.0, 10.0, 121.0]);
+        rig.motion.go_to(60.0, 10.0, 0.0, Pace::Run, rig.now);
+        for _ in 0..3 {
+            rig.tick(&t, 250, 1000);
+        }
+        rig.motion.stop();
+        let mut out = vec![cs::loot_open_bag(7, true), cs::ping(1)];
+        pin_before_range_checked(&mut rig.motion, &mut out, 1, rig.now, false);
+        assert_eq!(out.len(), 2);
+        assert!(
+            rig.motion.pin(rig.now, false).is_some(),
+            "nothing was spent"
+        );
     }
 
     #[test]

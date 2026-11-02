@@ -79,8 +79,10 @@ pub struct DoodadTemplate {
     pub name: Box<str>,
     /// What it can do.
     pub flags: DoodadFlags,
-    /// `func_skill_id` of its first function that names a skill (start group first); the skill a
-    /// client starts to use it. 0 = none (the client's default interaction applies).
+    /// The skill a client starts to use it: the skill of its first function that names one (start
+    /// group first) -- the function's `func_skill_id`, else the `fake_skill_id` of a
+    /// `DoodadFuncFakeUse` or the `skill_id` of a `DoodadFuncUse` (quest props such as signposts
+    /// and levers only have the latter). 0 = none (the client's default interaction applies).
     pub use_skill: u32,
 }
 
@@ -153,6 +155,24 @@ pub fn load(conn: &Connection, texts: &Texts) -> Result<DoodadData> {
         |r| start_crafts.entry(r.u32(0)).or_default().push(r.u32(1)),
     )?;
 
+    // The skills of plain-use functions that carry no `func_skill_id` of their own.
+    let mut fake_use_skill: FxHashMap<u32, u32> = FxHashMap::default();
+    each_row(
+        conn,
+        "SELECT id, fake_skill_id FROM doodad_func_fake_uses WHERE fake_skill_id != 0",
+        |r| {
+            fake_use_skill.insert(r.u32(0), r.u32(1));
+        },
+    )?;
+    let mut use_func_skill: FxHashMap<u32, u32> = FxHashMap::default();
+    each_row(
+        conn,
+        "SELECT id, skill_id FROM doodad_func_uses WHERE skill_id != 0",
+        |r| {
+            use_func_skill.insert(r.u32(0), r.u32(1));
+        },
+    )?;
+
     let mut flags: FxHashMap<u32, DoodadFlags> = FxHashMap::default();
     let mut use_skill: FxHashMap<u32, u32> = FxHashMap::default();
     let mut bench_pairs: Vec<(u32, u32)> = Vec::new();
@@ -197,7 +217,14 @@ pub fn load(conn: &Connection, texts: &Texts) -> Result<DoodadData> {
             }
             let e = flags.entry(doodad).or_default();
             *e = e.with(add);
-            let skill = r.u32(3);
+            let skill = match r.u32(3) {
+                0 => match ty {
+                    "DoodadFuncFakeUse" => fake_use_skill.get(&actual).copied().unwrap_or(0),
+                    "DoodadFuncUse" => use_func_skill.get(&actual).copied().unwrap_or(0),
+                    _ => 0,
+                },
+                direct => direct,
+            };
             if skill != 0 {
                 use_skill.entry(doodad).or_insert(skill);
             }
@@ -311,7 +338,7 @@ pub(crate) mod fixture {
     use super::*;
 
     /// Creates the doodad-related tables with a bench (doodad 4233 offering craft 6226 through
-    /// pack 68) and a gatherable flower (doodad 1598 looting item 14400).
+    /// pack 68), a gatherable flower (doodad 1598 looting item 14400) and a quest sign (5047).
     pub fn create(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE doodad_almighties (id INT, name TEXT);
@@ -323,6 +350,8 @@ pub(crate) mod fixture {
              CREATE TABLE doodad_func_craft_start_crafts (id INT, doodad_func_craft_start_id INT, craft_id INT);
              CREATE TABLE doodad_func_loot_items (id INT, item_id INT);
              CREATE TABLE doodad_func_loot_packs (id INT, loot_pack_id INT);
+             CREATE TABLE doodad_func_fake_uses (id INT, skill_id INT, fake_skill_id INT);
+             CREATE TABLE doodad_func_uses (id INT, skill_id INT);
              CREATE TABLE loots (loot_pack_id INT, item_id INT, drop_rate INT, always_drop TEXT);
              INSERT INTO doodad_almighties VALUES (4233, 'bench'), (1598, 'flower'), (5047, 'sign');
              INSERT INTO doodad_func_groups VALUES (10, 4233, 1), (11, 4233, 2), (12, 1598, 1), (13, 5047, 1);
@@ -356,6 +385,40 @@ mod tests {
         assert!(flower.flags.has(DoodadFlags::LOOT) && !flower.offers_crafts());
         assert_eq!(flower.use_skill, 77);
         assert!(d.templates.get(5047).unwrap().flags.has(DoodadFlags::QUEST));
+    }
+
+    #[test]
+    fn use_skills_come_from_the_func_then_the_fake_use_then_the_use_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE doodad_almighties (id INT, name TEXT);
+             CREATE TABLE doodad_func_groups (id INT, doodad_almighty_id INT, doodad_func_group_kind_id INT);
+             CREATE TABLE doodad_funcs (id INT, doodad_func_group_id INT, actual_func_id INT,
+               actual_func_type TEXT, func_skill_id INT);
+             CREATE TABLE craft_pack_crafts (id INT, craft_pack_id INT, craft_id INT);
+             CREATE TABLE doodad_func_craft_packs (id INT, craft_pack_id INT);
+             CREATE TABLE doodad_func_craft_start_crafts (id INT, doodad_func_craft_start_id INT, craft_id INT);
+             CREATE TABLE doodad_func_fake_uses (id INT, skill_id INT, fake_skill_id INT);
+             CREATE TABLE doodad_func_uses (id INT, skill_id INT);
+             INSERT INTO doodad_almighties VALUES (1451, 'a'), (77, 'b'), (88, 'c'), (55, 'd');
+             INSERT INTO doodad_func_groups VALUES (1, 1451, 1), (2, 77, 1), (3, 88, 1), (4, 88, 2), (5, 55, 1);
+             INSERT INTO doodad_funcs VALUES
+               (10, 1, 842, 'DoodadFuncFakeUse', NULL),
+               (11, 2, 5, 'DoodadFuncLootItem', 321),
+               (12, 3, 6, 'DoodadFuncUse', NULL),
+               (13, 4, 9, 'DoodadFuncFakeUse', NULL),
+               (14, 5, 1, 'DoodadFuncQuest', NULL);
+             INSERT INTO doodad_func_fake_uses VALUES (842, NULL, 14907), (9, NULL, 1);
+             INSERT INTO doodad_func_uses VALUES (6, 555);",
+        )
+        .unwrap();
+        let d = load(&conn, &Texts::empty()).unwrap();
+        let skill = |id| d.templates.get(id).unwrap().use_skill;
+        assert_eq!(skill(1451), 14907, "the fake use's skill");
+        assert_eq!(skill(77), 321, "the function's own skill");
+        // the start group's Use row wins over the later group's fake use
+        assert_eq!(skill(88), 555);
+        assert_eq!(skill(55), 0);
     }
 
     #[test]

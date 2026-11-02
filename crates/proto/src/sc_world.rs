@@ -373,7 +373,7 @@ pub enum ItemChange {
 }
 
 /// The decoded `SCItemTaskSuccessPacket`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemTaskInfo {
     /// `ItemTaskType` (why the items changed; models/item_task.rs:17).
     pub reason: u8,
@@ -750,7 +750,10 @@ pub enum WorldEvent {
     ErrorMsg {
         /// `ErrorMessageType` id.
         err: i16,
-        /// Second type field of the packet.
+        /// Second error field: equal to `err` for ordinary messages, a detail for some (the
+        /// craft-stop reason for error 148, `ErrCraftStopped`).
+        err2: i16,
+        /// Type field of the packet.
         kind: u32,
         /// Shown as a notification instead of a dialog.
         notify: bool,
@@ -1878,6 +1881,12 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
 }
 
 fn read_item_task(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    some(WorldEvent::ItemTask(Box::new(read_item_task_info(s)?)))
+}
+
+/// The item tasks of an `SCItemTaskSuccessPacket` body; `SCTradeMadePacket` starts with the same
+/// layout (its `action` byte is the task `reason`).
+pub(crate) fn read_item_task_info(s: &mut PacketStream) -> Res<ItemTaskInfo> {
     let reason = s.read_u8()?;
     let count = usize::from(s.read_u8()?);
     check_count(s, count, 1, "item task")?;
@@ -1891,11 +1900,11 @@ fn read_item_task(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     for _ in 0..removed {
         force_removed.push(s.read_u64()?);
     }
-    some(WorldEvent::ItemTask(Box::new(ItemTaskInfo {
+    Ok(ItemTaskInfo {
         reason,
         changes,
         force_removed,
-    })))
+    })
 }
 
 fn read_labor_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
@@ -2081,10 +2090,15 @@ fn read_chat(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
 
 fn read_error_msg(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let err = s.read_i16()?;
-    skip(s, 2)?; // the same error again
+    let err2 = s.read_i16()?;
     let kind = s.read_u32()?;
     let notify = s.read_bool()?;
-    some(WorldEvent::ErrorMsg { err, kind, notify })
+    some(WorldEvent::ErrorMsg {
+        err,
+        err2,
+        kind,
+        notify,
+    })
 }
 
 fn read_lootable_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {

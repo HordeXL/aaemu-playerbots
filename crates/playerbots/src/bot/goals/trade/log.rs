@@ -364,6 +364,7 @@ mod tests {
             &ActivityEvent::TradeMade {
                 action: 0,
                 tasks: 2,
+                items: Default::default(),
             },
             2000,
         );
@@ -411,6 +412,7 @@ mod tests {
             &ActivityEvent::TradeMade {
                 action: 0,
                 tasks: 0,
+                items: Default::default(),
             },
             10,
         );

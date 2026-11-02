@@ -154,6 +154,11 @@ fn leave_world_targets() {
 }
 
 #[test]
+fn instance_loaded_is_empty() {
+    game(cs::instance_loaded(), op::CSInstanceLoadedPacket, &[]);
+}
+
+#[test]
 fn teleport_ended_carries_the_position_and_an_identity_orientation() {
     let body = cat(&[&X_1, &Y_M2, &F_3_5, &[0; 12], &F_1_0]);
     assert_eq!(body.len(), 36);

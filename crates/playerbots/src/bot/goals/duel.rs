@@ -1039,6 +1039,7 @@ mod tests {
         let err = |e: i16| {
             ServerEvent::World(WorldEvent::ErrorMsg {
                 err: e,
+                err2: e,
                 kind: 0,
                 notify: false,
             })

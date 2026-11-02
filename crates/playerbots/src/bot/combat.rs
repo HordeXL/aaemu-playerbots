@@ -33,8 +33,9 @@ use super::rotation::{
 };
 use super::state::{dist2d, Unit, UnitKind};
 
-/// Distance within which a corpse can be looted.
-pub const LOOT_OPEN_RANGE: f32 = 5.0;
+/// The server takes loot from within 5 m of its picture of the bot (which can lag, see
+/// [`super::motion::Motion::pin`]); the bot opens a loot window only this close.
+pub const LOOT_OPEN_RANGE: f32 = 3.5;
 /// How close a bot walks to a corpse before it opens the loot.
 const LOOT_WALK_RADIUS: f32 = 2.5;
 /// How long a kill waits for the server's "has loot" notice.
@@ -82,6 +83,17 @@ const THREAT_WINDOW_MS: u64 = 10_000;
 const DAMAGE_WINDOW_MS: u64 = 3_000;
 /// How far the bot looks for an attacker it cannot name.
 const REACT_RANGE: f32 = 12.0;
+/// A goal that walks somewhere (a quest trip, a trade run) refreshes its note this often; the
+/// controller treats the bot as travelling for [`TRAVEL_NOTE_MS`] after the last one.
+const TRAVEL_NOTE_MS: u64 = 2_500;
+/// While travelling, a unit that targeted the bot longer ago than this is no threat.
+const TRAVEL_THREAT_WINDOW_MS: u64 = 4_000;
+/// While travelling, the bot only stops for attackers closer than this.
+const TRAVEL_FIGHT_M: f32 = 15.0;
+/// While travelling, the bot gives up a defence against an attacker that falls behind this far.
+const TRAVEL_LOSE_M: f32 = 25.0;
+/// While travelling, the bot looks for an unnamed attacker only this close.
+const TRAVEL_REACT_M: f32 = 6.0;
 /// Slack on a skill's range.
 const RANGE_SLACK: f32 = 0.25;
 /// A duel opponent is only lost beyond this distance (the server ends a duel at 75 m).
@@ -289,7 +301,7 @@ impl LootJob {
         }
         match self.stage {
             LootStage::Walk => {
-                if v.dist > LOOT_OPEN_RANGE - 1.0 {
+                if v.dist > LOOT_OPEN_RANGE {
                     LootAction::WalkTo
                 } else {
                     self.stage = LootStage::Opened;
@@ -349,6 +361,10 @@ pub struct Combat {
     last_refusal: Option<(u32, u8)>,
     kite_until_ms: u64,
     next_kite_ms: u64,
+    /// Until this bot clock a goal says the bot is travelling, see [`Combat::note_travelling`].
+    travelling_until_ms: u64,
+    /// The target the controller picked to defend against (0 = it is no defence).
+    defending: u32,
 }
 
 impl Default for Combat {
@@ -388,7 +404,22 @@ impl Combat {
             last_refusal: None,
             kite_until_ms: 0,
             next_kite_ms: 0,
+            travelling_until_ms: 0,
+            defending: 0,
         }
+    }
+
+    /// A goal that is walking somewhere (a quest trip, a trade run's way to the bench or buyer)
+    /// says so every tick it walks. For a moment after the last note the controller defends the
+    /// bot only against units that really attack it and are close, and drops a defence against an
+    /// attacker that falls far behind; everything else lets the bot keep going.
+    pub fn note_travelling(&mut self, now_ms: u64) {
+        self.travelling_until_ms = now_ms + TRAVEL_NOTE_MS;
+    }
+
+    /// Whether a goal said at the last tick that the bot is travelling.
+    pub fn travelling(&self, now_ms: u64) -> bool {
+        now_ms < self.travelling_until_ms
     }
 
     /// Fights the unit with object id `target_obj` (a no-op if it is the target already).
@@ -397,6 +428,7 @@ impl Combat {
             return;
         }
         self.target = Some(target_obj);
+        self.defending = 0;
         self.announced = false;
         self.last_goto = None;
         self.engaged_at_ms = None;
@@ -407,6 +439,7 @@ impl Combat {
     /// Stops fighting (a running loot job continues).
     pub fn disengage(&mut self) {
         self.target = None;
+        self.defending = 0;
         self.announced = false;
         self.last_goto = None;
         self.engaged_at_ms = None;
@@ -645,10 +678,17 @@ impl Combat {
 
     fn step(ctx: &mut Ctx<'_>) -> CombatStatus {
         let now = ctx.now_ms;
+        let travelling = ctx.combat.travelling(now);
         if ctx.combat.target.is_none() {
-            if let Some(obj) = pick_threat(ctx) {
+            let limits = if travelling {
+                TRAVEL_LIMITS
+            } else {
+                FIGHT_LIMITS
+            };
+            if let Some(obj) = pick_threat(ctx, &limits) {
                 ctx.log.debug(format!("defending against unit {obj}"));
                 ctx.combat.engage(obj);
+                ctx.combat.defending = obj;
             }
         }
         let Some(obj) = ctx.combat.target else {
@@ -685,7 +725,10 @@ impl Combat {
         } else {
             (LOST_DISTANCE, FIGHT_TIMEOUT_MS)
         };
-        if dist > lost_at || now.saturating_sub(engaged_at) > timeout {
+        if dist > lost_at
+            || now.saturating_sub(engaged_at) > timeout
+            || (travelling && ctx.combat.defending == obj && dist > TRAVEL_LOSE_M)
+        {
             ctx.combat.disengage();
             return CombatStatus::Lost;
         }
@@ -954,7 +997,9 @@ impl Combat {
         let info = ctx.world.skill(skill);
         let known =
             is_auto || ctx.state.skills.is_empty() || ctx.state.skill_level(skill).is_some();
-        let mana_ok = info.is_none_or(|i| i64::from(i.mana_cost) <= i64::from(ctx.state.me.mp));
+        let level = ctx.state.me.level;
+        let mana_ok =
+            info.is_none_or(|i| i64::from(i.mana_cost(level)) <= i64::from(ctx.state.me.mp));
         let max_range = info
             .map(|i| f32::from(i.max_range))
             .filter(|r| *r > 0.0)
@@ -1071,28 +1116,67 @@ fn char_name(ctx: &Ctx<'_>, char_id: u32) -> String {
         .map_or_else(|| format!("character {char_id}"), str::to_owned)
 }
 
-/// The unit to defend against: one that targets the bot, else (when the bot is losing hit
-/// points) the nearest monster close by.
-fn pick_threat(ctx: &Ctx<'_>) -> Option<u32> {
-    let me = ctx.state.me.pos;
-    let now = ctx.now_ms;
+/// How far the controller goes to defend the bot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThreatLimits {
+    /// A unit that targeted the bot longer ago than this is no threat.
+    window_ms: u64,
+    /// Threats farther away than this are left alone.
+    max_dist: f32,
+    /// How far the bot looks for an attacker it cannot name (when it loses hit points).
+    react_range: f32,
+}
+
+/// A bot that stands, wanders or hunts defends itself against whoever targeted it lately.
+const FIGHT_LIMITS: ThreatLimits = ThreatLimits {
+    window_ms: THREAT_WINDOW_MS,
+    max_dist: f32::INFINITY,
+    react_range: REACT_RANGE,
+};
+
+/// A bot on its way somewhere only turns on units that attack it right now and are close.
+const TRAVEL_LIMITS: ThreatLimits = ThreatLimits {
+    window_ms: TRAVEL_THREAT_WINDOW_MS,
+    max_dist: TRAVEL_FIGHT_M,
+    react_range: TRAVEL_REACT_M,
+};
+
+/// The nearest monster that targeted the bot within the limits.
+fn named_attacker(
+    threats: &[(u32, u64)],
+    units: &rustc_hash::FxHashMap<u32, Unit>,
+    me: [f32; 3],
+    now_ms: u64,
+    limits: &ThreatLimits,
+) -> Option<u32> {
     let mut best: Option<(u32, f32)> = None;
-    for &(obj, at) in &ctx.state.threats {
-        if now.saturating_sub(at) > THREAT_WINDOW_MS {
+    for &(obj, at) in threats {
+        if now_ms.saturating_sub(at) > limits.window_ms {
             continue;
         }
-        let Some(u) = ctx.state.units.get(&obj) else {
+        let Some(u) = units.get(&obj) else {
             continue;
         };
         if u.dead() || u.kind != UnitKind::Npc {
             continue;
         }
         let d = u.dist2d(me);
+        if d > limits.max_dist {
+            continue;
+        }
         if best.is_none_or(|b| d < b.1) {
             best = Some((obj, d));
         }
     }
-    if let Some((obj, _)) = best {
+    best.map(|b| b.0)
+}
+
+/// The unit to defend against: one that targets the bot, else (when the bot is losing hit
+/// points) the nearest monster close by.
+fn pick_threat(ctx: &Ctx<'_>, limits: &ThreatLimits) -> Option<u32> {
+    let me = ctx.state.me.pos;
+    if let Some(obj) = named_attacker(&ctx.state.threats, &ctx.state.units, me, ctx.now_ms, limits)
+    {
         return Some(obj);
     }
     if !ctx.state.damaged_within(DAMAGE_WINDOW_MS) {
@@ -1101,7 +1185,7 @@ fn pick_threat(ctx: &Ctx<'_>) -> Option<u32> {
     let mut near: Option<(u32, f32)> = None;
     for (&obj, u) in &ctx.state.units {
         let d = u.dist2d(me);
-        if d > REACT_RANGE || attackable(ctx.world, ctx.state.me.faction, u).is_none() {
+        if d > limits.react_range || attackable(ctx.world, ctx.state.me.faction, u).is_none() {
             continue;
         }
         if near.is_none_or(|b| d < b.1) {
@@ -1178,6 +1262,88 @@ mod tests {
         assert!(b.list.len() <= 4);
     }
 
+    fn npc(pos: [f32; 3]) -> Unit {
+        Unit {
+            kind: UnitKind::Npc,
+            id: 100,
+            pos,
+            hp: 100,
+            faction: 0,
+            level: 5,
+            flags: 0,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_travelling_bot_only_turns_on_close_and_current_attackers() {
+        let mut units = rustc_hash::FxHashMap::default();
+        units.insert(1, npc([8.0, 0.0, 0.0])); // close
+        units.insert(2, npc([40.0, 0.0, 0.0])); // far
+        let now = 20_000;
+        fn pick(
+            units: &rustc_hash::FxHashMap<u32, Unit>,
+            threats: &[(u32, u64)],
+            l: &ThreatLimits,
+        ) -> Option<u32> {
+            named_attacker(threats, units, [0.0; 3], 20_000, l)
+        }
+        // standing: everything that targeted the bot within ten seconds, however far
+        assert_eq!(pick(&units, &[(2, now - 9_000)], &FIGHT_LIMITS), Some(2));
+        assert_eq!(pick(&units, &[(1, now - 9_000)], &FIGHT_LIMITS), Some(1));
+        assert_eq!(pick(&units, &[(1, now - 11_000)], &FIGHT_LIMITS), None);
+        // travelling: close ones that attack right now
+        assert_eq!(pick(&units, &[(1, now - 1_000)], &TRAVEL_LIMITS), Some(1));
+        assert_eq!(
+            pick(&units, &[(1, now - 5_000)], &TRAVEL_LIMITS),
+            None,
+            "stale"
+        );
+        assert_eq!(
+            pick(&units, &[(2, now - 1_000)], &TRAVEL_LIMITS),
+            None,
+            "too far"
+        );
+        // the closer of two attackers
+        assert_eq!(
+            pick(&units, &[(2, now - 500), (1, now - 500)], &FIGHT_LIMITS),
+            Some(1)
+        );
+        // a dead unit and a player are no monster threat
+        units.get_mut(&1).unwrap().flags = crate::bot::state::U_DEAD;
+        assert_eq!(pick(&units, &[(1, now - 100)], &TRAVEL_LIMITS), None);
+        units.get_mut(&1).unwrap().flags = 0;
+        units.get_mut(&1).unwrap().kind = UnitKind::Character;
+        assert_eq!(pick(&units, &[(1, now - 100)], &TRAVEL_LIMITS), None);
+    }
+
+    // the travelling limits are the narrower ones, and a defence is not dropped the moment it
+    // starts
+    const _: () = {
+        assert!(TRAVEL_THREAT_WINDOW_MS < THREAT_WINDOW_MS);
+        assert!(TRAVEL_REACT_M < REACT_RANGE);
+        assert!(TRAVEL_FIGHT_M < TRAVEL_LOSE_M);
+    };
+
+    #[test]
+    fn a_goal_note_makes_the_bot_travel_for_a_moment() {
+        let mut c = Combat::new();
+        assert!(!c.travelling(1_000));
+        c.note_travelling(1_000);
+        assert!(c.travelling(1_000 + TRAVEL_NOTE_MS - 1));
+        assert!(
+            !c.travelling(1_000 + TRAVEL_NOTE_MS),
+            "it lapses on its own"
+        );
+        // a defence is tied to the target the controller picked itself
+        c.defending = 7;
+        c.engage(8);
+        assert_eq!(c.defending, 0, "a goal's own target is no defence");
+        c.defending = 8;
+        c.disengage();
+        assert_eq!(c.defending, 0);
+    }
+
     #[test]
     fn range_helpers() {
         assert!(!must_approach(4.0, 3.0));
@@ -1206,6 +1372,8 @@ mod tests {
         assert_eq!(j.step(&view(true, true, 12.0, 2000)), LootAction::WalkTo);
         assert_eq!(j.stage, LootStage::Walk);
         assert_eq!(j.step(&view(true, true, 6.0, 2500)), LootAction::WalkTo);
+        // 4 m from the corpse is too far to open: the server may see the bot farther back
+        assert_eq!(j.step(&view(true, true, 4.0, 2800)), LootAction::WalkTo);
         assert_eq!(j.step(&view(true, true, 3.5, 3000)), LootAction::Open);
         assert_eq!(j.stage, LootStage::Opened);
         assert_eq!(j.step(&view(true, true, 2.5, 3500)), LootAction::Wait);
@@ -1349,6 +1517,7 @@ mod tests {
         let mut out = Vec::new();
         let err = ServerEvent::World(WorldEvent::ErrorMsg {
             err: 1,
+            err2: 1,
             kind: 0,
             notify: false,
         });

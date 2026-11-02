@@ -29,6 +29,11 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// Default reply length cap in tokens when a request does not set its own.
     pub max_reply_tokens: u32,
+    /// Let the model occasionally choose a bot's next goal (the "director"). Needs `enabled`; off
+    /// by default. The playerbots runtime reads it, the client itself does not.
+    pub director: bool,
+    /// Average seconds between two director requests of one bot (each bot jitters around it).
+    pub director_interval_secs: u64,
 }
 
 impl Default for LlmConfig {
@@ -44,6 +49,8 @@ impl Default for LlmConfig {
             daily_token_budget: 200_000,
             temperature: 0.8,
             max_reply_tokens: 80,
+            director: false,
+            director_interval_secs: 600,
         }
     }
 }
@@ -65,6 +72,17 @@ mod tests {
         assert_eq!(cfg.max_requests_per_minute, 30);
         assert_eq!(cfg.daily_token_budget, 200_000);
         assert_eq!(cfg.max_reply_tokens, 80);
+        assert!(!cfg.director);
+        assert_eq!(cfg.director_interval_secs, 600);
+    }
+
+    #[test]
+    fn director_keys_are_optional_and_parse() {
+        let cfg: LlmConfig =
+            serde_json::from_str(r#"{"director": true, "director_interval_secs": 90}"#).unwrap();
+        assert!(cfg.director);
+        assert_eq!(cfg.director_interval_secs, 90);
+        assert!(!cfg.enabled);
     }
 
     #[test]

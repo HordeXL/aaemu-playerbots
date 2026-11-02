@@ -47,6 +47,9 @@ fn craft() -> Craft {
         is_pack: true,
         req_doodad: BENCH_TPL,
         benches: Box::new([BENCH_TPL]),
+        req_level: 10,
+        actability_group: 31,
+        actability_limit: 0,
     }
 }
 
@@ -58,6 +61,7 @@ fn plan() -> Plan {
         buyer_tpl: BUYER_TPL,
         bench: [100.0, 0.0],
         buyer: [300.0, 0.0],
+        price: 40_000,
         to_bench_m: 100.0,
         carry_m: 200.0,
     }
@@ -169,6 +173,7 @@ impl Fake {
     fn error(&mut self, err: i16) {
         self.feed(WorldEvent::ErrorMsg {
             err,
+            err2: err,
             kind: 0,
             notify: false,
         });
@@ -210,6 +215,9 @@ impl Env for Fake {
     }
     fn is_pack(&self, item: u32) -> bool {
         item == PACK
+    }
+    fn min_pack_level(&self) -> u8 {
+        10
     }
     fn name(&self, kind: Named, id: u32) -> String {
         format!("{kind:?}{id}")
@@ -465,7 +473,7 @@ fn trade_packs_need_level_10_and_a_gm_bot_levels_up_first() {
     let mut g = run();
     assert_eq!(
         failure(steps(&mut g, &mut f, 2)),
-        "trade packs need character level 10"
+        "trade packs need a higher character level"
     );
     assert!(f.new_plan.is_some(), "no plan was drawn");
     // a bot that carries a pack sells it at any level
@@ -841,5 +849,22 @@ fn sizes_stay_small() {
         size_of::<TradeRun>() <= 112,
         "TradeRun is {}",
         size_of::<TradeRun>()
+    );
+}
+
+#[test]
+fn the_carried_pack_is_found_in_the_equipment() {
+    let slot = |slot: u8, template: u32| aa_proto::sc_world::EquipSlot {
+        slot,
+        template,
+        id: 1,
+        grade: 0,
+    };
+    let is_pack = |t: u32| t == PACK;
+    assert_eq!(carried_pack(&[], is_pack), None);
+    assert_eq!(carried_pack(&[slot(2, 77), slot(3, 78)], is_pack), None);
+    assert_eq!(
+        carried_pack(&[slot(2, 77), slot(BACKPACK_SLOT, PACK)], is_pack),
+        Some(PACK)
     );
 }

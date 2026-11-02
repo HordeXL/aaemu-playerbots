@@ -230,6 +230,74 @@ fn main_world_facts() {
         .collect();
     assert!(levels.windows(2).all(|p| p[0] <= p[1]));
 
+    // ---- data the bot crate used to read itself ----------------------------------------------
+    // mana grows with the level (skills.mana_level_md)
+    let scaling = basic
+        .iter()
+        .filter_map(|id| w.skill(*id))
+        .find(|s| s.mana_level_md > 0.0)
+        .expect("a basic skill whose mana cost scales with the level");
+    println!(
+        "skill {} ({}): mana {} + {} per level -> {} at 1, {} at 50",
+        scaling.id,
+        scaling.name,
+        scaling.mana_cost,
+        scaling.mana_level_md,
+        scaling.mana_cost(1),
+        scaling.mana_cost(50)
+    );
+    assert!(scaling.mana_cost(50) > scaling.mana_cost(10));
+    assert!(scaling.mana_cost(10) >= scaling.mana_cost(1));
+    // the craft skill needs level 10, and so does every pack craft
+    assert_eq!(craft.req_level, 10);
+    assert_eq!(w.min_pack_craft_level(), 10);
+    println!(
+        "craft 6226: level {} actability {} limit {}",
+        craft.req_level, craft.actability_group, craft.actability_limit
+    );
+    // the skill that uses a doodad, and what an item use skill needs
+    let with_skill: Vec<(u32, u32)> = (1..40_000)
+        .map(|d| (d, w.doodad_use_skill(d)))
+        .filter(|(_, s)| *s != 0)
+        .collect();
+    println!(
+        "doodads with a use skill: {} (first {:?})",
+        with_skill.len(),
+        &with_skill[..3.min(with_skill.len())]
+    );
+    assert!(with_skill.len() > 100);
+    let known = with_skill
+        .iter()
+        .filter(|(_, s)| w.skill(*s).is_some())
+        .count();
+    println!("  of which the skill table knows the skill: {known}");
+    assert!(known * 10 > with_skill.len() * 9, "most use skills exist");
+    assert_eq!(w.doodad_use_skill(4233), 0, "a bench is used by crafting");
+    assert_eq!(w.doodad_use_skill(0), 0, "unknown doodads have none");
+    assert_eq!(w.item_use_skill(0), 0);
+    // quest start gates: level and the like
+    println!("quests with start gates: {}", w.start_gates().len());
+    assert!(!w.start_gates().is_empty());
+    println!(
+        "mother faction of the Nuian start faction: {}",
+        w.mother_faction(w.race_faction(1).expect("Nuian faction"))
+    );
+    assert_eq!(w.mother_faction(0), 0);
+    // trade pack prices: the Solzreed bench pack sold at its buyer
+    let price = w
+        .pack_price_estimate(31855, 14766, 0)
+        .expect("a price for pack 31855 at NPC 14766");
+    println!("pack 31855 at NPC 14766: {price} copper");
+    assert!(price > 10_000, "a pack pays gold, not copper: {price}");
+    assert_eq!(
+        w.pack_price_estimate(31855, 1, 0),
+        None,
+        "that NPC buys no pack"
+    );
+    // garden radius of the two designs the bots build
+    assert_eq!(d267.garden_radius, 4.0);
+    assert_eq!(d172.garden_radius, 7.5);
+
     // ---- baked data (only when AA_BAKED is set) --------------------------------------------
     if paths.baked.is_some() {
         println!("terrain present: {}", w.baked().terrain.is_some());

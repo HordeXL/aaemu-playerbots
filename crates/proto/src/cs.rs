@@ -215,6 +215,13 @@ pub fn leave_world(target: u8) -> Out {
     })
 }
 
+/// `CSInstanceLoadedPacket` (empty): the answer to `SCLoadInstance`; the server then files the
+/// character in the instance and repopulates its view. Server flow:
+/// `systems/instances/flow_tests.rs:1051`.
+pub fn instance_loaded() -> Out {
+    game(cs::CSInstanceLoadedPacket, |_| {})
+}
+
 /// `CSTeleportEndedPacket`: the answer to a server teleport; the server then accepts movement
 /// again. Server read: `systems/npcs/portal/packets.rs:207`.
 ///

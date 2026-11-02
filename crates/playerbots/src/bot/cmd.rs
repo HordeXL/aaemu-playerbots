@@ -129,6 +129,13 @@ pub enum BotCmd {
     Resume,
     /// `Command::Say`: a line of local chat.
     Say(String),
+    /// `Command::Whisper`: a private line to the named character.
+    Whisper {
+        /// Character name.
+        to: String,
+        /// The line.
+        text: String,
+    },
     /// `Command::DuelWith`: duel the bot with this id.
     DuelWith(u32),
     /// `Command::TradeWith`: trade with the bot with this id.

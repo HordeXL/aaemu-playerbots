@@ -58,6 +58,10 @@ impl BotHub for TestHub {
                 status: "active".into(),
             }],
             extra: vec![("tick".into(), "250 ms".into())],
+            chat: vec![LogLine {
+                t: 1_700_000_001_000,
+                text: "Bob: hi there".into(),
+            }],
         })
     }
 
@@ -303,6 +307,7 @@ async fn get_api_routes() {
     assert_eq!(d["log"][0]["text"], "hello");
     assert_eq!(d["quests"][0]["id"], 330);
     assert_eq!(d["extra"][0][0], "tick");
+    assert_eq!(d["chat"][0]["text"], "Bob: hi there");
 
     let missing = s.get("/api/bots/77").await;
     assert_eq!(missing.status, 404);
@@ -392,6 +397,23 @@ async fn commands_reach_the_hub() {
     assert_eq!(r.status, 200);
 
     let r = s
+        .post(
+            "/api/bots/1/command",
+            &[],
+            r#"{"type":"whisper","to":"Bob","text":"psst"}"#,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = s
+        .post(
+            "/api/bots/1/command",
+            &[],
+            r#"{"type":"goal","goal":"wander"}"#,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    let r = s
         .post("/api/command", &[], r#"{"type":"spawn","count":3}"#)
         .await;
     assert_eq!(r.status, 200);
@@ -419,6 +441,19 @@ async fn commands_reach_the_hub() {
                 }
             ),
             (Some(2), Command::DuelWith { other: 1 }),
+            (
+                Some(1),
+                Command::Whisper {
+                    to: "Bob".into(),
+                    text: "psst".into()
+                }
+            ),
+            (
+                Some(1),
+                Command::Goal {
+                    goal: "wander".into()
+                }
+            ),
             (None, Command::Spawn { count: 3 }),
             (None, Command::Pause),
             (
@@ -435,7 +470,7 @@ async fn commands_reach_the_hub() {
 #[tokio::test]
 async fn bad_commands_are_400_and_never_reach_the_hub() {
     let s = Server::start(None, false).await;
-    let cases: [(&str, &str); 9] = [
+    let cases: [(&str, &str); 11] = [
         ("/api/command", "{not json"),
         ("/api/command", r#"{"type":"explode"}"#),
         ("/api/command", r#"{"type":"spawn"}"#),
@@ -447,6 +482,14 @@ async fn bad_commands_are_400_and_never_reach_the_hub() {
             r#"{"type":"say","text":"/gold add self 5"}"#,
         ),
         ("/api/bots/1/command", r#"{"type":"duel_with","other":1}"#),
+        (
+            "/api/bots/1/command",
+            r#"{"type":"whisper","to":"Bob","text":"/gold add self 5"}"#,
+        ),
+        (
+            "/api/bots/1/command",
+            r#"{"type":"whisper","to":"","text":"hi"}"#,
+        ),
         ("/api/bots/1/command", r#"{"type":"spawn","count":1}"#),
     ];
     for (path, body) in cases {

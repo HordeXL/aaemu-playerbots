@@ -37,6 +37,7 @@ pub mod plan;
 use std::fmt::Write as _;
 
 use aa_proto::cs::{self, Out};
+use aa_proto::sc_world::EquipSlot;
 use aa_world::Craft;
 use smallvec::SmallVec;
 
@@ -59,8 +60,6 @@ const TELEPORT_RADIUS_M: f32 = 40_000.0;
 pub const SELL_LABOR: i32 = 60;
 /// Labor kept above what the run needs.
 const LABOR_MARGIN: i32 = 4;
-/// The craft skill (16766, `unit_reqs`) needs this character level; selling does not.
-pub const CRAFT_MIN_LEVEL: u8 = 10;
 /// Most copper-worth of materials (item count) a GM-supplied craft may ask for.
 const MAX_GM_MATERIALS: u32 = 600;
 /// `/item add` refuses more than this many items at once.
@@ -145,6 +144,9 @@ pub trait Env {
     fn craft(&self, id: u32) -> Option<&Craft>;
     /// Whether `item` is a trade pack some NPC buys.
     fn is_pack(&self, item: u32) -> bool;
+    /// The lowest character level any pack craft needs (the craft skill's level requirement;
+    /// selling needs none).
+    fn min_pack_level(&self) -> u8;
     /// An English name for the log and the web UI.
     fn name(&self, kind: Named, id: u32) -> String;
     /// Plans a fresh run (a pack to craft, a bench, a buyer).
@@ -205,6 +207,10 @@ impl Env for Live<'_, '_> {
         !self.0.world.specialty_buyers(item).is_empty()
     }
 
+    fn min_pack_level(&self) -> u8 {
+        self.0.world.min_pack_craft_level()
+    }
+
     fn name(&self, kind: Named, id: u32) -> String {
         let w = self.0.world;
         let found = match kind {
@@ -223,8 +229,12 @@ impl Env for Live<'_, '_> {
         let teleport = gm && ctx.cfg.bots.long_travel_teleport_m > 0.0;
         let labor = i32::from(ctx.state.me.labor);
         let st = &*ctx.state;
+        let level = st.me.level;
         let craft_ok = |c: &Craft| {
             if st.econ.skipped(SkipKind::Craft, c.id, now) {
+                return false;
+            }
+            if level < c.req_level && !gm {
                 return false;
             }
             if gm {
@@ -334,25 +344,40 @@ struct Shortfall {
     materials: SmallVec<[(u32, u32); 4]>,
     /// Labor missing for crafting plus selling (positive = missing).
     labor: i32,
-    /// The character is below [`CRAFT_MIN_LEVEL`].
-    level: bool,
+    /// The character level the craft needs when the character is below it, else 0.
+    level: u8,
 }
 
 impl Shortfall {
     fn none(&self) -> bool {
-        self.materials.is_empty() && self.labor <= 0 && !self.level
+        self.materials.is_empty() && self.labor <= 0 && self.level == 0
     }
 
     /// Why the run cannot go on without a GM.
     fn reason(&self) -> &'static str {
-        if self.level {
-            "trade packs need character level 10"
+        if self.level > 0 {
+            LEVEL_TOO_LOW
         } else if self.labor > 0 {
             "not enough labor"
         } else {
             "not enough materials"
         }
     }
+}
+
+/// Why a run fails when the character is too low for the craft skill.
+const LEVEL_TOO_LOW: &str = "trade packs need a higher character level";
+
+/// The trade pack among the worn `equipment` (a carried pack sits in the back slot), if any.
+pub fn carried_pack(equipment: &[EquipSlot], is_pack: impl Fn(u32) -> bool) -> Option<u32> {
+    equipment.iter().map(|e| e.template).find(|&t| is_pack(t))
+}
+
+/// The trade pack the bot carries, if any.
+pub fn carried_pack_of(ctx: &Ctx<'_>) -> Option<u32> {
+    carried_pack(&ctx.state.equipment, |t| {
+        !ctx.world.specialty_buyers(t).is_empty()
+    })
 }
 
 /// Craft, carry and sell trade packs. See the module docs.
@@ -370,6 +395,8 @@ pub struct TradeRun {
     until_ms: u64,
     /// Failed trips in a row.
     fails: u8,
+    /// The run reported its end (done or failed): a `stop` without it is an interruption.
+    finished: bool,
     /// Attempts in this phase.
     tries: u8,
     /// Craft and sale attempts in this run.
@@ -391,13 +418,24 @@ impl TradeRun {
 
     /// One tick.
     pub fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
-        self.step(&mut Live(ctx))
+        let status = self.step(&mut Live(ctx));
+        self.finished |= status != GoalStatus::Running;
+        if matches!(self.phase, Phase::ToBench | Phase::ToBuyer) {
+            // On the way: the combat controller only fights back against close attackers.
+            ctx.combat.note_travelling(ctx.now_ms);
+        }
+        status
     }
 
-    /// Called when the goal ends.
+    /// Called when the goal ends. A run that is cut short while the bot carries a pack is noted
+    /// in the ledger: the goal that takes over (a rest) can give the run back afterwards, see
+    /// [`carried_pack_of`].
     pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
         if ctx.motion.is_moving() {
             ctx.motion.stop();
+        }
+        if !self.finished && carried_pack_of(ctx).is_some() {
+            ctx.state.econ.note_interrupted_run(ctx.now_ms);
         }
     }
 
@@ -473,18 +511,13 @@ impl TradeRun {
     }
 
     fn do_plan(&mut self, env: &mut dyn Env) -> GoalStatus {
-        let carried = env
-            .state()
-            .equipment
-            .iter()
-            .map(|e| e.template)
-            .find(|&t| env.is_pack(t));
-        if carried.is_none() && env.state().me.level < CRAFT_MIN_LEVEL && !env.gm_allowed() {
-            return self.fail(
-                env,
-                FailReason::Other(""),
-                "trade packs need character level 10",
-            );
+        let carried = carried_pack(&env.state().equipment, |t| env.is_pack(t));
+        let need = env.min_pack_level();
+        if carried.is_none() && env.state().me.level < need && !env.gm_allowed() {
+            env.say(&format!(
+                "trade run: crafting packs needs character level {need}"
+            ));
+            return self.fail(env, FailReason::Other(""), LEVEL_TOO_LOW);
         }
         let plan = match carried {
             Some(item) => env.plan_carry(item),
@@ -532,7 +565,11 @@ impl TradeRun {
         Shortfall {
             materials,
             labor: need - i32::from(st.me.labor),
-            level: st.me.level < CRAFT_MIN_LEVEL,
+            level: if st.me.level < craft.req_level {
+                craft.req_level
+            } else {
+                0
+            },
         }
     }
 
@@ -560,8 +597,8 @@ impl TradeRun {
         }
         self.tries += 1;
         self.sent_ms = now;
-        if short.level {
-            env.gm(&format!("/level {CRAFT_MIN_LEVEL}"));
+        if short.level > 0 {
+            env.gm(&format!("/level {}", short.level));
         }
         for (item, mut n) in short.materials {
             while n > 0 {

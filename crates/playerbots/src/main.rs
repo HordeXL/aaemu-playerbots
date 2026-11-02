@@ -4,7 +4,7 @@
 //! playerbots example-config > playerbots.toml
 //! playerbots bake --pak <client>/game_pak --out <dir> --compact <compact.sqlite3>
 //! playerbots run --config playerbots.toml [--count N] [--duration-secs S]
-//! playerbots grant-gm-sql --config playerbots.toml
+//! playerbots grant-gm-sql --config playerbots.toml [--game-db aaemu_game] [--login-db aaemu_login]
 //! ```
 
 use std::path::PathBuf;
@@ -72,6 +72,12 @@ enum Command {
         /// The configuration file.
         #[arg(long, default_value = "playerbots.toml")]
         config: PathBuf,
+        /// The game server's MySQL database (accounts, characters).
+        #[arg(long, default_value = playerbots::gm::DEFAULT_GAME_DB)]
+        game_db: String,
+        /// The login server's MySQL database (users).
+        #[arg(long, default_value = playerbots::gm::DEFAULT_LOGIN_DB)]
+        login_db: String,
     },
     /// Print the commented example configuration.
     ExampleConfig,
@@ -89,9 +95,15 @@ fn main() -> anyhow::Result<()> {
             print!("{}", Config::example());
             Ok(())
         }
-        Command::GrantGmSql { config } => {
+        Command::GrantGmSql {
+            config,
+            game_db,
+            login_db,
+        } => {
             let cfg = Config::load(&config)?;
-            print!("{}", playerbots::gm::grant_sql(&cfg.server.account_prefix));
+            let sql = playerbots::gm::grant_sql(&cfg.server.account_prefix, &game_db, &login_db)
+                .map_err(anyhow::Error::msg)?;
+            print!("{sql}");
             Ok(())
         }
         Command::Bake {

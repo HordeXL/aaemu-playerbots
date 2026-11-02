@@ -24,6 +24,7 @@ pub mod cmd;
 pub mod combat;
 pub mod coordinator;
 pub mod ctx;
+pub mod director;
 pub mod goals;
 pub mod motion;
 pub mod rotation;
@@ -411,6 +412,7 @@ impl Bot {
             }
         }
         self.entry.char_id = Some(entered.char_id);
+        self.shared.hub.mark_bot_name(&self.entry.char_name);
         if entered.created {
             self.log.say(format!("created character {}", entered.name));
         }
@@ -490,12 +492,19 @@ impl Bot {
         }
         let now = self.now_ms();
         self.state.now_ms = now;
-        if let Some(tasks) = goals::trade::made_tasks(p) {
-            self.state.apply(&tasks);
-        }
         self.state.apply(&ev);
+        let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
+        self.pin_position(queued, now);
+    }
+
+    /// Tells the server exactly where the bot is before the first packet at `out[queued..]`
+    /// whose range it checks (loot, talk, sell, craft, cast): its picture of the bot's position
+    /// lags by a second of walking when the movement updates are spaced out.
+    fn pin_position(&mut self, queued: usize, now_ms: u64) {
+        let combat = self.combat.target().is_some();
+        motion::pin_before_range_checked(&mut self.motion, &mut self.out, queued, now_ms, combat);
     }
 
     fn on_command(&mut self, cmd: BotCmd) {
@@ -506,11 +515,10 @@ impl Bot {
                 self.combat.disengage();
             }
             BotCmd::Resume => self.paused = false,
-            BotCmd::Say(text) => {
-                let text = text.trim();
-                if !text.is_empty() && !text.starts_with('/') {
-                    self.out.push(cs::chat(cs::chat_type::SAY, "", text));
-                }
+            // (the packet builders refuse a line that would run as a command)
+            BotCmd::Say(text) => self.out.extend(goals::social::say_packet(text)),
+            BotCmd::Whisper { to, text } => {
+                self.out.extend(goals::social::whisper_packet(to, text))
             }
             BotCmd::DuelWith(other) => self.pair_with(*other, PairKind::Duel),
             BotCmd::TradeWith(other) => self.pair_with(*other, PairKind::Trade),
@@ -553,6 +561,7 @@ impl Bot {
             self.out.push(cs::resurrect(false));
             self.next_rez_ms = now_ms + RESURRECT_RETRY_MS;
         }
+        let queued = self.out.len();
         if !self.paused || self.state.me.dead {
             let mut ctx = Ctx {
                 world: &self.shared.world,
@@ -572,6 +581,7 @@ impl Bot {
             };
             self.brain.tick(&mut ctx);
         }
+        self.pin_position(queued, now_ms);
         let send_gap_ms = if self.real_near {
             self.shared.cfg.bots.tick_ms
         } else {
@@ -599,7 +609,7 @@ impl Bot {
         }
         if r.load_instance {
             self.motion.teleported(self.state.me.pos);
-            self.out.push(session::instance_loaded());
+            self.out.push(cs::instance_loaded());
         }
         if r.died {
             self.motion.stop();

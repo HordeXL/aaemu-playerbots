@@ -14,7 +14,7 @@
 
 use aa_proto::sc::ServerEvent;
 use aa_proto::sc_activity::{quest_status, ActivityEvent, QuestRow};
-use aa_proto::sc_world::{unit_type, EquipSlot, ItemChange, UnitInfo, WorldEvent};
+use aa_proto::sc_world::{unit_type, EquipSlot, ItemChange, ItemTaskInfo, UnitInfo, WorldEvent};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -28,6 +28,10 @@ pub const MAX_DOODADS: usize = 2048;
 pub const SLOT_EQUIPMENT: u8 = 1;
 /// `SlotType` of the bag.
 pub const SLOT_BAG: u8 = 2;
+
+/// How long a character found dead at login waits before it asks for the temple resurrection
+/// (the server sent no respawn timer for it).
+pub const DEAD_AT_LOGIN_WAIT_MS: u64 = 1_500;
 
 /// Unit flag: the unit is dead.
 pub const U_DEAD: u8 = 1;
@@ -187,12 +191,18 @@ pub struct Me {
 }
 
 impl Me {
-    /// Hit points in percent of the highest value seen; 100 when unknown.
+    /// Hit points in percent of the highest value seen. 0 without hit points (dead, or nothing
+    /// known yet: a character that logs in dead never saw a maximum); 100 when the bot has hit
+    /// points but no maximum is known.
     pub fn hp_pct(&self) -> u8 {
-        pct(self.hp, self.hp_max)
+        if self.hp <= 0 {
+            0
+        } else {
+            pct(self.hp, self.hp_max)
+        }
     }
 
-    /// Mana in percent of the highest value seen; 100 when unknown.
+    /// Mana in percent of the highest value seen; 100 when unknown (many builds have no mana).
     pub fn mp_pct(&self) -> u8 {
         pct(self.mp, self.mp_max)
     }
@@ -496,6 +506,10 @@ impl BotState {
                 me.labor = own.labor;
                 me.money = own.money;
                 self.equipment = own.equipment.to_vec();
+                // Saved with no hit points: the server sends no death event for it.
+                if own.hp <= 0 {
+                    self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
+                }
             }
             WorldEvent::UnitState(info) => self.apply_unit_state(info),
             WorldEvent::UnitsRemoved { objs } => {
@@ -527,6 +541,7 @@ impl BotState {
                     self.me.mp = *mp;
                     self.me.hp_max = self.me.hp_max.max(*hp);
                     self.me.mp_max = self.me.mp_max.max(*mp);
+                    self.check_alive();
                 } else if let Some(u) = self.units.get_mut(obj) {
                     u.hp = *hp;
                     if *hp <= 0 {
@@ -637,15 +652,7 @@ impl BotState {
                     }
                 }
             }
-            WorldEvent::ItemTask(task) => {
-                for change in &task.changes {
-                    self.apply_item_change(change);
-                }
-                if !task.force_removed.is_empty() {
-                    self.bag
-                        .retain(|_, item| !task.force_removed.contains(&item.id));
-                }
-            }
+            WorldEvent::ItemTask(task) => self.apply_item_task(task),
             WorldEvent::LaborChanged { delta, .. } => {
                 let v = i32::from(self.me.labor).saturating_add(*delta);
                 self.me.labor = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
@@ -756,6 +763,11 @@ impl BotState {
                     self.buffs.push((b.index, b.buff_id));
                 }
             }
+            if info.dead {
+                self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
+            } else {
+                self.check_alive();
+            }
             return;
         }
         let Some(kind) = UnitKind::from_wire(info.unit_type) else {
@@ -790,6 +802,30 @@ impl BotState {
         );
     }
 
+    /// The own hit points say the bot is dead although no death event told so (a character that
+    /// logged in dead, a lost packet): start the normal death flow. Hit points again after a
+    /// wrong guess (or a resurrection whose notice came late) clear it.
+    fn check_alive(&mut self) {
+        if self.me.hp <= 0 {
+            self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
+        } else if self.me.dead {
+            self.me.dead = false;
+        }
+    }
+
+    /// Marks the bot dead without a death event: like `apply_death` for the bot, but the first
+    /// timer stands when the death is already known.
+    fn found_dead(&mut self, wait_ms: u64) {
+        if self.me.dead {
+            return;
+        }
+        self.me.dead = true;
+        self.me.hp = 0;
+        self.me.respawn_at_ms = self.now_ms + wait_ms.max(1000);
+        self.reactions.died = true;
+        self.threats.clear();
+    }
+
     fn apply_death(&mut self, obj: u32, killer: u32, respawn_wait_ms: i32) {
         if obj == self.me.obj && self.me.obj != 0 {
             self.me.dead = true;
@@ -810,6 +846,16 @@ impl BotState {
                 self.kills.remove(0);
             }
             self.kills.push((obj, self.now_ms));
+        }
+    }
+
+    fn apply_item_task(&mut self, task: &ItemTaskInfo) {
+        for change in &task.changes {
+            self.apply_item_change(change);
+        }
+        if !task.force_removed.is_empty() {
+            self.bag
+                .retain(|_, item| !task.force_removed.contains(&item.id));
         }
     }
 
@@ -961,6 +1007,8 @@ impl BotState {
                 self.quests.mark_done(*quest_id);
             }
             ActivityEvent::QuestReset { quest_id, .. } => self.quests.mark_undone(*quest_id),
+            // the bag and the purse follow a finished trade
+            ActivityEvent::TradeMade { items, .. } => self.apply_item_task(items),
             ActivityEvent::QuestFailed { quest_id, err } => self.push_error(StateError::Quest {
                 quest: *quest_id,
                 err: *err,
@@ -1246,6 +1294,91 @@ mod tests {
     }
 
     #[test]
+    fn a_character_saved_dead_is_dead_at_login() {
+        // the server sends no death event for it: only hp 0 in CharacterState and UnitState
+        let mut s = BotState::new();
+        s.now_ms = 2000;
+        let mut own = own_state();
+        own.hp = 0;
+        s.apply(&world(WorldEvent::CharacterState(Box::new(own))));
+        assert!(s.me.dead, "dead from the character state");
+        assert_eq!(s.me.respawn_at_ms, 2000 + DEAD_AT_LOGIN_WAIT_MS);
+        assert!(std::mem::take(&mut s.reactions.died));
+        assert_eq!(s.me.hp_pct(), 0, "no maximum was ever seen, still not 100");
+        let mut me = unit_info(0x400, unit_type::CHARACTER, 500);
+        me.hp = 0;
+        me.dead = true;
+        s.apply(&world(WorldEvent::UnitState(Box::new(me))));
+        assert!(s.me.dead);
+        assert_eq!(s.me.hp_pct(), 0);
+        assert_eq!(
+            s.me.respawn_at_ms,
+            2000 + DEAD_AT_LOGIN_WAIT_MS,
+            "timer kept"
+        );
+        // the resurrection brings it back like after any death
+        s.apply(&world(WorldEvent::Resurrected {
+            obj: 0x400,
+            pos: (1.0, 2.0, 3.0),
+            yaw: 0.0,
+        }));
+        assert!(!s.me.dead);
+        assert!(s.me.hp_pct() > 0);
+    }
+
+    #[test]
+    fn own_dead_unit_state_alone_marks_the_bot_dead_and_hit_points_revive_it() {
+        let mut s = in_world();
+        let mut me = unit_info(0x400, unit_type::CHARACTER, 500);
+        me.hp = 0;
+        me.dead = true;
+        s.apply(&world(WorldEvent::UnitState(Box::new(me))));
+        assert!(s.me.dead);
+        assert!(std::mem::take(&mut s.reactions.died));
+        // a death event that follows brings the server's own timer
+        s.now_ms = 100;
+        s.apply(&world(WorldEvent::UnitDeath {
+            obj: 0x400,
+            killer: 0,
+            respawn_wait_ms: 9000,
+            lost_exp: 0,
+            reason: 0,
+        }));
+        assert_eq!(s.me.respawn_at_ms, 9100);
+        // hit points again (a wrong guess, a late resurrection notice) clear it
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 500,
+            mp: 100,
+        }));
+        assert!(!s.me.dead);
+        // zero hit points without a death event start the death flow too
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 0,
+            mp: 100,
+        }));
+        assert!(s.me.dead);
+    }
+
+    #[test]
+    fn hp_percent_is_never_100_without_hit_points() {
+        let mut me = Me::default();
+        assert_eq!(me.hp_pct(), 0, "nothing known yet");
+        me.hp = 0;
+        me.hp_max = 1000;
+        assert_eq!(me.hp_pct(), 0);
+        me.hp = 5;
+        assert_eq!(me.hp_pct(), 0, "rounded down, but not 100");
+        me.hp = 1000;
+        assert_eq!(me.hp_pct(), 100);
+        me.hp_max = 0;
+        assert_eq!(me.hp_pct(), 100, "hit points without a known maximum");
+        // mana without a maximum stays 100: many builds have none
+        assert_eq!(me.mp_pct(), 100);
+    }
+
+    #[test]
     fn teleport_and_kick_are_noted() {
         let mut s = in_world();
         s.apply(&world(WorldEvent::TeleportUnit {
@@ -1487,6 +1620,7 @@ mod tests {
             }));
             s.apply(&world(WorldEvent::ErrorMsg {
                 err: i as i16,
+                err2: i as i16,
                 kind: 0,
                 notify: false,
             }));

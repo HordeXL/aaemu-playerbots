@@ -923,20 +923,6 @@ fn describe_offer(world: &aa_world::World, offer: &Offer, mine: Option<Plan>) ->
     s
 }
 
-/// The item tasks of a finished trade. `SCTradeMade` carries them inline, in the layout of
-/// `SCItemTaskSuccess` (the proto crate only decodes the counts), so the bot task decodes the body
-/// a second time as an item task and applies it like any inventory change: the bag and the purse
-/// follow the trade.
-pub fn made_tasks(p: &aa_proto::game::Packet) -> Option<aa_proto::sc::ServerEvent> {
-    use aa_proto::opcodes::sc as op;
-    if p.level != aa_proto::game::LEVEL_GAME || p.opcode != op::SCTradeMadePacket {
-        return None;
-    }
-    aa_proto::sc::parse(p.level, op::SCItemTaskSuccessPacket, &p.body)
-        .ok()
-        .flatten()
-}
-
 /// Shows `bot` as the trade partner in the web UI (`None` clears it).
 fn set_partner(ctx: &Ctx<'_>, bot: Option<u32>) {
     let bot = bot.filter(|b| *b != 0);
@@ -1283,6 +1269,7 @@ mod tests {
             ActivityEvent::TradeMade {
                 action: 0,
                 tasks: 2,
+                items: Default::default(),
             },
             4800,
         );
@@ -1647,31 +1634,23 @@ mod tests {
     fn a_made_trade_applies_its_inline_item_tasks() {
         use aa_proto::opcodes::sc as op;
         use aa_proto::sc::ServerEvent;
-        use aa_proto::sc_world::{ItemChange, WorldEvent};
+        use aa_proto::sc_world::ItemChange;
         // action, 1 task: money -250, no forced removals, the trailing u32
         let mut body = vec![14u8, 1, 1];
         body.extend((-250i32).to_le_bytes());
         body.push(0);
         body.extend(0u32.to_le_bytes());
-        let p = aa_proto::game::Packet {
-            level: aa_proto::game::LEVEL_GAME,
-            opcode: op::SCTradeMadePacket,
-            body: bytes::Bytes::from(body.clone()),
+        let ev = aa_proto::sc::parse(aa_proto::game::LEVEL_GAME, op::SCTradeMadePacket, &body)
+            .unwrap()
+            .unwrap();
+        let ServerEvent::Activity(ActivityEvent::TradeMade { items, .. }) = &ev else {
+            panic!("expected TradeMade");
         };
-        let Some(ServerEvent::World(WorldEvent::ItemTask(t))) = made_tasks(&p) else {
-            panic!("expected an item task");
-        };
-        assert_eq!(t.changes.as_slice(), [ItemChange::Money(-250)]);
-        // other packets are not touched
-        let other = aa_proto::game::Packet {
-            opcode: op::SCTradeOkUpdatePacket,
-            ..p.clone()
-        };
-        assert!(made_tasks(&other).is_none());
+        assert_eq!(items.changes.as_slice(), [ItemChange::Money(-250)]);
         // a state that applies it loses the money
         let mut st = BotState::new();
         st.me.money = 1000;
-        st.apply(&made_tasks(&p).unwrap());
+        st.apply(&ev);
         assert_eq!(st.me.money, 750);
     }
 

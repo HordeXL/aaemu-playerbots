@@ -105,15 +105,6 @@ where
     Ok(())
 }
 
-/// `CSInstanceLoaded` (level 1, empty body); `aa_proto::cs` has no builder for it.
-pub fn instance_loaded() -> Out {
-    Out {
-        level: aa_proto::game::LEVEL_GAME,
-        opcode: aa_proto::opcodes::cs::CSInstanceLoadedPacket,
-        body: Vec::new(),
-    }
-}
-
 /// What the login server gave: the open login connection and the ticket for the game server.
 pub struct LoginTicket {
     /// Keep this alive as long as the game connection lives.
@@ -532,11 +523,5 @@ mod tests {
         assert!(SessionError::Login(LoginError::Denied(2)).is_permanent());
         assert!(!SessionError::Login(LoginError::Timeout).is_permanent());
         assert!(!SessionError::Timeout("x").is_permanent());
-    }
-
-    #[test]
-    fn instance_loaded_is_an_empty_level_one_packet() {
-        let o = instance_loaded();
-        assert_eq!((o.level, o.opcode, o.body.len()), (1, 0x0e0, 0));
     }
 }

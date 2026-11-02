@@ -17,11 +17,13 @@ use crate::geom::{IdMap, StrTable, Vec3};
 use crate::housing::{AreaIndex, Housing, HousingDesign};
 use crate::npc::{self, NpcTemplate};
 use crate::quest::{Quest, QuestStats, Quests};
+use crate::reqs::StartGates;
 use crate::skill::{SkillInfo, Skills};
 use crate::spatial::SpawnIndex;
 use crate::spawns::{self, Kind, SpawnStats};
 use crate::sql::{each_row, open_readonly, RowExt};
 use crate::text::{TextTable, Texts};
+use crate::uses::{ItemUses, SkillNeed};
 
 /// Where the world data lives.
 #[derive(Clone, Debug)]
@@ -100,10 +102,12 @@ pub struct World {
     npc_spawn_stats: SpawnStats,
     doodad_spawn_stats: SpawnStats,
     quests: Quests,
+    start_gates: StartGates,
     economy: Economy,
     housing: Housing,
     areas: AreaIndex,
     items: StrTable,
+    item_uses: ItemUses,
     zones: Zones,
     /// Doodad templates (that spawn) yielding a gather item.
     gather_doodads: FxHashMap<u32, Box<[u32]>>,
@@ -139,6 +143,7 @@ impl World {
         let mut npcs = npc::load(&conn, &texts).context("load npcs")?;
         let doodads = crate::doodad::load(&conn, &texts).context("load doodads")?;
         let items = load_items(&conn, &texts).context("load items")?;
+        let item_uses = ItemUses::load(&conn).context("load item use skills")?;
 
         // Spawn files.
         let world_dir: PathBuf = paths.server_data.join("Worlds").join(&paths.world);
@@ -163,6 +168,7 @@ impl World {
                 n.is_quest_giver = true;
             }
         }
+        let start_gates = StartGates::load(&conn).context("load quest start requirements")?;
         let gather_doodads = doodads
             .item_sources(&conn, &quests.gather_items(), |d| doodad_spawns.has(d))
             .context("resolve gather item sources")?;
@@ -191,10 +197,12 @@ impl World {
             npc_spawn_stats,
             doodad_spawn_stats,
             quests,
+            start_gates,
             economy,
             housing,
             areas,
             items,
+            item_uses,
             zones,
             gather_doodads,
             spheres,
@@ -214,6 +222,8 @@ impl World {
             crafts = world.economy.craft_count(),
             designs = world.housing.designs().len(),
             items = world.items.len(),
+            item_use_skills = world.item_uses.len(),
+            gated_quests = world.start_gates.len(),
             factions = world.factions.len(),
             terrain = world.baked.terrain.is_some(),
             memory_kib = world.memory_estimate() / 1024,
@@ -254,6 +264,8 @@ impl World {
             ("quests", self.quests.bytes()),
             ("skills", self.skills.bytes()),
             ("item names", self.items.bytes()),
+            ("item use skills", self.item_uses.bytes()),
+            ("quest start gates", self.start_gates.bytes()),
             ("crafts + specialty", self.economy.bytes()),
             ("housing", self.housing.bytes() + self.areas.bytes()),
             ("factions", self.factions.bytes()),
@@ -399,6 +411,17 @@ impl World {
         self.quests.stats()
     }
 
+    /// The unit requirements of the start components of the quests (level, race, faction, ...).
+    pub fn start_gates(&self) -> &StartGates {
+        &self.start_gates
+    }
+
+    /// `mother_id` of `faction` (the alliance it belongs to), 0 when it has none; what the
+    /// "mother faction" quest requirements compare with.
+    pub fn mother_faction(&self, faction: u32) -> u32 {
+        self.factions.mother_of(faction)
+    }
+
     /// The baked sign sphere of a quest component (start / objective position).
     pub fn quest_sphere(&self, quest: u32, component: u32) -> Option<&QuestSphere> {
         let i = *self.spheres.get(&(quest, component))?;
@@ -410,6 +433,26 @@ impl World {
     /// A skill.
     pub fn skill(&self, id: u32) -> Option<&SkillInfo> {
         self.skills.get(id)
+    }
+
+    /// The skill a client casts to use doodad template `doodad` (a quest prop, a lever, a bench);
+    /// 0 when it has none and the client's default interaction applies.
+    pub fn doodad_use_skill(&self, doodad: u32) -> u32 {
+        self.doodads
+            .templates
+            .get(doodad)
+            .map_or(0, |d| d.use_skill)
+    }
+
+    /// The skill using item `item` casts (`items.use_skill_id`), 0 when it has none.
+    pub fn item_use_skill(&self, item: u32) -> u32 {
+        self.item_uses.skill(item)
+    }
+
+    /// Where the item use skill `skill` must be cast (an NPC, a doodad within a range, a quest
+    /// sphere); empty when it works anywhere.
+    pub fn skill_needs(&self, skill: u32) -> &[SkillNeed] {
+        self.item_uses.needs(skill)
     }
 
     /// Skill ids of class ability `ability` (1..=10) ordered by required ability level.
@@ -434,9 +477,32 @@ impl World {
         self.economy.specialty_buyers(pack_item)
     }
 
+    /// The lowest character level any trade-pack recipe needs (the craft skill's level requirement).
+    pub fn min_pack_craft_level(&self) -> u8 {
+        self.economy.min_pack_level()
+    }
+
     /// Every trade-pack recipe.
     pub fn pack_crafts(&self) -> impl Iterator<Item = &Craft> {
         self.economy.pack_crafts()
+    }
+
+    /// What a specialty NPC pays for a trade pack (copper-equivalent, at the server's best price
+    /// ratio); `None` when it does not buy it. `from_zone` is the zone group the pack comes from;
+    /// see [`Economy::pack_price_estimate`](crate::economy::Economy::pack_price_estimate).
+    pub fn pack_price_estimate(
+        &self,
+        pack_item: u32,
+        buyer_npc: u32,
+        from_zone: u32,
+    ) -> Option<u32> {
+        self.economy
+            .pack_price_estimate(pack_item, buyer_npc, from_zone)
+    }
+
+    /// The `specialties` row between two zone groups: `(ratio, profit)`.
+    pub fn specialty_zone_pair(&self, from_group: u32, to_group: u32) -> Option<(u32, u32)> {
+        self.economy.zone_pair(from_group, to_group)
     }
 
     /// An item's English name.
@@ -449,6 +515,11 @@ impl World {
     /// Buildable house designs, cheapest first.
     pub fn housing_designs(&self) -> &[HousingDesign] {
         self.housing.designs()
+    }
+
+    /// A buildable house design.
+    pub fn housing_design(&self, design: u32) -> Option<&HousingDesign> {
+        self.housing.design(design)
     }
 
     /// Whether housing area `area_id` accepts houses of `category`.
