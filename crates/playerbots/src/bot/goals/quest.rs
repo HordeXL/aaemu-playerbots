@@ -33,10 +33,12 @@ use aa_proto::sc_activity::quest_status;
 use aa_world::{ObjKind, Quest as QuestData, QuestReport, SkillNeed, Vec3, World};
 use smallvec::SmallVec;
 
-use crate::bot::combat::CombatStatus;
+use crate::bot::avoid::UNREACHABLE_MS;
+use crate::bot::combat::{CombatStatus, Loss};
 use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, MoveFailure, Pace};
 use crate::bot::state::{dist2d, BotState, StateError, UnitKind};
+use crate::contest::{doodad_key, spot_key, unit_key};
 
 use objective::{Env, Plan, Slot};
 use select::{Candidate, Giver, Judge};
@@ -55,6 +57,11 @@ const ACK_MS: u64 = 5_000;
 const TALK_GAP_MS: u64 = 3_000;
 /// Minimum gap between two casts, on top of the skill's cast time.
 const CAST_GAP_MS: u64 = 2_000;
+/// Minimum gap between two casts of a quest item. The server needs a few seconds to credit the
+/// objective (its quest engine evaluates in batches) and to finish the cast: a second cast after
+/// the usual 2 s found the quest item gone once the quest had turned ready and completed, and
+/// the server logged a cancelled cast for each of them.
+const ITEM_CAST_GAP_MS: u64 = 4_500;
 /// An objective without a counter change for this long is skipped or fails its quest.
 const NO_PROGRESS_MS: u64 = 240_000;
 /// How long a quest with all objectives met may stay unready before the bot tries to complete it.
@@ -83,6 +90,17 @@ const IGNORE_MS: u64 = 30_000;
 const MAX_SPOTS: u8 = 3;
 /// Casts or packets without progress after which an objective fails.
 const MAX_TRIES: u8 = 6;
+/// Other characters within this many metres make a spawn "crowded".
+const CROWD_RADIUS_M: f32 = 60.0;
+/// A crowded spawn is given this long between two rounds of searching it (the respawns).
+const CROWD_ROUND_GAP_MS: u64 = 30_000;
+/// Rounds of searching a crowded spawn before the quest rests (an uncrowded one gets two).
+const CROWD_ROUNDS: u8 = 5;
+/// A claim on a target or spot is renewed this often.
+const CLAIM_RENEW_MS: u64 = 10_000;
+/// The same item cast this many times with nothing changing (not the objective counter, not the
+/// stack) is not in the server's bag any more: the bot's picture is out of date.
+const STALE_CASTS: u8 = 2;
 /// A giver or target must have shown up this long after the bot arrived at its spawn.
 const ARRIVE_GRACE_MS: u64 = 2_500;
 /// How long the counter of an item the quest supplies may lag behind the quest start.
@@ -220,6 +238,14 @@ struct Inner {
     engaged_ms: u64,
     visited: SmallVec<[(i32, i32); 4]>,
     ignore: SmallVec<[(u32, u64); 4]>,
+    /// The claim on the monster, doodad or spot in work: its key and the bot clock of its last
+    /// renewal.
+    claim_key: u64,
+    claim_ms: u64,
+    /// Item instances that were cast without effect (see [`STALE_CASTS`]).
+    stale: SmallVec<[u64; 2]>,
+    /// The last item cast `(instance, stack count, objective counter, casts in a row)`.
+    use_note: (u64, i32, i32, u8),
     detail: String,
     detail_key: u64,
 }
@@ -250,6 +276,10 @@ impl Default for Inner {
             engaged_ms: 0,
             visited: SmallVec::new(),
             ignore: SmallVec::new(),
+            claim_key: 0,
+            claim_ms: 0,
+            stale: SmallVec::new(),
+            use_note: (0, 0, 0, 0),
             detail: String::new(),
             detail_key: 0,
         }
@@ -286,15 +316,21 @@ impl Inner {
             ctx.motion.stop();
         }
         self.fighting = None;
+        ctx.hub.contest.release_bot(ctx.persona.id);
     }
 
     fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
         match ctx.combat.status() {
-            CombatStatus::TargetDead { .. } => self.fighting = None,
+            CombatStatus::TargetDead { .. } => {
+                if let Some(obj) = self.fighting.take() {
+                    ctx.hub.contest.release(unit_key(obj), ctx.persona.id);
+                }
+            }
             CombatStatus::Lost => {
                 if let Some(obj) = self.fighting.take() {
-                    self.ignore_for(obj, now + IGNORE_MS);
+                    let unreachable = ctx.combat.last_loss().is_some_and(Loss::unreachable);
+                    self.give_up(ctx, obj, IGNORE_MS, unreachable);
                 }
             }
             _ => {}
@@ -303,11 +339,16 @@ impl Inner {
             if target == obj && now.saturating_sub(self.engaged_ms) > FIGHT_BUDGET_MS {
                 ctx.log
                     .debug(format!("quest {}: giving up on monster {obj}", self.quest));
+                // a monster that never lost a hit point in all that time is out of reach
+                let unreachable = !ctx.combat.dealt_damage();
                 ctx.combat.disengage();
                 ctx.motion.stop();
-                self.ignore_for(obj, now + GIVE_UP_IGNORE_MS);
                 self.fighting = None;
+                self.give_up(ctx, obj, GIVE_UP_IGNORE_MS, unreachable);
             }
+        }
+        if let Some(obj) = self.fighting {
+            self.renew_claim(ctx, unit_key(obj));
         }
         if ctx.combat.busy() {
             // The controller defends the bot or loots; the walk is re-issued afterwards.
@@ -717,7 +758,7 @@ impl Inner {
             Plan::Interact { doodad, skill } => {
                 self.do_doodad(ctx, slot, std::slice::from_ref(&doodad), skill)
             }
-            Plan::UseItem { item, skill } => self.do_use_item(ctx, quest, item, skill),
+            Plan::UseItem { item, skill } => self.do_use_item(ctx, quest, slot, item, skill),
             Plan::Sphere { x, y, radius } => self.do_sphere(ctx, x, y, radius),
             Plan::Supplied => {
                 if ctx.now_ms.saturating_sub(self.since_ms) > SUPPLY_WAIT_MS {
@@ -769,6 +810,7 @@ impl Inner {
             self.fighting = Some(obj);
             self.engaged_ms = ctx.now_ms;
             ctx.combat.engage(obj);
+            self.claim(ctx, unit_key(obj));
             return GoalStatus::Running;
         }
         let world = ctx.world;
@@ -791,17 +833,19 @@ impl Inner {
     ) -> GoalStatus {
         let now = ctx.now_ms;
         let me = ctx.state.me.pos;
-        let mut best: Option<(u32, u32, [f32; 3], f32)> = None;
+        let bot = ctx.persona.id;
+        let mut best: Option<(u32, u32, [f32; 3], f32, bool)> = None;
         for (&obj, d) in &ctx.state.doodads {
             if !templates.contains(&d.template) {
                 continue;
             }
             let dist = dist2d(me, d.pos);
-            if best.is_none_or(|b| dist < b.3) {
-                best = Some((obj, d.template, d.pos, dist));
+            let taken = ctx.hub.contest.others(doodad_key(obj), bot) > 0;
+            if best.is_none_or(|b| better_target(taken, dist, b.4, b.3)) {
+                best = Some((obj, d.template, d.pos, dist, taken));
             }
         }
-        let Some((obj, template, pos, dist)) = best else {
+        let Some((obj, template, pos, dist, _)) = best else {
             let world = ctx.world;
             return self.search(ctx, |f: &mut dyn FnMut(Vec3)| {
                 for &t in templates {
@@ -811,6 +855,7 @@ impl Inner {
                 }
             });
         };
+        self.renew_claim(ctx, doodad_key(obj));
         if dist > DOODAD_RANGE {
             return match self.walk(ctx, pos[0], pos[1], DOODAD_STOP) {
                 Walk::Failed => self.fail(ctx, Failure::Unreachable),
@@ -847,18 +892,38 @@ impl Inner {
         &mut self,
         ctx: &mut Ctx<'_>,
         quest: &QuestData,
+        slot: &Slot<'_>,
         item: u32,
         skill: u32,
     ) -> GoalStatus {
         let now = ctx.now_ms;
-        let Some((_, it)) = ctx.state.find_item(item) else {
+        // A stack that is used up is no item, and neither is an instance the bot cast twice with
+        // nothing changing: the server's bag no longer has it, whatever the bot's picture says.
+        let stale = &self.stale;
+        let Some((_, it)) = ctx.state.find_item_where(item, |i| !stale.contains(&i.id)) else {
             // A supplied quest item arrives with the quest; give the server a moment.
             if now.saturating_sub(self.since_ms) > ACK_MS {
                 return self.fail(ctx, Failure::MissingItem);
             }
             return GoalStatus::Running;
         };
-        let (item_id, template) = (it.id, it.template);
+        let (item_id, template, count) = (it.id, it.template, it.count);
+        let seen = (item_id, count, slot.have);
+        if self.use_note.3 >= STALE_CASTS
+            && (self.use_note.0, self.use_note.1, self.use_note.2) == seen
+        {
+            ctx.log.say(format!(
+                "quest {}: item {item} was cast {STALE_CASTS} times without effect; giving it up",
+                self.quest
+            ));
+            if self.stale.len() >= 2 {
+                self.stale.remove(0);
+            }
+            self.stale.push(item_id);
+            self.use_note = (0, 0, 0, 0);
+            // the server did not honour the casts (refused them, or the item is gone there)
+            return self.fail(ctx, Failure::CastRefused);
+        }
         let me_obj = ctx.state.me.obj;
         // Some item skills only work at a certain place (a book read to a cat, a firework next
         // to a stand, a spell inside a quest area).
@@ -870,16 +935,25 @@ impl Inner {
                 Err(status) => return status,
             }
         }
-        let gap = cast_gap_ms(ctx.world, skill);
+        let gap = cast_gap_ms(ctx.world, skill).max(ITEM_CAST_GAP_MS);
         if self.sent_ms == 0 || now.saturating_sub(self.sent_ms) >= gap {
             if self.tries >= MAX_TRIES {
                 return self.fail(ctx, Failure::CastRefused);
             }
+            ctx.log.debug(format!(
+                "quest {}: using item {item_id} (template {template}, count {count}, objective at {})",
+                self.quest, slot.have
+            ));
             ctx.send(cs::start_skill_item(
                 skill, me_obj, item_id, template, target,
             ));
             self.tries += 1;
             self.sent_ms = now;
+            self.use_note = if (self.use_note.0, self.use_note.1, self.use_note.2) == seen {
+                (seen.0, seen.1, seen.2, self.use_note.3.saturating_add(1))
+            } else {
+                (seen.0, seen.1, seen.2, 1)
+            };
         }
         GoalStatus::Running
     }
@@ -1213,37 +1287,65 @@ impl Inner {
 
     /// Looks for something at spawns that are not searched yet. `spawns` feeds every candidate
     /// position to the callback. Gives up after the spots of two rounds were empty.
+    ///
+    /// Spots other bots work on count as farther away than they are, so the bots spread over the
+    /// spawn points of a template. When every spot is searched and other characters are around,
+    /// the targets are probably taken as fast as they respawn: the bot waits for them near the
+    /// spawn for several rounds ([`CROWD_ROUNDS`]) and then rests the quest ([`Failure::Crowded`])
+    /// instead of failing it for a missing target.
     fn search(&mut self, ctx: &mut Ctx<'_>, spawns: impl Fn(&mut dyn FnMut(Vec3))) -> GoalStatus {
         let now = ctx.now_ms;
         let me = ctx.state.me.pos;
+        let (bot, hub) = (ctx.persona.id, ctx.hub);
         let spot = match self.spot {
             Some(s) => s,
             None => {
                 let mut best: Option<(f32, f32, f32)> = None;
+                let mut contested = 0u32;
                 spawns(&mut |p| {
+                    let others = hub.contest.others(spot_key(p.x, p.y), bot);
+                    contested += u32::from(others > 0);
                     let d2 = (p.x - me[0]).powi(2) + (p.y - me[1]).powi(2);
                     if d2 < SPAWN_MIN_M * SPAWN_MIN_M
                         || d2 > SEARCH_RADIUS_M * SEARCH_RADIUS_M
                         || self.visited.contains(&cell(p.x, p.y))
-                        || best.is_some_and(|b| d2 >= b.2)
                     {
                         return;
                     }
-                    best = Some((p.x, p.y, d2));
+                    let score = spot_score(d2, others);
+                    if best.is_some_and(|b| score >= b.2) {
+                        return;
+                    }
+                    best = Some((p.x, p.y, score));
                 });
                 match best {
-                    Some((x, y, _)) => (x, y),
+                    Some((x, y, _)) => {
+                        self.claim(ctx, spot_key(x, y));
+                        (x, y)
+                    }
                     None => {
                         // Every spot was searched: wait for respawns, start another round, or
                         // give up.
-                        if now.saturating_sub(self.round_ms) < ROUND_GAP_MS {
+                        let crowded = contested > 0 || characters_near(ctx.state, CROWD_RADIUS_M);
+                        let gap = if crowded {
+                            CROWD_ROUND_GAP_MS
+                        } else {
+                            ROUND_GAP_MS
+                        };
+                        if now.saturating_sub(self.round_ms) < gap {
                             return GoalStatus::Running;
                         }
                         self.round_ms = now;
                         self.spots_tried += 1;
                         self.visited.clear();
-                        if self.spots_tried >= 2 {
-                            return self.fail(ctx, Failure::TargetMissing);
+                        let rounds = if crowded { CROWD_ROUNDS } else { 2 };
+                        if self.spots_tried >= rounds {
+                            let why = if crowded {
+                                Failure::Crowded
+                            } else {
+                                Failure::TargetMissing
+                            };
+                            return self.fail(ctx, why);
                         }
                         return GoalStatus::Running;
                     }
@@ -1251,10 +1353,10 @@ impl Inner {
             }
         };
         match self.walk(ctx, spot.0, spot.1, SPAWN_STOP_M) {
-            Walk::Moving => {}
+            Walk::Moving => self.renew_claim(ctx, spot_key(spot.0, spot.1)),
             Walk::Failed | Walk::Arrived => {
                 // Nothing there (a monster in view would have been picked): the next spot.
-                let _ = now;
+                hub.contest.release(spot_key(spot.0, spot.1), bot);
                 self.mark_visited(spot.0, spot.1);
                 self.spot = None;
             }
@@ -1284,6 +1386,44 @@ impl Inner {
         self.visited.push(cell(x, y));
     }
 
+    /// Monster `obj` is given up: left alone for `base_ms`, or for a long while when it could
+    /// not be reached (and its whole kind after the second time).
+    fn give_up(&mut self, ctx: &mut Ctx<'_>, obj: u32, base_ms: u64, unreachable: bool) {
+        let now = ctx.now_ms;
+        ctx.hub.contest.release(unit_key(obj), ctx.persona.id);
+        if !unreachable {
+            self.ignore_for(obj, now + base_ms);
+            return;
+        }
+        let until = now + UNREACHABLE_MS;
+        self.ignore_for(obj, until);
+        let template = ctx.state.units.get(&obj).map(|u| u.id);
+        let avoid = ctx.state.avoid_mut();
+        avoid.ignore_obj(obj, until);
+        if let Some(t) = template {
+            if avoid.strike(t, now) {
+                ctx.log.say(format!(
+                    "quest {}: leaving monsters of kind {t} alone, unreachable",
+                    self.quest
+                ));
+            }
+        }
+    }
+
+    /// Tells the other bots the bot works on `key`.
+    fn claim(&mut self, ctx: &Ctx<'_>, key: u64) {
+        ctx.hub.contest.claim(key, ctx.persona.id);
+        self.claim_key = key;
+        self.claim_ms = ctx.now_ms.max(1);
+    }
+
+    /// Claims `key` if it is a new one, or renews the claim every [`CLAIM_RENEW_MS`].
+    fn renew_claim(&mut self, ctx: &Ctx<'_>, key: u64) {
+        if key != self.claim_key || ctx.now_ms.saturating_sub(self.claim_ms) >= CLAIM_RENEW_MS {
+            self.claim(ctx, key);
+        }
+    }
+
     fn ignore_for(&mut self, obj: u32, until_ms: u64) {
         if self.ignore.len() >= 4 {
             self.ignore.remove(0);
@@ -1296,21 +1436,30 @@ impl Inner {
     }
 
     /// The nearest living monster of one of `templates` in view.
+    ///
+    /// A monster another bot is already fighting comes second: the bots spread over the monsters
+    /// in view before they queue at one. Monsters that were out of reach are skipped.
     fn pick_mob(&self, ctx: &Ctx<'_>, templates: &[u32]) -> Option<u32> {
         let me = ctx.state.me.pos;
-        let mut best: Option<(u32, f32)> = None;
+        let bot = ctx.persona.id;
+        let mut best: Option<(u32, bool, f32)> = None;
         for (&obj, u) in &ctx.state.units {
             if u.kind != UnitKind::Npc
                 || u.dead()
                 || u.owned()
                 || !templates.contains(&u.id)
                 || self.ignored(obj, ctx.now_ms)
+                || ctx.state.avoids(obj, u.id, ctx.now_ms)
             {
                 continue;
             }
             let d = u.dist2d(me);
-            if d <= VIEW_RADIUS && best.is_none_or(|b| d < b.1) {
-                best = Some((obj, d));
+            if d > VIEW_RADIUS {
+                continue;
+            }
+            let taken = ctx.hub.contest.others(unit_key(obj), bot) > 0;
+            if best.is_none_or(|b| better_target(taken, d, b.1, b.2)) {
+                best = Some((obj, taken, d));
             }
         }
         best.map(|b| b.0)
@@ -1426,6 +1575,31 @@ fn nearest_doodad(state: &BotState, template: u32, me: [f32; 3]) -> Option<(u32,
         .map(|(&obj, d)| (obj, d.pos, dist2d(me, d.pos)))
         .min_by(|a, b| a.2.total_cmp(&b.2))
         .map(|(obj, pos, _)| (obj, pos))
+}
+
+/// How far away a spawn spot counts when `others` other bots work on it already: every one of
+/// them makes it 2.5 times as far (squared distances in and out).
+fn spot_score(d2: f32, others: usize) -> f32 {
+    let k = 1.0 + 1.5 * others as f32;
+    d2 * k * k
+}
+
+/// Whether target A (`taken` by another bot, `d` metres away) is a better pick than the best so
+/// far (`best_taken`, `best_d`): a free target beats a taken one, then the nearer wins.
+fn better_target(taken: bool, d: f32, best_taken: bool, best_d: f32) -> bool {
+    match (taken, best_taken) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => d < best_d,
+    }
+}
+
+/// Whether another character (a real player or one of our bots) is within `radius` metres.
+fn characters_near(state: &BotState, radius: f32) -> bool {
+    state
+        .units
+        .values()
+        .any(|u| u.kind == UnitKind::Character && u.dist2d(state.me.pos) <= radius)
 }
 
 fn quest_name(world: &World, quest: u32) -> &str {
@@ -1569,5 +1743,68 @@ mod tests {
     fn cells_group_nearby_points() {
         assert_eq!(cell(1.0, 1.0), cell(19.9, 19.9));
         assert_ne!(cell(19.9, 0.0), cell(20.1, 0.0));
+    }
+
+    #[test]
+    fn a_spot_other_bots_work_on_counts_as_farther_away() {
+        // 100 m away and free beats 100 m away and taken
+        assert!(spot_score(100.0 * 100.0, 0) < spot_score(100.0 * 100.0, 1));
+        // one other bot makes a spot 2.5 times as far: a free spot at 200 m wins over a taken
+        // one at 100 m, but not over one at 30 m
+        let taken_near = spot_score(100.0 * 100.0, 1);
+        assert!(spot_score(200.0 * 200.0, 0) < taken_near);
+        assert!(spot_score(300.0 * 300.0, 0) > taken_near);
+        // more bots, farther still
+        assert!(spot_score(50.0 * 50.0, 3) > spot_score(50.0 * 50.0, 2));
+        assert_eq!(spot_score(0.0, 5), 0.0);
+    }
+
+    #[test]
+    fn a_free_target_beats_a_taken_one_and_then_the_nearer_wins() {
+        // (candidate taken, candidate dist, best taken, best dist)
+        assert!(better_target(false, 50.0, true, 5.0), "free beats taken");
+        assert!(
+            !better_target(true, 5.0, false, 50.0),
+            "taken loses to free"
+        );
+        assert!(better_target(false, 5.0, false, 50.0), "nearer wins");
+        assert!(!better_target(false, 50.0, false, 5.0));
+        assert!(better_target(true, 5.0, true, 50.0));
+        assert!(
+            !better_target(true, 50.0, true, 50.0),
+            "a tie keeps the first"
+        );
+    }
+
+    #[test]
+    fn characters_near_ignores_monsters_and_the_far() {
+        let mut s = BotState::new();
+        s.me.pos = [0.0, 0.0, 0.0];
+        let unit = |kind, x: f32| crate::bot::state::Unit {
+            kind,
+            id: 1,
+            pos: [x, 0.0, 0.0],
+            hp: 10,
+            faction: 0,
+            level: 1,
+            flags: 0,
+            name: None,
+        };
+        s.units.insert(1, unit(UnitKind::Npc, 3.0));
+        assert!(!characters_near(&s, CROWD_RADIUS_M));
+        s.units
+            .insert(2, unit(UnitKind::Character, CROWD_RADIUS_M + 1.0));
+        assert!(!characters_near(&s, CROWD_RADIUS_M));
+        s.units
+            .insert(3, unit(UnitKind::Character, CROWD_RADIUS_M - 1.0));
+        assert!(characters_near(&s, CROWD_RADIUS_M));
+    }
+
+    #[test]
+    fn crowded_spawns_get_more_patience_than_empty_ones() {
+        // the waits are what the module docs promise
+        const { assert!(CROWD_ROUNDS > 2) };
+        const { assert!(CROWD_ROUND_GAP_MS > ROUND_GAP_MS) };
+        const { assert!(memory::CROWD_BACKOFF_MS >= memory::BACKOFF_MS) };
     }
 }

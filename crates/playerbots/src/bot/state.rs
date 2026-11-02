@@ -29,6 +29,9 @@ pub const SLOT_EQUIPMENT: u8 = 1;
 /// `SlotType` of the bag.
 pub const SLOT_BAG: u8 = 2;
 
+/// Chat lines kept between two brain ticks (system lines, whispers and local chat).
+pub const INBOX_MAX: usize = 16;
+
 /// How long a character found dead at login waits before it asks for the temple resurrection
 /// (the server sent no respawn timer for it).
 pub const DEAD_AT_LOGIN_WAIT_MS: u64 = 1_500;
@@ -370,7 +373,7 @@ pub struct BotState {
     pub last_damage_ms: u64,
     /// Recent errors, newest last (at most 8).
     pub errors: SmallVec<[(u64, StateError); 8]>,
-    /// Chat the bot heard, newest last (at most 4).
+    /// Chat the bot heard, newest last (at most [`INBOX_MAX`]).
     pub inbox: SmallVec<[ChatIn; 2]>,
     /// The bot's clock in milliseconds, set by the bot task before it applies events.
     pub now_ms: u64,
@@ -386,6 +389,9 @@ pub struct BotState {
     pub econ: Ledger,
     /// What the quest goal remembers between its runs (failed and quarantined quests).
     pub quest_mem: Option<Box<super::goals::quest::Memory>>,
+    /// Monsters the bot could not reach and leaves alone (grind and quest goals), allocated at
+    /// the first one.
+    pub avoid: Option<Box<super::avoid::Avoid>>,
 }
 
 impl BotState {
@@ -411,16 +417,26 @@ impl BotState {
     pub fn item_count(&self, template: u32) -> i64 {
         self.bag
             .values()
-            .filter(|i| i.template == template)
+            .filter(|i| i.template == template && i.count > 0)
             .map(|i| i64::from(i.count))
             .sum()
     }
 
-    /// The bag slot holding `template`.
+    /// The bag slot holding `template`. A stack with no items left (a consumed item whose removal
+    /// the bot has not seen, or never will) is not an item.
     pub fn find_item(&self, template: u32) -> Option<(u16, &Item)> {
+        self.find_item_where(template, |_| true)
+    }
+
+    /// The lowest bag slot holding a stack of `template` that `keep` accepts.
+    pub fn find_item_where(
+        &self,
+        template: u32,
+        mut keep: impl FnMut(&Item) -> bool,
+    ) -> Option<(u16, &Item)> {
         self.bag
             .iter()
-            .filter(|(_, i)| i.template == template)
+            .filter(|(_, i)| i.template == template && i.count > 0 && keep(i))
             .min_by_key(|(slot, _)| **slot)
             .map(|(slot, item)| (*slot, item))
     }
@@ -458,6 +474,34 @@ impl BotState {
         self.units.values().any(|u| {
             u.kind == UnitKind::Character && !is_ours(u.id) && u.dist2d(self.me.pos) <= radius
         })
+    }
+
+    /// Keeps a chat line for the social duty, which files the inbox at every brain tick. At
+    /// [`INBOX_MAX`] lines the oldest ordinary chat line goes first, so a burst of system lines
+    /// (the answer to a GM command such as `/build` is one line per step) and whispers survive
+    /// the local chatter around them.
+    fn push_inbox(&mut self, line: ChatIn) {
+        if self.inbox.len() >= INBOX_MAX {
+            let victim = self
+                .inbox
+                .iter()
+                .position(|l| !matches!(l.kind, -3..=-1))
+                .unwrap_or(0);
+            self.inbox.remove(victim);
+        }
+        self.inbox.push(line);
+    }
+
+    /// The memory of unreachable monsters, created on first use.
+    pub fn avoid_mut(&mut self) -> &mut super::avoid::Avoid {
+        self.avoid.get_or_insert_with(Default::default)
+    }
+
+    /// Whether the bot leaves monster `obj` of NPC `template` alone at the bot clock `now_ms`.
+    pub fn avoids(&self, obj: u32, template: u32, now_ms: u64) -> bool {
+        self.avoid
+            .as_ref()
+            .is_some_and(|a| a.skips(obj, template, now_ms))
     }
 
     /// Records a refused action.
@@ -640,7 +684,7 @@ impl BotState {
                 if *slot_type == SLOT_BAG {
                     let lo = u16::from(*chunk) * 10;
                     self.bag.retain(|slot, _| !(lo..lo + 10).contains(slot));
-                    for it in items.iter() {
+                    for it in items.iter().filter(|it| it.count > 0) {
                         self.bag.insert(
                             it.slot,
                             Item {
@@ -698,10 +742,7 @@ impl BotState {
                 ..
             } => {
                 if *sender_obj != self.me.obj || *sender_obj == 0 {
-                    if self.inbox.len() >= 4 {
-                        self.inbox.remove(0);
-                    }
-                    self.inbox.push(ChatIn {
+                    self.push_inbox(ChatIn {
                         kind: *kind,
                         sender_obj: *sender_obj,
                         name: name.clone(),
@@ -804,12 +845,14 @@ impl BotState {
 
     /// The own hit points say the bot is dead although no death event told so (a character that
     /// logged in dead, a lost packet): start the normal death flow. Hit points again after a
-    /// wrong guess (or a resurrection whose notice came late) clear it.
+    /// wrong guess (or a resurrection whose notice came late or never) clear it, and the bot
+    /// goes on as after any resurrection (it rests first).
     fn check_alive(&mut self) {
         if self.me.hp <= 0 {
             self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
         } else if self.me.dead {
             self.me.dead = false;
+            self.reactions.resurrected = Some(self.me.pos);
         }
     }
 
@@ -871,14 +914,8 @@ impl BotState {
                 ..
             } => match slot_type {
                 SLOT_BAG => {
-                    self.bag.insert(
-                        u16::from(slot),
-                        Item {
-                            id,
-                            template,
-                            count,
-                        },
-                    );
+                    // an empty stack is no item: it would hide what the slot held before
+                    self.bag_put(u16::from(slot), id, template, count);
                 }
                 SLOT_EQUIPMENT => {
                     self.equipment.retain(|e| e.slot != slot);
@@ -898,7 +935,14 @@ impl BotState {
                 id,
                 template,
             } if slot_type == SLOT_BAG => {
-                let key = u16::from(slot);
+                // The stack is found by its instance id first: the slot number alone can be
+                // stale after a move the bot did not see.
+                let key = self
+                    .bag
+                    .iter()
+                    .find(|(_, i)| i.id == id && id != 0)
+                    .map(|(k, _)| *k)
+                    .unwrap_or_else(|| u16::from(slot));
                 match self.bag.get_mut(&key) {
                     Some(item) => {
                         item.count = item.count.saturating_add(delta);
@@ -907,27 +951,23 @@ impl BotState {
                         }
                     }
                     None if delta > 0 => {
-                        self.bag.insert(
-                            key,
-                            Item {
-                                id,
-                                template,
-                                count: delta,
-                            },
-                        );
+                        self.bag_put(key, id, template, delta);
                     }
                     None => {}
                 }
             }
             ItemChange::Removed {
-                slot_type, slot, ..
+                slot_type,
+                slot,
+                id,
+                ..
             }
             | ItemChange::RemovedSlot {
-                slot_type, slot, ..
+                slot_type,
+                slot,
+                id,
             } => match slot_type {
-                SLOT_BAG => {
-                    self.bag.remove(&u16::from(slot));
-                }
+                SLOT_BAG => self.bag_take(u16::from(slot), id),
                 SLOT_EQUIPMENT => self.equipment.retain(|e| e.slot != slot),
                 _ => {}
             },
@@ -947,6 +987,34 @@ impl BotState {
                 to_id,
             ),
             _ => {}
+        }
+    }
+
+    /// Puts a stack into a bag slot; a stack without items empties the slot instead.
+    fn bag_put(&mut self, slot: u16, id: u64, template: u32, count: i32) {
+        if count > 0 {
+            self.bag.insert(
+                slot,
+                Item {
+                    id,
+                    template,
+                    count,
+                },
+            );
+        } else {
+            self.bag.remove(&slot);
+        }
+    }
+
+    /// The server took item `id` out of bag slot `slot`: the stack with that id leaves wherever
+    /// the bot has it (its idea of the slot can be stale), else the slot is cleared.
+    fn bag_take(&mut self, slot: u16, id: u64) {
+        let before = self.bag.len();
+        if id != 0 {
+            self.bag.retain(|_, i| i.id != id);
+        }
+        if self.bag.len() == before {
+            self.bag.remove(&slot);
         }
     }
 
@@ -1625,7 +1693,7 @@ mod tests {
                 notify: false,
             }));
         }
-        assert_eq!(s.inbox.len(), 4);
+        assert_eq!(s.inbox.len(), 10);
         assert_eq!(s.inbox[0].text.chars().count(), 200);
         assert_eq!(s.errors.len(), 8);
         assert_eq!(s.errors.last().map(|e| e.1), Some(StateError::Msg(9)));
@@ -1639,6 +1707,250 @@ mod tests {
             msg: "me".into(),
         }));
         assert_eq!(s.inbox.len(), before);
+    }
+
+    fn chat(kind: i16, n: u32) -> WorldEvent {
+        WorldEvent::Chat {
+            kind,
+            sender_obj: if kind < 0 { 0 } else { 0x500 + n },
+            sender_id: 0,
+            name: format!("N{n}").into(),
+            msg: format!("line {n}").into(),
+        }
+    }
+
+    #[test]
+    fn a_burst_of_system_lines_survives_until_the_social_duty_files_it() {
+        let mut s = in_world();
+        // a GM /build answers with one line per step: more than the old four-line inbox held
+        for n in 0..INBOX_MAX as u32 {
+            s.apply(&world(chat(-2, n)));
+        }
+        assert_eq!(s.inbox.len(), INBOX_MAX);
+        assert_eq!(&*s.inbox[0].text, "line 0", "nothing was lost");
+        assert_eq!(&*s.inbox[INBOX_MAX - 1].text, "line 15");
+    }
+
+    #[test]
+    fn a_full_inbox_drops_local_chat_before_system_lines_and_whispers() {
+        let mut s = in_world();
+        s.apply(&world(chat(-3, 100))); // a whisper
+        s.apply(&world(chat(-2, 101))); // a system line
+        for n in 0..(INBOX_MAX as u32 + 6) {
+            s.apply(&world(chat(0, n))); // local chatter
+        }
+        assert_eq!(s.inbox.len(), INBOX_MAX);
+        let kinds: Vec<i16> = s.inbox.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            &kinds[..2],
+            &[-3, -2],
+            "the whisper and the system line stay"
+        );
+        // the oldest local lines went, the newest stayed
+        assert_eq!(&*s.inbox.last().unwrap().text, "line 21");
+        assert!(!s.inbox.iter().any(|l| &*l.text == "line 0"));
+        // when nothing but protected lines is left to drop, the oldest of them goes
+        for n in 0..(INBOX_MAX as u32 + 2) {
+            s.apply(&world(chat(-2, 200 + n)));
+        }
+        assert_eq!(s.inbox.len(), INBOX_MAX);
+        assert_eq!(&*s.inbox.last().unwrap().text, "line 217");
+    }
+
+    #[test]
+    fn empty_stacks_are_not_items() {
+        let mut s = in_world();
+        s.apply(&world(WorldEvent::Inventory {
+            slot_type: SLOT_BAG,
+            chunk: 0,
+            items: Box::new([
+                InvItem {
+                    slot: 0,
+                    id: 11,
+                    template: 16401,
+                    grade: 0,
+                    count: 0,
+                },
+                InvItem {
+                    slot: 3,
+                    id: 12,
+                    template: 16401,
+                    grade: 0,
+                    count: 2,
+                },
+            ]),
+        }));
+        assert_eq!(s.bag.len(), 1, "the empty stack was not stored");
+        assert_eq!(s.find_item(16401).map(|x| (x.0, x.1.id)), Some((3, 12)));
+        // a stack that is in the bag with nothing in it (a state older code could reach) is still
+        // not found, and not counted
+        s.bag.insert(
+            0,
+            Item {
+                id: 13,
+                template: 777,
+                count: 0,
+            },
+        );
+        assert!(s.find_item(777).is_none());
+        assert_eq!(s.item_count(777), 0);
+        // an item that arrives empty clears the slot instead of hiding what was there
+        s.apply(&world(WorldEvent::ItemTask(Box::new(ItemTaskInfo {
+            reason: 0,
+            changes: [ItemChange::Added {
+                action: 5,
+                slot_type: SLOT_BAG,
+                slot: 3,
+                template: 16401,
+                id: 14,
+                grade: 0,
+                count: 0,
+            }]
+            .into_iter()
+            .collect(),
+            force_removed: Default::default(),
+        }))));
+        assert!(s.find_item(16401).is_none());
+        assert!(!s.bag.contains_key(&3));
+        // a filter on top: the lowest slot that passes
+        for (slot, id) in [(5u16, 20u64), (6, 21)] {
+            s.bag.insert(
+                slot,
+                Item {
+                    id,
+                    template: 9,
+                    count: 1,
+                },
+            );
+        }
+        assert_eq!(s.find_item_where(9, |i| i.id != 20).map(|x| x.0), Some(6));
+    }
+
+    #[test]
+    fn a_consumed_item_leaves_the_bag_by_its_id_even_when_the_slot_is_stale() {
+        let task = |changes: Vec<ItemChange>| {
+            world(WorldEvent::ItemTask(Box::new(ItemTaskInfo {
+                reason: 0,
+                changes: changes.into_iter().collect(),
+                force_removed: Default::default(),
+            })))
+        };
+        for stale_slot in [false, true] {
+            let mut s = in_world();
+            s.bag.insert(
+                4,
+                Item {
+                    id: 700,
+                    template: 16401,
+                    count: 1,
+                },
+            );
+            s.bag.insert(
+                9,
+                Item {
+                    id: 701,
+                    template: 55,
+                    count: 3,
+                },
+            );
+            // the server says item 700 left slot 4 (or, with a stale picture, slot 11)
+            let slot = if stale_slot { 11 } else { 4 };
+            s.apply(&task(vec![ItemChange::RemovedSlot {
+                slot_type: SLOT_BAG,
+                slot,
+                id: 700,
+            }]));
+            assert!(s.find_item(16401).is_none(), "stale_slot={stale_slot}");
+            assert_eq!(s.item_count(55), 3, "another item stays");
+        }
+        // a removal of an id the bot never saw still clears the named slot
+        let mut s = in_world();
+        s.bag.insert(
+            4,
+            Item {
+                id: 700,
+                template: 16401,
+                count: 1,
+            },
+        );
+        s.apply(&task(vec![ItemChange::Removed {
+            slot_type: SLOT_BAG,
+            slot: 4,
+            id: 999,
+            template: 16401,
+        }]));
+        assert!(s.find_item(16401).is_none());
+    }
+
+    #[test]
+    fn a_count_update_finds_its_stack_by_id_and_removes_an_emptied_one() {
+        let mut s = in_world();
+        s.bag.insert(
+            8,
+            Item {
+                id: 40,
+                template: 16401,
+                count: 3,
+            },
+        );
+        let update = |slot: u8, delta: i32| {
+            world(WorldEvent::ItemTask(Box::new(ItemTaskInfo {
+                reason: 0,
+                changes: [ItemChange::CountUpdate {
+                    slot_type: SLOT_BAG,
+                    slot,
+                    id: 40,
+                    delta,
+                    template: 16401,
+                }]
+                .into_iter()
+                .collect(),
+                force_removed: Default::default(),
+            })))
+        };
+        // the packet names slot 2, the bot has the stack in slot 8: the id wins
+        s.apply(&update(2, -2));
+        assert_eq!(s.item_count(16401), 1);
+        assert_eq!(s.bag.len(), 1);
+        s.apply(&update(2, -1));
+        assert!(s.find_item(16401).is_none(), "used up");
+        assert!(s.bag.is_empty());
+    }
+
+    #[test]
+    fn hit_points_alone_start_the_death_flow_and_end_it() {
+        let mut s = in_world();
+        s.now_ms = 10_000;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 0,
+            mp: 50,
+        }));
+        // no SCUnitDeath came: the bot is dead all the same and asks for the resurrection
+        assert!(s.me.dead);
+        assert!(std::mem::take(&mut s.reactions.died));
+        assert_eq!(s.me.respawn_at_ms, 10_000 + DEAD_AT_LOGIN_WAIT_MS);
+        assert_eq!(s.me.hp_pct(), 0);
+        // the resurrection notice never comes, the hit points do: alive, and it rests as after
+        // any resurrection
+        s.now_ms = 20_000;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 100,
+            mp: 50,
+        }));
+        assert!(!s.me.dead);
+        assert!(s.reactions.resurrected.is_some());
+        assert!(s.me.hp_pct() > 0);
+        // a second report of other hit points changes nothing
+        s.reactions.resurrected = None;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 120,
+            mp: 50,
+        }));
+        assert!(s.reactions.resurrected.is_none());
+        assert!(!s.reactions.died);
     }
 
     #[test]

@@ -69,6 +69,8 @@ impl BotHub for TestHub {
         HubStats {
             bots_total: 2,
             bots_online: 2,
+            bytes_in_per_sec: 2048.0,
+            bytes_out_per_sec: 512.0,
             activity_counts: vec![(Activity::Questing, 1), (Activity::TradeRun, 1)],
             ..HubStats::default()
         }
@@ -316,6 +318,8 @@ async fn get_api_routes() {
 
     let stats = s.get("/api/stats").await.json();
     assert_eq!(stats["bots_total"], 2);
+    assert_eq!(stats["bytes_in_per_sec"], 2048.0);
+    assert_eq!(stats["bytes_out_per_sec"], 512.0);
     assert_eq!(stats["activity_counts"][1][0], "trade_run");
     assert!(stats["llm"].is_null());
 

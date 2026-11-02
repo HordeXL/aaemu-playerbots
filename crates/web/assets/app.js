@@ -275,6 +275,7 @@ function renderStats() {
   setTile('st-online', nf.format(s.bots_online) + ' / ' + nf.format(s.bots_total), null);
   setTile('st-mem', fmtBytes(s.rss_bytes), fmtBytes(s.bytes_per_bot) + '/bot');
   setTile('st-pkt', fmtRate(s.packets_in_per_sec) + ' in', fmtRate(s.packets_out_per_sec) + ' out');
+  setTile('st-bw', fmtBytes(s.bytes_in_per_sec) + '/s in', fmtBytes(s.bytes_out_per_sec) + '/s out');
   setTile('st-up', fmtDur(s.uptime_secs), null);
   const l = s.llm;
   $('st-llm-tile').hidden = !l;

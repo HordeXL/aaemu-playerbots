@@ -7,10 +7,16 @@
 //! [`FailReason::NotImplemented`] are switched off for good, goals that fail otherwise rest for a
 //! while ([`FAIL_COOLDOWN_MS`]).
 //!
+//! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
+//! pack recipe, housing without GM help or a design item) are left out of the draw up front
+//! ([`gate`]); the answer is reused for [`GATE_TTL_MS`] and asked again after a level-up.
+//!
 //! The brain also calls the combat controller on every tick, so a bot defends itself whatever it is
 //! doing, runs the chat duty ([`Social::tick`]) and, when `llm.director` is on, asks the LLM
 //! director for a goal now and then ([`director`]): the model picks among the goals the scoring
 //! itself would allow, and the pick is dropped silently if it is no longer eligible.
+
+use std::cell::Cell;
 
 use smallvec::SmallVec;
 
@@ -32,6 +38,22 @@ const HURT_PCT: u8 = 30;
 const GAP_MS: (u64, u64) = (800, 4_000);
 /// A forced goal that keeps failing is dropped after this many failures in a row.
 const MAX_FORCED_FAILS: u8 = 3;
+/// How long the answer of the eligibility predicates ([`gate`]) is reused. A level-up asks again
+/// at once.
+pub const GATE_TTL_MS: u64 = 30_000;
+
+/// The goals the bot cannot make anything of right now, as a bit per [`GoalKind::index`]. Every
+/// entry is a cheap predicate the goal's module exports; a goal without one is never gated.
+pub fn gate(ctx: &Ctx<'_>) -> u16 {
+    let mut mask = 0;
+    if super::goals::trade_run::unavailable(ctx).is_some() {
+        mask |= 1 << GoalKind::TradeRun.index();
+    }
+    if super::goals::housing::unavailable(ctx).is_some() {
+        mask |= 1 << GoalKind::Housing.index();
+    }
+    mask
+}
 
 /// What the scoring looks at.
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +156,9 @@ pub struct Brain {
     /// A goal to start at the next tick (operator command, pairing, recovery after death).
     queued: Option<(GoalKind, Option<PairOrder>)>,
     forced_fails: u8,
+    /// The last answer of [`gate`]: the bot clock it is good until, the level it was asked at and
+    /// the goals it blocks.
+    gated: Cell<(u64, u8, u16)>,
     /// Chat and director state, see [`Chat`].
     ext: Option<Box<Chat>>,
 }
@@ -151,6 +176,7 @@ impl Brain {
             next_think_ms: 0,
             queued: None,
             forced_fails: 0,
+            gated: Cell::new((0, 0, 0)),
             ext: None,
         }
     }
@@ -370,7 +396,7 @@ impl Brain {
     /// The score of every goal for the situation of this tick: the one table both the utility
     /// choice and the director's eligibility read.
     fn scores_now(&self, ctx: &Ctx<'_>) -> [f32; GoalKind::COUNT] {
-        let mut blocked = self.disabled;
+        let mut blocked = self.disabled | self.gated_goals(ctx);
         for g in GoalKind::ALL {
             if ctx.now_ms < self.cooldown_until[g.index()] {
                 blocked |= 1 << g.index();
@@ -384,6 +410,35 @@ impl Brain {
             blocked,
         };
         scores(&self.base, &input)
+    }
+
+    /// The goals [`gate`] blocks, asked again when the last answer is old or the level changed.
+    fn gated_goals(&self, ctx: &Ctx<'_>) -> u16 {
+        let (until, level, mask) = self.gated.get();
+        let now = ctx.now_ms;
+        if now < until && level == ctx.state.me.level {
+            return mask;
+        }
+        let fresh = gate(ctx);
+        if fresh != mask {
+            for g in GoalKind::ALL {
+                let bit = 1 << g.index();
+                if (fresh ^ mask) & bit != 0 {
+                    ctx.log.debug(format!(
+                        "goal {}: {}",
+                        g.name(),
+                        if fresh & bit != 0 {
+                            "cannot succeed now; left out of the choice"
+                        } else {
+                            "can be tried again"
+                        }
+                    ));
+                }
+            }
+        }
+        self.gated
+            .set((now + GATE_TTL_MS, ctx.state.me.level, fresh));
+        fresh
     }
 
     /// The goals the director may offer or apply right now.
@@ -617,6 +672,27 @@ mod tests {
             assert!(![GoalKind::Grind, GoalKind::Quest, GoalKind::Wander].contains(&g));
         }
         assert_eq!(choose(&[0.0; GoalKind::COUNT], &mut rng), None);
+    }
+
+    #[test]
+    fn gated_goals_are_never_drawn_and_their_bits_fit_the_mask() {
+        const _: () = assert!(GoalKind::COUNT <= 16);
+        let b = base();
+        let mut i = input(100);
+        i.blocked = (1 << GoalKind::TradeRun.index()) | (1 << GoalKind::Housing.index());
+        let s = scores(&b, &i);
+        assert_eq!(s[GoalKind::TradeRun.index()], 0.0);
+        assert_eq!(s[GoalKind::Housing.index()], 0.0);
+        let mut rng = fastrand::Rng::with_seed(11);
+        for _ in 0..5000 {
+            let g = choose(&s, &mut rng).unwrap();
+            assert!(g != GoalKind::TradeRun && g != GoalKind::Housing, "{g:?}");
+        }
+        // without the gate both are drawn now and then
+        i.blocked = 0;
+        let s = scores(&b, &i);
+        let mut drawn = |kind| (0..5000).any(|_| choose(&s, &mut rng) == Some(kind));
+        assert!(drawn(GoalKind::TradeRun) && drawn(GoalKind::Housing));
     }
 
     #[test]

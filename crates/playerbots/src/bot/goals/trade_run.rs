@@ -373,6 +373,32 @@ pub fn carried_pack(equipment: &[EquipSlot], is_pack: impl Fn(u32) -> bool) -> O
     equipment.iter().map(|e| e.template).find(|&t| is_pack(t))
 }
 
+/// Why a trade run cannot succeed for this bot right now, `None` when it can be tried. The brain
+/// asks this before it picks the goal, so a bot that is too low a level (or has no materials and
+/// no GM help) does not pick it over and over just to fail it.
+///
+/// A bot that carries a pack can always try (selling is all it needs), and with `gm_bootstrap` the
+/// GM supplies the rest. Without it the character needs the level of the lowest pack recipe and,
+/// for some recipe at its level, the labor and the materials in the bag.
+pub fn unavailable(ctx: &Ctx<'_>) -> Option<&'static str> {
+    if carried_pack_of(ctx).is_some() || ctx.gm_allowed() {
+        return None;
+    }
+    let (level, labor) = (ctx.state.me.level, i32::from(ctx.state.me.labor));
+    if level < ctx.world.min_pack_craft_level() {
+        return Some(LEVEL_TOO_LOW);
+    }
+    let st = &*ctx.state;
+    let possible = ctx.world.pack_crafts().any(|c| {
+        level >= c.req_level
+            && labor >= i32::from(c.labor) + SELL_LABOR
+            && c.materials
+                .iter()
+                .all(|&(item, n)| st.item_count(item) >= i64::from(n))
+    });
+    (!possible).then_some("no trade pack can be crafted from the bag")
+}
+
 /// The trade pack the bot carries, if any.
 pub fn carried_pack_of(ctx: &Ctx<'_>) -> Option<u32> {
     carried_pack(&ctx.state.equipment, |t| {

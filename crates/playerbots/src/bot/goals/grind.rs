@@ -12,7 +12,8 @@ use std::fmt::Write;
 use aa_world::{Relation, Vec3};
 use smallvec::SmallVec;
 
-use crate::bot::combat::{attackable, CombatStatus};
+use crate::bot::avoid::UNREACHABLE_MS;
+use crate::bot::combat::{attackable, CombatStatus, Loss, FIGHT_TIMEOUT_MS};
 use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, Pace};
 
@@ -32,8 +33,12 @@ const SPAWN_STOP_M: f32 = 6.0;
 const MAX_SEARCHES: u8 = 4;
 /// Below this many percent of hit points the goal ends (the brain rests).
 const LOW_HP_PCT: u8 = 40;
-/// A target that was lost is not picked again for this long.
-const IGNORE_MS: u64 = 30_000;
+/// A target that was lost is not picked again for this long. Longer than a fight can last
+/// ([`FIGHT_TIMEOUT_MS`]): with a shorter pause the bot walked back to the monster it just gave
+/// up and fought it again, for minutes. A target the bot could not reach is left alone for
+/// [`UNREACHABLE_MS`].
+const IGNORE_MS: u64 = FIGHT_TIMEOUT_MS + 30_000;
+const _: () = assert!(IGNORE_MS >= FIGHT_TIMEOUT_MS);
 /// Searched spots are remembered in cells of this size.
 const CELL_M: f32 = 20.0;
 
@@ -79,7 +84,7 @@ impl Grind {
             }
             CombatStatus::Lost => {
                 if let Some(obj) = self.fighting.take() {
-                    self.ignore_for(obj, now + IGNORE_MS);
+                    self.give_up(ctx, obj);
                 }
             }
             _ => {}
@@ -152,6 +157,28 @@ impl Grind {
         };
     }
 
+    /// The controller gave up monster `obj`: leave it alone for a while, a long while when the
+    /// bot could not hurt it (and its whole kind after the second time).
+    fn give_up(&mut self, ctx: &mut Ctx<'_>, obj: u32) {
+        let now = ctx.now_ms;
+        if !ctx.combat.last_loss().is_some_and(Loss::unreachable) {
+            self.ignore_for(obj, now + IGNORE_MS);
+            return;
+        }
+        let until = now + UNREACHABLE_MS;
+        let template = ctx.state.units.get(&obj).map(|u| u.id);
+        let avoid = ctx.state.avoid_mut();
+        avoid.ignore_obj(obj, until);
+        if let Some(t) = template {
+            if avoid.strike(t, now) {
+                ctx.log.say(format!(
+                    "grind: leaving monsters of kind {t} alone, unreachable"
+                ));
+            }
+        }
+        ctx.log.debug(format!("grind: unit {obj} is out of reach"));
+    }
+
     fn empty_search(&mut self) -> GoalStatus {
         self.searches += 1;
         if self.searches >= MAX_SEARCHES {
@@ -185,7 +212,7 @@ impl Grind {
         let (own_faction, own_level) = (ctx.state.me.faction, ctx.state.me.level);
         let mut best: Option<(u32, f32)> = None;
         for (&obj, u) in &ctx.state.units {
-            if self.ignored(obj, ctx.now_ms) {
+            if self.ignored(obj, ctx.now_ms) || ctx.state.avoids(obj, u.id, ctx.now_ms) {
                 continue;
             }
             let d = u.dist2d(me);
@@ -217,7 +244,9 @@ impl Grind {
                 if d2 < SPAWN_MIN_M * SPAWN_MIN_M || best.is_some_and(|b| d2 >= b.2) {
                     return;
                 }
-                if self.visited.contains(&cell(p.x, p.y)) {
+                if self.visited.contains(&cell(p.x, p.y))
+                    || ctx.state.avoids(0, template, ctx.now_ms)
+                {
                     return;
                 }
                 let Some(t) = ctx.world.npc(template) else {

@@ -845,6 +845,18 @@ fn flat(world: &aa_world::World, x: f32, y: f32, half: f32) -> bool {
         })
 }
 
+/// Why housing cannot succeed for this bot right now, `None` when it can be tried: a bot with a
+/// house can go home; one with `gm_bootstrap` gets the design and the certificates from the GM;
+/// any other needs a design item in the bag already.
+pub fn unavailable(ctx: &Ctx<'_>) -> Option<&'static str> {
+    if !ctx.state.houses.is_empty() || ctx.gm_allowed() {
+        return None;
+    }
+    pick_design(ctx.world.housing_designs(), &ctx.state.bag, false, false)
+        .is_none()
+        .then_some("housing needs gm_bootstrap or a design item")
+}
+
 /// Keeps the hub's map marker in step with the bot's first house. Cheap; the brain calls it on
 /// every tick.
 pub fn sync_marker(ctx: &mut Ctx<'_>) {

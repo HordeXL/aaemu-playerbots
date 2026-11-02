@@ -28,6 +28,9 @@ pub const QUARANTINE_MS: u64 = 300_000;
 pub const STORY_COOLDOWN_MS: u64 = 300_000;
 /// How long a quest stays out that the bot cannot do (an objective kind without support).
 pub const UNSUPPORTED_MS: u64 = 3_600_000;
+/// A quest whose targets other characters crowd out rests this long. It does not count towards a
+/// quarantine: the quest is fine, the spawn is just busy.
+pub const CROWD_BACKOFF_MS: u64 = 45_000;
 /// Entries kept; the one that expires first goes first.
 const MAX_ENTRIES: usize = 24;
 
@@ -56,6 +59,9 @@ pub enum Failure {
     MissingItem,
     /// The server refused the skill the objective needs.
     CastRefused,
+    /// The targets are there but other characters are working on them: wait for the respawns
+    /// took longer than the bot is willing to.
+    Crowded,
 }
 
 impl Failure {
@@ -79,6 +85,7 @@ impl fmt::Display for Failure {
             Failure::Unreachable => f.write_str("unreachable"),
             Failure::MissingItem => f.write_str("quest item missing"),
             Failure::CastRefused => f.write_str("skill refused"),
+            Failure::Crowded => f.write_str("targets taken by other characters"),
         }
     }
 }
@@ -130,8 +137,14 @@ impl Memory {
         self.failed += 1;
         let i = self.slot(quest, why);
         let e = &mut self.entries[i];
-        e.fails = e.fails.saturating_add(1);
         e.last = why;
+        if why == Failure::Crowded {
+            // not the quest's fault: a rest, no strike
+            e.quarantined = false;
+            e.until_ms = now_ms + CROWD_BACKOFF_MS;
+            return Verdict::Backoff(e.until_ms);
+        }
+        e.fails = e.fails.saturating_add(1);
         if why.permanent() {
             e.quarantined = true;
             e.until_ms = now_ms + UNSUPPORTED_MS;
@@ -305,6 +318,33 @@ mod tests {
         assert!(m.len() <= MAX_ENTRIES);
         // the newest failure is still remembered
         assert!(!m.usable(99, 995));
+    }
+
+    #[test]
+    fn a_crowded_spawn_rests_the_quest_without_a_strike() {
+        let mut m = Memory::default();
+        let mut now = 0;
+        // far more crowded failures than it takes to quarantine anything
+        for _ in 0..FAILS_TO_QUARANTINE * 3 {
+            let v = m.fail(251, Failure::Crowded, false, now);
+            assert_eq!(v, Verdict::Backoff(now + CROWD_BACKOFF_MS));
+            assert!(!m.usable(251, now + CROWD_BACKOFF_MS - 1));
+            assert!(m.usable(251, now + CROWD_BACKOFF_MS));
+            assert!(!m.quarantined(251, now + 1));
+            now += CROWD_BACKOFF_MS;
+        }
+        assert_eq!(m.last_failure(251), Some(Failure::Crowded));
+        assert!(!Failure::Crowded.permanent());
+        // a real failure after them is still only the first strike
+        assert!(matches!(
+            m.fail(251, Failure::NoProgress, false, now),
+            Verdict::Backoff(t) if t == now + BACKOFF_MS
+        ));
+        assert!(!m.quarantined(251, now + 1));
+        assert_eq!(
+            Failure::Crowded.to_string(),
+            "targets taken by other characters"
+        );
     }
 
     #[test]

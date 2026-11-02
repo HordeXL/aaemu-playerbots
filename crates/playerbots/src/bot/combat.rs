@@ -68,7 +68,26 @@ pub const GCD_MS: u64 = 1000;
 /// Time between two auto attacks.
 pub const AUTO_ATTACK_GAP_MS: u64 = 1200;
 /// A fight against one target ends after this long.
-const FIGHT_TIMEOUT_MS: u64 = 120_000;
+pub const FIGHT_TIMEOUT_MS: u64 = 120_000;
+/// A fight in which neither side lost a hit point for this long is given up: the target cannot
+/// be reached, evades, or is out of sight of every skill.
+pub const NO_DAMAGE_MS: u64 = 30_000;
+/// `SkillResult::Obstacle`: terrain or a model blocks the line of sight to the target.
+const OBSTACLE_REFUSED: u8 = 12;
+/// The server's `NoTarget`: the unit the cast was aimed at does not exist for the server (it
+/// despawned, or the bot's picture of it is stale).
+const NO_TARGET_REFUSED: u8 = 9;
+/// Refusals with [`NO_TARGET_REFUSED`] against the current target after which it is given up.
+const NO_TARGET_GIVE_UP: u8 = 3;
+/// A unit the server does not know is left alone this long (longer than a fight can last).
+const GONE_IGNORE_MS: u64 = FIGHT_TIMEOUT_MS + 30_000;
+/// Blocked casts in one fight after which a monster counts as unreachable.
+const OBSTACLE_GIVE_UP: u8 = 4;
+/// After a blocked cast the bot casts nothing for this long while it takes another position.
+const OBSTACLE_HOLD_MS: u64 = 1_500;
+/// Angle (degrees around the target) of the first position tried after a blocked cast, and what
+/// each further blocked cast adds.
+const SIDESTEP_DEG: (f32, f32) = (50.0, 25.0);
 /// A target further away than this is lost.
 const LOST_DISTANCE: f32 = 80.0;
 /// Pauses after a refused skill: first, second and later failures.
@@ -123,6 +142,104 @@ pub enum CombatStatus {
     },
     /// The target left the view, ran too far or the fight took too long.
     Lost,
+}
+
+/// Why the controller gave up a target ([`CombatStatus::Lost`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostReason {
+    /// The target left the view (died elsewhere, evaded, despawned).
+    Gone,
+    /// The target ran farther than the controller follows.
+    Far,
+    /// The fight took longer than [`FIGHT_TIMEOUT_MS`].
+    Timeout,
+    /// Nobody lost a hit point for [`NO_DAMAGE_MS`]: the bot could not hurt the target.
+    Stalled,
+    /// The way to the target is blocked, or the server kept refusing casts for an obstacle.
+    Blocked,
+    /// A defence against an attacker was dropped because the bot is on its way somewhere.
+    Travel,
+}
+
+/// How the last [`CombatStatus::Lost`] came about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Loss {
+    /// Why the target was given up.
+    pub reason: LostReason,
+    /// The target lost hit points during the fight (the bot can hurt it at all).
+    pub dealt: bool,
+}
+
+impl Loss {
+    /// Whether the target looks out of the bot's reach: the fight stalled, ran into a wall, or
+    /// ran out of time without the target ever losing a hit point. Goals leave such a target
+    /// alone for a long time. (A target that left the view or ran away is just gone.)
+    pub fn unreachable(self) -> bool {
+        match self.reason {
+            LostReason::Stalled | LostReason::Blocked => true,
+            LostReason::Timeout => !self.dealt,
+            LostReason::Gone | LostReason::Far | LostReason::Travel => false,
+        }
+    }
+}
+
+/// What the controller saw of the fight against the current target.
+#[derive(Debug, Clone, Copy)]
+struct Watch {
+    /// Bot clock of the last hit point loss on either side (the engagement before that).
+    progress_ms: u64,
+    /// The target's hit points at the last step; `i32::MIN` before the first.
+    target_hp: i32,
+    /// The bot's `last_damage_ms` at the last step.
+    damage_seen: u64,
+    /// The target lost hit points during this fight.
+    dealt: bool,
+    /// Casts the server refused for an obstacle during this fight.
+    obstacles: u8,
+    /// Casts the server refused because it does not know the target.
+    no_target: u8,
+    /// A blocked cast waits for the bot to take another position.
+    sidestep: bool,
+    /// Until then the bot casts nothing (it takes another position).
+    hold_until_ms: u64,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Watch {
+            progress_ms: 0,
+            target_hp: i32::MIN,
+            damage_seen: 0,
+            dealt: false,
+            obstacles: 0,
+            no_target: 0,
+            sidestep: false,
+            hold_until_ms: 0,
+        }
+    }
+}
+
+impl Watch {
+    /// Notes the target's hit points and the bot's last hit point loss at `now_ms`.
+    fn observe(&mut self, now_ms: u64, target_hp: i32, last_damage_ms: u64) {
+        if self.target_hp == i32::MIN {
+            self.progress_ms = now_ms;
+            self.damage_seen = last_damage_ms;
+        } else if target_hp < self.target_hp {
+            self.dealt = true;
+            self.progress_ms = now_ms;
+        }
+        if last_damage_ms > self.damage_seen {
+            self.damage_seen = last_damage_ms;
+            self.progress_ms = now_ms;
+        }
+        self.target_hp = target_hp;
+    }
+
+    /// Whether neither side lost a hit point for [`NO_DAMAGE_MS`].
+    fn stalled(&self, now_ms: u64) -> bool {
+        self.target_hp != i32::MIN && now_ms.saturating_sub(self.progress_ms) > NO_DAMAGE_MS
+    }
 }
 
 /// A skill the bot could cast right now, as far as the facts go.
@@ -365,6 +482,12 @@ pub struct Combat {
     travelling_until_ms: u64,
     /// The target the controller picked to defend against (0 = it is no defence).
     defending: u32,
+    /// What the controller saw of the fight against the current target.
+    watch: Watch,
+    /// How the last target was lost.
+    loss: Option<Loss>,
+    /// Casts the server refused for an obstacle so far (this process).
+    obstructed: u32,
 }
 
 impl Default for Combat {
@@ -406,6 +529,9 @@ impl Combat {
             next_kite_ms: 0,
             travelling_until_ms: 0,
             defending: 0,
+            watch: Watch::default(),
+            loss: None,
+            obstructed: 0,
         }
     }
 
@@ -434,6 +560,19 @@ impl Combat {
         self.engaged_at_ms = None;
         self.rot.reset_fight(self.me_obj);
         self.target_cast = None;
+        self.watch = Watch::default();
+    }
+
+    /// A fresh start against the current target: forgets what the fight so far taught the
+    /// controller (skill back-offs, range corrections, the stall watch) and keeps the target.
+    pub fn restart_fight(&mut self) {
+        let Some(target) = self.target else { return };
+        self.disengage();
+        self.engage(target);
+        self.backoffs = Backoffs::default();
+        self.range_pen = 0.0;
+        self.kite_until_ms = 0;
+        self.next_kite_ms = 0;
     }
 
     /// Stops fighting (a running loot job continues).
@@ -447,11 +586,13 @@ impl Combat {
 
     /// Forgets everything (death, reconnect).
     pub fn reset(&mut self) {
-        let (kills, casts, failed) = (self.kills, self.casts, self.cast_failed);
+        let (kills, casts, failed, obstructed) =
+            (self.kills, self.casts, self.cast_failed, self.obstructed);
         *self = Combat::new();
         self.kills = kills;
         self.casts = casts;
         self.cast_failed = failed;
+        self.obstructed = obstructed;
     }
 
     /// The current target.
@@ -487,6 +628,22 @@ impl Combat {
         self.cast_failed
     }
 
+    /// Casts the server refused because something blocked the line of sight (this process).
+    pub fn casts_obstructed(&self) -> u32 {
+        self.obstructed
+    }
+
+    /// Whether the current target lost hit points since the controller engaged it.
+    pub fn dealt_damage(&self) -> bool {
+        self.watch.dealt
+    }
+
+    /// How the last target was lost; read it when [`Combat::tick`] returned
+    /// [`CombatStatus::Lost`].
+    pub fn last_loss(&self) -> Option<Loss> {
+        self.loss
+    }
+
     /// Skills learned and learn requests the server ignored.
     pub fn learned(&self) -> (u16, u16) {
         self.learner.counts()
@@ -508,6 +665,7 @@ impl Combat {
                 caster_obj,
                 skill,
                 result,
+                target_obj,
                 ..
             } if *caster_obj == me_obj && me_obj != 0 => {
                 if *result == COOLDOWN_REFUSED {
@@ -519,17 +677,31 @@ impl Combat {
                     self.gcd_ms = (self.gcd_ms + GCD_STEP_MS).min(GCD_MAX_MS);
                     self.gcd_ok = 0;
                     self.gcd_until_ms = self.gcd_until_ms.max(now_ms + u64::from(GCD_STEP_MS));
+                } else if *result == OBSTACLE_REFUSED {
+                    // Something stands between the bot and the target. That is the position's
+                    // fault, not the skill's: a short pause (no escalating back-off, no failure
+                    // count) while the controller takes another position.
+                    self.backoffs.fail_short(*skill, now_ms);
+                    self.obstructed += 1;
+                    self.watch.obstacles = self.watch.obstacles.saturating_add(1);
+                    self.watch.sidestep = true;
+                    self.watch.hold_until_ms = now_ms + OBSTACLE_HOLD_MS;
+                    self.last_refusal = Some((*skill, *result));
                 } else if *result != 0 {
                     if *result == MANA_REFUSED {
                         self.mana_refused = *skill;
                     } else if *result == TOO_FAR_REFUSED {
                         self.range_pen = (self.range_pen + RANGE_PEN_STEP_M).min(RANGE_PEN_MAX_M);
+                    } else if *result == NO_TARGET_REFUSED && Some(*target_obj) == self.target {
+                        self.watch.no_target = self.watch.no_target.saturating_add(1);
                     }
                     self.backoffs.fail(*skill, now_ms);
                     self.cast_failed += 1;
                     self.last_refusal = Some((*skill, *result));
                 } else {
                     self.backoffs.succeed(*skill);
+                    self.watch.obstacles = 0;
+                    self.watch.no_target = 0;
                     self.range_pen = (self.range_pen - RANGE_PEN_STEP_M / 4.0).max(0.0);
                     self.gcd_ok += 1;
                     if self.gcd_ok >= GCD_RELAX_AFTER {
@@ -637,7 +809,12 @@ impl Combat {
         match ctx.combat.duel.phase() {
             DuelPhase::Active { opponent, .. } => {
                 ctx.combat.duel_opponent = opponent;
-                if ctx.combat.target != Some(opponent) {
+                if ctx.combat.duel.withdrawing() {
+                    // The goal is walking away from a duel that went nowhere.
+                    if ctx.combat.target == Some(opponent) {
+                        ctx.combat.disengage();
+                    }
+                } else if ctx.combat.target != Some(opponent) {
                     ctx.combat.engage(opponent);
                 }
             }
@@ -697,14 +874,13 @@ impl Combat {
         };
         let engaged_at = *ctx.combat.engaged_at_ms.get_or_insert(now);
 
-        let Some((upos, dead, is_char)) = ctx
+        let Some((upos, dead, is_char, target_hp)) = ctx
             .state
             .units
             .get(&obj)
-            .map(|u| (u.pos, u.dead(), u.kind == UnitKind::Character))
+            .map(|u| (u.pos, u.dead(), u.kind == UnitKind::Character, u.hp))
         else {
-            ctx.combat.disengage();
-            return CombatStatus::Lost;
+            return Self::lose(ctx, LostReason::Gone);
         };
         if dead {
             let ours = !is_char && ctx.state.kills.iter().any(|k| k.0 == obj);
@@ -725,12 +901,41 @@ impl Combat {
         } else {
             (LOST_DISTANCE, FIGHT_TIMEOUT_MS)
         };
-        if dist > lost_at
-            || now.saturating_sub(engaged_at) > timeout
-            || (travelling && ctx.combat.defending == obj && dist > TRAVEL_LOSE_M)
-        {
-            ctx.combat.disengage();
-            return CombatStatus::Lost;
+        ctx.combat
+            .watch
+            .observe(now, target_hp, ctx.state.last_damage_ms);
+        let reason = if dist > lost_at {
+            Some(LostReason::Far)
+        } else if now.saturating_sub(engaged_at) > timeout {
+            Some(LostReason::Timeout)
+        } else if travelling && ctx.combat.defending == obj && dist > TRAVEL_LOSE_M {
+            Some(LostReason::Travel)
+        } else if !is_char && ctx.combat.watch.no_target >= NO_TARGET_GIVE_UP {
+            // The server keeps saying the unit does not exist: the bot's picture of it is stale.
+            Some(LostReason::Gone)
+        } else if !is_char && ctx.combat.watch.stalled(now) {
+            // No hit point lost on either side for a long while: the target cannot be hurt from
+            // here (an unreachable ledge, a wall, evading), whatever the casts say.
+            Some(LostReason::Stalled)
+        } else if !is_char && ctx.combat.watch.obstacles >= OBSTACLE_GIVE_UP {
+            Some(LostReason::Blocked)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            ctx.log.debug(format!("giving up unit {obj}: {reason:?}"));
+            return Self::lose(ctx, reason);
+        }
+        // A cast the server refused for an obstacle: take another position around the target
+        // and cast nothing until the bot is there.
+        if std::mem::take(&mut ctx.combat.watch.sidestep) {
+            Self::sidestep(ctx, upos, dist);
+        }
+        if now < ctx.combat.watch.hold_until_ms {
+            if ctx.motion.is_moving() {
+                ctx.motion.face(upos[0], upos[1]);
+            }
+            return CombatStatus::Fighting;
         }
 
         // What the rotation wants this tick.
@@ -791,9 +996,8 @@ impl Combat {
                 && matches!(ctx.motion.status(), MotionStatus::Failed(_))
             {
                 // The way to the target is blocked: give up on it.
-                ctx.combat.disengage();
                 ctx.motion.stop();
-                return CombatStatus::Lost;
+                return Self::lose(ctx, LostReason::Blocked);
             }
             let moved_target = ctx
                 .combat
@@ -828,6 +1032,76 @@ impl Combat {
             }
         }
         CombatStatus::Fighting
+    }
+
+    /// Gives the target up: notes how, and disengages.
+    fn lose(ctx: &mut Ctx<'_>, reason: LostReason) -> CombatStatus {
+        let dealt = ctx.combat.watch.dealt;
+        let loss = Loss { reason, dealt };
+        ctx.combat.loss = Some(loss);
+        if let Some(obj) = ctx.combat.target {
+            Self::shun(ctx, obj, loss);
+        }
+        ctx.combat.disengage();
+        CombatStatus::Lost
+    }
+
+    /// Leaves `obj` alone after the controller gave it up. A goal that picked the fight does the
+    /// same on its own terms (and for the whole kind); this covers what nobody picked: a defence
+    /// would take up the same unit again as soon as it targets the bot, and a unit the server
+    /// does not know would be tried again by whatever goal still has it in view.
+    fn shun(ctx: &mut Ctx<'_>, obj: u32, loss: Loss) {
+        let now = ctx.now_ms;
+        let unknown = ctx.combat.watch.no_target >= NO_TARGET_GIVE_UP;
+        if loss.unreachable() {
+            ctx.state
+                .avoid_mut()
+                .ignore_obj(obj, now + super::avoid::UNREACHABLE_MS);
+        } else if unknown {
+            ctx.state.avoid_mut().ignore_obj(obj, now + GONE_IGNORE_MS);
+        }
+        if unknown {
+            ctx.state.units.remove(&obj);
+        }
+    }
+
+    /// Walks to another place around the target after the server refused a cast because
+    /// something blocks the line of sight: on a circle around the target, a little closer, at a
+    /// wider angle with every further refusal, alternating the side. Returns whether the bot
+    /// started walking.
+    fn sidestep(ctx: &mut Ctx<'_>, upos: [f32; 3], dist: f32) -> bool {
+        let now = ctx.now_ms;
+        let me = ctx.state.me.pos;
+        let n = ctx.combat.watch.obstacles.max(1);
+        let bearing = (me[1] - upos[1]).atan2(me[0] - upos[0]);
+        let deg = SIDESTEP_DEG.0 + SIDESTEP_DEG.1 * f32::from(n - 1);
+        let first = if (u32::from(n) + ctx.persona.id) % 2 == 1 {
+            1.0
+        } else {
+            -1.0
+        };
+        let radius = (dist * 0.75).clamp(2.0, 30.0);
+        let tries = [
+            (first, radius),
+            (-first, radius),
+            (0.0, (dist * 0.5).clamp(1.5, 30.0)),
+        ];
+        for (sign, r) in tries {
+            let a = bearing + sign * deg.to_radians();
+            let (x, y) = (upos[0] + a.cos() * r, upos[1] + a.sin() * r);
+            if !super::goals::walkable(ctx.world, x, y) {
+                continue;
+            }
+            ctx.motion.go_to(x, y, 1.0, Pace::Run, now);
+            let c = &mut *ctx.combat;
+            c.last_goto = None;
+            c.kite_until_ms = now + OBSTACLE_HOLD_MS + 1_000;
+            ctx.log.debug(format!(
+                "line of sight blocked (try {n}): stepping to {x:.0}, {y:.0}"
+            ));
+            return true;
+        }
+        false
     }
 
     /// Asks the rotation what to do against `target` at `dist` metres.
@@ -1175,11 +1449,30 @@ fn named_attacker(
 /// points) the nearest monster close by.
 fn pick_threat(ctx: &Ctx<'_>, limits: &ThreatLimits) -> Option<u32> {
     let me = ctx.state.me.pos;
-    if let Some(obj) = named_attacker(&ctx.state.threats, &ctx.state.units, me, ctx.now_ms, limits)
-    {
-        return Some(obj);
+    let hurt = ctx.state.damaged_within(DAMAGE_WINDOW_MS);
+    // Units the controller gave up on (nobody could hurt anybody) are not defended against again,
+    // unless the bot is losing hit points after all.
+    let named = if ctx.state.avoid.is_some() && !hurt {
+        let threats: SmallVec<[(u32, u64); 8]> = ctx
+            .state
+            .threats
+            .iter()
+            .copied()
+            .filter(|&(obj, _)| {
+                !ctx.state
+                    .units
+                    .get(&obj)
+                    .is_some_and(|u| ctx.state.avoids(obj, u.id, ctx.now_ms))
+            })
+            .collect();
+        named_attacker(&threats, &ctx.state.units, me, ctx.now_ms, limits)
+    } else {
+        named_attacker(&ctx.state.threats, &ctx.state.units, me, ctx.now_ms, limits)
+    };
+    if named.is_some() {
+        return named;
     }
-    if !ctx.state.damaged_within(DAMAGE_WINDOW_MS) {
+    if !hurt {
         return None;
     }
     let mut near: Option<(u32, f32)> = None;
@@ -1572,6 +1865,170 @@ mod tests {
         );
         // first item: index 3, owner type 1, owner 9
         assert_eq!(out[0].body[..4], [3, 0, 1, 0]);
+    }
+
+    #[test]
+    fn the_watch_sees_progress_on_either_side_and_stalls_without_it() {
+        let mut w = Watch::default();
+        assert!(!w.stalled(1_000_000), "nothing observed yet");
+        w.observe(1_000, 100, 0);
+        assert!(!w.dealt);
+        assert!(!w.stalled(1_000 + NO_DAMAGE_MS));
+        assert!(w.stalled(1_000 + NO_DAMAGE_MS + 1));
+        // the target loses hit points: progress, and the bot can hurt it at all
+        w.observe(20_000, 90, 0);
+        assert!(w.dealt);
+        assert!(!w.stalled(20_000 + NO_DAMAGE_MS));
+        // healing is not progress
+        w.observe(30_000, 100, 0);
+        assert!(w.stalled(20_000 + NO_DAMAGE_MS + 1));
+        // the bot is hurt: progress too (the monster does fight back)
+        w.observe(45_000, 100, 44_000);
+        assert!(!w.stalled(45_000 + NO_DAMAGE_MS));
+        assert!(w.stalled(45_000 + NO_DAMAGE_MS + 1));
+        // damage the bot took before the fight is no progress of the fight
+        let mut w = Watch::default();
+        w.observe(5_000, 100, 4_000);
+        w.observe(6_000, 100, 4_000);
+        assert!(w.stalled(5_000 + NO_DAMAGE_MS + 1));
+        assert!(!w.dealt);
+    }
+
+    #[test]
+    fn a_target_that_was_never_hurt_is_called_unreachable_after_a_timeout() {
+        let loss = |reason, dealt| Loss { reason, dealt };
+        for dealt in [false, true] {
+            assert!(loss(LostReason::Stalled, dealt).unreachable());
+            assert!(loss(LostReason::Blocked, dealt).unreachable());
+            assert!(!loss(LostReason::Gone, dealt).unreachable());
+            assert!(!loss(LostReason::Far, dealt).unreachable());
+            assert!(!loss(LostReason::Travel, dealt).unreachable());
+        }
+        assert!(loss(LostReason::Timeout, false).unreachable());
+        assert!(
+            !loss(LostReason::Timeout, true).unreachable(),
+            "a long fight that did hurt the target is just a hard monster"
+        );
+        // the give-up comes well before the fight timeout
+        const _: () = assert!(NO_DAMAGE_MS * 2 < FIGHT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn a_line_of_sight_refusal_repositions_instead_of_counting_as_a_skill_failure() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        let started = |caster: u32, result: u8| {
+            ServerEvent::World(WorldEvent::SkillStarted {
+                caster_obj: caster,
+                skill: 18132,
+                tl: 1,
+                target_obj: 5,
+                result,
+            })
+        };
+        let gcd = c.gcd_ms;
+        // someone else's refusal is none of the bot's business
+        c.on_event(&started(0x500, OBSTACLE_REFUSED), 0x400, 900, &mut out);
+        assert_eq!(c.casts_obstructed(), 0);
+        assert!(!c.watch.sidestep);
+
+        c.on_event(&started(0x400, OBSTACLE_REFUSED), 0x400, 1000, &mut out);
+        assert_eq!(c.casts_obstructed(), 1);
+        assert_eq!(c.casts_refused(), 0, "not a failure of the skill");
+        assert!(c.watch.sidestep, "the controller takes another position");
+        assert_eq!(c.watch.hold_until_ms, 1000 + OBSTACLE_HOLD_MS);
+        assert_eq!(c.gcd_ms, gcd, "no cooldown lesson either");
+        assert_eq!(c.range_pen, 0.0);
+        assert!(c.backoffs.blocked(18132, 1001));
+        assert!(!c.backoffs.blocked(18132, 1000 + SHORT_BACKOFF_MS));
+        // repeated refusals never escalate the back-off
+        for i in 1..OBSTACLE_GIVE_UP {
+            c.on_event(
+                &started(0x400, OBSTACLE_REFUSED),
+                0x400,
+                1000 + u64::from(i) * 5_000,
+                &mut out,
+            );
+        }
+        assert_eq!(c.watch.obstacles, OBSTACLE_GIVE_UP);
+        let last = 1000 + u64::from(OBSTACLE_GIVE_UP - 1) * 5_000;
+        assert!(!c.backoffs.blocked(18132, last + SHORT_BACKOFF_MS));
+        assert_eq!(c.casts_refused(), 0);
+        // a cast that goes through ends the streak
+        c.on_event(&started(0x400, 0), 0x400, last + 2_000, &mut out);
+        assert_eq!(c.watch.obstacles, 0);
+        // a real refusal still counts
+        c.on_event(&started(0x400, 3), 0x400, last + 3_000, &mut out);
+        assert_eq!(c.casts_refused(), 1);
+        // the totals survive a reset, the per-fight streak does not
+        c.on_event(
+            &started(0x400, OBSTACLE_REFUSED),
+            0x400,
+            last + 4_000,
+            &mut out,
+        );
+        c.reset();
+        assert_eq!(c.casts_obstructed(), u32::from(OBSTACLE_GIVE_UP) + 1);
+        assert_eq!(c.watch.obstacles, 0);
+        assert!(!c.watch.sidestep);
+    }
+
+    #[test]
+    fn refusals_for_a_missing_target_are_counted_against_the_current_target() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        let started = |target: u32, result: u8| {
+            ServerEvent::World(WorldEvent::SkillStarted {
+                caster_obj: 0x400,
+                skill: 18132,
+                tl: 1,
+                target_obj: target,
+                result,
+            })
+        };
+        // no target engaged: nothing to count
+        c.on_event(&started(5, NO_TARGET_REFUSED), 0x400, 1000, &mut out);
+        assert_eq!(c.watch.no_target, 0);
+        c.engage(5);
+        c.on_event(&started(6, NO_TARGET_REFUSED), 0x400, 1100, &mut out);
+        assert_eq!(c.watch.no_target, 0, "another unit");
+        for i in 1..=NO_TARGET_GIVE_UP {
+            c.on_event(&started(5, NO_TARGET_REFUSED), 0x400, 2000, &mut out);
+            assert_eq!(c.watch.no_target, i);
+        }
+        // these are failures of the skill like any other
+        assert_eq!(c.casts_refused(), u32::from(NO_TARGET_GIVE_UP) + 2);
+        // a cast that goes through shows that the target exists
+        c.on_event(&started(5, 0), 0x400, 3000, &mut out);
+        assert_eq!(c.watch.no_target, 0);
+        // a new fight starts clean
+        c.on_event(&started(5, NO_TARGET_REFUSED), 0x400, 3100, &mut out);
+        c.engage(7);
+        assert_eq!(c.watch.no_target, 0);
+    }
+
+    #[test]
+    fn restarting_a_fight_keeps_the_target_and_forgets_the_lessons() {
+        let mut c = Combat::new();
+        c.restart_fight();
+        assert!(c.target().is_none(), "nothing to restart");
+        c.engage(5);
+        c.watch.dealt = true;
+        c.watch.obstacles = 3;
+        c.watch.sidestep = true;
+        c.range_pen = 3.0;
+        c.backoffs.fail(7, 0);
+        c.kite_until_ms = 99;
+        c.next_kite_ms = 99;
+        c.announced = true;
+        c.restart_fight();
+        assert_eq!(c.target(), Some(5));
+        assert!(!c.dealt_damage());
+        assert_eq!((c.watch.obstacles, c.watch.sidestep), (0, false));
+        assert_eq!(c.range_pen, 0.0);
+        assert!(!c.backoffs.blocked(7, 1));
+        assert_eq!((c.kite_until_ms, c.next_kite_ms), (0, 0));
+        assert!(!c.announced, "the target is announced afresh");
     }
 
     #[test]

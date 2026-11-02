@@ -19,6 +19,7 @@
 //! handed to the [`Brain`](brain::Brain); goals never see the connection, only the outbox
 //! (`ctx.out`), which the task flushes after the tick.
 
+pub mod avoid;
 pub mod brain;
 pub mod cmd;
 pub mod combat;
@@ -266,6 +267,7 @@ impl Bot {
 
     fn go_offline(&mut self) {
         self.online_since = None;
+        self.shared.hub.contest.release_bot(self.entry.id);
         self.motion.leave_world();
         self.slot.set_offline();
     }
@@ -835,7 +837,9 @@ mod tests {
         for (name, n) in sizes {
             println!("size_of {name}: {n} bytes");
         }
-        assert!(size_of::<Bot>() < 3072, "Bot is {} bytes", size_of::<Bot>());
+        // 3 KB plus the fight watch, the death/duel/gate notes and the unreachable-monster
+        // pointer the behaviour fixes added (about 100 bytes).
+        assert!(size_of::<Bot>() < 3200, "Bot is {} bytes", size_of::<Bot>());
         assert!(size_of::<goals::Goal>() <= 160);
         assert!(size_of::<state::Unit>() <= 64);
     }

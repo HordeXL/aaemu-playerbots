@@ -247,7 +247,7 @@ h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: 
 
 #stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 6px;
   flex: none;
 }
@@ -260,6 +260,8 @@ h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: 
   display: flex;
   flex-direction: column;
 }
+.tile { grid-column: span 2; }
+.tile.half { grid-column: span 3; }
 .tile.wide { grid-column: 1 / -1; }
 .tile .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .tile b { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

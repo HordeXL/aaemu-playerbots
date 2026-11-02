@@ -85,6 +85,16 @@ struct Sim {
     /// What the server refused, for the asserts.
     refused: Vec<String>,
     started: Vec<u32>,
+    /// Casts of an item, by item template.
+    item_casts: HashMap<u32, u32>,
+    /// The server takes item casts and does nothing with them: no credit, the item stays.
+    deaf_items: bool,
+    /// The server credits an item cast this long after it (0 = at once), like its quest engine.
+    item_delay_ms: u64,
+    /// Credits still to come: `(due bot clock, item template)`.
+    item_pending: Vec<(u64, u32)>,
+    /// Item casts credited, by item template.
+    item_credited: HashMap<u32, u32>,
 }
 
 impl Rig {
@@ -187,7 +197,29 @@ impl Rig {
         };
         self.motion.tick(&mut env);
         self.state.me.pos = self.motion.pos();
+        self.credit_due_items();
         self.serve();
+    }
+
+    /// Credits the item casts whose delay has passed.
+    fn credit_due_items(&mut self) {
+        let now = self.now_ms;
+        let due: Vec<u32> = self
+            .sim
+            .item_pending
+            .iter()
+            .filter(|p| p.0 <= now)
+            .map(|p| p.1)
+            .collect();
+        self.sim.item_pending.retain(|p| p.0 > now);
+        for template in due {
+            *self.sim.item_credited.entry(template).or_default() += 1;
+            self.credit(
+                |k| matches!(k, ObjKind::UseItem { item, .. } if *item == template),
+                1,
+                None,
+            );
+        }
     }
 
     fn feed_world(&mut self, ev: WorldEvent) {
@@ -540,6 +572,16 @@ impl Rig {
         let target_type = s.read_u8().unwrap();
         let target = s.read_bc().unwrap();
         if caster_type == 2 {
+            *self.sim.item_casts.entry(item_template).or_default() += 1;
+            if self.sim.deaf_items {
+                return;
+            }
+            if self.sim.item_delay_ms > 0 {
+                let due = self.now_ms + self.sim.item_delay_ms;
+                self.sim.item_pending.push((due, item_template));
+                return;
+            }
+            *self.sim.item_credited.entry(item_template).or_default() += 1;
             self.credit(
                 |k| matches!(k, ObjKind::UseItem { item, .. } if *item == item_template),
                 1,
@@ -693,5 +735,90 @@ fn other_races_start_their_chains_too() {
             rig.sim.completed, rig.sim.started, rig.sim.refused
         );
         assert!(!rig.sim.completed.is_empty(), "race {race} did nothing");
+    }
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn items_the_server_does_not_consume_are_not_cast_for_ever() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let mut rig = Rig::new(world, 1, 11);
+    rig.sim.deaf_items = true;
+    rig.force(GoalKind::Quest);
+    run_for(&mut rig, 25);
+    println!("item casts: {:?}", rig.sim.item_casts);
+    println!("completed: {:?}", rig.sim.completed);
+    for (item, n) in &rig.sim.item_casts {
+        assert!(*n <= 12, "item {item} was cast {n} times");
+    }
+    assert!(
+        !rig.sim.completed.is_empty(),
+        "the bot went on to other quests"
+    );
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_bot_hunts_another_monster_when_somebody_else_works_on_the_first() {
+    use playerbots::contest::unit_key;
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    const DECOY: u32 = 999;
+    // the first monster the bot claims, with the decoy holding `decoy_claim` all along
+    let first_claim = |decoy_claim: Option<u32>| -> Option<u32> {
+        let mut rig = Rig::new(world.clone(), 1, 11);
+        rig.force(GoalKind::Quest);
+        for _ in 0..(12 * 60 * 4) {
+            if let Some(obj) = decoy_claim {
+                rig.hub.contest.claim(unit_key(obj), DECOY);
+            }
+            rig.tick(250);
+            let mut held: Vec<u32> = rig
+                .state
+                .units
+                .keys()
+                .copied()
+                .filter(|&obj| rig.hub.contest.others(unit_key(obj), DECOY) > 0)
+                .collect();
+            held.sort_unstable();
+            if let Some(&obj) = held.first() {
+                return Some(obj);
+            }
+        }
+        None
+    };
+    let alone = first_claim(None).expect("the bot claims a monster when alone");
+    let crowded = first_claim(Some(alone)).expect("the bot claims a monster when that is taken");
+    assert_ne!(alone, crowded, "both bots hunted the same monster");
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_quest_item_is_cast_once_when_the_server_is_slow_to_credit_it() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    // the server's quest engine credits a cast about 3.5 s after it; a second cast before that
+    // would find the item gone once the quest has completed
+    let mut rig = Rig::new(world, 1, 11);
+    rig.sim.item_delay_ms = 3_500;
+    rig.force(GoalKind::Quest);
+    run_for(&mut rig, 25);
+    println!("item casts: {:?}", rig.sim.item_casts);
+    println!("item credits: {:?}", rig.sim.item_credited);
+    println!("completed: {:?}", rig.sim.completed);
+    assert!(
+        !rig.sim.item_casts.is_empty(),
+        "no quest item was ever used"
+    );
+    // every one of these quest objectives wants a single use
+    for (item, casts) in &rig.sim.item_casts {
+        assert_eq!(*casts, 1, "item {item} was cast {casts} times for one use");
     }
 }

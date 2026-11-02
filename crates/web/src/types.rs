@@ -152,6 +152,12 @@ pub struct HubStats {
     pub bytes_per_bot: u64,
     pub packets_in_per_sec: f32,
     pub packets_out_per_sec: f32,
+    /// Bytes received from the game server per second, all bots together.
+    #[serde(default)]
+    pub bytes_in_per_sec: f32,
+    /// Bytes sent to the game server per second, all bots together.
+    #[serde(default)]
+    pub bytes_out_per_sec: f32,
     pub uptime_secs: u64,
     pub llm: Option<LlmStats>,
     /// Serialized as `[["idle", 12], ["questing", 40], …]`.
@@ -465,6 +471,26 @@ mod tests {
         assert_eq!(v["activity_counts"][1][0], "trade_run");
         assert_eq!(v["activity_counts"][1][1], 1);
         assert!(v["llm"].is_null());
+    }
+
+    #[test]
+    fn stats_carry_the_traffic_rates_and_older_json_without_them_parses() {
+        let stats = HubStats {
+            bytes_in_per_sec: 12_345.5,
+            bytes_out_per_sec: 678.0,
+            ..HubStats::default()
+        };
+        let v = serde_json::to_value(&stats).unwrap();
+        assert_eq!(v["bytes_in_per_sec"], 12_345.5);
+        assert_eq!(v["bytes_out_per_sec"], 678.0);
+        let old: HubStats = serde_json::from_str(
+            r#"{"bots_total":1,"bots_online":1,"rss_bytes":2,"bytes_per_bot":3,
+                "packets_in_per_sec":4.0,"packets_out_per_sec":5.0,"uptime_secs":6,
+                "llm":null,"activity_counts":[]}"#,
+        )
+        .unwrap();
+        assert_eq!((old.bytes_in_per_sec, old.bytes_out_per_sec), (0.0, 0.0));
+        assert_eq!(old.packets_in_per_sec, 4.0);
     }
 
     #[test]

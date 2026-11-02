@@ -421,6 +421,8 @@ impl BotHub for MockHub {
             bytes_per_bot: if total > 0 { rss / u64::from(total) } else { 0 },
             packets_in_per_sec: f32::from(total as u16) * 3.1 + fastrand::f32() * 30.0,
             packets_out_per_sec: f32::from(total as u16) * 1.4 + fastrand::f32() * 10.0,
+            bytes_in_per_sec: f32::from(total as u16) * 410.0 + fastrand::f32() * 4_000.0,
+            bytes_out_per_sec: f32::from(total as u16) * 95.0 + fastrand::f32() * 900.0,
             uptime_secs: inner.started.elapsed().as_secs() + 7_300,
             llm: Some(LlmStats {
                 requests: 12 + inner.tick / 20,

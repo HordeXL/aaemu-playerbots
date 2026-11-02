@@ -14,6 +14,11 @@
 //!   rests to full afterwards. While it runs the partner is shown in the snapshot and a duel
 //!   flag marker is on the map.
 //!
+//! A duel in which nobody loses a hit point is not left to run into the server's five-minute
+//! draw: after [`STALL_NUDGE_MS`] the bot walks up to the opponent and starts the fight afresh,
+//! and when [`STALL_QUIT_MS`] later still nothing happened it walks [`WALK_AWAY_M`] away from
+//! the flag, which the server counts as a surrender (there is no surrender packet).
+//!
 //! Server rules the goal works around (`systems/social/duel.rs`): a challenge expires after 30 s
 //! (the challenger gets error 507 `TargetRejectedDuel`), a bot cannot be in two duels (504 bad
 //! target, 505/506 already in a duel, 513 self), the duel starts 3 s after the acceptance and ends
@@ -69,6 +74,14 @@ const COUNTDOWN_TIMEOUT_MS: u64 = 10_000;
 const FIGHT_TIMEOUT_MS: u64 = 330_000;
 /// The opponent may be out of sight this long during a fight.
 const OPPONENT_GONE_MS: u64 = 10_000;
+/// Neither side lost a hit point for this long: walk up to the opponent and fight afresh.
+const STALL_NUDGE_MS: u64 = 45_000;
+/// Still nothing this long after the nudge: leave the duel.
+const STALL_QUIT_MS: u64 = 30_000;
+/// The server ends a duel for a side that is this far from the flag (`DistanceForSurrender`).
+const SURRENDER_M: f32 = 75.0;
+/// How far from the flag a bot that leaves walks (a margin over [`SURRENDER_M`]).
+const WALK_AWAY_M: f32 = SURRENDER_M + 12.0;
 /// Rest after the duel: at least this long, at most [`RECOVER_MAX_MS`].
 const RECOVER_MIN_MS: u64 = 5_000;
 const RECOVER_MAX_MS: u64 = 60_000;
@@ -162,6 +175,8 @@ pub struct DuelWatch {
     attended: bool,
     started: u16,
     finished: u16,
+    /// The goal walks away from a stalled duel: the controller must not fight the opponent.
+    withdraw: bool,
 }
 
 impl DuelWatch {
@@ -204,6 +219,7 @@ impl DuelWatch {
                     since_ms: now_ms,
                 };
                 self.pending = None;
+                self.withdraw = false;
                 self.started = self.started.saturating_add(1);
             }
             ActivityEvent::DuelEnded {
@@ -230,6 +246,7 @@ impl DuelWatch {
                 });
                 self.phase = DuelPhase::Idle;
                 self.pending = None;
+                self.withdraw = false;
                 self.finished = self.finished.saturating_add(1);
             }
             _ => {}
@@ -245,6 +262,17 @@ impl DuelWatch {
     /// The goal no longer expects anything.
     pub fn clear_expect(&mut self) {
         self.expect = None;
+    }
+
+    /// The goal leaves a duel that went nowhere (`on`): the controller stops fighting the
+    /// opponent until the duel is over.
+    pub fn set_withdraw(&mut self, on: bool) {
+        self.withdraw = on;
+    }
+
+    /// Whether the goal is walking away from the duel.
+    pub fn withdrawing(&self) -> bool {
+        self.withdraw
     }
 
     /// Marks whether a duel goal is running (it reads the end of the duel itself).
@@ -304,6 +332,7 @@ impl DuelWatch {
     pub fn clear_notes(&mut self) {
         self.error = None;
         self.ended = None;
+        self.withdraw = false;
     }
 
     /// Decides what to do with the pending challenge. `idle` says the bot may take an
@@ -333,6 +362,104 @@ impl DuelWatch {
         self.pending = None;
         Answer::Accept(p.challenger)
     }
+}
+
+// ---- the stall watch ---------------------------------------------------------------------------
+
+/// What the stall watch wants done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallStep {
+    /// Nothing.
+    Fine,
+    /// Walk up to the opponent and start the fight afresh.
+    Nudge,
+    /// Leave the duel (walk away from the flag).
+    Leave,
+}
+
+/// Watches the hit points of both duellists. A loss on either side is progress; healing is not.
+#[derive(Debug, Clone, Copy)]
+pub struct Stall {
+    mine: i32,
+    foe: Option<i32>,
+    /// Bot clock of the last hit point loss on either side (the start of the fight before that).
+    quiet_since_ms: u64,
+    /// Bot clock of the nudge, 0 before it.
+    nudged_ms: u64,
+    leaving: bool,
+    /// Where the flag stands.
+    flag: (f32, f32),
+}
+
+impl Stall {
+    /// A watch that starts at `now_ms` with the hit points seen then.
+    pub fn new(now_ms: u64, mine: i32, foe: Option<i32>, flag: (f32, f32)) -> Stall {
+        Stall {
+            mine,
+            foe,
+            quiet_since_ms: now_ms,
+            nudged_ms: 0,
+            leaving: false,
+            flag,
+        }
+    }
+
+    /// Notes the hit points at `now_ms` and says what to do.
+    pub fn observe(&mut self, now_ms: u64, mine: i32, foe: Option<i32>) -> StallStep {
+        let hurt = mine < self.mine || matches!((foe, self.foe), (Some(f), Some(p)) if f < p);
+        self.mine = mine;
+        if foe.is_some() {
+            self.foe = foe;
+        }
+        if self.leaving {
+            return StallStep::Fine;
+        }
+        if hurt {
+            self.quiet_since_ms = now_ms;
+            self.nudged_ms = 0;
+            return StallStep::Fine;
+        }
+        if self.nudged_ms == 0 {
+            if now_ms.saturating_sub(self.quiet_since_ms) >= STALL_NUDGE_MS {
+                self.nudged_ms = now_ms;
+                return StallStep::Nudge;
+            }
+        } else if now_ms.saturating_sub(self.nudged_ms) >= STALL_QUIT_MS {
+            self.leaving = true;
+            return StallStep::Leave;
+        }
+        StallStep::Fine
+    }
+
+    /// The flag position.
+    pub fn flag(&self) -> (f32, f32) {
+        self.flag
+    }
+}
+
+/// A point [`WALK_AWAY_M`] from `flag`, in the direction of `away_from` -> `me` (else of
+/// `flag` -> `me`), turned in steps of 45 degrees until `ok` accepts it.
+pub fn leave_point(
+    flag: (f32, f32),
+    me: [f32; 3],
+    away_from: Option<[f32; 3]>,
+    ok: impl Fn(f32, f32) -> bool,
+) -> Option<(f32, f32)> {
+    let (ox, oy) = away_from.map_or(flag, |p| (p[0], p[1]));
+    let (dx, dy) = (me[0] - ox, me[1] - oy);
+    let base = if dx.abs() + dy.abs() < 0.1 {
+        0.0
+    } else {
+        dy.atan2(dx)
+    };
+    (0..8).find_map(|i| {
+        let a = base + (i as f32) * std::f32::consts::FRAC_PI_4;
+        let (x, y) = (
+            flag.0 + a.cos() * WALK_AWAY_M,
+            flag.1 + a.sin() * WALK_AWAY_M,
+        );
+        ok(x, y).then_some((x, y))
+    })
 }
 
 // ---- the goal ----------------------------------------------------------------------------------
@@ -379,6 +506,8 @@ pub struct Duel {
     result: Option<(Outcome, u64)>,
     partner_char: u32,
     next_request_ms: u64,
+    /// The stall watch of the fight, created when it starts.
+    stall: Option<Box<Stall>>,
 }
 
 impl Duel {
@@ -396,6 +525,7 @@ impl Duel {
             result: None,
             partner_char: 0,
             next_request_ms: 0,
+            stall: None,
         }
     }
 
@@ -763,6 +893,13 @@ impl Duel {
         };
         let label = format!("duel: {} vs {}", ctx.persona.name, self.partner_name(ctx));
         ctx.hub.set_duel_flag(self.flag_key, x, y, label);
+        let foe = ctx.state.units.get(&opponent).map(|u| u.hp);
+        self.stall = Some(Box::new(Stall::new(
+            ctx.now_ms,
+            ctx.state.me.hp,
+            foe,
+            (x, y),
+        )));
     }
 
     fn fighting(&mut self, ctx: &mut Ctx<'_>) -> Step {
@@ -783,8 +920,46 @@ impl Duel {
             } else if now.saturating_sub(self.last_seen_ms) > OPPONENT_GONE_MS {
                 return Err(GoalStatus::Failed(FailReason::Other("lost the opponent")));
             }
+            self.watch_stall(ctx, opp);
         }
         Ok(())
+    }
+
+    /// Nudges a duel in which nobody loses hit points, and finally leaves it.
+    fn watch_stall(&mut self, ctx: &mut Ctx<'_>, opp: u32) {
+        let now = ctx.now_ms;
+        let foe = ctx.state.units.get(&opp).map(|u| u.hp);
+        let mine = ctx.state.me.hp;
+        let me = ctx.pos();
+        let stall = self
+            .stall
+            .get_or_insert_with(|| Box::new(Stall::new(now, mine, foe, (me[0], me[1]))));
+        let flag = stall.flag();
+        match stall.observe(now, mine, foe) {
+            StallStep::Fine => {}
+            StallStep::Nudge => {
+                ctx.log
+                    .say("duel: nobody is getting hurt; closing in on the opponent");
+                ctx.combat.restart_fight();
+                if let Some(u) = ctx.state.units.get(&opp) {
+                    let pos = u.pos;
+                    ctx.travel(pos[0], pos[1], 2.5, Pace::Run);
+                }
+            }
+            StallStep::Leave => {
+                let foe_pos = ctx.state.units.get(&opp).map(|u| u.pos);
+                let world = ctx.world;
+                let spot = leave_point(flag, me, foe_pos, |x, y| super::walkable(world, x, y));
+                ctx.log
+                    .say("duel: still nobody is getting hurt; leaving it");
+                ctx.combat.duel.set_withdraw(true);
+                ctx.combat.disengage();
+                match spot {
+                    Some((x, y)) => ctx.travel(x, y, 1.0, Pace::Run),
+                    None => ctx.motion.stop(),
+                }
+            }
+        }
     }
 
     fn finish(&mut self, ctx: &mut Ctx<'_>, end: DuelEnd) {
@@ -1075,6 +1250,124 @@ mod tests {
             1,
         );
         assert!(!w.in_duel());
+    }
+
+    fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn a_duel_nobody_loses_hit_points_in_is_nudged_once_and_then_left() {
+        let t0 = 10_000;
+        let mut s = Stall::new(t0, 1000, Some(1000), (5.0, 5.0));
+        let quiet = |s: &mut Stall, at: u64| s.observe(at, 1000, Some(1000));
+        assert_eq!(quiet(&mut s, t0 + 1_000), StallStep::Fine);
+        assert_eq!(quiet(&mut s, t0 + STALL_NUDGE_MS - 1), StallStep::Fine);
+        assert_eq!(quiet(&mut s, t0 + STALL_NUDGE_MS), StallStep::Nudge);
+        // once only
+        let n = t0 + STALL_NUDGE_MS;
+        assert_eq!(quiet(&mut s, n + 1_000), StallStep::Fine);
+        assert_eq!(quiet(&mut s, n + STALL_QUIT_MS - 1), StallStep::Fine);
+        assert_eq!(quiet(&mut s, n + STALL_QUIT_MS), StallStep::Leave);
+        // and once only
+        assert_eq!(quiet(&mut s, n + STALL_QUIT_MS + 60_000), StallStep::Fine);
+        assert_eq!(s.flag(), (5.0, 5.0));
+        // the whole thing is over well before the server's five minute draw
+        const _: () = assert!(STALL_NUDGE_MS + STALL_QUIT_MS < 150_000);
+    }
+
+    #[test]
+    fn a_lost_hit_point_on_either_side_is_progress_and_healing_is_not() {
+        let t0 = 1_000;
+        let mut s = Stall::new(t0, 1000, Some(1000), (0.0, 0.0));
+        // healing, or the opponent out of view, is no progress
+        assert_eq!(s.observe(t0 + 20_000, 1000, None), StallStep::Fine);
+        assert_eq!(
+            s.observe(t0 + 40_000, 1000, Some(1000)),
+            StallStep::Fine,
+            "the opponent is back at the hit points it had"
+        );
+        // the opponent loses hit points: the clock starts afresh
+        assert_eq!(s.observe(t0 + 44_000, 1000, Some(990)), StallStep::Fine);
+        assert_eq!(
+            s.observe(t0 + 44_000 + STALL_NUDGE_MS - 1, 1000, Some(990)),
+            StallStep::Fine
+        );
+        let nudge_at = t0 + 44_000 + STALL_NUDGE_MS;
+        assert_eq!(s.observe(nudge_at, 1000, Some(995)), StallStep::Nudge);
+        // the nudge worked: the bot is hit, and the stall is over until the next quiet spell
+        assert_eq!(s.observe(nudge_at + 5_000, 900, Some(995)), StallStep::Fine);
+        assert_eq!(
+            s.observe(nudge_at + 5_000 + STALL_QUIT_MS, 900, Some(995)),
+            StallStep::Fine,
+            "no leaving after a nudge that worked"
+        );
+        assert_eq!(
+            s.observe(nudge_at + 5_000 + STALL_NUDGE_MS, 900, Some(995)),
+            StallStep::Nudge,
+            "a new quiet spell is nudged again"
+        );
+        // a bot that is healed, not hurt, makes no progress either
+        let mut h = Stall::new(0, 500, Some(1000), (0.0, 0.0));
+        assert_eq!(h.observe(30_000, 700, Some(1000)), StallStep::Fine);
+        assert_eq!(h.observe(STALL_NUDGE_MS, 800, Some(1000)), StallStep::Nudge);
+    }
+
+    #[test]
+    fn the_leaving_point_lies_past_the_surrender_distance_away_from_the_opponent() {
+        let flag = (100.0, 100.0);
+        let me = [90.0, 100.0, 0.0];
+        let foe = Some([110.0, 100.0, 0.0]);
+        let p = leave_point(flag, me, foe, |_, _| true).expect("open ground");
+        assert!(dist(p, flag) > SURRENDER_M, "{p:?}");
+        assert!((dist(p, flag) - WALK_AWAY_M).abs() < 0.01);
+        assert!(
+            p.0 < flag.0 - 80.0,
+            "away from the opponent, to the west: {p:?}"
+        );
+        // the first direction is blocked: the next free one is taken, still past the distance
+        let q = leave_point(flag, me, foe, |x, _| x > flag.0 - 50.0).expect("a free direction");
+        assert!(q.0 > flag.0 - 50.0);
+        assert!(dist(q, flag) > SURRENDER_M);
+        // nowhere to go
+        assert!(leave_point(flag, me, foe, |_, _| false).is_none());
+        // without an opponent in view the bot leaves along flag -> bot
+        let r = leave_point(flag, [100.0, 130.0, 0.0], None, |_, _| true).unwrap();
+        assert!(r.1 > flag.1 + 80.0, "{r:?}");
+        // standing on the flag: some direction is still chosen
+        let s = leave_point(flag, [100.0, 100.0, 0.0], None, |_, _| true).unwrap();
+        assert!(dist(s, flag) > SURRENDER_M);
+    }
+
+    #[test]
+    fn walking_away_lasts_until_the_duel_is_over_and_a_new_duel_starts_clean() {
+        let mut w = DuelWatch::default();
+        let started = act(ActivityEvent::DuelStarted {
+            challenger_obj: FOE,
+            challenged_obj: ME,
+        });
+        assert!(!w.withdrawing());
+        w.on_event(&started, ME, 1000);
+        w.set_withdraw(true);
+        assert!(w.withdrawing());
+        w.on_event(
+            &act(ActivityEvent::DuelEnded {
+                winner_id: 2,
+                loser_id: 1,
+                winner_obj: FOE,
+                loser_obj: ME,
+                det: duel_det::WIN,
+            }),
+            ME,
+            2000,
+        );
+        assert!(!w.withdrawing(), "the surrender ended it");
+        w.set_withdraw(true);
+        w.on_event(&started, ME, 3000);
+        assert!(!w.withdrawing(), "a new duel starts clean");
+        w.set_withdraw(true);
+        w.clear_notes();
+        assert!(!w.withdrawing());
     }
 
     #[test]

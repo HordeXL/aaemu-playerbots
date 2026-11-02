@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use crate::bot::cmd::{BotCmd, GoalChoice};
 use crate::bot::goals::social::gate::ChatHub;
 use crate::bot::goals::social::SlotSocial;
+use crate::contest::Contest;
 
 /// Entries of a bot's event log.
 pub const LOG_LINES: usize = 32;
@@ -190,22 +191,54 @@ struct Rates {
     at: Instant,
     packets_in: u64,
     packets_out: u64,
+    bytes_in: u64,
+    bytes_out: u64,
     in_per_sec: f32,
     out_per_sec: f32,
+    bytes_in_per_sec: f32,
+    bytes_out_per_sec: f32,
+}
+
+/// The counter values [`Rates::update`] turns into rates.
+#[derive(Debug, Clone, Copy, Default)]
+struct Totals {
+    packets_in: u64,
+    packets_out: u64,
+    bytes_in: u64,
+    bytes_out: u64,
 }
 
 impl Rates {
+    /// Rates that start counting at `now` from zero totals.
+    fn new(now: Instant) -> Rates {
+        Rates {
+            at: now,
+            packets_in: 0,
+            packets_out: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            in_per_sec: 0.0,
+            out_per_sec: 0.0,
+            bytes_in_per_sec: 0.0,
+            bytes_out_per_sec: 0.0,
+        }
+    }
+
     /// Recomputes the per-second rates from the counters if a window has passed.
-    fn update(&mut self, now: Instant, packets_in: u64, packets_out: u64) {
+    fn update(&mut self, now: Instant, t: Totals) {
         let dt = now.saturating_duration_since(self.at);
         if dt < RATE_WINDOW {
             return;
         }
         let secs = dt.as_secs_f32();
-        self.in_per_sec = packets_in.saturating_sub(self.packets_in) as f32 / secs;
-        self.out_per_sec = packets_out.saturating_sub(self.packets_out) as f32 / secs;
-        self.packets_in = packets_in;
-        self.packets_out = packets_out;
+        self.in_per_sec = t.packets_in.saturating_sub(self.packets_in) as f32 / secs;
+        self.out_per_sec = t.packets_out.saturating_sub(self.packets_out) as f32 / secs;
+        self.bytes_in_per_sec = t.bytes_in.saturating_sub(self.bytes_in) as f32 / secs;
+        self.bytes_out_per_sec = t.bytes_out.saturating_sub(self.bytes_out) as f32 / secs;
+        self.packets_in = t.packets_in;
+        self.packets_out = t.packets_out;
+        self.bytes_in = t.bytes_in;
+        self.bytes_out = t.bytes_out;
         self.at = now;
     }
 }
@@ -284,6 +317,8 @@ pub struct Hub {
     bot_chars: RwLock<FxHashSet<u32>>,
     /// Chat limits and the names of our bots.
     pub chat: ChatHub,
+    /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
+    pub contest: Contest,
     /// Packet counters; bot tasks add to them.
     pub counters: Counters,
     rates: Mutex<Rates>,
@@ -309,14 +344,9 @@ impl Hub {
             slots: RwLock::new(FxHashMap::default()),
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
+            contest: Contest::new(),
             counters: Counters::default(),
-            rates: Mutex::new(Rates {
-                at: Instant::now(),
-                packets_in: 0,
-                packets_out: 0,
-                in_per_sec: 0.0,
-                out_per_sec: 0.0,
-            }),
+            rates: Mutex::new(Rates::new(Instant::now())),
             rss: Mutex::new(Rss::new()),
             started: Instant::now(),
             markers: Mutex::new(Markers {
@@ -382,10 +412,15 @@ impl Hub {
 
     /// Call about once a second: refreshes the packet rates and (every 2 s) the memory figure.
     pub fn tick(&self) {
+        let c = &self.counters;
         self.rates.lock().update(
             Instant::now(),
-            self.counters.packets_in.load(Ordering::Relaxed),
-            self.counters.packets_out.load(Ordering::Relaxed),
+            Totals {
+                packets_in: c.packets_in.load(Ordering::Relaxed),
+                packets_out: c.packets_out.load(Ordering::Relaxed),
+                bytes_in: c.bytes_in.load(Ordering::Relaxed),
+                bytes_out: c.bytes_out.load(Ordering::Relaxed),
+            },
         );
         self.rss.lock().refresh(false);
     }
@@ -532,6 +567,8 @@ impl BotHub for Hub {
             bytes_per_bot: Hub::per_bot_bytes(&rss, online),
             packets_in_per_sec: rates.in_per_sec,
             packets_out_per_sec: rates.out_per_sec,
+            bytes_in_per_sec: rates.bytes_in_per_sec,
+            bytes_out_per_sec: rates.bytes_out_per_sec,
             uptime_secs: self.uptime_secs(),
             llm: self.llm.as_ref().map(|l| {
                 let u = l.usage();
@@ -732,25 +769,46 @@ mod tests {
         assert!(to_bot_cmd(Command::Spawn { count: 1 }).is_err());
     }
 
+    fn totals(packets_in: u64, packets_out: u64, bytes_in: u64, bytes_out: u64) -> Totals {
+        Totals {
+            packets_in,
+            packets_out,
+            bytes_in,
+            bytes_out,
+        }
+    }
+
     #[test]
     fn rates_come_from_counter_deltas_once_a_window_has_passed() {
         let t0 = Instant::now();
-        let mut r = Rates {
-            at: t0,
-            packets_in: 100,
-            packets_out: 10,
-            in_per_sec: 0.0,
-            out_per_sec: 0.0,
-        };
+        let mut r = Rates::new(t0);
+        r.packets_in = 100;
+        r.packets_out = 10;
+        r.bytes_in = 4_000;
+        r.bytes_out = 1_000;
         // less than a window: nothing changes
-        r.update(t0 + Duration::from_millis(400), 900, 90);
-        assert_eq!(r.in_per_sec, 0.0);
-        // two seconds later: (500 - 100) / 2 and (50 - 10) / 2
-        r.update(t0 + Duration::from_secs(2), 500, 50);
+        r.update(
+            t0 + Duration::from_millis(400),
+            totals(900, 90, 90_000, 9_000),
+        );
+        assert_eq!((r.in_per_sec, r.bytes_in_per_sec), (0.0, 0.0));
+        // two seconds later: (500 - 100) / 2 and (50 - 10) / 2, and the same for the bytes
+        r.update(t0 + Duration::from_secs(2), totals(500, 50, 24_000, 5_000));
         assert!((r.in_per_sec - 200.0).abs() < 0.01, "{}", r.in_per_sec);
         assert!((r.out_per_sec - 20.0).abs() < 0.01, "{}", r.out_per_sec);
+        assert!(
+            (r.bytes_in_per_sec - 10_000.0).abs() < 0.01,
+            "{}",
+            r.bytes_in_per_sec
+        );
+        assert!(
+            (r.bytes_out_per_sec - 2_000.0).abs() < 0.01,
+            "{}",
+            r.bytes_out_per_sec
+        );
         // counters never run backwards into a huge rate
-        r.update(t0 + Duration::from_secs(4), 10, 5);
+        r.update(t0 + Duration::from_secs(4), totals(10, 5, 10, 5));
         assert_eq!((r.in_per_sec, r.out_per_sec), (0.0, 0.0));
+        assert_eq!((r.bytes_in_per_sec, r.bytes_out_per_sec), (0.0, 0.0));
     }
 }
