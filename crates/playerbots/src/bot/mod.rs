@@ -620,7 +620,9 @@ impl Bot {
 
     fn housekeeping(&mut self, conn: &GameConn) {
         self.secs += 1;
-        if self.secs.is_multiple_of(5) {
+        // The first housekeeping tick fires as the loop starts: ping then and every
+        // `PING_EVERY` after (the server drops connections that have not pinged in its sweep).
+        if (self.secs - 1).is_multiple_of(session::PING_EVERY.as_secs() as u32) {
             let ms = self.clock.elapsed().as_millis() as i64;
             self.out.push(cs::ping(ms));
         }

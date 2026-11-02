@@ -24,7 +24,10 @@ use super::state::BotState;
 /// How long each lobby step may take.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(25);
 /// Keep-alive interval (the server drops a connection that is silent for 30 s).
-pub const PING_EVERY: Duration = Duration::from_secs(5);
+/// Keep-alive cadence. The server closes any registered connection that has not pinged within
+/// its 30 s sweep — including one that entered the world a moment before the sweep and has not
+/// pinged yet — so bots ping right away and then about as often as the real client.
+pub const PING_EVERY: Duration = Duration::from_secs(3);
 /// How long the login server exchange may take in total.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(45);
 /// Quiet time after the character data before the bot spawns (the inventory burst has ended).
@@ -232,7 +235,8 @@ where
     conn.send(&cs::enter_world(account_id, cookie)).await?;
     let mut step = Step::Enter;
     let mut deadline = Instant::now() + STEP_TIMEOUT;
-    let mut next_ping = Instant::now() + PING_EVERY;
+    // Ping immediately: see PING_EVERY.
+    let mut next_ping = Instant::now();
     let mut chars: SmallVec<[CharSummary; 4]> = SmallVec::new();
     let mut created = false;
     loop {
