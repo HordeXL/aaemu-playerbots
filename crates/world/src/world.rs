@@ -23,6 +23,7 @@ use crate::spatial::SpawnIndex;
 use crate::spawns::{self, Kind, SpawnStats};
 use crate::sql::{each_row, open_readonly, RowExt};
 use crate::text::{TextTable, Texts};
+use crate::travel::{Travel, TravelInputs};
 use crate::uses::{ItemUses, SkillNeed};
 
 /// Where the world data lives.
@@ -113,6 +114,8 @@ pub struct World {
     gather_doodads: FxHashMap<u32, Box<[u32]>>,
     /// `(quest, component) -> index into baked.quest_spheres`.
     spheres: FxHashMap<(u32, u32), u32>,
+    /// Portals, instance dungeons and boats (the travel abilities' static data).
+    travel: Travel,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -185,6 +188,19 @@ impl World {
             .map(|(i, s)| ((s.quest, s.component), i as u32))
             .collect();
 
+        let travel = Travel::load(&TravelInputs {
+            conn: &conn,
+            texts: &texts,
+            server_data: &paths.server_data,
+            main_world: &paths.world,
+            npcs: &npcs,
+            doodads: &doodads,
+            skills: &skills,
+            doodad_spawns: &doodad_spawns,
+            items: &items,
+        })
+        .context("load travel data")?;
+
         let world = World {
             baked,
             factions,
@@ -206,6 +222,7 @@ impl World {
             zones,
             gather_doodads,
             spheres,
+            travel,
         };
         let q = world.quests.stats();
         tracing::info!(
@@ -224,6 +241,10 @@ impl World {
             items = world.items.len(),
             item_use_skills = world.item_uses.len(),
             gated_quests = world.start_gates.len(),
+            recall_points = world.travel.portals.recall_points().len(),
+            dungeons = world.travel.dungeons.dungeons().len(),
+            instance_worlds = world.travel.dungeons.worlds().all().len(),
+            boat_scrolls = world.travel.boats.scrolls().len(),
             factions = world.factions.len(),
             terrain = world.baked.terrain.is_some(),
             memory_kib = world.memory_estimate() / 1024,
@@ -274,6 +295,7 @@ impl World {
             ("baked (areas, spheres, zones)", baked),
             ("indexes", gather + self.spheres.capacity() * 16),
         ];
+        v.extend(self.travel.memory_breakdown());
         v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
@@ -281,6 +303,11 @@ impl World {
     /// The baked extras (terrain, map calibration, housing areas, quest spheres, zones).
     pub fn baked(&self) -> &Baked {
         &self.baked
+    }
+
+    /// Portals, instance dungeons and boats; see [`crate::travel`].
+    pub fn travel(&self) -> &Travel {
+        &self.travel
     }
 
     /// Terrain height at (x, y) from the baked grid; `None` without baked terrain or outside it.

@@ -25,6 +25,7 @@ pub mod spatial;
 pub mod spawns;
 mod sql;
 mod text;
+pub mod travel;
 pub mod uses;
 mod world;
 
@@ -41,5 +42,6 @@ pub use quest::{
 pub use reqs::{Gate, StartGates, Who};
 pub use skill::{mana_level_scale, SkillInfo};
 pub use spawns::SpawnStats;
+pub use travel::Travel;
 pub use uses::{ItemUses, SkillNeed};
 pub use world::{World, WorldPaths};

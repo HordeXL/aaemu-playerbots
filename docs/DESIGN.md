@@ -179,3 +179,28 @@ data/
 
 Runtime also reads the server's `compact.sqlite3` (read-only) and `app/Data/Worlds/*/` spawn
 files, paths given in `playerbots.toml`.
+
+## Travel data (`aa-world::travel`)
+
+Static data for the portal, instance-dungeon and boat abilities, loaded once with the world
+(about 180 KiB of heap) and read through `World::travel()` or the `World` shortcuts
+(`recall_points`, `nearest_recall`, `portal_reagents`, `dungeons`, `dungeon_by_entrance_doodad`,
+`instance_world`, `instance_world_by_zone_key`, `boat_scrolls`, `slave_template`,
+`boat_for_scroll`).
+
+- **Portals** (`portal.rs`): `Data/Portal/{recalls,worldgates,respawns}.json`, the open-portal
+  reagent tables (1 stone on the same continent, 3 across), the Teleport Book / record / recall /
+  Memory Tome skills with their timings, the gate NPCs 3891 / 6949 and the Memory Tome doodad
+  spawns of the main world with the recall point each binds per faction.
+- **Dungeons** (`dungeon.rs`, `instance.rs`, `funcs.rs`): the `DoodadFuncEnterInstance` entrance
+  doodads that spawn in the main world, the `indun_zones` rules (level, party, item, `closed`),
+  the entry limit (3 per zone group per 4 h) and every `Worlds/<name>/` instance world: zone keys,
+  spawn points, NPC / usable doodad spawns and the exit doodads. The zone key an `SCLoadInstance`
+  carries is matched to a world by `zones.name` (the client's `world.xml` is not server data).
+- **Boats** (`boat.rs`): items whose use skill has the `SpawnSlave` effect and summon a boat-kind
+  slave, with seats (`model_bindings`), `ship_models.velocity` and the slave's `MoveSpeedMul`
+  (top speed = velocity x MoveSpeedMul / 2) and an estimated hit point pool.
+
+Fixed ids (Teleport Book 4045, skills 11215 / 11216 / 10594 / 14602 / 16841 / 15802, ...) are
+checked against `compact.sqlite3` at load and only warn when missing. Real-data checks:
+`AA_COMPACT=... AA_SERVER_DATA=... cargo test -p aa-world --test travel_real_data -- --ignored`.
