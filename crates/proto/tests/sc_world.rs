@@ -312,8 +312,8 @@ fn load_instance_and_kicked() {
         .write_f32(100.0)
         .write_f32(200.0)
         .write_f32(30.0)
-        .write_f32(0.0)
-        .write_f32(0.0)
+        .write_f32(0.25)
+        .write_f32(-0.5)
         .write_f32(1.25);
     assert_eq!(
         game(sc::SCLoadInstancePacket, &s),
@@ -321,7 +321,9 @@ fn load_instance_and_kicked() {
             instance_id: 5,
             zone_id: 6,
             pos: (100.0, 200.0, 30.0),
-            yaw: 1.25
+            yaw: 1.25,
+            ang_x: 0.25,
+            ang_y: -0.5,
         }
     );
     // packets/g2c_misc.rs:160

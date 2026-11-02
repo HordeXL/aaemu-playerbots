@@ -6,7 +6,18 @@
 //! - [`login`]: login server client (Trion ticket auth, world list, world cookie).
 //! - [`game`]: game server connection (framing, DD04 batches, send/recv).
 //! - [`cs`]: client → server packet builders.
-//! - [`sc`]: server → client packet parsers ([`sc::ServerEvent`]).
+//! - [`sc`]: server → client packet parsers ([`sc::ServerEvent`]): [`sc_world`] (world, units,
+//!   inventory, combat, chat, loot, plus the travel packets below), [`sc_activity`] (quests,
+//!   duels, trade, teams, houses, mail, crafting).
+//! - [`sc_travel`]: the payload types and readers of the travel packets: the teleport book and
+//!   recall districts (`SCCharacterPortals`, `SCCharacterReturnDistricts`, `SCPortalInfoSaved`,
+//!   `SCPortalDeleted`, `SCUnitPortalUsed`), instance dungeons (`SCProcessingInstance`,
+//!   `SCLoadInstance`) and boats (`SCSlaveCreated`, `SCMySlave`, `SCSlaveBound`,
+//!   `SCUnitAttached`/`Detached`, `SCSlaveDespawn`/`Removed`, ship `SCOneUnitMovement`). The
+//!   matching client packets are `cs::use_portal`, `cs::delete_portal`, `cs::notify_sub_zone`,
+//!   `cs::bind_slave`, `cs::discard_slave`, `cs::despawn_slave`, `cs::destroy_slave`,
+//!   `cs::ship_request`, and the skill casts with a skill object
+//!   (`cs::record_portal`, `cs::rename_portal`, `cs::open_portal`, `cs::start_skill_*_with`).
 
 pub mod codec;
 pub mod cs;
@@ -16,6 +27,7 @@ pub mod opcodes;
 pub mod pos;
 pub mod sc;
 pub mod sc_activity;
+pub mod sc_travel;
 pub mod sc_world;
 pub mod stream;
 
