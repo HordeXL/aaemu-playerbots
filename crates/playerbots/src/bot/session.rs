@@ -21,6 +21,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::state::BotState;
+use super::watch::classify::{Cause, Fault, Phase};
+use crate::issues::Dir;
 
 /// How long each lobby step may take.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(25);
@@ -77,6 +79,48 @@ pub enum SessionError {
     },
 }
 
+impl SessionError {
+    /// The connection fault this failure comes to, in `phase`; `None` for failures that are not
+    /// the server's doing (waiting for a free login slot, a rejected character name).
+    pub fn fault(&self, phase: Phase) -> Option<Fault> {
+        let cause = match self {
+            SessionError::Login(l) => match l {
+                LoginError::Denied(r) => Cause::Denied(*r),
+                LoginError::JoinRefused(r) => Cause::JoinRefused(*r),
+                LoginError::EnterWorldDenied(r) => Cause::EnterDenied(*r),
+                LoginError::Connect { .. } => Cause::ConnectFailed,
+                LoginError::Io(_) => Cause::Reset,
+                LoginError::Closed => Cause::Closed,
+                LoginError::Timeout => Cause::StepTimeout("the login server"),
+                _ => Cause::Protocol,
+            },
+            SessionError::Game(g) => cause_of(g, false),
+            SessionError::NoWorld => Cause::NoWorld,
+            SessionError::Refused(r) => Cause::Refused(*r),
+            SessionError::Timeout("a free login slot" | "the login slot") => return None,
+            SessionError::Timeout(what) => Cause::StepTimeout(what),
+            SessionError::NameRejected(_) => return None,
+            SessionError::CreateFailed(r) => Cause::CreateFailed(*r),
+            SessionError::Kicked { reason, .. } => Cause::Kicked(*reason),
+        };
+        Some(Fault { phase, cause })
+    }
+}
+
+/// The cause of a failed game connection call. `writing` = the call was a send: a timed-out send
+/// is the server not taking data any more.
+pub fn cause_of(e: &GameError, writing: bool) -> Cause {
+    match e {
+        GameError::Connect { .. } => Cause::ConnectFailed,
+        GameError::Io(io) if writing && io.kind() == std::io::ErrorKind::TimedOut => {
+            Cause::WriteTimeout
+        }
+        GameError::Io(_) => Cause::Reset,
+        GameError::Closed => Cause::Closed,
+        GameError::BadFrame(_) | GameError::TooLarge { .. } => Cause::Protocol,
+    }
+}
+
 /// The `SCCharacterCreationFailed` reasons that are about the name (the server's
 /// `CharacterCreateError`: `NameAlreadyExists` = 4, `InvalidCharacters` = 5,
 /// `NamePendingDeletion` = 6). The others (`Failed` = 2, `WorldLimit` = 9, ...) are not.
@@ -97,16 +141,59 @@ impl SessionError {
     }
 }
 
+/// What a server packet turned out to be.
+#[derive(Debug)]
+pub enum Decoded {
+    /// A packet the bots use, parsed.
+    Event(ServerEvent),
+    /// A packet the bots do not need.
+    Ignored,
+    /// A packet the parser rejects; the text is the parser's message.
+    Malformed(String),
+}
+
+/// Decodes a packet; one that does not match its layout is logged at debug level and reported as
+/// [`Decoded::Malformed`] (a bot must survive whatever the server sends, and the bot loop files a
+/// report about it).
+pub fn decode_checked(p: &Packet) -> Decoded {
+    match sc::parse(p.level, p.opcode, &p.body) {
+        Ok(Some(ev)) => Decoded::Event(ev),
+        Ok(None) => Decoded::Ignored,
+        Err(e) => {
+            tracing::debug!(packet = p.name(), "undecodable packet: {e}");
+            Decoded::Malformed(e.to_string())
+        }
+    }
+}
+
 /// Decodes a packet into an event; a packet that does not match its layout is logged at debug
 /// level and dropped (a bot must survive whatever the server sends).
 pub fn decode(p: &Packet) -> Option<ServerEvent> {
-    match sc::parse(p.level, p.opcode, &p.body) {
-        Ok(ev) => ev,
-        Err(e) => {
-            tracing::debug!(packet = p.name(), "undecodable packet: {e}");
-            None
-        }
+    match decode_checked(p) {
+        Decoded::Event(ev) => Some(ev),
+        Decoded::Ignored | Decoded::Malformed(_) => None,
     }
+}
+
+/// Sends `out`, noting it in the packet trail of `st` first (the trail shows what the bot asked
+/// for even when the write then fails).
+async fn send_traced<R, W>(
+    conn: &mut GameConn<R, W>,
+    st: &mut BotState,
+    start: Instant,
+    out: &Out,
+) -> Result<(), GameError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    st.watch.packet(
+        start.elapsed().as_millis() as u64,
+        Dir::C2S,
+        out.level,
+        out.opcode,
+    );
+    conn.send(out).await
 }
 
 /// Sends and empties `out`. Every packet must be written within [`SEND_TIMEOUT`]: a connection
@@ -331,7 +418,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    conn.send(&cs::enter_world(account_id, cookie)).await?;
+    send_traced(conn, st, start, &cs::enter_world(account_id, cookie)).await?;
     let mut step = Step::Enter;
     let mut deadline = Instant::now() + STEP_TIMEOUT;
     // Ping immediately: see PING_EVERY.
@@ -344,8 +431,13 @@ where
             return Err(SessionError::Timeout(step.what()));
         }
         if now >= next_ping {
-            conn.send(&cs::ping(start.elapsed().as_millis() as i64))
-                .await?;
+            send_traced(
+                conn,
+                st,
+                start,
+                &cs::ping(start.elapsed().as_millis() as i64),
+            )
+            .await?;
             next_ping = now + PING_EVERY;
         }
         let mut wait = deadline.min(next_ping).saturating_duration_since(now);
@@ -356,15 +448,18 @@ where
             Ok(r) => r?,
             Err(_) => {
                 if step == Step::Settle {
-                    conn.send(&cs::spawn_character()).await?;
+                    send_traced(conn, st, start, &cs::spawn_character()).await?;
                     step = Step::Spawn;
                     deadline = Instant::now() + STEP_TIMEOUT;
                 }
                 continue;
             }
         };
-        let Some(ev) = decode(&packet) else { continue };
         st.now_ms = start.elapsed().as_millis() as u64;
+        st.watch
+            .packet(st.now_ms, Dir::S2C, packet.level, packet.opcode);
+        st.watch.conn.on_rx(st.now_ms);
+        let Some(ev) = decode(&packet) else { continue };
         st.apply(&ev);
         let ServerEvent::World(w) = &ev else { continue };
         match (step, w) {
@@ -379,10 +474,10 @@ where
             }
             (Step::Enter, WorldEvent::ChangeState(n)) => {
                 if (0..=LAST_STATE).contains(n) {
-                    conn.send(&cs::finish_state(*n)).await?;
+                    send_traced(conn, st, start, &cs::finish_state(*n)).await?;
                 }
                 if *n >= LAST_STATE {
-                    conn.send(&cs::list_characters()).await?;
+                    send_traced(conn, st, start, &cs::list_characters()).await?;
                     step = Step::List;
                     chars.clear();
                 }
@@ -402,18 +497,18 @@ where
                         .or_else(|| chars.first());
                     match pick {
                         Some(c) => {
-                            conn.send(&cs::select_character(c.id)).await?;
+                            send_traced(conn, st, start, &cs::select_character(c.id)).await?;
                             step = Step::Select;
                         }
                         None => {
-                            conn.send(&cs::create_character(&cs::CreateCharacter {
+                            let create = cs::create_character(&cs::CreateCharacter {
                                 name: wish.name,
                                 race: wish.race,
                                 gender: wish.gender,
                                 body_items: [0; 7],
                                 ability1: wish.ability,
-                            }))
-                            .await?;
+                            });
+                            send_traced(conn, st, start, &create).await?;
                             step = Step::Create;
                         }
                     }
@@ -422,7 +517,7 @@ where
             }
             (Step::Create, WorldEvent::CharacterCreated { id, .. }) => {
                 created = true;
-                conn.send(&cs::select_character(*id)).await?;
+                send_traced(conn, st, start, &cs::select_character(*id)).await?;
                 step = Step::Select;
                 deadline = Instant::now() + STEP_TIMEOUT;
             }
@@ -438,8 +533,8 @@ where
                 deadline = Instant::now() + STEP_TIMEOUT;
             }
             (Step::Spawn, WorldEvent::UnitState(_)) if st.me.spawned && st.me.obj != 0 => {
-                conn.send(&cs::notify_in_game()).await?;
-                conn.send(&cs::notify_in_game_completed()).await?;
+                send_traced(conn, st, start, &cs::notify_in_game()).await?;
+                send_traced(conn, st, start, &cs::notify_in_game_completed()).await?;
                 return Ok(Entered {
                     char_id: st.me.char_id,
                     name: st.me.name.to_string(),
@@ -581,6 +676,51 @@ mod tests {
         assert_eq!(finishes, 8, "FinishState 0..=7: {seen:?}");
         assert!(seen.contains(&cso::CSListCharacterPacket));
         assert_eq!(*seen.last().unwrap(), cso::CSCreateCharacterPacket);
+    }
+
+    #[tokio::test]
+    async fn the_lobby_leaves_a_trail_of_named_packets_in_both_directions() {
+        use crate::issues::Dir;
+        let (a, b) = duplex(64 * 1024);
+        let mut client = GameConn::from_io(a);
+        let server = tokio::spawn(fake_server(GameConn::from_io(b), 5));
+        let mut st = BotState::new();
+        let wish = Wish {
+            name: "Tester",
+            char_id: None,
+            race: 1,
+            gender: 1,
+            ability: 1,
+        };
+        let start = Instant::now();
+        let _ = enter_game(&mut client, &mut st, 42, 9, &wish, start).await;
+        drop(client);
+        let _ = server.await;
+        let trail = st.watch.trail.snapshot(start.elapsed().as_millis() as u64);
+        assert!(
+            !trail.is_empty() && trail.len() <= 48,
+            "{} entries",
+            trail.len()
+        );
+        assert_eq!(
+            (trail[0].dir, trail[0].level, trail[0].opcode),
+            (Dir::C2S, LEVEL_GAME, cso::X2EnterWorldPacket),
+            "the first packet is the one the bot sent first"
+        );
+        assert_eq!(trail[0].name, "X2EnterWorldPacket");
+        assert!(
+            trail
+                .iter()
+                .any(|e| e.dir == Dir::S2C && e.name == "X2EnterWorldResponsePacket"),
+            "the answer is in it, by name: {trail:?}"
+        );
+        assert!(trail
+            .iter()
+            .any(|e| e.dir == Dir::C2S && e.name == "FinishStatePacket"));
+        assert!(
+            trail.iter().all(|e| e.name != "Unknown"),
+            "every packet of the lobby has a name"
+        );
     }
 
     #[tokio::test]
@@ -787,6 +927,103 @@ mod tests {
         )
         .await
         .expect("leave must return");
+    }
+
+    #[test]
+    fn failures_map_to_faults_with_a_phase_and_a_cause() {
+        let io = |k| std::io::Error::new(k, "x");
+        let f = |e: SessionError, p| e.fault(p);
+        assert_eq!(
+            f(SessionError::Login(LoginError::Denied(2)), Phase::Login),
+            Some(Fault {
+                phase: Phase::Login,
+                cause: Cause::Denied(2)
+            })
+        );
+        assert_eq!(
+            f(
+                SessionError::Game(GameError::Connect {
+                    addr: "a".into(),
+                    source: io(std::io::ErrorKind::ConnectionRefused)
+                }),
+                Phase::Connect
+            )
+            .unwrap()
+            .cause,
+            Cause::ConnectFailed
+        );
+        assert_eq!(
+            f(SessionError::Timeout("the own unit state"), Phase::Lobby)
+                .unwrap()
+                .cause,
+            Cause::StepTimeout("the own unit state")
+        );
+        assert_eq!(
+            f(
+                SessionError::Kicked {
+                    reason: 3,
+                    msg: "x".into()
+                },
+                Phase::Lobby
+            )
+            .unwrap()
+            .cause,
+            Cause::Kicked(3)
+        );
+        assert_eq!(
+            f(SessionError::Refused(5), Phase::Lobby).unwrap().cause,
+            Cause::Refused(5)
+        );
+        assert_eq!(
+            f(SessionError::CreateFailed(9), Phase::Lobby)
+                .unwrap()
+                .cause,
+            Cause::CreateFailed(9)
+        );
+        // the bot's own waiting and a rejected name are not the server's fault
+        assert_eq!(
+            f(SessionError::Timeout("a free login slot"), Phase::Login),
+            None
+        );
+        assert_eq!(
+            f(SessionError::Timeout("the login slot"), Phase::Login),
+            None
+        );
+        assert_eq!(f(SessionError::NameRejected(5), Phase::Lobby), None);
+        // a send that timed out is the server not taking data; a read that failed is a reset
+        assert_eq!(
+            cause_of(&GameError::Io(io(std::io::ErrorKind::TimedOut)), true),
+            Cause::WriteTimeout
+        );
+        assert_eq!(
+            cause_of(
+                &GameError::Io(io(std::io::ErrorKind::ConnectionReset)),
+                false
+            ),
+            Cause::Reset
+        );
+        assert_eq!(cause_of(&GameError::Closed, false), Cause::Closed);
+        assert_eq!(cause_of(&GameError::BadFrame("x"), false), Cause::Protocol);
+    }
+
+    #[test]
+    fn a_malformed_packet_is_told_from_one_the_bots_do_not_need() {
+        use aa_proto::game::LEVEL_GAME;
+        // a packet nobody here parses
+        let ignored = Packet {
+            level: LEVEL_GAME,
+            opcode: 0xfff,
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(decode_checked(&ignored), Decoded::Ignored));
+        // a death packet that stops after one byte
+        let bad = Packet {
+            level: LEVEL_GAME,
+            opcode: sco::SCUnitDeathPacket,
+            body: bytes::Bytes::from_static(&[1]),
+        };
+        assert!(matches!(decode_checked(&bad), Decoded::Malformed(_)));
+        assert!(decode(&bad).is_none());
     }
 
     #[test]

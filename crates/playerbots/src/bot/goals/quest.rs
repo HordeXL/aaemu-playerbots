@@ -38,6 +38,8 @@ use crate::bot::combat::{CombatStatus, Loss};
 use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, MoveFailure, Pace};
 use crate::bot::state::{dist2d, BotState, StateError, UnitKind};
+use crate::bot::watch::classify::{CreditNote, CreditStep};
+use crate::bot::watch::{Finding, Role};
 use crate::contest::{doodad_key, spot_key, unit_key};
 
 use objective::{Env, Plan, Slot};
@@ -92,6 +94,9 @@ const MAX_SPOTS: u8 = 3;
 const MAX_TRIES: u8 = 6;
 /// Other characters within this many metres make a spawn "crowded".
 const CROWD_RADIUS_M: f32 = 60.0;
+/// Another character within this many metres of a kill may have tagged the monster first, which
+/// takes the quest credit away from the bot that strikes last.
+const TAG_SHARE_RADIUS_M: f32 = 40.0;
 /// A crowded spawn is given this long between two rounds of searching it (the respawns).
 const CROWD_ROUND_GAP_MS: u64 = 30_000;
 /// Rounds of searching a crowded spawn before the quest rests (an uncrowded one gets two).
@@ -246,6 +251,13 @@ struct Inner {
     stale: SmallVec<[u64; 2]>,
     /// The last item cast `(instance, stack count, objective counter, casts in a row)`.
     use_note: (u64, i32, i32, u8),
+    /// The kill or cast the server confirmed that has not been credited yet.
+    credit: Option<CreditNote>,
+    /// The skill of the cast that is the objective itself (an item or a doodad use), 0 for none;
+    /// its confirmation is the start of a [`CreditNote`].
+    cast_skill: u32,
+    /// Spawn points of the target in work where the bot stood and found nothing.
+    stood: u8,
     detail: String,
     detail_key: u64,
 }
@@ -280,6 +292,9 @@ impl Default for Inner {
             claim_ms: 0,
             stale: SmallVec::new(),
             use_note: (0, 0, 0, 0),
+            credit: None,
+            cast_skill: 0,
+            stood: 0,
             detail: String::new(),
             detail_key: 0,
         }
@@ -325,6 +340,7 @@ impl Inner {
             CombatStatus::TargetDead { .. } => {
                 if let Some(obj) = self.fighting.take() {
                     ctx.hub.contest.release(unit_key(obj), ctx.persona.id);
+                    self.note_kill(ctx, obj);
                 }
             }
             CombatStatus::Lost => {
@@ -564,6 +580,9 @@ impl Inner {
         self.progress_ms = now;
         self.fighting = None;
         self.visited.clear();
+        self.credit = None;
+        self.cast_skill = 0;
+        self.stood = 0;
     }
 
     fn back_to_pick(&mut self, ctx: &mut Ctx<'_>) {
@@ -612,6 +631,12 @@ impl Inner {
             }
             Stage::Wait => {
                 if let Some(err) = server_error(ctx.state, q, self.sent_ms) {
+                    // the bot's gates (level, race, prior quests, items) let this quest through
+                    ctx.find(Finding::QuestRefused {
+                        quest: q,
+                        code: err,
+                        turn_in: false,
+                    });
                     return self.fail(ctx, Failure::Server(err));
                 }
                 if now.saturating_sub(self.sent_ms) > ACK_MS {
@@ -675,11 +700,135 @@ impl Inner {
         } else if now.saturating_sub(self.progress_ms) > NO_PROGRESS_MS {
             return self.stall(ctx, quest, &row, &slot);
         }
+        self.track_credit(ctx, &slot);
         let facts = Env { world };
         match objective::plan(&facts, quest, slot.obj, ctx.state.me.level) {
             Ok(plan) => self.exec(ctx, quest, &slot, plan),
             Err(why) => self.fail(ctx, why),
         }
+    }
+
+    /// The monster the bot was fighting for the quest died by the bot's hand: if killing it is the
+    /// objective, the server must credit it.
+    fn note_kill(&mut self, ctx: &mut Ctx<'_>, obj: u32) {
+        if self.credit.is_some() || self.mode != Mode::Work {
+            return;
+        }
+        let state = &*ctx.state;
+        let Some(template) = state.units.get(&obj).map(|u| u.id) else {
+            return;
+        };
+        // (only a kill the server named the bot as the killer of counts)
+        if !state.kills.iter().any(|k| k.0 == obj) {
+            return;
+        }
+        // The server credits a kill to whoever tagged the monster first (and their team): another
+        // character at the fight may have, and the bot cannot see the tag. Judged only when the
+        // bot fought alone. (Seen live: two bots on the same boss, the one that struck last got
+        // no credit and the report was a false alarm.)
+        if characters_near(state, TAG_SHARE_RADIUS_M) {
+            return;
+        }
+        let (Some(quest), Some(row)) = (ctx.world.quest(self.quest), state.quests.row(self.quest))
+        else {
+            return;
+        };
+        let Some(slot) = objective::unmet(quest, row).find(|s| s.idx == usize::from(self.obj))
+        else {
+            return;
+        };
+        let facts = Env { world: ctx.world };
+        if let Ok(Plan::Kill { templates }) =
+            objective::plan(&facts, quest, slot.obj, state.me.level)
+        {
+            if templates.contains(&template) {
+                self.credit = Some(CreditNote {
+                    by_skill: false,
+                    source: template,
+                    idx: self.obj,
+                    have: slot.have,
+                    since_ms: ctx.now_ms,
+                });
+            }
+        }
+    }
+
+    /// Follows the action the server confirmed (a kill, an item or doodad cast) until the counter
+    /// of the objective moves; reports it when it does not.
+    fn track_credit(&mut self, ctx: &mut Ctx<'_>, slot: &Slot<'_>) {
+        let now = ctx.now_ms;
+        let Some(note) = self.credit else {
+            // an item or doodad cast the server accepted: the credit is due after the cast
+            let (skill, at) = ctx.state.watch.cast_ok;
+            if self.cast_skill != 0
+                && skill == self.cast_skill
+                && self.sent_ms != 0
+                && at >= self.sent_ms
+            {
+                let cast_ms = ctx
+                    .world
+                    .skill(skill)
+                    .map_or(0, |s| u64::from(s.casting_time));
+                self.credit = Some(CreditNote {
+                    by_skill: true,
+                    source: skill,
+                    idx: slot.idx.min(usize::from(u8::MAX)) as u8,
+                    have: slot.have,
+                    since_ms: at + cast_ms,
+                });
+                self.cast_skill = 0;
+            }
+            return;
+        };
+        let damaged = ctx.state.last_damage_ms > note.since_ms.saturating_sub(10_000);
+        match note.step(slot.idx, slot.have, now, damaged) {
+            CreditStep::Keep => {}
+            CreditStep::Drop => self.credit = None,
+            CreditStep::Report => {
+                self.credit = None;
+                ctx.find(Finding::QuestCreditMissing {
+                    quest: self.quest,
+                    component: slot.obj.component,
+                    source: note.source,
+                    by_skill: note.by_skill,
+                    have: slot.have,
+                    need: slot.need,
+                });
+            }
+        }
+    }
+
+    /// The giver, turn-in NPC or doodad of the quest is not at any of its spawns that the bot
+    /// stood at: a finding when it really stood at one, saw nothing and no corpse of the NPC is
+    /// around (a dead NPC is waiting to respawn, not missing).
+    fn role_missing(&self, ctx: &mut Ctx<'_>, target: Target) {
+        if self.stood == 0 {
+            return;
+        }
+        let (template, doodad) = match target {
+            Target::Npc(t) => (t, false),
+            Target::Doodad(t) => (t, true),
+        };
+        if !doodad
+            && ctx
+                .state
+                .units
+                .values()
+                .any(|u| u.kind == UnitKind::Npc && u.id == template)
+        {
+            return;
+        }
+        let role = match self.mode {
+            Mode::Accept => Role::Giver,
+            Mode::TurnIn => Role::TurnIn,
+            _ => Role::Objective,
+        };
+        ctx.find(Finding::RoleMissing {
+            template,
+            doodad,
+            role,
+            spots: self.stood,
+        });
     }
 
     /// The quest left the journal: completed (automatic report), dropped, or never there.
@@ -883,8 +1032,11 @@ impl Inner {
             ctx.send(cs::start_skill_doodad(skill, me_obj, obj));
             self.tries += 1;
             self.sent_ms = now;
+            // using the doodad *is* the objective only for an interaction; a harvest pays in items
+            if matches!(slot.obj.kind, ObjKind::Interact { .. }) {
+                self.cast_skill = skill;
+            }
         }
-        let _ = slot;
         GoalStatus::Running
     }
 
@@ -949,6 +1101,7 @@ impl Inner {
             ));
             self.tries += 1;
             self.sent_ms = now;
+            self.cast_skill = skill;
             self.use_note = if (self.use_note.0, self.use_note.1, self.use_note.2) == seen {
                 (seen.0, seen.1, seen.2, self.use_note.3.saturating_add(1))
             } else {
@@ -1104,6 +1257,11 @@ impl Inner {
         let now = ctx.now_ms;
         if self.sent_ms != 0 {
             if let Some(err) = server_error(ctx.state, quest, self.sent_ms) {
+                ctx.find(Finding::QuestRefused {
+                    quest,
+                    code: err,
+                    turn_in: true,
+                });
                 if self.tries >= 2 {
                     return self.fail(ctx, Failure::Server(err));
                 }
@@ -1237,6 +1395,7 @@ impl Inner {
                     return Reach::Missing;
                 }
                 let Some(p) = self.nearest_unvisited(spawns, me, 0.0) else {
+                    self.role_missing(ctx, target);
                     return Reach::Missing;
                 };
                 (p.0, p.1)
@@ -1274,9 +1433,11 @@ impl Inner {
                 ));
                 self.mark_visited(spot.0, spot.1);
                 self.spots_tried += 1;
+                self.stood = self.stood.saturating_add(1);
                 self.spot = None;
                 self.arrived_ms = 0;
                 if self.spots_tried >= MAX_SPOTS {
+                    self.role_missing(ctx, target);
                     Reach::Missing
                 } else {
                     Reach::Walking

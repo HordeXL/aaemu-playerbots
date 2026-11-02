@@ -181,6 +181,35 @@ example `quest=251 npc=3475`), so the same problem met by fifty bots is one **is
 the bots that met it, the first and last time and up to three samples (the first and the latest
 two, each with the bot's position, goal, packet trail, server log lines and own log).
 
+What the bots look for (the code is `crates/playerbots/src/bot/watch/`; the judgement of each is a
+pure function with tests in `watch/classify.rs`):
+
+* **Requests that go unanswered:** a quest accept or turn-in, a loot window, a skill cast or a GM
+  `/move` that gets no answer in 6 s (a cast is answered by `SCSkillStarted`, which the server sends
+  only for casts with a casting time and for refusals; an accepted instant skill is answered by
+  `SCSkillFired` alone and a plot skill by its `SCPlotEvent`s, which the bot reads from the raw packet;
+  the default attacks, skill ids below 5000, repeat by themselves and the server accepts a repeat in
+  silence, so they are not tracked). Dropped when the bot died, was teleported or walked away, or
+  when the whole connection was quiet (that is a stall, not this).
+* **The connection:** a packet the parser rejects (key = opcode, with the first bytes of the packet),
+  a kick or an unexpected disconnect (key = phase and reason; the bot's own shutdown and the
+  login flow's refusals are not issues), a stall (no packet for 8 s or a ping that took more than
+  5 s, key = phase; blamed on the bot when its own loop was starved). One report per outage.
+* **Quests:** a kill or a cast the server confirmed whose counter never moved (key = quest and
+  component); a quest start the bot's own gates let through that the server refuses (key = quest and
+  the server's code); a quest giver, turn-in NPC or quest doodad that is not at any spawn point the
+  world data has for it.
+* **Combat:** a monster that takes no damage from eight confirmed casts (or says it is immune); a
+  skill refused for a reason the bot's own checks rule out (range, mana, cooldown, line of sight and
+  moving are the bot's fault and stay local).
+* **The bot's life:** hit points 0 without a death packet; a character that logs in dead and is not
+  revived; a bot that died and is not resurrected after asking.
+* **Money and goods:** a finished trade whose purse or bag moved by something other than the two
+  offers; a sold trade pack whose payment mail is empty or cannot be read.
+
+Every report carries the **packet trail**: the last 48 packets sent and received, with their names
+and ages (`trail.txt` in the evidence folder).
+
 Every issue has a **suspect** (`server`, `data`, `bot`, `unknown`) and a **severity** (`low`,
 `medium`, `high`), set by the detector. An issue is *reportable* when its suspect is not `bot` and
 
@@ -238,7 +267,9 @@ noticed, colour codes are removed, and the newest 4000 lines (1 MiB) are kept. A
 `WARN` and `ERROR` lines within five seconds of it, plus the lines that name the bot's character,
 and a new `WARN` or `ERROR` line that names one of our characters is handed to that bot, which
 files a "server log during action" report with its own context (at most 20 lines a second go to
-the bots). Lines look like `HH:MM:SS [LEVEL] target - message`; other prefixes are tolerated.
+the bots). Lines that are ordinary events the server logs at `WARN` (a quest leaving the journal, a
+cast refused for line of sight) are dropped by the bot, see `routine_server_line` in
+`bot/watch/classify.rs`. Lines look like `HH:MM:SS [LEVEL] target - message`; other prefixes are tolerated.
 
 ### Privacy
 
@@ -256,9 +287,18 @@ them as private as the roster.
 `crates/playerbots/src/issues/mod.rs` has the tour. In short: build an `IssueReport` with
 `IssueReport::new(kind, key, title).expected(..).actual(..).suspect(..).severity(..).area(..).fact(..)`
 and file it with `ctx.report_issue(report)` in a goal or `self.file_issue(report)` in the bot
-loop; the bot's identity, position, zone, goal and log are attached for you. `TrailRing` keeps the
-packet trail (`snapshot(now_ms)` for `.trail(..)`), `.packet_head(&bytes)` keeps the first 96 bytes
-of the triggering packet. Report an episode once, not on every tick, and pick the suspect honestly.
+loop; the bot's identity, position, zone, goal and log are attached for you, and so is the packet
+trail (`bot.state.watch.trail`, a `TrailRing`: `push(now_ms, dir, level, opcode)` per packet, names
+are resolved only by `snapshot(now_ms)`), unless the report brought its own. `.packet_head(&bytes)`
+keeps the first 96 bytes of the triggering packet. Report an episode once, not on every tick, and
+pick the suspect honestly.
+
+A new detector for a goal or the combat controller leaves a `watch::Finding` (a `Copy` note, ids and
+counters only) with `ctx.find(..)`; `Finding::report` makes the report (key, title, suspect,
+severity) and `Watch::push` keeps one finding per episode and session. Put the decision (when is it
+a finding, whose fault is it) into a pure function in `watch/classify.rs` and test it there. A
+request the server must answer is registered with `ctx.expect(..)` (or automatically from the
+outgoing packet, see `watch/tracker.rs`).
 
 ## Memory and scale
 

@@ -138,6 +138,26 @@ goals and file an `IssueReport` through `Ctx::report_issue` / `Bot::file_issue` 
   `logtail.rs` the server log follower and its bounded ring; `redact.rs` removes addresses and
   credential values from every text; `timefmt.rs` local times; `view.rs` the web types.
 
+The detectors are `crates/playerbots/src/bot/watch/`, one `Box<Watch>` per bot in `BotState` (a single
+allocation; `size_of::<Bot>()` grew by 24 bytes for it):
+
+- `tracker.rs` a fixed table of eight requests the server must answer (quest accept/complete, loot
+  open, skill cast, GM `/move`) with a 6 s deadline. Requests are registered from the outgoing packet
+  in one place (`Tracker::on_sent`), cleared by the matching server event, and forgotten when the bot
+  died, was teleported or moved away, or when nothing at all arrived since (then it is a stall).
+- `classify.rs` the judgement as pure functions: whose fault a skill refusal is, when a quiet line is a
+  sustained stall, whether a counter that did not move is a missing credit, whether a monster that
+  takes no damage is immune, what a finished trade must have changed, what a bad payment mail is.
+- `finding.rs` `Finding` (a `Copy` note a detector leaves) and its report: kind, id-only key,
+  title, expected/actual, suspect and severity. The `Names` trait keeps it testable without a `World`.
+- `mod.rs` `Watch` (trail, tracker, connection and death watches, findings, per-session episode
+  dedupe) and the connection watch.
+
+The flow is note, then drain: a detector pushes a finding, the bot loop drains them after every packet
+and tick and files them with the packet trail attached (`TrailRing`: 8 bytes per packet, 48 packets,
+allocated on the first packet, names resolved from the opcode tables only when a report is made).
+Nothing runs per tick except a few comparisons; an episode is reported once.
+
 The web crate only knows `IssueSummary` / `IssueDetail` / `IssueAction` and three defaulted `BotHub`
 methods. Operator documentation: the README section "Server issue reports".
 

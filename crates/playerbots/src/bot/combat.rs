@@ -32,6 +32,8 @@ use super::rotation::{
     self, CastKind, Decision, Inputs, LearnCtx, Learner, RotState, Rotation, SkillBook, TargetView,
 };
 use super::state::{dist2d, Unit, UnitKind};
+use super::watch::classify::{self, Refusal};
+use super::watch::Finding;
 
 /// The server takes loot from within 5 m of its picture of the bot (which can lag, see
 /// [`super::motion::Motion::pin`]); the bot opens a loot window only this close.
@@ -202,6 +204,12 @@ struct Watch {
     sidestep: bool,
     /// Until then the bot casts nothing (it takes another position).
     hold_until_ms: u64,
+    /// Casts at this target the server accepted (`SkillStarted` with result 0).
+    accepted: u8,
+    /// Bot clock of the first of them.
+    first_accept_ms: u64,
+    /// The "takes no damage" finding was left for this target.
+    immune_told: bool,
 }
 
 impl Default for Watch {
@@ -215,6 +223,9 @@ impl Default for Watch {
             no_target: 0,
             sidestep: false,
             hold_until_ms: 0,
+            accepted: 0,
+            first_accept_ms: 0,
+            immune_told: false,
         }
     }
 }
@@ -488,6 +499,8 @@ pub struct Combat {
     loss: Option<Loss>,
     /// Casts the server refused for an obstacle so far (this process).
     obstructed: u32,
+    /// Object id of a target the server called immune to a skill, until [`Combat::tick`] reports it.
+    immune_refused: u32,
 }
 
 impl Default for Combat {
@@ -532,6 +545,7 @@ impl Combat {
             watch: Watch::default(),
             loss: None,
             obstructed: 0,
+            immune_refused: 0,
         }
     }
 
@@ -694,6 +708,9 @@ impl Combat {
                     self.watch.hold_until_ms = now_ms + OBSTACLE_HOLD_MS;
                     self.last_refusal = Some((*skill, *result));
                 } else if *result != 0 {
+                    if classify::refusal(*result) == Refusal::Immune {
+                        self.immune_refused = *target_obj;
+                    }
                     if *result == MANA_REFUSED {
                         self.mana_refused = *skill;
                     } else if *result == TOO_FAR_REFUSED {
@@ -705,6 +722,12 @@ impl Combat {
                     self.cast_failed += 1;
                     self.last_refusal = Some((*skill, *result));
                 } else {
+                    if self.target.is_some() && Some(*target_obj) == self.target {
+                        if self.watch.accepted == 0 {
+                            self.watch.first_accept_ms = now_ms;
+                        }
+                        self.watch.accepted = self.watch.accepted.saturating_add(1);
+                    }
                     self.backoffs.succeed(*skill);
                     self.watch.obstacles = 0;
                     self.watch.no_target = 0;
@@ -783,6 +806,30 @@ impl Combat {
         if let Some((skill, result)) = ctx.combat.last_refusal.take() {
             ctx.log
                 .debug(format!("skill {skill} was refused (result {result})"));
+            // A refusal the bot's own checks rule out is the server's to explain; the cooldown,
+            // mana, range, sight and movement refusals are the bot's rough pre-checks.
+            if classify::refusal(result) == Refusal::Unexpected {
+                ctx.find(Finding::SkillRefused {
+                    skill,
+                    code: result,
+                });
+            }
+        }
+        if ctx.combat.immune_refused != 0 {
+            let obj = std::mem::take(&mut ctx.combat.immune_refused);
+            let npc = ctx
+                .state
+                .units
+                .get(&obj)
+                .filter(|u| u.kind == UnitKind::Npc)
+                .map(|u| u.id);
+            if let Some(npc) = npc {
+                ctx.find(Finding::TargetImmune {
+                    npc,
+                    casts: 0,
+                    refused: true,
+                });
+            }
         }
         ctx.combat.status = status;
         status
@@ -910,6 +957,20 @@ impl Combat {
         ctx.combat
             .watch
             .observe(now, target_hp, ctx.state.last_damage_ms);
+        let w = &mut ctx.combat.watch;
+        if !is_char
+            && !w.immune_told
+            && classify::target_immune(w.accepted, w.dealt, now.saturating_sub(w.first_accept_ms))
+        {
+            // The server accepted cast after cast at this monster and it never lost a hit point.
+            w.immune_told = true;
+            let (npc, casts) = (ctx.state.units.get(&obj).map_or(0, |u| u.id), w.accepted);
+            ctx.find(Finding::TargetImmune {
+                npc,
+                casts,
+                refused: false,
+            });
+        }
         let reason = if dist > lost_at {
             Some(LostReason::Far)
         } else if now.saturating_sub(engaged_at) > timeout {

@@ -10,6 +10,7 @@ use super::combat::Combat;
 use super::coordinator::CoordHandle;
 use super::motion::{Motion, MotionEnv, Pace};
 use super::state::BotState;
+use super::watch::{Finding, Pending, Req};
 use crate::archetype::Archetype;
 use crate::config::Config;
 use crate::hub::{Hub, Logger};
@@ -132,6 +133,10 @@ impl Ctx<'_> {
         let Some(out) = cs::gm_command(&wire.line) else {
             return false;
         };
+        if wire.line.starts_with("/move") {
+            // the server answers a /move with SCTeleportUnit (or a chat line that refuses it)
+            self.expect(Req::Teleport, 0);
+        }
         self.log
             .debug(format!("gm {}: {}", self.persona.name, wire.line));
         self.out.push(out);
@@ -144,10 +149,33 @@ impl Ctx<'_> {
     /// episode once, not on every tick.
     pub fn report_issue(&self, report: IssueReport) {
         let (pos, char_id) = (self.state.me.pos, self.state.me.char_id);
+        let report = self.state.watch.attach_trail(report, self.now_ms);
         let report = self
             .log
             .with_slot(|g| crate::issues::attach_context(report, g, char_id, Some(pos)));
         self.hub.report_issue(report);
+    }
+
+    /// Leaves a finding of a detector (see [`super::watch`]) for the bot loop to file with the
+    /// packet trail. Each episode is kept once per session, so a goal may call this every tick
+    /// the symptom lasts.
+    pub fn find(&mut self, finding: Finding) {
+        self.state.watch.push(finding);
+    }
+
+    /// Registers a request the server must answer (see [`super::watch::tracker`]). Requests whose
+    /// packets say what they are (quests, loot, skills) are registered by the bot loop itself;
+    /// this is for the others.
+    pub fn expect(&mut self, req: Req, id: u32) {
+        let pos = self.state.me.pos;
+        self.state.watch.tracker.expect(Pending {
+            req,
+            id,
+            aux: 0,
+            sent_ms: self.now_ms,
+            wait_ms: super::watch::tracker::WAIT_MS,
+            pos: [pos[0], pos[1]],
+        });
     }
 
     /// Whether GM commands may be used.

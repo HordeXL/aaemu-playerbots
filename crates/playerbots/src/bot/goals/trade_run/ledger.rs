@@ -14,6 +14,8 @@ use aa_proto::sc_activity::{mail_type, ActivityEvent};
 use aa_proto::sc_world::WorldEvent;
 use smallvec::SmallVec;
 
+use crate::bot::watch::PayFault;
+
 /// `ErrorMessageType` of "the craft cannot go on"; the second field of the packet is the reason.
 pub const ERR_CRAFT_STOPPED: i16 = 148;
 /// Stands for a refused skill start in [`Ledger::error_since`]; the reason is the `SkillResult`.
@@ -135,6 +137,8 @@ pub struct Ledger {
     /// Bot clock at which a trade run that carried a pack was interrupted, see
     /// [`Ledger::note_interrupted_run`].
     run_interrupted_ms: Option<u64>,
+    /// A payment mail the bot had to give up on, until [`Ledger::take_fault`].
+    fault: Option<PayFault>,
 }
 
 impl Ledger {
@@ -382,8 +386,19 @@ impl Ledger {
             let d = cold.due.remove(i);
             cold.remember(d.mail_id);
             self.awaiting = self.awaiting.saturating_sub(1);
+            // an empty payment, or a server that did not answer the requests for the mail
+            self.fault = Some(if d.known && d.money <= 0 && d.items == 0 {
+                PayFault::Empty
+            } else {
+                PayFault::Unanswered
+            });
         }
         paid
+    }
+
+    /// The payment mail that had to be given up on, once (see [`PayFault`]).
+    pub fn take_fault(&mut self) -> Option<PayFault> {
+        self.fault.take()
     }
 
     fn should_list(&mut self, now_ms: u64) -> bool {
@@ -468,6 +483,40 @@ mod tests {
 
     fn ops(out: &[Out]) -> Vec<u16> {
         out.iter().map(|o| o.opcode).collect()
+    }
+
+    #[test]
+    fn a_payment_mail_that_is_empty_or_unanswered_is_a_fault_once() {
+        // an empty one: announced, read, and there is nothing to take
+        let mut l = Ledger::default();
+        let mut out = Vec::new();
+        l.note_sale();
+        l.observe(&got(5, mail_type::SYS_SELL_BACKPACK), 1_000, 9);
+        l.tick(1_000, &mut out);
+        assert_eq!(out.len(), 1, "the mail is read");
+        l.observe(&body(5, 0), 1_100, 9);
+        l.tick(1_200, &mut out);
+        assert_eq!(l.take_fault(), Some(PayFault::Empty));
+        assert_eq!(l.take_fault(), None, "taken once");
+        assert_eq!(l.awaiting(), 0);
+
+        // one the server never answers: three tries, then the fault
+        let mut l = Ledger::default();
+        l.note_sale();
+        l.observe(&got(6, mail_type::SYS_SELL_BACKPACK), 1_000, 9);
+        for t in [1_000, 6_000, 11_000, 16_000, 21_000] {
+            l.tick(t, &mut out);
+        }
+        assert_eq!(l.take_fault(), Some(PayFault::Unanswered));
+
+        // a mail that is paid out is no fault
+        let mut l = Ledger::default();
+        l.note_sale();
+        l.observe(&got(7, mail_type::SYS_SELL_BACKPACK), 1_000, 9);
+        l.tick(1_000, &mut out);
+        l.observe(&body(7, 5_000), 1_100, 9);
+        l.tick(1_200, &mut out);
+        assert_eq!(l.take_fault(), None);
     }
 
     #[test]

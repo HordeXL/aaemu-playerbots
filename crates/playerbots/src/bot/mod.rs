@@ -31,6 +31,7 @@ pub mod motion;
 pub mod rotation;
 pub mod session;
 pub mod state;
+pub mod watch;
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
@@ -38,7 +39,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aa_proto::cs::{self, Out};
-use aa_proto::game::{ConnStats, GameConn, Packet};
+use aa_proto::game::{ConnStats, GameConn, Packet, LEVEL_PROXY};
+use aa_proto::opcodes::pp;
 use aa_proto::sc::ServerEvent;
 use aa_proto::sc_world::{DoodadInfo, WorldEvent};
 use aa_world::{DoodadFlags, World};
@@ -51,7 +53,7 @@ use tracing::Instrument;
 use crate::archetype::{Archetype, Archetypes};
 use crate::config::{race_name, Config};
 use crate::hub::{Hub, Logger};
-use crate::issues::{IssueReport, LogLevel};
+use crate::issues::{Dir, IssueReport, LogLevel};
 use crate::roster::{RosterEntry, SharedRoster};
 use crate::secrets::Secret;
 
@@ -61,8 +63,11 @@ use combat::Combat;
 use coordinator::CoordHandle;
 use ctx::{Ctx, Persona};
 use motion::{Motion, MotionCfg, MotionEnv};
-use session::{SessionError, Wish};
+use session::{Decoded, SessionError, Wish};
 use state::{BotState, UnitKind};
+use watch::classify::{self, Cause, Fault, Phase};
+use watch::finding::{fault_report, malformed_report, stall_report};
+use watch::Finding;
 
 /// Concurrent logins (login server plus lobby), so a restart does not stampede the servers.
 pub const LOGIN_PERMITS: usize = 4;
@@ -122,13 +127,15 @@ enum SessionEnd {
         why: String,
         permanent: bool,
         online: Duration,
+        /// The connection problem this end comes to, if the server is to blame for it.
+        fault: Option<Fault>,
     },
 }
 
 /// Why the world loop returned.
 enum WorldEnd {
     Shutdown,
-    Lost(String),
+    Lost(String, Cause),
 }
 
 /// Runs bot `id` until `cancel` fires: connect, play, reconnect with backoff, log out.
@@ -173,6 +180,9 @@ struct Bot {
     detail: String,
     secs: u32,
     sessions: u32,
+    /// A connection problem was reported and the bot has not been healthy since: the failed
+    /// reconnects of one outage are one episode, one report.
+    outage_reported: bool,
 }
 
 impl Bot {
@@ -215,6 +225,7 @@ impl Bot {
             detail: String::new(),
             secs: 0,
             sessions: 0,
+            outage_reported: false,
             shared,
         }
     }
@@ -251,11 +262,16 @@ impl Bot {
                     why,
                     permanent,
                     online,
+                    fault,
                 } => {
                     name_retries = 0;
                     self.log.say(format!("offline: {why}"));
                     if online >= HEALTHY_SESSION {
                         backoff = min;
+                        self.outage_reported = false;
+                    }
+                    if let Some(f) = fault {
+                        self.report_fault(f, &why);
                     }
                     if permanent {
                         backoff = max;
@@ -298,13 +314,23 @@ impl Bot {
             p = tokio::time::timeout(PERMIT_WAIT, shared.login_gate.acquire()) => match p {
                 Ok(p) => p.ok(),
                 Err(_) => {
-                    return failed(SessionError::Timeout("a free login slot"), Duration::ZERO)
+                    return failed(
+                        SessionError::Timeout("a free login slot"),
+                        Duration::ZERO,
+                        Phase::Login,
+                    )
                 }
             },
         };
         // The slot is held until the bot is in the world, but not longer than PERMIT_HOLD.
         let hold = Instant::now() + PERMIT_HOLD;
-        let held_too_long = || failed(SessionError::Timeout("the login slot"), Duration::ZERO);
+        let held_too_long = || {
+            failed(
+                SessionError::Timeout("the login slot"),
+                Duration::ZERO,
+                Phase::Login,
+            )
+        };
         self.sessions += 1;
         let ticket = tokio::select! {
             _ = cancel.cancelled() => return SessionEnd::Shutdown,
@@ -315,7 +341,7 @@ impl Bot {
                 cfg.server.world_id,
             )) => match r {
                 Ok(Ok(t)) => t,
-                Ok(Err(e)) => return failed(e, Duration::ZERO),
+                Ok(Err(e)) => return failed(e, Duration::ZERO, Phase::Login),
                 Err(_) => return held_too_long(),
             },
         };
@@ -325,8 +351,14 @@ impl Bot {
             _ = cancel.cancelled() => return SessionEnd::Shutdown,
             r = tokio::time::timeout_at(connect_by, connect) => match r {
                 Ok(Ok(c)) => c,
-                Ok(Err(e)) => return failed(e.into(), Duration::ZERO),
-                Err(_) => return failed(SessionError::Timeout("the game server"), Duration::ZERO),
+                Ok(Err(e)) => return failed(e.into(), Duration::ZERO, Phase::Connect),
+                Err(_) => {
+                    return failed(
+                        SessionError::Timeout("the game server"),
+                        Duration::ZERO,
+                        Phase::Connect,
+                    )
+                }
             },
         };
         self.state.reset();
@@ -371,7 +403,7 @@ impl Bot {
             }
             Err(e) => {
                 session::close(&mut conn).await;
-                return failed(e, Duration::ZERO);
+                return failed(e, Duration::ZERO, Phase::Lobby);
             }
         };
         self.record_character(&entered);
@@ -389,12 +421,16 @@ impl Bot {
                 self.count_packets(&conn);
                 SessionEnd::Shutdown
             }
-            WorldEnd::Lost(why) => {
+            WorldEnd::Lost(why, cause) => {
                 session::close(&mut conn).await;
                 SessionEnd::Ended {
                     why,
                     permanent: false,
                     online,
+                    fault: Some(Fault {
+                        phase: Phase::World,
+                        cause,
+                    }),
                 }
             }
         }
@@ -423,6 +459,7 @@ impl Bot {
                 why: "the roster entry is gone".into(),
                 permanent: true,
                 online: Duration::ZERO,
+                fault: None,
             },
         }
     }
@@ -484,10 +521,13 @@ impl Bot {
                 }
                 _ = housekeeping.tick() => {
                     if let Some(quiet) = watch.expired(Instant::now()) {
-                        return WorldEnd::Lost(format!(
-                            "no packet from the server for {} s (the connection is dead)",
-                            quiet.as_secs()
-                        ));
+                        return WorldEnd::Lost(
+                            format!(
+                                "no packet from the server for {} s (the connection is dead)",
+                                quiet.as_secs()
+                            ),
+                            Cause::Silent,
+                        );
                     }
                     self.housekeeping(conn);
                     if let Some(end) = self.flush(conn, cancel).await {
@@ -502,7 +542,10 @@ impl Bot {
                             return end;
                         }
                     }
-                    Err(e) => return WorldEnd::Lost(e.to_string()),
+                    Err(e) => {
+                        let cause = session::cause_of(&e, false);
+                        return WorldEnd::Lost(e.to_string(), cause);
+                    }
                 },
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(c) => self.on_command(c),
@@ -516,10 +559,31 @@ impl Bot {
     /// Writes the outbox. Gives up at once when `cancel` fires (a shutdown must not wait for a
     /// dead connection) and treats a write that does not finish in time as a lost connection.
     async fn flush(&mut self, conn: &mut GameConn, cancel: &CancellationToken) -> Option<WorldEnd> {
+        self.note_sent();
         match session::flush_until_cancelled(conn, &mut self.out, cancel).await {
             session::Flushed::Done => None,
             session::Flushed::Cancelled => Some(WorldEnd::Shutdown),
-            session::Flushed::Failed(e) => Some(WorldEnd::Lost(e.to_string())),
+            session::Flushed::Failed(e) => {
+                let cause = session::cause_of(&e, true);
+                Some(WorldEnd::Lost(e.to_string(), cause))
+            }
+        }
+    }
+
+    /// Notes the packets about to be written in the trail, and registers those the server must
+    /// answer with the expectation tracker.
+    fn note_sent(&mut self) {
+        if self.out.is_empty() {
+            return;
+        }
+        let now = self.now_ms();
+        let st = &mut self.state;
+        let (pos, units) = (st.me.pos, &st.units);
+        for o in &self.out {
+            st.watch.packet(now, Dir::C2S, o.level, o.opcode);
+            st.watch
+                .tracker
+                .on_sent(o, now, pos, |obj| units.get(&obj).map_or(0, |u| u.id));
         }
     }
 
@@ -534,8 +598,22 @@ impl Bot {
     }
 
     fn on_packet(&mut self, p: &Packet) {
-        let Some(mut ev) = session::decode(p) else {
-            return;
+        let now = self.now_ms();
+        self.state.now_ms = now;
+        let w = &mut self.state.watch;
+        w.packet(now, Dir::S2C, p.level, p.opcode);
+        w.conn.on_rx(now);
+        w.on_raw(p.level, p.opcode, &p.body, self.state.me.obj, now);
+        if p.level == LEVEL_PROXY && p.opcode == pp::PongPacket {
+            self.on_pong(p, now);
+        }
+        let mut ev = match session::decode_checked(p) {
+            Decoded::Event(ev) => ev,
+            Decoded::Ignored => return,
+            Decoded::Malformed(err) => {
+                self.on_malformed(p, &err);
+                return;
+            }
         };
         if let ServerEvent::World(WorldEvent::DoodadsCreated(list)) = &mut ev {
             let world = &self.shared.world;
@@ -544,14 +622,60 @@ impl Bot {
                 return;
             }
         }
-        let now = self.now_ms();
-        self.state.now_ms = now;
         self.state.apply(&ev);
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
         self.pin_position(queued, now);
         self.clear_target_after_player_fight();
+        self.drain_findings();
+    }
+
+    /// A pong: its first field is the bot clock at which the ping left.
+    fn on_pong(&mut self, p: &Packet, now: u64) {
+        let Some(head) = p.body.first_chunk::<8>() else {
+            return;
+        };
+        let sent = i64::from_le_bytes(*head);
+        // (`now` is the bot clock plus one, see `now_ms`)
+        let rtt = (now as i64 - 1).saturating_sub(sent).max(0) as u64;
+        self.state.watch.conn.on_pong(rtt);
+    }
+
+    /// A packet the parser rejects: one report per packet kind and session, with the head of the
+    /// body.
+    fn on_malformed(&mut self, p: &Packet, err: &str) {
+        if self.state.watch.new_malformed(p.level, p.opcode) {
+            let report = malformed_report(p.level, p.opcode, err, &p.body);
+            self.log.say(format!(
+                "the server sent {} that does not parse: {err}",
+                p.name()
+            ));
+            self.file_issue(report);
+        }
+    }
+
+    /// Files what the detectors in the state, the goals and the combat controller left.
+    fn drain_findings(&mut self) {
+        if !self.state.watch.has_findings() {
+            return;
+        }
+        for f in self.state.watch.take_findings() {
+            let report = f.report(&*self.shared.world);
+            self.file_issue(report);
+        }
+    }
+
+    /// The connection ended or could not be made: one report per outage.
+    fn report_fault(&mut self, fault: Fault, why: &str) {
+        if !classify::new_episode(&mut self.outage_reported) {
+            return;
+        }
+        if matches!(fault.phase, Phase::Login | Phase::Connect) {
+            // (no packet of this attempt: the trail of the previous session is not evidence)
+            self.state.watch.trail.clear();
+        }
+        self.file_issue(fault_report(fault, why));
     }
 
     /// When a fight against a character (a duel) is over, clears the server-side target: it would
@@ -628,6 +752,7 @@ impl Bot {
     /// A detector in the bot loop calls this; goals call [`Ctx::report_issue`].
     fn file_issue(&self, report: IssueReport) {
         let (pos, char_id) = (self.state.me.pos, self.state.me.char_id);
+        let report = self.state.watch.attach_trail(report, self.now_ms());
         let report = self
             .slot
             .with(|g| crate::issues::attach_context(report, g, char_id, Some(pos)));
@@ -635,8 +760,11 @@ impl Bot {
     }
 
     /// The server logged a warning or an error that names this bot's character: files a
-    /// `ServerLogDuringAction` report. (The bot has no packet trail to add yet.)
+    /// `ServerLogDuringAction` report (with the packet trail of the moment).
     fn on_server_log_line(&mut self, level: LogLevel, line: &str) {
+        if classify::routine_server_line(crate::issues::logtail::split_line(line).message) {
+            return;
+        }
         let report = crate::issues::server_log_report(level, line, &self.persona.name);
         self.file_issue(report);
     }
@@ -694,6 +822,7 @@ impl Bot {
         self.motion.tick(&mut env);
         self.state.me.pos = self.motion.pos();
         self.clear_target_after_player_fight();
+        self.drain_findings();
         None
     }
 
@@ -720,10 +849,16 @@ impl Bot {
             self.log.say("resurrected");
         }
         if let Some((reason, msg)) = r.kicked {
-            return Some(WorldEnd::Lost(format!("kicked (reason {reason}): {msg}")));
+            return Some(WorldEnd::Lost(
+                format!("kicked (reason {reason}): {msg}"),
+                Cause::Kicked(reason),
+            ));
         }
         if r.leave_granted {
-            return Some(WorldEnd::Lost("the server logged the character out".into()));
+            return Some(WorldEnd::Lost(
+                "the server logged the character out".into(),
+                Cause::Logout,
+            ));
         }
         None
     }
@@ -742,7 +877,41 @@ impl Bot {
         self.real_near = self
             .state
             .any_character_within(WATCH_RADIUS, |id| hub.is_bot_char(id));
+        self.watch_server();
         self.publish(conn);
+    }
+
+    /// The once-a-second pass of the detectors that look at time: requests the server never
+    /// answered, a stalled connection, a death nobody announced or undid.
+    fn watch_server(&mut self) {
+        let now = self.now_ms();
+        let st = &mut self.state;
+        let pos = st.me.pos;
+        let rx = st.watch.conn.last_rx_ms();
+        if !st.watch.tracker.is_empty() {
+            for p in st.watch.tracker.take_due(now, pos, rx) {
+                st.watch.push(Finding::NoResponse {
+                    req: p.req,
+                    id: p.id,
+                    aux: p.aux,
+                    waited_ms: now.saturating_sub(p.sent_ms).min(u64::from(u32::MAX)) as u32,
+                });
+            }
+        }
+        let (dead, respawn_at) = (st.me.dead, st.me.respawn_at_ms);
+        if let Some(d) = st.watch.death.check(now, dead, respawn_at) {
+            st.watch.push(Finding::Death(d));
+        }
+        let stall = st.watch.conn.check(now);
+        self.drain_findings();
+        if let Some(s) = stall {
+            self.log.say(format!(
+                "the server is slow: nothing for {} s, ping {} s",
+                s.quiet_ms / 1000,
+                s.rtt_ms / 1000
+            ));
+            self.file_issue(stall_report(s));
+        }
     }
 
     fn count_packets(&mut self, conn: &GameConn) {
@@ -886,9 +1055,10 @@ pub fn initial_snapshot(entry: &RosterEntry, archetype: &Archetype) -> pb_web::B
     }
 }
 
-fn failed(e: SessionError, online: Duration) -> SessionEnd {
+fn failed(e: SessionError, online: Duration, phase: Phase) -> SessionEnd {
     SessionEnd::Ended {
         permanent: e.is_permanent(),
+        fault: e.fault(phase),
         why: e.to_string(),
         online,
     }
@@ -986,15 +1156,22 @@ mod tests {
         match failed(
             SessionError::Login(aa_proto::login::LoginError::Denied(3)),
             Duration::ZERO,
+            Phase::Login,
         ) {
-            SessionEnd::Ended { why, permanent, .. } => {
+            SessionEnd::Ended {
+                why,
+                permanent,
+                fault,
+                ..
+            } => {
                 assert!(permanent);
                 assert!(why.contains("denied"), "{why}");
+                assert_eq!(fault.unwrap().cause, Cause::Denied(3));
             }
             _ => panic!("expected Ended"),
         }
         assert!(matches!(
-            failed(SessionError::Timeout("x"), Duration::ZERO),
+            failed(SessionError::Timeout("x"), Duration::ZERO, Phase::Lobby),
             SessionEnd::Ended {
                 permanent: false,
                 ..

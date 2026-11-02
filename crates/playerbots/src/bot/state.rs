@@ -18,7 +18,10 @@ use aa_proto::sc_world::{unit_type, EquipSlot, ItemChange, ItemTaskInfo, UnitInf
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use super::goals::trade::Outcome;
 use super::goals::trade_run::Ledger;
+use super::watch::classify;
+use super::watch::{Finding, Watch};
 
 /// Most units kept in the view.
 pub const MAX_UNITS: usize = 1024;
@@ -392,6 +395,9 @@ pub struct BotState {
     /// Monsters the bot could not reach and leaves alone (grind and quest goals), allocated at
     /// the first one.
     pub avoid: Option<Box<super::avoid::Avoid>>,
+    /// The detectors that tell the team about server problems (packet trail, requests waiting for
+    /// an answer, findings), see [`super::watch`]. One allocation per bot.
+    pub watch: Box<Watch>,
 }
 
 impl BotState {
@@ -522,6 +528,7 @@ impl BotState {
     /// Updates the state from one server event.
     pub fn apply(&mut self, ev: &ServerEvent) {
         self.econ.observe(ev, self.now_ms, self.me.obj);
+        self.watch.observe(ev, self.me.obj, self.now_ms);
         match ev {
             ServerEvent::World(w) => self.apply_world(w),
             ServerEvent::Activity(a) => self.apply_activity(a),
@@ -552,6 +559,7 @@ impl BotState {
                 self.equipment = own.equipment.to_vec();
                 // Saved with no hit points: the server sends no death event for it.
                 if own.hp <= 0 {
+                    self.watch.death.found_dead_at_login(self.now_ms);
                     self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
                 }
             }
@@ -585,6 +593,10 @@ impl BotState {
                     self.me.mp = *mp;
                     self.me.hp_max = self.me.hp_max.max(*hp);
                     self.me.mp_max = self.me.mp_max.max(*mp);
+                    if *hp <= 0 && !self.me.dead {
+                        // (the server says SCUnitDeath right after; if it does not, that is a finding)
+                        self.watch.death.points_zero(self.now_ms);
+                    }
                     self.check_alive();
                 } else if let Some(u) = self.units.get_mut(obj) {
                     u.hp = *hp;
@@ -601,6 +613,7 @@ impl BotState {
             } => self.apply_death(*obj, *killer, *respawn_wait_ms),
             WorldEvent::Resurrected { obj, pos, yaw } => {
                 if *obj == self.me.obj && self.me.obj != 0 {
+                    self.watch.death.alive();
                     self.me.dead = false;
                     self.me.pos = [pos.0, pos.1, pos.2];
                     self.me.yaw = *yaw;
@@ -783,6 +796,7 @@ impl BotState {
             && self.me.char_id != 0
             && info.id == self.me.char_id;
         if is_me {
+            let first_spawn = !self.me.spawned;
             let me = &mut self.me;
             me.obj = info.obj;
             me.level = info.level;
@@ -805,6 +819,9 @@ impl BotState {
                 }
             }
             if info.dead {
+                if first_spawn {
+                    self.watch.death.found_dead_at_login(self.now_ms);
+                }
                 self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
             } else {
                 self.check_alive();
@@ -851,6 +868,7 @@ impl BotState {
         if self.me.hp <= 0 {
             self.found_dead(DEAD_AT_LOGIN_WAIT_MS);
         } else if self.me.dead {
+            self.watch.death.alive();
             self.me.dead = false;
             self.reactions.resurrected = Some(self.me.pos);
         }
@@ -867,6 +885,8 @@ impl BotState {
         self.me.respawn_at_ms = self.now_ms + wait_ms.max(1000);
         self.reactions.died = true;
         self.threats.clear();
+        // the requests of a dead bot are moot
+        self.watch.tracker.clear();
     }
 
     fn apply_death(&mut self, obj: u32, killer: u32, respawn_wait_ms: i32) {
@@ -877,6 +897,8 @@ impl BotState {
             self.me.respawn_at_ms = self.now_ms + wait;
             self.reactions.died = true;
             self.threats.clear();
+            self.watch.death.death_packet();
+            self.watch.tracker.clear();
             return;
         }
         if let Some(u) = self.units.get_mut(&obj) {
@@ -1076,7 +1098,10 @@ impl BotState {
             }
             ActivityEvent::QuestReset { quest_id, .. } => self.quests.mark_undone(*quest_id),
             // the bag and the purse follow a finished trade
-            ActivityEvent::TradeMade { items, .. } => self.apply_item_task(items),
+            ActivityEvent::TradeMade { items, .. } => {
+                self.audit_trade(items);
+                self.apply_item_task(items);
+            }
             ActivityEvent::QuestFailed { quest_id, err } => self.push_error(StateError::Quest {
                 quest: *quest_id,
                 err: *err,
@@ -1094,6 +1119,36 @@ impl BotState {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Compares a finished trade with the two offers, before its item task changes the bag: a
+    /// purse or a bag that moved by something else than both sides put up is a finding.
+    fn audit_trade(&mut self, task: &ItemTaskInfo) {
+        let Some(Outcome::Made(w)) = &self.trade.outcome else {
+            return;
+        };
+        if task.changes.is_empty() {
+            // the item tasks did not parse: nothing to compare
+            return;
+        }
+        let got = classify::tally(task, &self.bag);
+        let mine_items: i64 = w.mine.items.iter().map(|p| i64::from(p.amount)).sum();
+        let mut other: SmallVec<[(u32, i64); 4]> = SmallVec::new();
+        for p in &w.other.items {
+            match other.iter_mut().find(|o| o.0 == p.template) {
+                Some(o) => o.1 += i64::from(p.amount),
+                None => other.push((p.template, i64::from(p.amount))),
+            }
+        }
+        if let Some(fault) = classify::trade_fault(
+            i64::from(w.mine.money),
+            i64::from(w.other.money),
+            mine_items,
+            &other,
+            &got,
+        ) {
+            self.watch.push(Finding::Trade(fault));
         }
     }
 
@@ -1951,6 +2006,185 @@ mod tests {
         }));
         assert!(s.reactions.resurrected.is_none());
         assert!(!s.reactions.died);
+    }
+
+    #[test]
+    fn zero_points_without_a_death_packet_are_a_finding_and_the_packet_clears_it() {
+        use crate::bot::watch::classify::{Death, DEATH_PACKET_GRACE_MS};
+        use crate::bot::watch::{Pending, Req};
+        // the points reach 0, the server never says the bot died
+        let mut s = in_world();
+        s.now_ms = 10_000;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 0,
+            mp: 50,
+        }));
+        assert_eq!(s.watch.death.points_zero_ms, 10_000);
+        assert_eq!(
+            s.watch.death.check(10_500, s.me.dead, s.me.respawn_at_ms),
+            None
+        );
+        let late = 10_000 + DEATH_PACKET_GRACE_MS + 1;
+        assert_eq!(
+            s.watch.death.check(late, s.me.dead, s.me.respawn_at_ms),
+            Some(Death::NoDeathPacket)
+        );
+        assert_eq!(
+            s.watch
+                .death
+                .check(late + 1_000, s.me.dead, s.me.respawn_at_ms),
+            None,
+            "once per episode"
+        );
+
+        // the packet follows right away: nothing to report, and the requests of a dead bot go
+        let mut s = in_world();
+        s.watch.tracker.expect(Pending {
+            req: Req::SkillCast,
+            id: 1,
+            aux: 0,
+            sent_ms: 9_000,
+            wait_ms: 6_000,
+            pos: [0.0; 2],
+        });
+        s.now_ms = 10_000;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 0,
+            mp: 50,
+        }));
+        s.now_ms = 10_100;
+        s.apply(&world(WorldEvent::UnitDeath {
+            obj: 0x400,
+            killer: 0x999,
+            respawn_wait_ms: 5_000,
+            lost_exp: 0,
+            reason: 0,
+        }));
+        assert_eq!(s.watch.death.points_zero_ms, 0);
+        assert_eq!(
+            s.watch.death.check(61_000, s.me.dead, s.me.respawn_at_ms),
+            Some(Death::NeverResurrected),
+            "the bot died properly but was never revived, a different finding"
+        );
+        assert_eq!(s.watch.tracker.len(), 0, "the dead bot waits for nothing");
+    }
+
+    #[test]
+    fn a_bot_found_dead_at_login_is_noted_and_a_revival_forgets_it() {
+        use crate::bot::watch::{Pending, Req};
+        let mut s = BotState::new();
+        s.now_ms = 3_000;
+        let mut own = own_state();
+        own.hp = 0;
+        s.apply(&world(WorldEvent::CharacterState(Box::new(own))));
+        assert!(s.me.dead);
+        assert_eq!(s.watch.death.login_dead_ms, 3_000);
+        s.watch.tracker.expect(Pending {
+            req: Req::QuestAccept,
+            id: 4,
+            aux: 0,
+            sent_ms: 3_000,
+            wait_ms: 6_000,
+            pos: [0.0; 2],
+        });
+        // alive again: the episode is over
+        s.now_ms = 9_000;
+        s.apply(&world(WorldEvent::UnitPoints {
+            obj: 0x400,
+            hp: 500,
+            mp: 50,
+        }));
+        s.apply(&world(WorldEvent::UnitState(Box::new(unit_info(
+            0x400,
+            unit_type::CHARACTER,
+            500,
+        )))));
+        assert!(!s.me.dead);
+        assert_eq!(s.watch.death.login_dead_ms, 0);
+    }
+
+    #[test]
+    fn a_finished_trade_is_audited_against_both_offers() {
+        use crate::bot::goals::trade::{Put, Window};
+        use crate::bot::watch::classify::TradeFault;
+        let task = |changes: Vec<ItemChange>| ActivityEvent::TradeMade {
+            action: 0,
+            tasks: changes.len() as u8,
+            items: Box::new(ItemTaskInfo {
+                reason: 0,
+                changes: changes.into_iter().collect(),
+                force_removed: Default::default(),
+            }),
+        };
+        // the bot puts up 1 gold, the partner 3 items of template 55; both arrive correctly
+        let window = || {
+            let mut w = Window::new(0x777, 0);
+            w.mine.money = 10_000;
+            w.other.items.push(Put {
+                slot: 0,
+                template: 55,
+                amount: 3,
+            });
+            Box::new(w)
+        };
+        let good = vec![
+            ItemChange::Money(-10_000),
+            ItemChange::Added {
+                action: 5,
+                slot_type: SLOT_BAG,
+                slot: 4,
+                template: 55,
+                id: 90,
+                grade: 0,
+                count: 3,
+            },
+        ];
+        let mut s = in_world();
+        s.trade.window = Some(window());
+        s.apply(&ServerEvent::Activity(task(good.clone())));
+        assert!(!s.watch.has_findings(), "a right trade is not a finding");
+
+        // the items never come
+        let mut s = in_world();
+        s.trade.window = Some(window());
+        s.apply(&ServerEvent::Activity(task(vec![ItemChange::Money(
+            -10_000,
+        )])));
+        let found = s.watch.take_findings();
+        assert_eq!(
+            found.as_slice(),
+            &[Finding::Trade(TradeFault::ItemsIn {
+                template: 55,
+                expected: 3,
+                actual: 0
+            })]
+        );
+
+        // the purse moved by another amount
+        let mut s = in_world();
+        s.trade.window = Some(window());
+        let mut wrong = good;
+        wrong[0] = ItemChange::Money(-9_000);
+        s.apply(&ServerEvent::Activity(task(wrong)));
+        let found = s.watch.take_findings();
+        assert!(matches!(
+            found.as_slice(),
+            [Finding::Trade(TradeFault::Money {
+                expected: -10_000,
+                actual: -9_000
+            })]
+        ));
+
+        // an item task that did not parse is nothing to compare, and neither is a trade the
+        // bot saw no window for
+        let mut s = in_world();
+        s.trade.window = Some(window());
+        s.apply(&ServerEvent::Activity(task(Vec::new())));
+        let mut s2 = in_world();
+        s2.apply(&ServerEvent::Activity(task(vec![ItemChange::Money(5)])));
+        assert!(!s.watch.has_findings() && !s2.watch.has_findings());
     }
 
     #[test]

@@ -10,7 +10,6 @@
 //! (other than 127.x) and credential-looking `key=value` pairs are removed from all of them.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fmt::{self, Display};
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +31,7 @@ pub const MAX_FACT_NAME_CHARS: usize = 40;
 /// Longest fact value, in characters.
 pub const MAX_FACT_VALUE_CHARS: usize = 160;
 /// Most trail entries of a report (the newest are kept).
-pub const MAX_TRAIL: usize = 40;
+pub const MAX_TRAIL: usize = 48;
 /// Most bytes of the triggering packet that are kept.
 pub const MAX_PACKET_HEAD: usize = 96;
 /// Most bot log lines of a report (the newest are kept).
@@ -283,12 +282,29 @@ impl TrailEntry {
     }
 }
 
+/// One slot of the [`TrailRing`]: 8 bytes, no name.
+#[derive(Debug, Clone, Copy, Default)]
+struct RingEntry {
+    /// The bot clock in milliseconds, wrapped to 32 bit (49 days).
+    t_ms: u32,
+    opcode: u16,
+    /// Bit 0: `1` = received (S2C); bits 1..: the packet level.
+    flags: u8,
+}
+
 /// A bounded ring of the last packets of a bot, for [`IssueReport::trail`]. A bot keeps one
 /// (`push` for each packet it sends or receives, with the bot clock in milliseconds) and takes a
-/// [`TrailRing::snapshot`] when it files a report. It allocates on the first `push` only.
+/// [`TrailRing::snapshot`] when it files a report.
+///
+/// Compact on purpose (every bot has one): a slot is 8 bytes (time, opcode, direction and level),
+/// the packet *names* are looked up in the opcode tables only when a snapshot is taken, and the
+/// 48 slots are allocated on the first `push`, so a bot that never connected costs a null pointer.
 #[derive(Debug, Default, Clone)]
 pub struct TrailRing {
-    buf: VecDeque<(u64, Dir, u8, u16, &'static str)>,
+    slots: Option<Box<[RingEntry; MAX_TRAIL]>>,
+    /// Index of the oldest entry.
+    head: u8,
+    len: u8,
 }
 
 impl TrailRing {
@@ -301,37 +317,61 @@ impl TrailRing {
     }
 
     /// Records a packet seen at `now_ms` (the bot clock).
-    pub fn push(&mut self, now_ms: u64, dir: Dir, level: u8, opcode: u16, name: &'static str) {
-        if self.buf.len() >= Self::CAPACITY {
-            self.buf.pop_front();
+    pub fn push(&mut self, now_ms: u64, dir: Dir, level: u8, opcode: u16) {
+        let slots = self
+            .slots
+            .get_or_insert_with(|| Box::new([RingEntry::default(); MAX_TRAIL]));
+        let entry = RingEntry {
+            t_ms: now_ms as u32,
+            opcode,
+            flags: level << 1 | u8::from(dir == Dir::S2C),
+        };
+        let cap = Self::CAPACITY;
+        if usize::from(self.len) < cap {
+            slots[(usize::from(self.head) + usize::from(self.len)) % cap] = entry;
+            self.len += 1;
+        } else {
+            slots[usize::from(self.head)] = entry;
+            self.head = ((usize::from(self.head) + 1) % cap) as u8;
         }
-        self.buf.push_back((now_ms, dir, level, opcode, name));
     }
 
-    /// The packets, oldest first, with their age at `now_ms`.
+    /// The packets, oldest first, with their age at `now_ms` and their names.
     pub fn snapshot(&self, now_ms: u64) -> Vec<TrailEntry> {
-        self.buf
-            .iter()
-            .map(|&(t, dir, level, opcode, name)| {
-                let age = now_ms.saturating_sub(t).min(u64::from(u32::MAX)) as u32;
-                TrailEntry::new(age, dir, level, opcode, name)
+        let Some(slots) = self.slots.as_deref() else {
+            return Vec::new();
+        };
+        let now = now_ms as u32;
+        (0..usize::from(self.len))
+            .map(|i| {
+                let e = slots[(usize::from(self.head) + i) % Self::CAPACITY];
+                let (dir, level) = (
+                    if e.flags & 1 == 1 { Dir::S2C } else { Dir::C2S },
+                    e.flags >> 1,
+                );
+                let name = match dir {
+                    Dir::S2C => aa_proto::game::sc_name(level, e.opcode),
+                    Dir::C2S => aa_proto::game::cs_name(level, e.opcode),
+                };
+                TrailEntry::new(now.wrapping_sub(e.t_ms), dir, level, e.opcode, name)
             })
             .collect()
     }
 
     /// Number of packets held.
     pub fn len(&self) -> usize {
-        self.buf.len()
+        usize::from(self.len)
     }
 
     /// Whether the ring is empty.
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len == 0
     }
 
     /// Forgets everything (a new connection).
     pub fn clear(&mut self) {
-        self.buf.clear();
+        self.head = 0;
+        self.len = 0;
     }
 }
 
@@ -883,22 +923,53 @@ mod tests {
     fn the_trail_ring_keeps_the_newest_and_reports_ages() {
         let mut ring = TrailRing::new();
         assert!(ring.is_empty());
+        assert!(ring.snapshot(5).is_empty());
         for i in 0..100u64 {
-            ring.push(1_000 + i * 10, Dir::S2C, 1, i as u16, "SCx");
+            ring.push(1_000 + i * 10, Dir::S2C, 1, i as u16);
         }
         assert_eq!(ring.len(), TrailRing::CAPACITY);
         let snap = ring.snapshot(2_000);
         assert_eq!(snap.len(), TrailRing::CAPACITY);
         assert_eq!(snap.last().unwrap().opcode, 99);
         assert_eq!(snap.last().unwrap().t_ms_before, 2_000 - (1_000 + 990));
-        assert_eq!(snap[0].opcode, 60);
+        assert_eq!(snap[0].opcode, 100 - TrailRing::CAPACITY as u16);
         assert!(snap
             .windows(2)
             .all(|w| w[0].t_ms_before >= w[1].t_ms_before));
-        // a clock that ran backwards never underflows
-        assert_eq!(ring.snapshot(0).last().unwrap().t_ms_before, 0);
+        // a clock that ran backwards never underflows to a huge age that matters: it wraps
+        assert!(ring.snapshot(0).last().unwrap().t_ms_before > 1_000_000);
         ring.clear();
-        assert!(ring.snapshot(5).is_empty());
+        assert!(ring.snapshot(5).is_empty() && ring.is_empty());
+        // after a clear the ring fills from the start again
+        ring.push(10, Dir::C2S, 1, 7);
+        assert_eq!(ring.snapshot(15).len(), 1);
+    }
+
+    #[test]
+    fn the_trail_ring_is_compact_and_resolves_names_from_the_opcode_tables() {
+        use aa_proto::opcodes::{cs, pp, sc};
+        // 8 bytes a slot, one pointer when empty
+        assert_eq!(std::mem::size_of::<RingEntry>(), 8);
+        assert!(std::mem::size_of::<TrailRing>() <= 16);
+        let mut ring = TrailRing::new();
+        ring.push(100, Dir::C2S, 1, cs::CSStartSkillPacket);
+        ring.push(120, Dir::S2C, 1, sc::SCSkillStartedPacket);
+        ring.push(130, Dir::C2S, 2, pp::PingPacket);
+        ring.push(140, Dir::S2C, 2, pp::PongPacket);
+        ring.push(150, Dir::S2C, 1, 0xfff0);
+        let snap = ring.snapshot(200);
+        let names: Vec<_> = snap.iter().map(|e| (e.dir, e.level, &*e.name)).collect();
+        assert_eq!(
+            names,
+            vec![
+                (Dir::C2S, 1, "CSStartSkillPacket"),
+                (Dir::S2C, 1, "SCSkillStartedPacket"),
+                (Dir::C2S, 2, "PingPacket"),
+                (Dir::S2C, 2, "PongPacket"),
+                (Dir::S2C, 1, "Unknown"),
+            ]
+        );
+        assert_eq!(snap[0].t_ms_before, 100);
     }
 
     #[test]

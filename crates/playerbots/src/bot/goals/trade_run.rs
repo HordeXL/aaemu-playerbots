@@ -972,7 +972,11 @@ impl TradeRun {
 /// Collects the payment of sold trade packs. Runs on every brain tick whatever the bot is doing:
 /// the payment mail can come long after the goal ended.
 pub fn collect_payments(ctx: &mut Ctx<'_>) {
-    if let Some(p) = ctx.state.econ.tick(ctx.now_ms, ctx.out) {
+    let paid = ctx.state.econ.tick(ctx.now_ms, ctx.out);
+    if let Some(fault) = ctx.state.econ.take_fault() {
+        ctx.find(crate::bot::watch::Finding::Payment { fault });
+    }
+    if let Some(p) = paid {
         let mut text = format!(
             "trade run: payment collected, {}",
             coins(i64::from(p.money))
