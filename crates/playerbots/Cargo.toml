@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "playerbots"
+path = "src/lib.rs"
+
 [[bin]]
 name = "playerbots"
 path = "src/main.rs"
@@ -16,6 +20,7 @@ aa-bake.workspace = true
 pb-web.workspace = true
 pb-llm.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -31,3 +36,7 @@ smallvec.workspace = true
 rustc-hash.workspace = true
 fastrand.workspace = true
 sysinfo.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

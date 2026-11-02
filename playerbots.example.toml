@@ -1,0 +1,92 @@
+# playerbots.toml - configuration of the aaemu-playerbots binary.
+#
+#   playerbots example-config > playerbots.toml     (this file)
+#   playerbots run --config playerbots.toml
+#
+# Every key is optional; the values below are the defaults. Unknown keys are an error.
+
+[server]
+# Public login port of the AAEmu Rust server (the port the client connects to).
+login = "127.0.0.1:1237"
+# Game server (world) id to enter. 0 = the first active world the login server lists.
+world_id = 0
+# Bot accounts are "<prefix><bot id>" (pb1, pb2, ...). The login server creates unknown
+# accounts on first login (AutoAccount = true in its Config.json).
+account_prefix = "pb"
+# Password of every bot account. Empty = the environment variable PLAYERBOTS_PASSWORD, and if
+# that is not set either, "playerbots". The password is never logged.
+password = ""
+
+[data]
+# The server's compact.sqlite3 (opened read-only).
+compact = "compact.sqlite3"
+# The server's app/Data directory (Worlds/<world>/*.json, CharTemplates.json).
+server_data = "Data"
+# Output directory of `playerbots bake` (terrain heights, world map, housing areas, quest spheres,
+# zones). Without it bots walk on flat terrain and the web map has no picture.
+# baked = "D:/aaemu-playerbots-data"
+world = "main_world"
+
+# Paths on the dev machine (uncomment and adapt):
+#   compact     = 'C:\Users\messe\Documents\GitHub\AAEmu-rust-1.2\rust\crates\aaemu-game\app\Data\compact.sqlite3'
+#   server_data = 'C:\Users\messe\Documents\GitHub\AAEmu-rust-1.2\rust\crates\aaemu-game\app\Data'
+#   baked       = 'D:\aaemu-playerbots-data'
+
+[bots]
+# Bots started at launch. More can be started and stopped from the web UI.
+count = 10
+# Delay between two bot logins.
+ramp_ms = 750
+# The persistent roster: accounts, character names, classes and personas of all bots.
+# Created on the first run; keep it, it ties the bots to their characters.
+roster = "roster.json"
+# Races for new characters: nuian, elf, hariharan, ferre (the ones 1.2 lets a player create).
+races = ["nuian", "elf", "hariharan", "ferre"]
+# Let bots use GM chat commands (/item add, /gold add, /labor, /move) to get what trade runs and
+# housing need. Requires access level 100 on the bot accounts: `playerbots grant-gm-sql`.
+gm_bootstrap = false
+# Brain tick while a bot moves or fights, and while it stands still (milliseconds).
+tick_ms = 250
+idle_tick_ms = 1500
+# Run and walk speed in metres per second.
+move_speed = 5.4
+walk_speed = 1.8
+# With gm_bootstrap, trips longer than this many metres use /move instead of walking. 0 = never.
+long_travel_teleport_m = 0
+# Wait after a failed connection (doubles up to the maximum), in seconds.
+reconnect_min_secs = 5
+reconnect_max_secs = 120
+
+[behavior]
+# Relative weights of the goals; 0 switches a goal off. Each bot also has a persona that scales
+# them (some bots like quests, some duels, some trading).
+quest = 1.0
+grind = 1.0
+duel = 0.3
+trade = 0.2
+trade_run = 0.3
+housing = 0.2
+rest = 0.4
+wander = 0.5
+# 0 = every bot has the same temperament, 1 = the full spread stored in the roster.
+persona_spread = 0.6
+
+[web]
+# Operator UI and JSON API. Keep it on loopback unless you set a token.
+bind = "127.0.0.1:8790"
+# With a token, POST requests need the header "x-playerbots-token: <token>".
+# token = "change-me"
+
+[llm]
+# Optional chat / decision add-on for any OpenAI-compatible endpoint. Off by default; the bots
+# work the same without it. The key is read from the environment variable named below.
+enabled = false
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+api_key_env = "DEEPSEEK_API_KEY"
+timeout_secs = 20
+max_concurrent = 2
+max_requests_per_minute = 30
+daily_token_budget = 200000
+temperature = 0.8
+max_reply_tokens = 80
