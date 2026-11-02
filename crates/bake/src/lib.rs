@@ -15,6 +15,7 @@ pub mod dds;
 pub mod heights;
 pub mod hmap;
 pub mod map;
+pub mod nav;
 pub mod pak;
 pub mod worldxml;
 
@@ -83,6 +84,11 @@ pub struct BakeSteps {
     pub housing: bool,
     pub spheres: bool,
     pub map: bool,
+    /// The navigation mesh of the world being baked (`nav_<world>.bin`).
+    pub nav: bool,
+    /// The navigation meshes of every other world with `.bai` files in the pak (the instance
+    /// worlds).
+    pub nav_instances: bool,
 }
 
 impl BakeSteps {
@@ -93,6 +99,8 @@ impl BakeSteps {
             housing: true,
             spheres: true,
             map: true,
+            nav: true,
+            nav_instances: true,
         }
     }
 
@@ -103,6 +111,8 @@ impl BakeSteps {
             housing: false,
             spheres: false,
             map: false,
+            nav: false,
+            nav_instances: false,
         }
     }
 }
@@ -130,6 +140,8 @@ pub struct BakeReport {
     /// `"painted"` or `"relief"`: what `map_<world>.json` points at.
     pub map_source: Option<String>,
     pub map_rect: Option<WorldRect>,
+    /// One entry per navigation mesh baked (the world, then the instance worlds).
+    pub nav: Vec<nav::NavReport>,
     pub checks: Vec<Check>,
     pub warnings: Vec<String>,
     /// Step name and seconds.
@@ -185,6 +197,9 @@ impl fmt::Display for BakeReport {
                 "map: source {src}, rect x {}..{} y {}..{}",
                 r.min_x, r.max_x, r.min_y, r.max_y
             )?;
+        }
+        for n in &self.nav {
+            write!(f, "{n}")?;
         }
         for (name, bytes) in &self.files {
             writeln!(f, "file {name}: {bytes} bytes")?;
@@ -268,8 +283,16 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
 
     let t = Instant::now();
     let world_prefix = format!("game/worlds/{world_name}/");
+    let nav_instances = steps.nav_instances;
     let mut pak = Pak::open_filtered(&opts.pak, |n| {
-        n.starts_with(&world_prefix) || n.starts_with("game/ui/map/world/")
+        n.starts_with(&world_prefix)
+            || n.starts_with("game/ui/map/world/")
+            // other worlds: only what the navigation meshes need
+            || (nav_instances
+                && n.starts_with("game/worlds/")
+                && (n.ends_with("/world.xml")
+                    || (n.ends_with(".bai")
+                        && (n.contains("/netmission") || n.contains("/vertsmission")))))
     })?;
     report.pak_entries_kept = pak.len();
     let xml = pak
@@ -426,6 +449,51 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
             .push(("quest spheres".into(), t.elapsed().as_secs_f32()));
     }
 
+    if steps.nav {
+        let t = Instant::now();
+        let origins = world.zones.iter().map(|z| (z.key, z.origin)).collect();
+        let min_nodes = if world_name == "main_world" {
+            nav::MIN_COMPONENT_MAIN
+        } else {
+            nav::MIN_COMPONENT_INSTANCE
+        };
+        match nav::bake_nav_world(&mut pak, world_name, &origins, &opts.out, min_nodes) {
+            Ok(r) => finish_nav(&mut report, &opts.out, r),
+            Err(e) => report.warn(format!("navigation mesh of {world_name} not baked: {e:#}")),
+        }
+        report
+            .timings
+            .push(("navigation mesh".into(), t.elapsed().as_secs_f32()));
+    }
+
+    if steps.nav_instances {
+        let t = Instant::now();
+        let others: Vec<String> = nav::nav_worlds_in_pak(&pak)
+            .into_keys()
+            .filter(|w| w != world_name)
+            .collect();
+        for w in others {
+            let origins = match pak.read_text(&format!("game/worlds/{w}/world.xml")) {
+                Ok(Some(xml)) => nav::parse_zone_origins(&xml),
+                _ => Default::default(),
+            };
+            match nav::bake_nav_world(
+                &mut pak,
+                &w,
+                &origins,
+                &opts.out,
+                nav::MIN_COMPONENT_INSTANCE,
+            ) {
+                Ok(r) => finish_nav(&mut report, &opts.out, r),
+                Err(e) => report.warn(format!("navigation mesh of {w} not baked: {e:#}")),
+            }
+        }
+        report.timings.push((
+            "instance navigation meshes".into(),
+            t.elapsed().as_secs_f32(),
+        ));
+    }
+
     if steps.map {
         let t = Instant::now();
         let grid = match grid.take() {
@@ -439,6 +507,70 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
             .push(("map".into(), t.elapsed().as_secs_f32()));
     }
     Ok(report)
+}
+
+/// Records a baked navigation mesh and verifies the file by reading it back (a full scan of its
+/// indices); for `main_world` also checks that the Nuian start is on the mesh and walkable to the
+/// neighbouring towns.
+fn finish_nav(report: &mut BakeReport, out: &Path, r: nav::NavReport) {
+    use aa_world::nav::{NavMesh, PathQuery, PathResult};
+    use aa_world::Vec3;
+
+    report.files.push((r.file.clone(), r.bytes));
+    let world = r.world.clone();
+    let path = out.join(&r.file);
+    for w in &r.warnings {
+        tracing::warn!("nav {world}: {w}");
+    }
+    report.nav.push(r);
+    let mesh = match NavMesh::open(&path).and_then(|m| m.verify().map(|()| m)) {
+        Ok(m) => {
+            report.check(
+                &format!("nav {world} reads back"),
+                true,
+                format!(
+                    "{} nodes, {} links verified",
+                    m.node_count(),
+                    m.link_count()
+                ),
+            );
+            m
+        }
+        Err(e) => {
+            report.check(&format!("nav {world} reads back"), false, format!("{e:#}"));
+            return;
+        }
+    };
+    if world != "main_world" {
+        return;
+    }
+    // Nuian start, Desireen and Wardton (positions of well-known NPCs)
+    let start = Vec3::new(15578.04, 15382.12, 126.3);
+    let on_mesh = mesh.locate(start, 8.0).is_some();
+    report.check(
+        "nav: Nuian start is on the mesh",
+        on_mesh,
+        "within 8 m of (15578.04, 15382.12, 126.3)".into(),
+    );
+    for (name, to) in [
+        ("Desireen", Vec3::new(15667.9, 15166.7, 120.7)),
+        ("Wardton", Vec3::new(14809.2, 14295.8, 119.9)),
+    ] {
+        let res = mesh.find_path(&PathQuery::new(start, to));
+        let (ok, detail) = match &res {
+            PathResult::Found(p) => (
+                true,
+                format!(
+                    "{} corners, {:.0} m, {} expansions",
+                    p.points.len(),
+                    p.length,
+                    p.expansions
+                ),
+            ),
+            other => (false, format!("{other:?}").chars().take(80).collect()),
+        };
+        report.check(&format!("nav: path Nuian start -> {name}"), ok, detail);
+    }
 }
 
 /// Width of the relief fallback image in pixels.

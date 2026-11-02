@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 
+use crate::nav::NavSet;
 use crate::terrain::Terrain;
 
 /// World rectangle covered by the map image (metres).
@@ -159,6 +160,8 @@ pub struct Baked {
     pub housing_areas: Vec<HousingAreaPoly>,
     pub quest_spheres: Vec<QuestSphere>,
     pub zones: Option<ZoneGrid>,
+    /// The navigation meshes (`nav_<world>.bin`): the main world's and the instance worlds'.
+    pub navs: NavSet,
 }
 
 /// Runs `load` on `path` if the file exists; a missing file warns, a malformed one warns with the
@@ -218,6 +221,7 @@ impl Baked {
                 "zone grid",
                 ZoneGrid::open,
             ),
+            navs: NavSet::load(dir, world),
         }
     }
 }
