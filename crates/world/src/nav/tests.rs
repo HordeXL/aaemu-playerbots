@@ -1,4 +1,5 @@
 use super::format::{flag, NavData, Section, NAV_HEADER_LEN, NAV_SECTION_ENTRY_LEN};
+use super::mesh::MAX_FLOOR_GAP;
 use super::testmesh::TestMesh;
 use super::*;
 use crate::geom::Vec3;
@@ -76,11 +77,13 @@ fn locate_picks_the_floor_closest_in_z() {
     assert_eq!(z_of(0.3), 0.0);
     assert_eq!(z_of(2.4), 0.0);
     assert_eq!(z_of(2.6), 5.0);
-    assert_eq!(
-        z_of(300.0),
-        5.0,
-        "no height limit for a triangle that contains the position"
-    );
+    // a triangle that contains the position counts up to MAX_FLOOR_GAP above or below it; a
+    // floor further away (a junk plane, another storey of the map) is no answer
+    assert_eq!(z_of(5.0 + MAX_FLOOR_GAP - 1.0), 5.0);
+    assert!(m
+        .locate_detailed(v(5.0, 5.0, 5.0 + MAX_FLOOR_GAP + 1.0), 1.0)
+        .is_none());
+    assert!(m.locate_detailed(v(5.0, 5.0, 300.0), 1.0).is_none());
 }
 
 #[test]

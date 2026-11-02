@@ -86,7 +86,14 @@ fn off_mesh_samples(mesh: &NavMesh, path: &aa_world::nav::Path) -> usize {
             // the segments of the first / last piece start at the query's own z; look at x/y
             // 5 cm of slack: strings hug triangle edges and f32 positions at x = 15 000 are
             // only good to ~1 mm
-            let ok = mesh.locate(p, 0.05).is_some();
+            // (a long straight segment over a hill, or a sliver triangle with a junk vertex at
+            // z = 0, can lie more than the locate floor gap above or below the surface; then only
+            // x/y has to be on a triangle: probe other heights, 60 m apart)
+            let ok = mesh.locate(p, 0.05).is_some()
+                || (-25..=25).any(|k| {
+                    let q = Vec3::new(p.x, p.y, k as f32 * 60.0);
+                    mesh.locate_detailed(q, 0.05).is_some_and(|l| l.inside)
+                });
             if !ok {
                 bad += 1;
             }
