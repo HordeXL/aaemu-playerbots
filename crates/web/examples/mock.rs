@@ -544,6 +544,14 @@ impl BotHub for MockHub {
             }
         }
         let rss = 38_000_000 + u64::from(total) * 190_000 + (inner.tick % 50) * 10_000;
+        // One lock for both counts: a second `self.issues.lock()` inside the struct literal below
+        // would wait for the first guard (a temporary that lives to the end of the statement) and
+        // deadlock `/api/stats` and, through `inner`, the whole mock.
+        let (open_issues, queued_issues) = {
+            let issues = self.issues.lock();
+            let count = |state: &str| issues.iter().filter(|i| i.summary.state == state).count();
+            (count("open") as u32, count("queued") as u32)
+        };
         HubStats {
             bots_total: total,
             bots_online: total,
@@ -563,18 +571,8 @@ impl BotHub for MockHub {
                 chat_replies: 3 + inner.tick / 40,
                 director_picks: 2 + inner.tick / 120,
             }),
-            open_issues: self
-                .issues
-                .lock()
-                .iter()
-                .filter(|i| i.summary.state == "open")
-                .count() as u32,
-            queued_issues: self
-                .issues
-                .lock()
-                .iter()
-                .filter(|i| i.summary.state == "queued")
-                .count() as u32,
+            open_issues,
+            queued_issues,
             activity_counts: counts,
         }
     }

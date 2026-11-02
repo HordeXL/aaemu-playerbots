@@ -44,6 +44,11 @@
       <div class="tile wide" id="st-llm-tile" hidden><span class="k">LLM</span><b id="st-llm">-</b></div>
     </section>
 
+    <div id="tabs" role="group" aria-label="Side panel view">
+      <button id="tab-bots" type="button" aria-pressed="true">Bots</button>
+      <button id="tab-issues" type="button" aria-pressed="false" aria-label="Server issues">Issues<b id="tab-open" class="badge open" hidden></b><b id="tab-queued" class="badge queued" hidden></b></button>
+    </div>
+
     <section id="filters">
       <div id="chips" role="group" aria-label="Filter by activity"></div>
       <input id="search" type="search" placeholder="Search name, class, zone, goal&hellip;" autocomplete="off" spellcheck="false" aria-label="Search bots">
@@ -109,6 +114,33 @@
       </div>
       <h3>Log <span class="muted">(newest first)</span></h3>
       <ol id="d-log" class="log"></ol>
+    </section>
+
+    <section id="issues" aria-label="Server issues">
+      <div id="i-listview">
+        <div id="i-chips" role="group" aria-label="Filter by state"></div>
+        <div id="i-status" class="status" role="status"></div>
+        <ul id="i-list" class="issue-list" aria-label="Issue list"></ul>
+        <div id="i-foot"></div>
+      </div>
+      <div id="i-detailview" hidden>
+        <div class="d-head">
+          <button id="i-back" type="button" title="Back to the list (Esc)">&lsaquo; Issues</button>
+          <span id="i-fp" class="mono muted"></span>
+        </div>
+        <h2 id="i-title"></h2>
+        <div id="i-pills" class="pills"></div>
+        <div id="i-actions" class="cmd-row"></div>
+        <div id="i-astatus" class="status" role="status"></div>
+        <div id="i-derr" class="status err" role="status"></div>
+        <dl id="i-fields" class="kv"></dl>
+        <h3>Samples <span class="muted">(newest first)</span></h3>
+        <div id="i-samples"></div>
+        <details id="i-entry-wrap">
+          <summary>Queue entry <span class="muted">(as written to the team's issue queue)</span></summary>
+          <pre id="i-entry" class="blk" tabindex="0"></pre>
+        </details>
+      </div>
     </section>
 
     <details id="global">

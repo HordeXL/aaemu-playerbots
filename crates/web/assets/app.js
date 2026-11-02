@@ -3,6 +3,8 @@
  * Data flow: poll /api/bots + /api/stats (1 s), /api/markers (5 s), /api/bots/:id (2 s while a bot
  * is selected), /api/map (30 s). Only while the tab is visible. Bot dots are interpolated between
  * polls; the canvas only redraws when something changed (requestAnimationFrame on demand).
+ * The Issues view polls /api/issues (or /api/issues/:fp in the detail view) every 5 s, only while
+ * it is on screen; the open/queued badge follows the 1 s /api/stats poll.
  * Every string that comes from the bot process is inserted with textContent, never innerHTML.
  */
 (() => {
@@ -41,7 +43,8 @@ const MARKER = {
 };
 const MARKER_KINDS = Object.keys(MARKER);
 
-const POLL = { bots: 1000, markers: 5000, detail: 2000, map: 30000 };
+const POLL = { bots: 1000, markers: 5000, detail: 2000, map: 30000, issues: 5000 };
+const FLASH_MS = 30000;   // how long the "show on map" marker of an issue stays
 const ROW_H = 28;
 const TAU = Math.PI * 2;
 const MAX_SCALE = 80;
@@ -106,13 +109,13 @@ const S = {
   W: 0, H: 0, dpr: 1, cx: 0, cy: 0, scale: 0.02, userMoved: false, fitted: false, vanim: null,
   mouse: { x: 0, y: 0, in: false, touch: false }, hover: null, hoverMarker: null, dragging: false,
   sx: new Float32Array(0), sy: new Float32Array(0), on: new Uint8Array(0),
-  failures: 0, lastOkAt: 0, token: '', partnerSig: '', restoredHash: false,
+  failures: 0, lastOkAt: 0, token: '', partnerSig: '', restoredHash: false, flash: null,
 };
 const C = {}; // theme colours read from CSS variables
 
 function readTheme() {
   const cs = getComputedStyle(document.documentElement);
-  for (const k of ['map-bg', 'grid', 'grid-text', 'label', 'halo', 'accent', 'panel', 'border', 'muted']) {
+  for (const k of ['map-bg', 'grid', 'grid-text', 'label', 'halo', 'accent', 'panel', 'border', 'muted', 'danger']) {
     C[k] = cs.getPropertyValue('--' + k).trim() || '#888';
   }
 }
@@ -290,6 +293,7 @@ function renderStats() {
       (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));
   }
   document.title = 'Playerbots (' + s.bots_online + '/' + s.bots_total + ')';
+  renderIssueBadge(s);
 }
 
 function renderConn() {
@@ -482,7 +486,7 @@ function select(id, opts) {
       const g = GOALS.find(([v]) => v === b.goal);
       D.goal.value = g ? g[0] : 'auto';
     }
-    if (opts.openPanel) setPanel(true);
+    if (opts.openPanel) { setPanel(true); if (I.tab) setTab(false); }
     renderDetail();
     if (opts.openPanel && changed) revealDetail();
     if (changed) { last.detail = -Infinity; tick(); }
@@ -635,35 +639,42 @@ function setStatus(el, kind, text) {
   if (kind === 'ok') statusTimers.set(el, setTimeout(() => { if (el.textContent === text) { el.textContent = ''; el.className = 'status'; } }, 5000));
 }
 
-async function sendCommand(bot, cmd, statusEl) {
-  const url = bot == null ? '/api/command' : '/api/bots/' + bot + '/command';
+// POST a JSON body with the operator token (if any). Resolves to { ok: true } or { ok: false, error }.
+async function postJson(url, payload) {
   const headers = { 'content-type': 'application/json' };
   if (S.token) headers['x-playerbots-token'] = S.token;
-  setStatus(statusEl, '', 'Sending ' + cmd.type + '…');
   try {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), 8000);
     let r;
     try {
-      r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(cmd), signal: ac.signal });
+      r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: ac.signal });
     } finally { clearTimeout(t); }
     let body = null;
     try { body = await r.json(); } catch (_) { /* no JSON body */ }
-    if (r.ok) {
-      setStatus(statusEl, 'ok', 'Sent: ' + describe(cmd));
-      last.bots = -Infinity; last.detail = -Infinity; tick();
-      return true;
-    }
+    if (r.ok) return { ok: true };
     let msg = (body && body.error) || ('HTTP ' + r.status);
     if (r.status === 401) {
       msg = 'Not authorised: enter the API token under Global controls. (' + msg + ')';
       $('global').open = true;
       $('g-token').focus();
     }
-    setStatus(statusEl, 'err', msg);
+    return { ok: false, error: msg };
   } catch (e) {
-    setStatus(statusEl, 'err', 'Request failed: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || e));
+    return { ok: false, error: 'Request failed: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || e) };
   }
+}
+
+async function sendCommand(bot, cmd, statusEl) {
+  const url = bot == null ? '/api/command' : '/api/bots/' + bot + '/command';
+  setStatus(statusEl, '', 'Sending ' + cmd.type + '…');
+  const r = await postJson(url, cmd);
+  if (r.ok) {
+    setStatus(statusEl, 'ok', 'Sent: ' + describe(cmd));
+    last.bots = -Infinity; last.detail = -Infinity; tick();
+    return true;
+  }
+  setStatus(statusEl, 'err', r.error);
   return false;
 }
 
@@ -698,9 +709,398 @@ function buildGlobal() {
   $('g-resume').addEventListener('click', () => sendCommand(null, { type: 'resume' }, st));
 }
 
+// ------------------------------------------------------------------ issues
+// Problems of the game server that the bots ran into, deduplicated by the bot process.
+const ISSUE_STATES = ['open', 'queued', 'ignored', 'resolved'];
+const STATE_LABEL = { open: 'Open', queued: 'Queued', ignored: 'Ignored', resolved: 'Resolved' };
+const STATE_CLS = { open: 'st-open', queued: 'st-queued', ignored: 'st-ignored', resolved: 'st-resolved' };
+const SEV_CLS = { high: 'sev-high', medium: 'sev-medium', low: 'sev-low' };
+// What the operator can do in each state (the server refuses the rest, e.g. queueing twice).
+const ISSUE_ACTIONS = {
+  open: ['queue', 'ignore', 'resolve'], queued: ['ignore', 'resolve'],
+  ignored: ['reopen', 'resolve'], resolved: ['reopen', 'ignore'],
+};
+const ACTION_INFO = {
+  queue: ['Queue', 'Write the entry to the team issue queue now'],
+  ignore: ['Ignore', 'Never queue this one by itself'],
+  resolve: ['Resolve', 'Mark it as fixed'],
+  reopen: ['Reopen', 'Back to open'],
+};
+const ISSUE_MAX_ROWS = 300;
+const POS_RE = /\bat \((-?\d+(?:\.\d+)?), (-?\d+(?:\.\d+)?), (-?\d+(?:\.\d+)?)\)/g;
+
+const I = {
+  tab: false, list: [], loaded: false, states: new Set(['open', 'queued']),
+  sel: null, detail: null, sampleKey: '', initFor: '', open: new Set(), acting: false, badgeKey: '',
+};
+const IE = { rows: new Map(), chipEls: {} }; // elements
+
+function words(s) { return String(s || '').replace(/_/g, ' '); }
+function fmtAgo(ms) {
+  if (!num(ms)) return '-';
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  return s < 5 ? 'just now' : fmtDur(s) + ' ago';
+}
+function fmtStamp(ms) { return num(ms) ? new Date(ms).toLocaleString() : '-'; }
+
+function pill(text, classes) { return h('span', 'pill ' + (classes[text] || 'other'), text || '-'); }
+
+function cleanSummary(s) {
+  return {
+    fingerprint: String(s.fingerprint || ''), kind: String(s.kind || ''), title: String(s.title || ''),
+    suspect: String(s.suspect || ''), severity: String(s.severity || ''), count: num(s.count), bots: num(s.bots),
+    first_seen: num(s.first_seen), last_seen: num(s.last_seen), state: String(s.state || ''), reportable: !!s.reportable,
+  };
+}
+
+// The bot's position is only in the context line: "... at (x, y, z) in Zone". The last match wins.
+function samplePos(s) {
+  let m = null;
+  for (const x of String(s.context || '').matchAll(POS_RE)) m = x;
+  if (!m) return null;
+  const x = Number(m[1]), y = Number(m[2]);
+  return isFinite(x) && isFinite(y) ? { x, y, z: Number(m[3]) } : null;
+}
+
+function fillKv(dl, rows) {
+  const f = document.createDocumentFragment();
+  for (const [label, val, cls] of rows) {
+    const dd = h('dd', cls || null);
+    if (val instanceof Node) dd.append(val); else dd.textContent = String(val);
+    f.append(h('dt', null, label), dd);
+  }
+  dl.replaceChildren(f);
+}
+
+function renderIssueBadge(s) {
+  const open = num(s.open_issues) | 0, queued = num(s.queued_issues) | 0;
+  const key = open + '/' + queued;
+  if (key === I.badgeKey) return;
+  I.badgeKey = key;
+  const a = $('tab-open'), b = $('tab-queued');
+  a.hidden = open === 0;
+  b.hidden = queued === 0;
+  setText(a, String(open));
+  setText(b, String(queued));
+  a.title = open + ' open';
+  b.title = queued + ' queued';
+  $('tab-issues').setAttribute('aria-label', 'Server issues: ' + open + ' open, ' + queued + ' queued');
+}
+
+function issuesVisible() { return I.tab && !document.body.classList.contains('panel-hidden'); }
+
+// The operator is selecting text in `el` (a path to copy, a log line): do not rebuild it under them.
+function selecting(el) {
+  const sel = window.getSelection();
+  return !!sel && !sel.isCollapsed && el.contains(sel.anchorNode);
+}
+
+function setTab(issues) {
+  I.tab = issues;
+  $('sidebar').classList.toggle('view-issues', issues);
+  $('tab-bots').setAttribute('aria-pressed', issues ? 'false' : 'true');
+  $('tab-issues').setAttribute('aria-pressed', issues ? 'true' : 'false');
+  lsSet('pb_tab', issues ? 'issues' : 'bots');
+  last.issues = -Infinity; // the 200 ms tick picks it up
+}
+
+function toggleIssueState(st) {
+  if (st == null) I.states.clear();
+  else if (I.states.has(st)) I.states.delete(st);
+  else I.states.add(st);
+  lsSet('pb_issue_states', JSON.stringify([...I.states]));
+  renderIssueList();
+}
+
+function buildIssues() {
+  for (const id of ['issues', 'i-listview', 'i-detailview', 'i-chips', 'i-status', 'i-list', 'i-foot', 'i-back', 'i-fp',
+    'i-title', 'i-pills', 'i-actions', 'i-astatus', 'i-derr', 'i-fields', 'i-samples', 'i-entry']) {
+    IE[id.replace(/^i-/, '')] = $(id);
+  }
+  try {
+    const a = JSON.parse(lsGet('pb_issue_states') || 'null');
+    if (Array.isArray(a)) I.states = new Set(a.filter((s) => ISSUE_STATES.includes(s)));
+  } catch (_) { /* default filter */ }
+
+  IE.chipAll = h('button', 'chip');
+  IE.chipAll.type = 'button';
+  IE.chipAll.append(h('span', null, 'All'), h('b', null, '0'));
+  IE.chipAll.addEventListener('click', () => toggleIssueState(null));
+  IE.chips.append(IE.chipAll);
+  for (const st of ISSUE_STATES) {
+    const b = h('button', 'chip');
+    b.type = 'button';
+    const cnt = h('b', null, '0');
+    b.append(h('span', null, STATE_LABEL[st]), cnt);
+    b.addEventListener('click', () => toggleIssueState(st));
+    IE.chips.append(b);
+    IE.chipEls[st] = { b, cnt };
+  }
+
+  $('tab-bots').addEventListener('click', () => setTab(false));
+  $('tab-issues').addEventListener('click', () => setTab(true));
+  IE.back.addEventListener('click', closeIssue);
+  setTab(lsGet('pb_tab') === 'issues');
+}
+
+function renderIssueList() {
+  const counts = {};
+  for (const st of ISSUE_STATES) counts[st] = 0;
+  for (const it of I.list) if (counts[it.state] !== undefined) counts[it.state]++;
+  IE.chipAll.setAttribute('aria-pressed', I.states.size === 0 ? 'true' : 'false');
+  setText(IE.chipAll.lastChild, String(I.list.length));
+  for (const st of ISSUE_STATES) {
+    const c = IE.chipEls[st];
+    setText(c.cnt, String(counts[st]));
+    c.b.setAttribute('aria-pressed', I.states.has(st) ? 'true' : 'false');
+    c.b.classList.toggle('empty', counts[st] === 0 && !I.states.has(st));
+  }
+
+  const shown = I.list.filter((it) => I.states.size === 0 || I.states.has(it.state))
+    .sort((a, b) => b.last_seen - a.last_seen || coll.compare(a.fingerprint, b.fingerprint));
+  const focused = document.activeElement && IE.list.contains(document.activeElement) ? document.activeElement._fp : null;
+  IE.rows.clear();
+  const f = document.createDocumentFragment();
+  for (const it of shown.slice(0, ISSUE_MAX_ROWS)) {
+    const li = h('li');
+    const b = h('button', 'issue-row');
+    b.type = 'button';
+    b._fp = it.fingerprint;
+    b.title = it.fingerprint + ' · last seen ' + fmtStamp(it.last_seen);
+    const top = h('span', 'i-top');
+    top.append(pill(it.state, STATE_CLS), pill(it.severity, SEV_CLS), h('span', 'i-ago', fmtAgo(it.last_seen)));
+    const meta = [words(it.kind), nf.format(it.count) + '×', nf.format(it.bots) + (it.bots === 1 ? ' bot' : ' bots'),
+      'suspect ' + (it.suspect || 'unknown')];
+    b.append(top, h('span', 'i-title', it.title || words(it.kind) || it.fingerprint), h('span', 'i-meta', meta.join(' · ')));
+    b.addEventListener('click', () => openIssue(it.fingerprint));
+    li.append(b);
+    f.append(li);
+    IE.rows.set(it.fingerprint, b);
+  }
+  if (!shown.length) {
+    f.append(h('li', 'empty', !I.loaded ? 'Loading…' : I.list.length ? 'No issues in the selected states.' : 'No server issues reported.'));
+  }
+  IE.list.replaceChildren(f);
+  if (focused && IE.rows.has(focused)) IE.rows.get(focused).focus({ preventScroll: true });
+  setText(IE.foot, shown.length === I.list.length
+    ? nf.format(I.list.length) + (I.list.length === 1 ? ' issue' : ' issues')
+    : nf.format(shown.length) + ' of ' + nf.format(I.list.length) + ' issues' + (shown.length > ISSUE_MAX_ROWS ? ' (first ' + ISSUE_MAX_ROWS + ' shown)' : ''));
+}
+
+function showIssueView() {
+  IE.listview.hidden = I.sel != null;
+  IE.detailview.hidden = I.sel == null;
+  IE.issues.classList.toggle('has-issue', I.sel != null);
+}
+
+function openIssue(fp) {
+  I.sel = fp;
+  I.detail = null;
+  I.sampleKey = '';
+  setStatus(IE.astatus, '', '');
+  setText(IE.derr, '');
+  showIssueView();
+  const it = I.list.find((x) => x.fingerprint === fp);
+  if (it) renderIssueDetail({ summary: it, samples: [], entry: '', area: null, evidence: null, queued_at: null, partial: true });
+  IE.back.focus();
+  last.issues = -Infinity;
+  tick();
+}
+
+function closeIssue() {
+  const fp = I.sel;
+  I.sel = null;
+  I.detail = null;
+  showIssueView();
+  renderIssueList();
+  if (fp && IE.rows.has(fp)) IE.rows.get(fp).focus();
+  last.issues = -Infinity;
+  tick();
+}
+
+function renderIssueDetail(d) {
+  const s = d.summary;
+  const fp = s.fingerprint;
+  I.detail = d;
+  setText(IE.fp, fp);
+  setText(IE.title, s.title || words(s.kind) || fp);
+  IE.pills.replaceChildren(pill(s.state, STATE_CLS), pill(s.severity, SEV_CLS));
+  renderIssueActions();
+
+  const newest = (d.samples || []).reduce((a, x) => (!a || x.at > a.at ? x : a), null);
+  let queue;
+  if (s.state === 'queued') {
+    queue = (d.queued_at ? 'queued ' + fmtAgo(d.queued_at) + ' (' + fmtStamp(d.queued_at) + ')' : 'queued') + '; marker ' + fp;
+  } else if (s.state === 'open') {
+    queue = s.reportable ? 'not queued yet; the policy queues it when its rules allow'
+      : 'not queued; the policy never queues it by itself (Queue does it anyway)';
+  } else {
+    queue = 'not queued';
+  }
+  fillKv(IE.fields, [
+    ['Expected', newest ? newest.expected || '-' : '-'],
+    ['Actual', newest ? newest.actual || '-' : '-'],
+    ['Kind', words(s.kind) || '-'],
+    ['Suspect', s.suspect || 'unknown'],
+    ['Seen', nf.format(s.count) + (s.count === 1 ? ' time by ' : ' times by ') + nf.format(s.bots) + (s.bots === 1 ? ' bot' : ' bots')],
+    ['First seen', fmtAgo(s.first_seen) + ' (' + fmtStamp(s.first_seen) + ')'],
+    ['Last seen', fmtAgo(s.last_seen) + ' (' + fmtStamp(s.last_seen) + ')'],
+    ['Queue', queue],
+    ['Evidence', d.evidence || (d.partial ? '-' : 'not written yet'), d.evidence ? 'mono' : null],
+    ['Area', d.area ? d.area + ' (hint, not verified)' : '-'],
+  ]);
+
+  if (d.partial) {
+    IE.samples.replaceChildren(h('p', 'muted', 'Loading samples…'));
+    setText(IE.entry, '');
+    return;
+  }
+  const entry = String(d.entry || '').replace(/\r\n/g, '\n');
+  setText(IE.entry, entry || '(no entry yet)');
+  renderSamples(d);
+}
+
+function renderIssueActions() {
+  const state = I.detail ? I.detail.summary.state : '';
+  const acts = ISSUE_ACTIONS[state] || Object.keys(ACTION_INFO);
+  const key = acts.join(',');
+  if (IE.actions._k !== key) {
+    IE.actions._k = key;
+    const f = document.createDocumentFragment();
+    for (const a of acts) {
+      const b = h('button', null, ACTION_INFO[a][0]);
+      b.type = 'button';
+      b.title = ACTION_INFO[a][1];
+      b.addEventListener('click', () => issueAction(a));
+      f.append(b);
+    }
+    IE.actions.replaceChildren(f);
+  }
+  for (const b of IE.actions.children) b.disabled = I.acting;
+}
+
+function trackOpen(det, key) {
+  det.open = I.open.has(key);
+  det.addEventListener('toggle', () => { if (det.open) I.open.add(key); else I.open.delete(key); });
+}
+
+function renderSamples(d) {
+  const fp = d.summary.fingerprint;
+  const samples = (d.samples || []).slice().sort((a, b) => b.at - a.at);
+  const key = fp + JSON.stringify(samples);
+  if (key === I.sampleKey) return;
+  I.sampleKey = key;
+  if (I.initFor !== fp) { // first look at this issue: the newest sample is open, nothing else
+    I.initFor = fp;
+    I.open.clear();
+    if (samples.length) I.open.add(sampleKey(fp, samples[0]));
+  }
+  const f = document.createDocumentFragment();
+  if (!samples.length) f.append(h('p', 'muted', 'No samples kept.'));
+  for (const s of samples) f.append(sampleEl(d.summary, s));
+  IE.samples.replaceChildren(f);
+}
+
+function sampleKey(fp, s) { return fp + '|' + s.at + '|' + s.bot; }
+
+function sampleEl(sum, s) {
+  const key = sampleKey(sum.fingerprint, s);
+  const det = h('details', 'sample');
+  trackOpen(det, key);
+  det.append(h('summary', null, (s.bot || 'unknown bot') + ' · ' + fmtStamp(s.at)));
+  const body = h('div', 's-body');
+  if (s.context) body.append(h('p', 's-ctx', s.context));
+  const rows = [['Expected', s.expected || '-'], ['Actual', s.actual || '-']];
+  const pos = samplePos(s);
+  if (pos) {
+    const cell = h('span');
+    const go = h('button', 'link', 'Show on map');
+    go.type = 'button';
+    go.addEventListener('click', () => showOnMap(pos, words(sum.kind) + ' · ' + (s.bot || sum.fingerprint)));
+    cell.append(document.createTextNode(pos.x + ', ' + pos.y + ', ' + pos.z + '  '), go);
+    rows.push(['Position', cell]);
+  }
+  for (const kv of s.facts || []) rows.push([String(kv[0]), String(kv[1])]);
+  const dl = h('dl', 'kv');
+  fillKv(dl, rows);
+  body.append(dl);
+  for (const [title, lines, tag] of [['Packet trail', s.trail, 'trail'], ['Server log', s.server_log, 'server'], ['Bot log', s.bot_log, 'bot']]) {
+    if (!lines || !lines.length) continue;
+    const blk = h('details', 'blk-wrap');
+    trackOpen(blk, key + '#' + tag);
+    const pre = h('pre', 'blk', lines.map(String).join('\n'));
+    pre.tabIndex = 0;
+    blk.append(h('summary', null, title + ' (' + lines.length + ')'), pre);
+    body.append(blk);
+  }
+  det.append(body);
+  return det;
+}
+
+async function issueAction(action) {
+  const fp = I.sel;
+  if (!fp || I.acting) return;
+  I.acting = true;
+  renderIssueActions();
+  const label = ACTION_INFO[action][0];
+  setStatus(IE.astatus, '', label + '…');
+  const r = await postJson('/api/issues/' + encodeURIComponent(fp) + '/action', { action });
+  I.acting = false;
+  renderIssueActions();
+  if (r.ok) {
+    setStatus(IE.astatus, 'ok', label + ': done');
+    last.issues = -Infinity;
+    tick();
+  } else {
+    setStatus(IE.astatus, 'err', r.error);
+    IE.astatus.scrollIntoView({ block: 'nearest' }); // a 401 moves the focus down to the token field
+  }
+}
+
+async function pollIssues() {
+  busy.issues = true;
+  last.issues = performance.now();
+  const fp = I.sel;
+  try {
+    if (fp) {
+      const d = await fetchJson('/api/issues/' + encodeURIComponent(fp));
+      if (I.sel !== fp || !d || !d.summary || selecting(IE.detailview)) return;
+      d.summary = cleanSummary(d.summary);
+      setText(IE.derr, '');
+      renderIssueDetail(d);
+    } else {
+      const arr = await fetchJson('/api/issues');
+      if (I.sel || !Array.isArray(arr) || selecting(IE.list)) return;
+      I.list = arr.map(cleanSummary).filter((it) => it.fingerprint);
+      I.loaded = true;
+      setStatus(IE.status, '', '');
+      renderIssueList();
+    }
+  } catch (e) {
+    if (fp && I.sel === fp && e && e.status === 404) {
+      closeIssue();
+      setStatus(IE.status, 'err', 'That issue is gone.');
+      last.issues = performance.now(); // keep the message for a poll
+    } else if (fp) {
+      if (I.sel === fp) setText(IE.derr, 'Could not refresh: ' + ((e && e.message) || e));
+    } else {
+      setStatus(IE.status, 'err', 'Could not load the issues: ' + ((e && e.message) || e));
+    }
+  } finally { busy.issues = false; }
+}
+
+// "Show on map": centre there and draw a pulsing marker for a while.
+function showOnMap(pos, label) {
+  setFollow(false);
+  const f = S.flash = { x: pos.x, y: pos.y, label, t0: performance.now(), until: performance.now() + FLASH_MS };
+  setTimeout(() => { if (S.flash === f) { S.flash = null; requestDraw(); } }, FLASH_MS + 50);
+  centerOn({ dx: pos.x, dy: pos.y });
+}
+
 // ------------------------------------------------------------------ map: view maths
 const cv = $('map');
 const ctx = cv.getContext('2d', { alpha: false });
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const wrap = $('mapwrap');
 
 function worldRect() {
@@ -805,8 +1205,8 @@ function frame(now) {
     const b = S.bots.get(S.sel);
     if (b) { S.cx = b.dx; S.cy = b.dy; }
   }
-  draw();
-  if (S.vanim || S.posDirty || now < S.animUntil) requestDraw();
+  draw(now);
+  if (S.vanim || S.posDirty || (S.flash && !reduceMotion.matches) || now < S.animUntil) requestDraw();
 }
 
 function niceStep(minPx) {
@@ -1019,7 +1419,42 @@ function drawBots() {
   }
 }
 
-function draw() {
+// The temporary marker of "show on map" in the issue detail: a pulsing ring with crosshair and label.
+function drawFlash(now) {
+  const f = S.flash;
+  if (!f) return;
+  if (now > f.until) { S.flash = null; return; }
+  const x = (f.x - S.cx) * S.scale + S.W / 2, y = (S.cy - f.y) * S.scale + S.H / 2;
+  if (x < -40 || x > S.W + 40 || y < -40 || y > S.H + 40) return;
+  const t = reduceMotion.matches ? 0 : (Math.max(0, now - f.t0) % 1400) / 1400;
+  ctx.beginPath();
+  ctx.arc(x, y, 9, 0, TAU);
+  ctx.moveTo(x - 17, y); ctx.lineTo(x - 5, y);
+  ctx.moveTo(x + 5, y); ctx.lineTo(x + 17, y);
+  ctx.moveTo(x, y - 17); ctx.lineTo(x, y - 5);
+  ctx.moveTo(x, y + 5); ctx.lineTo(x, y + 17);
+  ctx.lineWidth = 5.5; // a light/dark outline first, so the red shows on every kind of terrain
+  ctx.strokeStyle = C.halo;
+  ctx.stroke();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = C.danger;
+  ctx.stroke();
+  if (t > 0) {
+    ctx.globalAlpha = 1 - t;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, 9 + 24 * t, 0, TAU);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.lineJoin = 'round';
+  haloText(f.label, x + 21, y);
+}
+
+function draw(now) {
   const dpr = S.dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = C['map-bg'];
@@ -1028,6 +1463,7 @@ function draw() {
   if (S.showMarkers) drawMarkers();
   if (S.showLines) drawLines();
   drawBots();
+  drawFlash(now);
   updateHover();
 }
 
@@ -1187,7 +1623,7 @@ function bindMap() {
     if (e.key === '+' || e.key === '=') zoomAt(1.4, S.W / 2, S.H / 2);
     else if (e.key === '-' || e.key === '_') zoomAt(1 / 1.4, S.W / 2, S.H / 2);
     else if (e.key === 'f' || e.key === 'F') { S.userMoved = false; fitAll(); }
-    else if (e.key === 'Escape') select(null);
+    else if (e.key === 'Escape') { if (I.tab && I.sel) closeIssue(); else select(null); }
   });
 }
 
@@ -1206,8 +1642,8 @@ function bindToggle(id, key, dflt, apply) {
 }
 
 // ------------------------------------------------------------------ polling
-const last = { bots: -Infinity, markers: -Infinity, detail: -Infinity, map: -Infinity };
-const busy = { bots: false, markers: false, detail: false, map: false };
+const last = { bots: -Infinity, markers: -Infinity, detail: -Infinity, map: -Infinity, issues: -Infinity };
+const busy = { bots: false, markers: false, detail: false, map: false, issues: false };
 
 async function fetchJson(url, ms) {
   const ac = new AbortController();
@@ -1293,6 +1729,7 @@ function tick() {
   if (!busy.markers && now - last.markers >= POLL.markers) pollMarkers();
   if (!busy.map && now - last.map >= POLL.map) pollMap();
   if (!busy.detail && S.sel != null && now - last.detail >= POLL.detail) pollDetail();
+  if (!busy.issues && issuesVisible() && now - last.issues >= POLL.issues) pollIssues();
 }
 
 function restoreHash() {
@@ -1300,7 +1737,7 @@ function restoreHash() {
   const m = /^#bot=(\d+)$/.exec(location.hash);
   if (!m) return;
   const id = Number(m[1]);
-  if (S.bots.has(id)) select(id, { center: true, reveal: true });
+  if (S.bots.has(id)) { setTab(false); select(id, { center: true, reveal: true }); }
 }
 
 // ------------------------------------------------------------------ boot
@@ -1308,6 +1745,7 @@ function setPanel(open) {
   document.body.classList.toggle('panel-hidden', !open);
   $('btn-panel').setAttribute('aria-expanded', open ? 'true' : 'false');
   lsSet('pb_panel', open ? '1' : '0');
+  last.issues = -Infinity; // refresh the issues at once when the panel opens
 }
 
 function init() {
@@ -1323,6 +1761,7 @@ function init() {
   buildList();
   buildDetail();
   buildGlobal();
+  buildIssues();
   bindMap();
 
   let searchTimer = 0;
@@ -1337,7 +1776,7 @@ function init() {
   window.addEventListener('resize', resize);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      last.bots = last.markers = last.detail = last.map = -Infinity;
+      last.bots = last.markers = last.detail = last.map = last.issues = -Infinity;
       tick();
       requestDraw();
     }
