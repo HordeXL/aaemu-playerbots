@@ -387,18 +387,153 @@ pub fn yaw_to_direction(yaw: f32) -> i8 {
 
 // ---- combat and interaction -----------------------------------------------------------------
 
-/// Writes a `CSStartSkillPacket` header and caster `0` (unit) + the object id.
+/// The skill object that follows the target of a `CSStartSkillPacket`: the flag byte (the
+/// object's type in its low nibble) and the object's own fields. Server read:
+/// `SkillObject::read` (`systems/skills/types.rs:417`), called from
+/// `CSStartSkillPacket::read` (`systems/skills/handlers.rs:36-55`, `flag & 15`).
+///
+/// Most casts carry [`SkillObject::None`] (flag 0 and nothing else); the teleport book needs the
+/// two portal objects ([`record_portal`], [`rename_portal`], [`open_portal`] build those casts).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SkillObject {
+    /// Flag 0: no skill object.
+    #[default]
+    None,
+    /// Flag 1 `SkillObjectPortalInfo`: `u8 kind, i32 entry id, fx64 x, fx64 y, f32 z`. For the
+    /// Teleport Book's open-gate skill: the book entry to open a gate to and the world point
+    /// where the entrance gate appears (types.rs:419; effect `systems/npcs/bridges.rs:1087`).
+    PortalInfo {
+        /// [`PORTAL_KIND_DISTRICT`] or [`PORTAL_KIND_PRIVATE`]; the server stores it but looks the
+        /// entry up by `id` only.
+        kind: u8,
+        /// Teleport book entry id.
+        id: i32,
+        /// World X of the entrance gate.
+        x: f32,
+        /// World Y of the entrance gate.
+        y: f32,
+        /// World Z of the entrance gate.
+        z: f32,
+    },
+    /// Flag 2 `SkillObjectSavePortalInfo`: `i32 id, str name`. Id 0 records the caster's position
+    /// as a new book entry, another id renames that entry (types.rs:426).
+    SavePortalInfo {
+        /// Book entry id, 0 for a new entry.
+        id: i32,
+        /// Entry name.
+        name: String,
+    },
+    /// Flag 3 `SkillObjectText`: `str`.
+    Text(String),
+    /// Flag 4 `SkillObjectPosition`: `fx64 x, fx64 y, f32 z`.
+    Position {
+        /// World X.
+        x: f32,
+        /// World Y.
+        y: f32,
+        /// World Z.
+        z: f32,
+    },
+    /// Flag 5 `SkillObjectUnk5`: `i32` (the server calls it `step`).
+    Unk5(i32),
+    /// Flag 6 `SkillObjectUnk6`: `str`.
+    Unk6(String),
+    /// Flag 7 `SkillObjectItemGradeEnchantingSupport`: `u32 id, u64 support item id,
+    /// bool auto use AA point`.
+    ItemGradeEnchantingSupport {
+        /// Enchanting support id.
+        id: u32,
+        /// Item id of the support item.
+        support_item_id: u64,
+        /// Pay missing scrolls with AA points.
+        auto_use_aa_point: bool,
+    },
+}
+
+impl SkillObject {
+    /// The flag byte (the object type; the server reads `flag & 15`).
+    pub fn flag(&self) -> u8 {
+        match self {
+            SkillObject::None => 0,
+            SkillObject::PortalInfo { .. } => 1,
+            SkillObject::SavePortalInfo { .. } => 2,
+            SkillObject::Text(_) => 3,
+            SkillObject::Position { .. } => 4,
+            SkillObject::Unk5(_) => 5,
+            SkillObject::Unk6(_) => 6,
+            SkillObject::ItemGradeEnchantingSupport { .. } => 7,
+        }
+    }
+
+    /// Writes the flag byte and the object fields.
+    fn write(&self, s: &mut PacketStream) {
+        s.write_u8(self.flag());
+        match self {
+            SkillObject::None => {}
+            SkillObject::PortalInfo { kind, id, x, y, z } => {
+                s.write_u8(*kind)
+                    .write_i32(*id)
+                    .write_i64(fx64(*x))
+                    .write_i64(fx64(*y))
+                    .write_f32(*z);
+            }
+            SkillObject::SavePortalInfo { id, name } => {
+                s.write_i32(*id).write_str(name);
+            }
+            SkillObject::Text(t) | SkillObject::Unk6(t) => {
+                s.write_str(t);
+            }
+            SkillObject::Position { x, y, z } => {
+                s.write_i64(fx64(*x)).write_i64(fx64(*y)).write_f32(*z);
+            }
+            SkillObject::Unk5(step) => {
+                s.write_i32(*step);
+            }
+            SkillObject::ItemGradeEnchantingSupport {
+                id,
+                support_item_id,
+                auto_use_aa_point,
+            } => {
+                s.write_u32(*id)
+                    .write_u64(*support_item_id)
+                    .write_bool(*auto_use_aa_point);
+            }
+        }
+    }
+}
+
+/// Writes a `CSStartSkillPacket`: skill, caster, target, then the skill object (flag + fields).
 fn start_skill(
     skill_id: u32,
     caster: impl FnOnce(&mut PacketStream),
     target: impl FnOnce(&mut PacketStream),
+    object: &SkillObject,
 ) -> Out {
     game(cs::CSStartSkillPacket, |s| {
         s.write_u32(skill_id);
         caster(s);
         target(s);
-        s.write_u8(0); // flag: no skill object
+        object.write(s);
     })
+}
+
+/// Caster block of a unit caster: `u8 0, bc obj`.
+fn unit_caster(caster: u32) -> impl FnOnce(&mut PacketStream) {
+    move |s| {
+        s.write_u8(0).write_bc(caster);
+    }
+}
+
+/// Caster block of an inventory item: `u8 2, bc obj, u64 item id, u32 template, u8 0, u32 0`.
+fn item_caster(caster: u32, item_id: u64, item_template: u32) -> impl FnOnce(&mut PacketStream) {
+    move |s| {
+        s.write_u8(2)
+            .write_bc(caster)
+            .write_u64(item_id)
+            .write_u32(item_template)
+            .write_u8(0)
+            .write_u32(0);
+    }
 }
 
 /// `CSStartSkillPacket`: a unit casting on a unit (the common attack / buff / heal).
@@ -407,14 +542,20 @@ fn start_skill(
 ///
 /// Body: `u32 skill, u8 0 caster type, bc caster, u8 0 target type, bc target, u8 0 flag`.
 pub fn start_skill_unit(skill_id: u32, caster: u32, target: u32) -> Out {
+    start_skill_unit_with(skill_id, caster, target, &SkillObject::None)
+}
+
+/// [`start_skill_unit`] with a skill object after the target (the flag byte is the object's
+/// type, then its fields; see [`SkillObject`]). Slave seats are taken this way: skill 13863
+/// ([`SKILL_PASSENGER_SEAT`]) cast by the player on the slave's object id.
+pub fn start_skill_unit_with(skill_id: u32, caster: u32, target: u32, object: &SkillObject) -> Out {
     start_skill(
         skill_id,
-        |s| {
-            s.write_u8(0).write_bc(caster);
-        },
+        unit_caster(caster),
         |s| {
             s.write_u8(0).write_bc(target);
         },
+        object,
     )
 }
 
@@ -423,14 +564,23 @@ pub fn start_skill_unit(skill_id: u32, caster: u32, target: u32) -> Out {
 ///
 /// Body: `u32 skill, u8 0, bc caster, u8 4 target type, bc doodad, u8 0`.
 pub fn start_skill_doodad(skill_id: u32, caster: u32, doodad: u32) -> Out {
+    start_skill_doodad_with(skill_id, caster, doodad, &SkillObject::None)
+}
+
+/// [`start_skill_doodad`] with a skill object after the target.
+pub fn start_skill_doodad_with(
+    skill_id: u32,
+    caster: u32,
+    doodad: u32,
+    object: &SkillObject,
+) -> Out {
     start_skill(
         skill_id,
-        |s| {
-            s.write_u8(0).write_bc(caster);
-        },
+        unit_caster(caster),
         |s| {
             s.write_u8(4).write_bc(doodad);
         },
+        object,
     )
 }
 
@@ -445,11 +595,20 @@ pub fn start_skill_position(
     pos: (f32, f32, f32),
     rotation: f32,
 ) -> Out {
+    start_skill_position_with(skill_id, caster, pos, rotation, &SkillObject::None)
+}
+
+/// [`start_skill_position`] with a skill object after the target.
+pub fn start_skill_position_with(
+    skill_id: u32,
+    caster: u32,
+    pos: (f32, f32, f32),
+    rotation: f32,
+    object: &SkillObject,
+) -> Out {
     start_skill(
         skill_id,
-        |s| {
-            s.write_u8(0).write_bc(caster);
-        },
+        unit_caster(caster),
         |s| {
             s.write_u8(1)
                 .write_i64(fx64(pos.0))
@@ -459,6 +618,7 @@ pub fn start_skill_position(
                 .write_bc(0)
                 .write_bc(0);
         },
+        object,
     )
 }
 
@@ -474,19 +634,33 @@ pub fn start_skill_item(
     item_template: u32,
     target: u32,
 ) -> Out {
+    start_skill_item_with(
+        skill_id,
+        caster,
+        item_id,
+        item_template,
+        target,
+        &SkillObject::None,
+    )
+}
+
+/// [`start_skill_item`] with a skill object after the target ([`open_portal`] is the Teleport
+/// Book's cast).
+pub fn start_skill_item_with(
+    skill_id: u32,
+    caster: u32,
+    item_id: u64,
+    item_template: u32,
+    target: u32,
+    object: &SkillObject,
+) -> Out {
     start_skill(
         skill_id,
-        |s| {
-            s.write_u8(2)
-                .write_bc(caster)
-                .write_u64(item_id)
-                .write_u32(item_template)
-                .write_u8(0)
-                .write_u32(0);
-        },
+        item_caster(caster, item_id, item_template),
         |s| {
             s.write_u8(0).write_bc(target);
         },
+        object,
     )
 }
 
@@ -1059,5 +1233,208 @@ pub fn read_mail(is_sent: bool, mail_id: i64) -> Out {
 pub fn take_attachment_sequentially(mail_id: i64) -> Out {
     game(cs::CSTakeAttachmentSequentially, |s| {
         s.write_i64(mail_id);
+    })
+}
+
+// ---- travel: portals, instances, boats -------------------------------------------------------
+
+/// Skill 11215 "Entering location in Teleport Book": records the caster's position as a new book
+/// entry for one Memory Ink ([`ITEM_MEMORY_INK`]; `skill_reagents` row 809). A plain
+/// `CSStartSkill` from the player with a [`SkillObject::SavePortalInfo`]
+/// (`systems/skills/effects/special/misc.rs:362`, `data/skills.rs:207-219`).
+pub const SKILL_RECORD_PORTAL: u32 = 11_215;
+/// Skill 16841 "Editing Location in Teleport Book": renames an existing entry; it has no reagent
+/// and never creates one (`systems/skills/effects/special/misc.rs:375`).
+pub const SKILL_RENAME_PORTAL: u32 = 16_841;
+/// Skill 11216 "Opening Worldgate": the use skill of the Teleport Book ([`ITEM_TELEPORT_BOOK`],
+/// `items.use_skill_id`), a 10 s cast that opens a gate pair to a book entry for a Hereafter
+/// Stone (`systems/npcs/portal/mod.rs:628`).
+pub const SKILL_OPEN_PORTAL: u32 = 11_216;
+/// Skill 13863 "Take the Passenger Seat": seats the caster on the targeted slave at passenger
+/// point 2 (`special_effects` 2378 type 53 `AttachTo`, `systems/npcs/npc/packets.rs:35`). The
+/// driver's seat is `CSBindSlave` ([`bind_slave`]) instead.
+pub const SKILL_PASSENGER_SEAT: u32 = 13_863;
+/// Item 4045, the Teleport Book (use skill [`SKILL_OPEN_PORTAL`]).
+pub const ITEM_TELEPORT_BOOK: u32 = 4_045;
+/// Item 4053, the Memory Ink [`SKILL_RECORD_PORTAL`] consumes.
+pub const ITEM_MEMORY_INK: u32 = 4_053;
+/// `CSDeletePortal` type and [`SkillObject::PortalInfo`] kind of a recall district entry
+/// (`systems/npcs/portal/mod.rs:515` `PORTAL_TYPE_DISTRICT`).
+pub const PORTAL_KIND_DISTRICT: u8 = 1;
+/// Type of a private teleport book entry: the server treats every value but
+/// [`PORTAL_KIND_DISTRICT`] as private; the 1.2 client and `aaemu-testclient` send 2
+/// (`aaemu-testclient/src/scenario/portal.rs:271`).
+pub const PORTAL_KIND_PRIVATE: u8 = 2;
+
+/// `CSStartSkill` 11215: records the character's current position in the teleport book under
+/// `name`. The answer is `SCCharacterPortals` with the new entry
+/// ([`crate::sc_world::WorldEvent::PortalBook`]); without a Memory Ink the server refuses.
+///
+/// Body: caster unit `me`, target unit `me`, flag 2, `i32 0, str name` (see [`SkillObject`]).
+pub fn record_portal(me: u32, name: &str) -> Out {
+    start_skill_unit_with(
+        SKILL_RECORD_PORTAL,
+        me,
+        me,
+        &SkillObject::SavePortalInfo {
+            id: 0,
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// `CSStartSkill` 16841: renames book entry `id`. The answer is `SCPortalInfoSaved`
+/// ([`crate::sc_world::WorldEvent::PortalSaved`]).
+///
+/// Body: caster unit `me`, target unit `me`, flag 2, `i32 id, str name`.
+pub fn rename_portal(me: u32, id: i32, name: &str) -> Out {
+    start_skill_unit_with(
+        SKILL_RENAME_PORTAL,
+        me,
+        me,
+        &SkillObject::SavePortalInfo {
+            id,
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// `CSStartSkill` 11216 from the Teleport Book item `book_item_id` ([`ITEM_TELEPORT_BOOK`]):
+/// opens a gate pair to book entry `entry_id`. `gate_pos` is the world point where the
+/// *entrance* gate appears; the server refuses it when it is more than a few metres from the
+/// caster (`systems/npcs/portal/mod.rs:1037`, the effect's distance plus a slack), so pass a
+/// point next to the bot. `kind` is [`PORTAL_KIND_PRIVATE`] or [`PORTAL_KIND_DISTRICT`].
+///
+/// Body: caster item (`u8 2, bc me, u64 item, u32 4045, u8 0, u32 0`), target unit `me`, flag 1,
+/// `u8 kind, i32 entry, fx64 x, fx64 y, f32 z`.
+pub fn open_portal(
+    me: u32,
+    book_item_id: u64,
+    kind: u8,
+    entry_id: i32,
+    gate_pos: (f32, f32, f32),
+) -> Out {
+    start_skill_item_with(
+        SKILL_OPEN_PORTAL,
+        me,
+        book_item_id,
+        ITEM_TELEPORT_BOOK,
+        me,
+        &SkillObject::PortalInfo {
+            kind,
+            id: entry_id,
+            x: gate_pos.0,
+            y: gate_pos.1,
+            z: gate_pos.2,
+        },
+    )
+}
+
+/// `CSStartSkill` 13863 on a slave: takes the passenger seat ([`SKILL_PASSENGER_SEAT`]). The
+/// answer is `SCUnitAttached` ([`crate::sc_world::WorldEvent::UnitAttached`]).
+pub fn take_passenger_seat(me: u32, slave_obj: u32) -> Out {
+    start_skill_unit(SKILL_PASSENGER_SEAT, me, slave_obj)
+}
+
+/// `CSUsePortalPacket` (0x0de): goes through the gate NPC `gate_obj` (an entrance gate the bot
+/// stands within the server's portal use range of). With `only_my_portal` the server refuses a
+/// gate somebody else opened. Server read: `systems/npcs/portal/packets.rs:29`.
+///
+/// Body: `bc gate, bool only_my_portal`.
+pub fn use_portal(gate_obj: u32, only_my_portal: bool) -> Out {
+    game(cs::CSUsePortalPacket, |s| {
+        s.write_bc(gate_obj).write_bool(only_my_portal);
+    })
+}
+
+/// `CSDeletePortalPacket` (0x0df): removes a teleport book entry (`kind` [`PORTAL_KIND_PRIVATE`])
+/// or forgets a recall district ([`PORTAL_KIND_DISTRICT`]; the bound recall point cannot be
+/// deleted). The answer is `SCPortalDeleted` ([`crate::sc_world::WorldEvent::PortalDeleted`]).
+/// Server read: `systems/npcs/portal/packets.rs:67`.
+///
+/// Body: `u8 kind, u32 id`.
+pub fn delete_portal(kind: u8, id: u32) -> Out {
+    game(cs::CSDeletePortalPacket, |s| {
+        s.write_u8(kind).write_u32(id);
+    })
+}
+
+/// `CSNotifySubZonePacket` (0x112): the client entered sub zone `sub_zone_id`; the server records
+/// a new recall district for it and re-sends the book (`SCCharacterPortals` and
+/// `SCCharacterReturnDistricts`). Id 0 is ignored. Server read: `systems/npcs/subzone.rs:420`,
+/// handler `:426`, effect `systems/npcs/portal/mod.rs:380`.
+///
+/// Body: `u32 sub_zone_id`.
+pub fn notify_sub_zone(sub_zone_id: u32) -> Out {
+    game(cs::CSNotifySubZonePacket, |s| {
+        s.write_u32(sub_zone_id);
+    })
+}
+
+/// `CSBindSlavePacket` (0x031): takes the driver's seat of the slave with timeline id `tl` (from
+/// `SlaveCreated` / `MySlave` / the slave's unit state). The bot must be within a few metres.
+/// The answer is `SCUnitAttached` (point 1) then `SCSlaveBound`. Server read:
+/// `systems/vehicles/packets.rs:287`, handler `slaves.rs:2016` (always the driver point).
+///
+/// Body: `u16 tl`.
+pub fn bind_slave(tl: u16) -> Out {
+    game(cs::CSBindSlavePacket, |s| {
+        s.write_u16(tl);
+    })
+}
+
+/// `CSDiscardSlavePacket` (0x032): leaves the seat on the slave with timeline id `tl` (driver or
+/// passenger). The answer is `SCUnitDetached`. Server read: `systems/vehicles/packets.rs:335`,
+/// handler `slaves.rs:1308` (the 1.2 client itself refuses this above 5 m/s).
+///
+/// Body: `u16 tl`.
+pub fn discard_slave(tl: u16) -> Out {
+    game(cs::CSDiscardSlavePacket, |s| {
+        s.write_u16(tl);
+    })
+}
+
+/// `CSDespawnSlavePacket` (0x02f): the owner removes the slave `slave_obj` from the world. The
+/// answer is `SCSlaveDespawn` and `SCSlaveRemoved`. Server read:
+/// `systems/vehicles/packets.rs:311`, handler `slaves::delete` (`slaves.rs:2085`).
+///
+/// Body: `bc slave`.
+pub fn despawn_slave(slave_obj: u32) -> Out {
+    game(cs::CSDespawnSlavePacket, |s| {
+        s.write_bc(slave_obj);
+    })
+}
+
+/// `CSDestroySlavePacket` (0x030): the owner destroys the active slave with timeline id `tl`
+/// (`RemoveActiveSlave`). Server read: `systems/vehicles/packets.rs:323`, handler
+/// `slaves.rs:2299`.
+///
+/// Body: `u16 tl`.
+pub fn destroy_slave(tl: u16) -> Out {
+    game(cs::CSDestroySlavePacket, |s| {
+        s.write_u16(tl);
+    })
+}
+
+/// `CSMoveUnitPacket` (0x089) of move type 4 (`ShipRequest`): the helmsman's request. Only the
+/// driver of the ship `ship_obj` is obeyed; the server physics then moves the ship and broadcasts
+/// its `SCOneUnitMovement` updates (a request stays in force until the next one). Server read:
+/// `packets/c2g_world.rs:224`, `MoveType::read` `models/movement.rs:261`, `ShipRequestMove::read`
+/// `:617` (note the order: throttle, then steering), handler
+/// `systems/vehicles/movement.rs:17`.
+///
+/// `throttle` -127..=127 (positive = ahead, negative = astern), `steering` -127..=127 (positive
+/// turns to starboard, see [`crate::sc_travel::ShipMotion::steering`]). A request of 0 and 0
+/// lets the ship coast.
+///
+/// Body: `bc ship, u8 4, u32 time, u8 0 flags, i8 throttle, i8 steering`.
+pub fn ship_request(ship_obj: u32, time: u32, throttle: i8, steering: i8) -> Out {
+    game(cs::CSMoveUnitPacket, |s| {
+        s.write_bc(ship_obj)
+            .write_u8(4) // MoveTypeEnum.ShipRequest
+            .write_u32(time)
+            .write_u8(0) // flags: no sc type / phase
+            .write_i8(throttle)
+            .write_i8(steering);
     })
 }

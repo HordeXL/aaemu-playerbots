@@ -16,9 +16,10 @@ use smallvec::SmallVec;
 
 use crate::opcodes::{pp, sc};
 use crate::pos::convert_long_to_coord;
+use crate::sc_travel::{self, MySlaveInfo, PortalEntry, ShipMotion};
 use crate::stream::{MarshalError, PacketStream};
 
-type Res<T> = Result<T, MarshalError>;
+pub(crate) type Res<T> = Result<T, MarshalError>;
 
 /// `(x, y, z)` in world coordinates.
 pub type Pos = (f32, f32, f32);
@@ -473,8 +474,19 @@ pub enum WorldEvent {
         zone_id: u32,
         /// Arrival position.
         pos: Pos,
-        /// Arrival yaw in radians.
+        /// Arrival yaw in radians (the packet's third angle, `ang_z`).
         yaw: f32,
+        /// First angle of the packet (`ang_x`, radians; the destination roll, normally 0).
+        ang_x: f32,
+        /// Second angle of the packet (`ang_y`, radians; the destination pitch, normally 0).
+        ang_y: f32,
+    },
+    /// `SCProcessingInstancePacket` (systems/instances/packets.rs:387, writer :397): the server is
+    /// still building the dungeon the character asked for; `SCLoadInstance` follows when it is
+    /// ready (systems/instances/dungeon.rs:370).
+    ProcessingInstance {
+        /// Zone key of the instance being built.
+        zone_id: i32,
     },
     /// `SCKickedPacket` (packets/g2c_misc.rs:150).
     Kicked {
@@ -493,7 +505,8 @@ pub enum WorldEvent {
         objs: SmallVec<[u32; 4]>,
     },
     /// `SCOneUnitMovementPacket` (packets/world.rs:577, models/movement.rs:715), for the unit
-    /// (1), vehicle (2), ship (3) and transfer (5) move types; other types parse to `None`.
+    /// (1), vehicle (2), ship (3) and transfer (5) move types; other types parse to `None`. A
+    /// ship's heading, speed and helm are in [`WorldEvent::ShipMoved`] ([`parse_ship`]).
     UnitMoved {
         /// Object id.
         obj: u32,
@@ -517,6 +530,10 @@ pub enum WorldEvent {
         /// Destination.
         pos: Pos,
     },
+    /// A ship's `SCOneUnitMovementPacket` (move type 3, models/movement.rs:552; built by
+    /// systems/ai/physics/replication.rs:198) with its heading, speed and helm. Only produced by
+    /// [`parse_ship`]: [`parse`] keeps returning [`WorldEvent::UnitMoved`] for the same packet.
+    ShipMoved(Box<ShipMotion>),
     /// `SCUnitPointsPacket` (packets/world.rs:534); the wire values are times 100.
     UnitPoints {
         /// Object id.
@@ -609,6 +626,101 @@ pub enum WorldEvent {
         obj: u32,
         /// New phase (`func_group_id`).
         phase: u32,
+    },
+
+    // ---- portals (teleport book, recall points) ------------------------------------------
+    /// `SCCharacterPortalsPacket` (packets/world.rs:238, writer :248): the teleport book. The
+    /// full private list is sent at login when the book is not empty (world/session.rs:710) and
+    /// again, in full, by a `CSNotifySubZone` that adds a recall point
+    /// (systems/npcs/portal/mod.rs:353); a newly recorded location arrives alone
+    /// (portal/mod.rs:486). Merge by [`PortalEntry::id`].
+    PortalBook(Box<[PortalEntry]>),
+    /// `SCCharacterReturnDistrictsPacket` (packets/world.rs:257, writer :268): the visited recall
+    /// districts (always the full list; sent at login when non-empty, world/session.rs:720, and
+    /// by `CSNotifySubZone`), plus the character's bound recall point.
+    ReturnDistricts {
+        /// All visited districts.
+        portals: Box<[PortalEntry]>,
+        /// Id of the bound return point (0 = none): the id the server compares with the entries'
+        /// ids (a bound entry cannot be deleted, systems/npcs/portal/mod.rs:544).
+        bound: u32,
+    },
+    /// `SCPortalInfoSavedPacket` (systems/npcs/portal/packets.rs:287, writer :297): a book entry
+    /// was renamed (systems/npcs/portal/mod.rs:508).
+    PortalSaved(Box<PortalEntry>),
+    /// `SCPortalDeletedPacket` (systems/npcs/portal/packets.rs:270, writer :281): the answer to
+    /// `CSDeletePortal`, once per removed entry (portal/mod.rs:576).
+    PortalDeleted {
+        /// 1 = a recall district, anything else a private book entry (the request's type).
+        kind: u8,
+        /// Entry id.
+        id: i32,
+    },
+    /// `SCUnitPortalUsedPacket` (systems/npcs/portal/packets.rs:303, writer :313): someone went
+    /// through a gate; sent to everyone around it, before the traveller's `TeleportUnit`
+    /// (portal/mod.rs:959).
+    PortalUsed {
+        /// Object id of the gate NPC that was used.
+        gate: u32,
+    },
+
+    // ---- slaves (boats) --------------------------------------------------------------------
+    /// `SCSlaveCreatedPacket` (systems/vehicles/packets.rs:107): a slave was summoned; its
+    /// `UnitState` follows.
+    SlaveCreated {
+        /// Object id of the summoner.
+        owner_obj: u32,
+        /// Slave timeline id (`tl`).
+        tl: u16,
+        /// Object id of the slave.
+        slave_obj: u32,
+        /// The summon effect is skipped.
+        hide_effect: bool,
+        /// Name of the summoner.
+        creator: Box<str>,
+    },
+    /// `SCMySlavePacket` (systems/vehicles/packets.rs:147): the summoner's own slave record.
+    MySlave(Box<MySlaveInfo>),
+    /// `SCSlaveBoundPacket` (systems/vehicles/packets.rs:140): a character took the driver's seat
+    /// of a slave (sent right after the matching [`WorldEvent::UnitAttached`],
+    /// systems/vehicles/slaves.rs:1742).
+    SlaveBound {
+        /// Character id (not an object id) of the driver.
+        master_id: u32,
+        /// Object id of the slave.
+        slave_obj: u32,
+    },
+    /// `SCUnitAttachedPacket` (packets/world_objects.rs:224, writer :239): a unit was seated on a
+    /// slave or mate (also re-sent when a seated unit comes into view, world/visibility.rs:151).
+    UnitAttached {
+        /// Object id of the attached unit.
+        child: u32,
+        /// `AttachPointKind` ([`crate::sc_travel::attach_point`]).
+        point: u8,
+        /// Object id of the parent (the slave).
+        parent: u32,
+        /// `AttachUnitReason` ([`crate::sc_travel::attach_reason`]).
+        reason: u8,
+    },
+    /// `SCUnitDetachedPacket` (systems/vehicles/packets.rs:97): a unit left its seat.
+    UnitDetached {
+        /// Object id of the detached unit.
+        obj: u32,
+        /// `AttachUnitReason`.
+        reason: u8,
+    },
+    /// `SCSlaveDespawnPacket` (systems/vehicles/packets.rs:133): the slave is going away.
+    SlaveDespawned {
+        /// Object id of the slave.
+        obj: u32,
+    },
+    /// `SCSlaveRemovedPacket` (systems/vehicles/packets.rs:126): the summoner no longer owns the
+    /// slave with timeline id `tl`.
+    SlaveRemoved {
+        /// Object id of the owner (the slave itself in the rider's escape path).
+        obj: u32,
+        /// Slave timeline id.
+        tl: u16,
     },
 
     // ---- own data ----------------------------------------------------------------------
@@ -826,6 +938,18 @@ pub fn interesting(level: u8, opcode: u16) -> bool {
     reader(level, opcode).is_some()
 }
 
+/// The ship companion of [`parse`]: decodes a ship's `SCOneUnitMovementPacket` (move type 3)
+/// into [`WorldEvent::ShipMoved`] with its heading, velocity and helm. Every other packet and
+/// every other move type is `Ok(None)` (a non-movement packet without reading its body);
+/// [`parse`] still returns [`WorldEvent::UnitMoved`] for the same ship packet, so a bot that
+/// follows ships calls both.
+pub fn parse_ship(level: u8, opcode: u16, body: &[u8]) -> Result<Option<WorldEvent>, MarshalError> {
+    if level != LEVEL_GAME || opcode != sc::SCOneUnitMovementPacket {
+        return Ok(None);
+    }
+    sc_travel::read_ship_moved(&mut PacketStream::from_bytes(body))
+}
+
 type Reader = fn(&mut PacketStream) -> Res<Option<WorldEvent>>;
 
 fn reader(level: u8, opcode: u16) -> Option<Reader> {
@@ -855,6 +979,7 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCLeaveWorldGrantedPacket => read_leave_world_granted,
         sc::SCLeaveWorldCanceledPacket => |_| some(WorldEvent::LeaveWorldCanceled),
         sc::SCLoadInstancePacket => read_load_instance,
+        sc::SCProcessingInstancePacket => sc_travel::read_processing_instance,
         sc::SCKickedPacket => read_kicked,
         // units
         sc::SCUnitStatePacket => read_unit_state,
@@ -875,6 +1000,20 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCCombatEngagedPacket => |s| some(WorldEvent::CombatEngaged { obj: s.read_bc()? }),
         sc::SCCombatClearedPacket => |s| some(WorldEvent::CombatCleared { obj: s.read_bc()? }),
         sc::SCUnitFactionChangedPacket => read_faction_changed,
+        // portals
+        sc::SCCharacterPortalsPacket => sc_travel::read_portal_book,
+        sc::SCCharacterReturnDistrictsPacket => sc_travel::read_return_districts,
+        sc::SCPortalInfoSavedPacket => sc_travel::read_portal_saved,
+        sc::SCPortalDeletedPacket => sc_travel::read_portal_deleted,
+        sc::SCUnitPortalUsedPacket => sc_travel::read_portal_used,
+        // slaves
+        sc::SCSlaveCreatedPacket => sc_travel::read_slave_created,
+        sc::SCMySlavePacket => sc_travel::read_my_slave,
+        sc::SCSlaveBoundPacket => sc_travel::read_slave_bound,
+        sc::SCUnitAttachedPacket => sc_travel::read_unit_attached,
+        sc::SCUnitDetachedPacket => sc_travel::read_unit_detached,
+        sc::SCSlaveDespawnPacket => sc_travel::read_slave_despawned,
+        sc::SCSlaveRemovedPacket => sc_travel::read_slave_removed,
         // doodads
         sc::SCDoodadCreatedPacket => read_doodad_created,
         sc::SCDoodadsCreatedPacket => read_doodads_created,
@@ -908,7 +1047,7 @@ fn game_reader(opcode: u16) -> Option<Reader> {
     })
 }
 
-fn some(event: WorldEvent) -> Res<Option<WorldEvent>> {
+pub(crate) fn some(event: WorldEvent) -> Res<Option<WorldEvent>> {
     Ok(Some(event))
 }
 
@@ -928,12 +1067,12 @@ pub fn movement_direction_radians(direction: i8) -> f32 {
 
 // ---- stream helpers ------------------------------------------------------------------------
 
-fn invalid<T>(msg: impl Into<String>) -> Res<T> {
+pub(crate) fn invalid<T>(msg: impl Into<String>) -> Res<T> {
     Err(MarshalError::Invalid(msg.into()))
 }
 
 /// Advances over `n` bytes without copying them.
-fn skip(s: &mut PacketStream, n: usize) -> Res<()> {
+pub(crate) fn skip(s: &mut PacketStream, n: usize) -> Res<()> {
     if n > s.remaining() {
         return Err(MarshalError::EndOfStream {
             pos: s.pos(),
@@ -947,14 +1086,14 @@ fn skip(s: &mut PacketStream, n: usize) -> Res<()> {
 
 /// Rejects a counted list whose elements (at least `min_size` bytes each) cannot fit in the rest
 /// of the body, so a corrupt count never drives a large allocation.
-fn check_count(s: &PacketStream, count: usize, min_size: usize, what: &str) -> Res<()> {
+pub(crate) fn check_count(s: &PacketStream, count: usize, min_size: usize, what: &str) -> Res<()> {
     if count.saturating_mul(min_size) > s.remaining() {
         return invalid(format!("{what} count {count} exceeds the packet body"));
     }
     Ok(())
 }
 
-fn boxed(s: String) -> Box<str> {
+pub(crate) fn boxed(s: String) -> Box<str> {
     s.into_boxed_str()
 }
 
@@ -1248,14 +1387,16 @@ fn read_load_instance(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let instance_id = s.read_u32()?;
     let zone_id = s.read_u32()?;
     let pos = (s.read_f32()?, s.read_f32()?, s.read_f32()?);
-    s.read_f32()?; // angle x
-    s.read_f32()?; // angle y
+    let ang_x = s.read_f32()?;
+    let ang_y = s.read_f32()?;
     let yaw = s.read_f32()?;
     some(WorldEvent::LoadInstance {
         instance_id,
         zone_id,
         pos,
         yaw,
+        ang_x,
+        ang_y,
     })
 }
 
