@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, LogLine, MapInfo, Marker,
-    MarkerKind, QuestLine, WebConfig, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
+    IssueSample, IssueSummary, LogLine, MapInfo, Marker, MarkerKind, QuestLine, WebConfig,
+    WorldRect,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,6 +20,25 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really a png";
 struct TestHub {
     commands: Mutex<Vec<(Option<u32>, Command)>>,
     with_image: bool,
+    actions: Mutex<Vec<(String, IssueAction)>>,
+}
+
+const ISSUE: &str = "pb:6f3b2e1c";
+
+fn issue_summary(fp: &str, state: &str) -> IssueSummary {
+    IssueSummary {
+        fingerprint: fp.into(),
+        kind: "quest_credit_missing".into(),
+        title: "Quest 251 gives no credit".into(),
+        suspect: "server".into(),
+        severity: "medium".into(),
+        count: 4,
+        bots: 2,
+        first_seen: 1_700_000_000_000,
+        last_seen: 1_700_000_900_000,
+        state: state.into(),
+        reportable: true,
+    }
 }
 
 fn snap(id: u32, activity: Activity) -> BotSnapshot {
@@ -71,6 +91,8 @@ impl BotHub for TestHub {
             bots_online: 2,
             bytes_in_per_sec: 2048.0,
             bytes_out_per_sec: 512.0,
+            open_issues: 2,
+            queued_issues: 1,
             activity_counts: vec![(Activity::Questing, 1), (Activity::TradeRun, 1)],
             ..HubStats::default()
         }
@@ -110,6 +132,46 @@ impl BotHub for TestHub {
             }
         }
         self.commands.lock().unwrap().push((bot, cmd));
+        Ok(())
+    }
+
+    fn issues(&self) -> Vec<IssueSummary> {
+        vec![
+            issue_summary(ISSUE, "open"),
+            issue_summary("pb:00000001", "queued"),
+        ]
+    }
+
+    fn issue(&self, fp: &str) -> Option<IssueDetail> {
+        (fp == ISSUE).then(|| IssueDetail {
+            summary: issue_summary(ISSUE, "open"),
+            entry: "[2026-11-02 14:03:09 EST] Quest 251 gives no credit (playerbots)\r\nObserved by playerbots: x."
+                .into(),
+            area: Some("rust/crates/aaemu-game/src/systems/quests/".into()),
+            evidence: None,
+            queued_at: None,
+            samples: vec![IssueSample {
+                at: 1_700_000_000_000,
+                bot: "Bot1".into(),
+                expected: "credit".into(),
+                actual: "nothing".into(),
+                context: "bot Bot1 (level 10)".into(),
+                facts: vec![("quest".into(), "251".into())],
+                trail: vec!["-   10 ms  S2C L1 0x0123 SCFooPacket".into()],
+                server_log: vec!["14:03:09 [WARN] x - y".into()],
+                bot_log: vec!["killed a boar".into()],
+            }],
+        })
+    }
+
+    fn issue_action(&self, fp: &str, action: IssueAction) -> Result<(), String> {
+        if fp != ISSUE {
+            return Err(format!("no issue {fp}"));
+        }
+        if action == IssueAction::Reopen {
+            return Err("it is not closed".into());
+        }
+        self.actions.lock().unwrap().push((fp.to_string(), action));
         Ok(())
     }
 }
@@ -326,6 +388,8 @@ async fn get_api_routes() {
     assert_eq!(stats["bots_total"], 2);
     assert_eq!(stats["bytes_in_per_sec"], 2048.0);
     assert_eq!(stats["bytes_out_per_sec"], 512.0);
+    assert_eq!(stats["open_issues"], 2);
+    assert_eq!(stats["queued_issues"], 1);
     assert_eq!(stats["activity_counts"][1][0], "trade_run");
     assert!(stats["llm"].is_null());
 
@@ -565,6 +629,8 @@ async fn token_protects_posts_only() {
         "/api/stats",
         "/api/markers",
         "/api/map",
+        "/api/issues",
+        "/api/issues/pb:6f3b2e1c",
         "/map.png",
     ] {
         assert_eq!(s.get(path).await.status, 200, "{path}");
@@ -650,6 +716,8 @@ async fn rebound_host_names_are_refused_on_loopback_without_a_token() {
         "/api/stats",
         "/api/markers",
         "/api/map",
+        "/api/issues",
+        "/api/issues/pb:6f3b2e1c",
     ] {
         let r = s
             .request("GET", path, &[("Host", "evil.example")], None)
@@ -805,4 +873,199 @@ async fn serve_reports_a_busy_port() {
     .await
     .unwrap_err();
     assert!(format!("{err:#}").contains(&addr.to_string()), "{err:#}");
+}
+
+#[tokio::test]
+async fn issues_are_listed_and_served_by_fingerprint() {
+    let s = Server::start(None, false).await;
+
+    let r = s.get("/api/issues").await;
+    assert_eq!(r.status, 200);
+    assert!(r.header("content-type").starts_with("application/json"));
+    assert_eq!(r.header("cache-control"), "no-store");
+    let list = r.json();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list[0]["fingerprint"], "pb:6f3b2e1c");
+    assert_eq!(list[0]["kind"], "quest_credit_missing");
+    assert_eq!(list[0]["suspect"], "server");
+    assert_eq!(list[0]["severity"], "medium");
+    assert_eq!(list[0]["count"], 4);
+    assert_eq!(list[0]["bots"], 2);
+    assert_eq!(list[0]["first_seen"], 1_700_000_000_000u64);
+    assert_eq!(list[0]["last_seen"], 1_700_000_900_000u64);
+    assert_eq!(list[0]["state"], "open");
+    assert_eq!(list[0]["reportable"], true);
+    assert_eq!(list[1]["state"], "queued");
+
+    let d = s.get("/api/issues/pb:6f3b2e1c").await;
+    assert_eq!(d.status, 200, "{}", d.text());
+    let d = d.json();
+    assert_eq!(d["summary"]["fingerprint"], "pb:6f3b2e1c");
+    assert!(d["entry"]
+        .as_str()
+        .unwrap()
+        .contains("(playerbots)\r\nObserved"));
+    assert_eq!(d["area"], "rust/crates/aaemu-game/src/systems/quests/");
+    assert!(d["evidence"].is_null() && d["queued_at"].is_null());
+    let sample = &d["samples"][0];
+    assert_eq!(sample["bot"], "Bot1");
+    assert_eq!(sample["expected"], "credit");
+    assert_eq!(sample["actual"], "nothing");
+    assert_eq!(sample["facts"][0][0], "quest");
+    assert_eq!(sample["trail"][0], "-   10 ms  S2C L1 0x0123 SCFooPacket");
+    assert_eq!(sample["server_log"][0], "14:03:09 [WARN] x - y");
+    assert_eq!(sample["bot_log"][0], "killed a boar");
+
+    let missing = s.get("/api/issues/pb:deadbeef").await;
+    assert_eq!(missing.status, 404);
+    assert!(missing.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("pb:deadbeef"));
+    // things that are not fingerprints never reach the hub
+    for bad in [
+        "/api/issues/not%20valid",
+        "/api/issues/%2e%2e%2fetc",
+        &format!("/api/issues/{}", "a".repeat(40)),
+    ] {
+        assert_eq!(s.get(bad).await.status, 400, "{bad}");
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue_actions_reach_the_hub() {
+    let s = Server::start(None, false).await;
+    for action in ["queue", "ignore", "resolve"] {
+        let r = s
+            .post(
+                "/api/issues/pb:6f3b2e1c/action",
+                &[],
+                &format!(r#"{{"action":"{action}"}}"#),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{action}: {}", r.text());
+        assert_eq!(r.json()["ok"], true);
+    }
+    assert_eq!(
+        *s.hub.actions.lock().unwrap(),
+        vec![
+            (ISSUE.to_string(), IssueAction::Queue),
+            (ISSUE.to_string(), IssueAction::Ignore),
+            (ISSUE.to_string(), IssueAction::Resolve),
+        ]
+    );
+
+    // the hub's refusals come back as 400 with their words
+    let r = s
+        .post(
+            "/api/issues/pb:6f3b2e1c/action",
+            &[],
+            r#"{"action":"reopen"}"#,
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "it is not closed");
+    let r = s
+        .post(
+            "/api/issues/pb:00000009/action",
+            &[],
+            r#"{"action":"queue"}"#,
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "no issue pb:00000009");
+
+    // bad requests
+    for body in [
+        "",
+        "{nope",
+        r#"{}"#,
+        r#"{"action":"delete"}"#,
+        r#"{"action":7}"#,
+    ] {
+        let r = s.post("/api/issues/pb:6f3b2e1c/action", &[], body).await;
+        assert_eq!(r.status, 400, "{body:?}: {}", r.text());
+        assert!(r.json()["error"].is_string());
+    }
+    let r = s
+        .post("/api/issues/bad%20id/action", &[], r#"{"action":"queue"}"#)
+        .await;
+    assert_eq!(r.status, 400);
+    // a missing content type is refused
+    let r = s
+        .request(
+            "POST",
+            "/api/issues/pb:6f3b2e1c/action",
+            &[],
+            Some(r#"{"action":"queue"}"#),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert_eq!(
+        s.hub.actions.lock().unwrap().len(),
+        3,
+        "nothing else got through"
+    );
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue_actions_need_the_token_and_the_right_origin() {
+    let s = Server::start(Some("sekrit"), false).await;
+    let body = r#"{"action":"queue"}"#;
+    let path = "/api/issues/pb:6f3b2e1c/action";
+    for headers in [
+        vec![],
+        vec![("x-playerbots-token", "nope")],
+        vec![("x-playerbots-token", "")],
+    ] {
+        assert_eq!(
+            s.post(path, &headers, body).await.status,
+            401,
+            "{headers:?}"
+        );
+    }
+    // authorisation comes before the body and the id are looked at
+    assert_eq!(s.post(path, &[], "{nope").await.status, 401);
+    assert_eq!(
+        s.post("/api/issues/bad%20id/action", &[], body)
+            .await
+            .status,
+        401
+    );
+    assert!(s.hub.actions.lock().unwrap().is_empty());
+    let ok = [("x-playerbots-token", "sekrit")];
+    assert_eq!(s.post(path, &ok, body).await.status, 200);
+    assert_eq!(s.hub.actions.lock().unwrap().len(), 1);
+    // reads are open
+    assert_eq!(s.get("/api/issues").await.status, 200);
+    s.shutdown().await;
+
+    // without a token a cross-origin page cannot queue anything
+    let s = Server::start(None, false).await;
+    let r = s
+        .post(path, &[("Origin", "http://evil.example")], body)
+        .await;
+    assert_eq!(r.status, 403);
+    let r = s
+        .post(
+            path,
+            &[
+                ("Host", "evil.example:8790"),
+                ("Origin", "http://evil.example:8790"),
+            ],
+            body,
+        )
+        .await;
+    assert_eq!(r.status, 403);
+    assert!(s.hub.actions.lock().unwrap().is_empty());
+    let same = format!("http://{}", s.addr);
+    assert_eq!(
+        s.post(path, &[("Origin", same.as_str())], body)
+            .await
+            .status,
+        200
+    );
+    s.shutdown().await;
 }

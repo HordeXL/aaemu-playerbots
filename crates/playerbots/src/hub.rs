@@ -14,16 +14,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, LlmStats, LogLine, MapInfo,
-    Marker, MarkerKind, QuestLine, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
+    IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind, QuestLine, WorldRect,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
 
 use crate::bot::cmd::{BotCmd, GoalChoice};
-use crate::bot::goals::social::gate::ChatHub;
+use crate::bot::goals::social::gate::{BotNames, ChatHub};
 use crate::bot::goals::social::SlotSocial;
 use crate::contest::Contest;
+use crate::issues::logtail::{words, LineHook};
+use crate::issues::{view, IssueReport, IssueTasks, Issues, LogLevel};
 
 /// Entries of a bot's event log.
 pub const LOG_LINES: usize = 32;
@@ -33,6 +35,8 @@ pub const CMD_QUEUE: usize = 8;
 const RSS_REFRESH: Duration = Duration::from_secs(2);
 /// Window of the packet-rate figures.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Server log lines the hub hands to bots per second, all together.
+const LOG_FEED_PER_SEC: u32 = 20;
 /// The world rectangle assumed when no map was baked (`main_world`).
 const DEFAULT_WORLD: WorldRect = WorldRect {
     min_x: 0.0,
@@ -319,6 +323,10 @@ pub struct Hub {
     pub chat: ChatHub,
     /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
     pub contest: Contest,
+    /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
+    issue_svc: Arc<Issues>,
+    /// Server log lines handed to bots in the current second (second, lines).
+    log_feed: Mutex<(u64, u32)>,
     /// Packet counters; bot tasks add to them.
     pub counters: Counters,
     rates: Mutex<Rates>,
@@ -345,6 +353,8 @@ impl Hub {
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
             contest: Contest::new(),
+            issue_svc: Arc::new(Issues::disabled()),
+            log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),
             rates: Mutex::new(Rates::new(Instant::now())),
             rss: Mutex::new(Rss::new()),
@@ -466,6 +476,46 @@ impl Hub {
         self.started.elapsed().as_secs()
     }
 
+    // ---- server issue reports ------------------------------------------------------------
+
+    /// Uses `issues` for the reports of this hub (the default drops them). Call before the hub is
+    /// shared; `Hub::start_issues` starts the background work.
+    pub fn with_issues(mut self, issues: Arc<Issues>) -> Hub {
+        self.issue_svc = issues;
+        self
+    }
+
+    /// The issue service.
+    pub fn issue_service(&self) -> &Arc<Issues> {
+        &self.issue_svc
+    }
+
+    /// Files a report of a problem with the server (see [`crate::issues`]). Cheap and never
+    /// blocks on I/O: the report is deduplicated and counted, the slow work happens in the
+    /// background. Detectors call [`crate::bot::ctx::Ctx::report_issue`] (goals) or the bot's
+    /// `file_issue` (the bot loop), which attach the bot's context first. Returns the fingerprint
+    /// of the issue, `None` when issue reports are switched off.
+    pub fn report_issue(&self, report: IssueReport) -> Option<String> {
+        self.issue_svc.report(report)
+    }
+
+    /// Starts the background tasks of the issue reports (saving, evidence and queue entries, the
+    /// server log tail). Stop them with [`IssueTasks::stop`] after the bots are gone.
+    pub fn start_issues(self: &Arc<Hub>) -> IssueTasks {
+        let hub = self.clone();
+        let hook: LineHook = Arc::new(move |level, line| hub.feed_server_log(level, line));
+        self.issue_svc.start(Some(hook))
+    }
+
+    /// A `WARN` / `ERROR` line of the server log: bots whose character it names are told, so each
+    /// can file a report with its own trail. At most [`LOG_FEED_PER_SEC`] lines a second.
+    fn feed_server_log(&self, level: LogLevel, line: &str) {
+        if !feed_allowed(&mut self.log_feed.lock(), unix_ms(), LOG_FEED_PER_SEC) {
+            return;
+        }
+        deliver_log_line(&self.chat.names, &|| self.slots(), level, line);
+    }
+
     fn per_bot_bytes(rss: &Rss, online: u32) -> u64 {
         if online == 0 {
             0
@@ -473,6 +523,49 @@ impl Hub {
             rss.bytes.saturating_sub(rss.baseline) / u64::from(online)
         }
     }
+}
+
+/// Whether one more server log line may be handed to the bots in the second of `now_ms`:
+/// `window` is `(second, lines so far in it)`.
+fn feed_allowed(window: &mut (u64, u32), now_ms: u64, per_sec: u32) -> bool {
+    let sec = now_ms / 1000;
+    if window.0 != sec {
+        *window = (sec, 0);
+    }
+    if window.1 >= per_sec {
+        return false;
+    }
+    window.1 += 1;
+    true
+}
+
+/// Sends a server log line to every bot whose character name it contains (as a word) and returns
+/// their ids. `slots` is only called when the line names one of ours.
+fn deliver_log_line(
+    names: &BotNames,
+    slots: &dyn Fn() -> Vec<Arc<BotSlot>>,
+    level: LogLevel,
+    line: &str,
+) -> Vec<u32> {
+    let mut told: Vec<u32> = Vec::new();
+    let mut all: Option<Vec<Arc<BotSlot>>> = None;
+    for word in words(line) {
+        if word.chars().count() < 2 || !names.contains(word) {
+            continue;
+        }
+        for slot in all.get_or_insert_with(slots).iter() {
+            if told.contains(&slot.id) || !slot.with(|g| g.snap.name.eq_ignore_ascii_case(word)) {
+                continue;
+            }
+            told.push(slot.id);
+            // (a busy or stopped bot simply misses it)
+            let _ = slot.send(BotCmd::ServerLogLine {
+                level,
+                line: line.to_string(),
+            });
+        }
+    }
+    told
 }
 
 /// Specialty NPC spawns: where a trade pack can be sold.
@@ -580,6 +673,7 @@ impl BotHub for Hub {
                 online += 1;
             }
         }
+        let issue_counts = self.issue_svc.stats().counts;
         let rates = self.rates.lock();
         let rss = self.rss.lock();
         HubStats {
@@ -592,6 +686,8 @@ impl BotHub for Hub {
             bytes_in_per_sec: rates.bytes_in_per_sec,
             bytes_out_per_sec: rates.bytes_out_per_sec,
             uptime_secs: self.uptime_secs(),
+            open_issues: issue_counts.open,
+            queued_issues: issue_counts.queued,
             llm: self.llm.as_ref().map(|l| {
                 let u = l.usage();
                 let s = &self.chat.gate.stats;
@@ -629,6 +725,18 @@ impl BotHub for Hub {
 
     fn map_image(&self) -> Option<Vec<u8>> {
         self.map.png.as_ref().map(|p| p.as_ref().clone())
+    }
+
+    fn issues(&self) -> Vec<IssueSummary> {
+        self.issue_svc.summaries()
+    }
+
+    fn issue(&self, fingerprint: &str) -> Option<IssueDetail> {
+        self.issue_svc.detail(fingerprint)
+    }
+
+    fn issue_action(&self, fingerprint: &str, action: IssueAction) -> Result<(), String> {
+        self.issue_svc.action(fingerprint, view::action(action))
     }
 
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
@@ -752,6 +860,88 @@ mod tests {
         let mut rx = slot.attach();
         slot.send(BotCmd::Pause).unwrap();
         assert_eq!(rx.try_recv().unwrap(), BotCmd::Pause);
+    }
+
+    #[test]
+    fn a_server_log_line_reaches_the_bots_it_names() {
+        let names = BotNames::default();
+        let slots: Vec<_> = (1..=3).map(|i| BotSlot::new(snap(i))).collect();
+        for s in &slots {
+            names.add(&s.snapshot().name);
+        }
+        let mut rx: Vec<_> = slots.iter().map(|s| s.attach()).collect();
+        let all = || slots.clone();
+
+        let told = deliver_log_line(
+            &names,
+            &all,
+            LogLevel::Warn,
+            "14:03:09 [WARN] aaemu_game::x - bot1 moved too fast, then BOT1 again",
+        );
+        assert_eq!(
+            told,
+            vec![1],
+            "one message per bot, names are case-insensitive"
+        );
+        assert_eq!(
+            rx[0].try_recv().unwrap(),
+            BotCmd::ServerLogLine {
+                level: LogLevel::Warn,
+                line: "14:03:09 [WARN] aaemu_game::x - bot1 moved too fast, then BOT1 again".into()
+            }
+        );
+        assert!(rx[0].try_recv().is_err());
+        assert!(rx[1].try_recv().is_err() && rx[2].try_recv().is_err());
+
+        // two bots named in one line
+        let told = deliver_log_line(
+            &names,
+            &all,
+            LogLevel::Error,
+            "duel of Bot2 and Bot3 failed",
+        );
+        assert_eq!(told, vec![2, 3]);
+        assert!(matches!(
+            rx[1].try_recv(),
+            Ok(BotCmd::ServerLogLine {
+                level: LogLevel::Error,
+                ..
+            })
+        ));
+        assert!(rx[2].try_recv().is_ok());
+
+        // a name inside another word, a stranger, a line without names: nobody (and no slot scan)
+        let scanned = std::cell::Cell::new(false);
+        let spy = || {
+            scanned.set(true);
+            slots.clone()
+        };
+        for line in ["Bot10 only", "player Zed failed", "nothing to see", ""] {
+            assert!(
+                deliver_log_line(&names, &spy, LogLevel::Warn, line).is_empty(),
+                "{line}"
+            );
+        }
+        assert!(!scanned.get());
+
+        // a bot that is not running misses the line without trouble
+        drop(rx);
+        assert_eq!(
+            deliver_log_line(&names, &all, LogLevel::Warn, "Bot1 again"),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn at_most_so_many_log_lines_reach_the_bots_per_second() {
+        let mut w = (0u64, 0u32);
+        for _ in 0..5 {
+            assert!(feed_allowed(&mut w, 10_500, 5));
+        }
+        assert!(!feed_allowed(&mut w, 10_999, 5));
+        assert!(feed_allowed(&mut w, 11_000, 5), "a new second");
+        let mut none = (0u64, 0u32);
+        assert!(!feed_allowed(&mut none, 1_000, 0));
     }
 
     #[test]

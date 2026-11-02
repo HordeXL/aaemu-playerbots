@@ -162,6 +162,12 @@ pub struct HubStats {
     pub llm: Option<LlmStats>,
     /// Serialized as `[["idle", 12], ["questing", 40], …]`.
     pub activity_counts: Vec<(Activity, u32)>,
+    /// Server issues the bots collected that nobody has dealt with (state "open").
+    #[serde(default)]
+    pub open_issues: u32,
+    /// Server issues whose entry was written to the team's issue queue.
+    #[serde(default)]
+    pub queued_issues: u32,
 }
 
 /// What a map marker stands for. Serialized as `snake_case`.
@@ -334,6 +340,89 @@ impl Command {
     }
 }
 
+/// One row of the issue list: a problem with the server that the bots ran into, deduplicated.
+/// All the words are `snake_case` strings (the hub owns the vocabulary).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct IssueSummary {
+    /// Stable id of the issue (`pb:` and 8 hex digits); the marker in the team's issue queue.
+    pub fingerprint: String,
+    /// What went wrong: `quest_credit_missing`, `kicked`, ...
+    pub kind: String,
+    /// One line.
+    pub title: String,
+    /// Who is probably at fault: `server`, `data`, `bot`, `unknown`.
+    pub suspect: String,
+    /// `low`, `medium`, `high`.
+    pub severity: String,
+    /// Occurrences.
+    pub count: u64,
+    /// Different bots that met it.
+    pub bots: u32,
+    /// Unix milliseconds of the first and the latest occurrence.
+    pub first_seen: u64,
+    pub last_seen: u64,
+    /// `open`, `queued`, `ignored`, `resolved`.
+    pub state: String,
+    /// Whether the hub's policy would tell the team about it (bot-suspect issues never are).
+    pub reportable: bool,
+}
+
+/// One kept observation of an issue (the first and the latest two are kept).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct IssueSample {
+    /// Unix milliseconds.
+    pub at: u64,
+    /// Name of the reporting bot.
+    pub bot: String,
+    pub expected: String,
+    pub actual: String,
+    /// `bot Aria (level 12 Elf Archery) doing quest (...) at (x, y, z) in Solzreed`.
+    pub context: String,
+    /// `(name, value)` details.
+    pub facts: Vec<(String, String)>,
+    /// The packets before it, oldest first, one readable line each (and the triggering packet's head).
+    pub trail: Vec<String>,
+    /// Server log lines around it.
+    pub server_log: Vec<String>,
+    /// The bot's own log lines.
+    pub bot_log: Vec<String>,
+}
+
+/// Everything about one issue.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct IssueDetail {
+    pub summary: IssueSummary,
+    /// The entry as it is (or would be) written to the team's issue queue, CRLF line breaks included.
+    pub entry: String,
+    /// Server area hint (a path in the server repository; not verified).
+    pub area: Option<String>,
+    /// The evidence folder on the machine the bots run on, once written.
+    pub evidence: Option<String>,
+    /// Unix milliseconds at which the entry was queued, in state `queued`.
+    pub queued_at: Option<u64>,
+    pub samples: Vec<IssueSample>,
+}
+
+/// What the operator can do with an issue: `{"action":"queue"}`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueAction {
+    /// Write a queue entry now, whatever the policy and the rate limits say.
+    Queue,
+    /// Never queue it by itself.
+    Ignore,
+    /// It is fixed.
+    Resolve,
+    /// Back to open.
+    Reopen,
+}
+
+/// The JSON body of `POST /api/issues/{fingerprint}/action`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IssueActionRequest {
+    pub action: IssueAction,
+}
+
 /// What the web UI needs from the bot runtime. Implemented by the `playerbots` binary.
 ///
 /// All methods are called from async handlers, so they must return quickly and never block on
@@ -352,6 +441,19 @@ pub trait BotHub: Send + Sync + 'static {
     /// Run a command. `bot` is `None` for global commands (spawn/despawn, pause all, …). The error
     /// text is shown to the operator.
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String>;
+
+    /// The server issues the bots collected, in any order (the UI sorts). Empty by default.
+    fn issues(&self) -> Vec<IssueSummary> {
+        Vec::new()
+    }
+    /// One issue by its fingerprint (`pb:abcd1234`), `None` if unknown.
+    fn issue(&self, _fingerprint: &str) -> Option<IssueDetail> {
+        None
+    }
+    /// Applies an operator action to an issue. The error text is shown to the operator.
+    fn issue_action(&self, _fingerprint: &str, _action: IssueAction) -> Result<(), String> {
+        Err("issue reports are not available".into())
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +593,75 @@ mod tests {
         .unwrap();
         assert_eq!((old.bytes_in_per_sec, old.bytes_out_per_sec), (0.0, 0.0));
         assert_eq!(old.packets_in_per_sec, 4.0);
+    }
+
+    #[test]
+    fn issue_json_shapes() {
+        let req: IssueActionRequest = serde_json::from_str(r#"{"action":"queue"}"#).unwrap();
+        assert_eq!(req.action, IssueAction::Queue);
+        for (word, want) in [
+            ("ignore", IssueAction::Ignore),
+            ("resolve", IssueAction::Resolve),
+            ("reopen", IssueAction::Reopen),
+        ] {
+            let req: IssueActionRequest =
+                serde_json::from_str(&format!(r#"{{"action":"{word}"}}"#)).unwrap();
+            assert_eq!(req.action, want);
+        }
+        assert!(serde_json::from_str::<IssueActionRequest>(r#"{"action":"delete"}"#).is_err());
+        assert!(serde_json::from_str::<IssueActionRequest>(r#"{}"#).is_err());
+
+        let s = IssueSummary {
+            fingerprint: "pb:6f3b2e1c".into(),
+            kind: "kicked".into(),
+            count: 3,
+            bots: 2,
+            reportable: true,
+            ..IssueSummary::default()
+        };
+        let d = IssueDetail {
+            summary: s.clone(),
+            entry: "[t] x (playerbots)".into(),
+            ..IssueDetail::default()
+        };
+        let back: IssueDetail = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back, d);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["summary"]["fingerprint"], "pb:6f3b2e1c");
+        assert!(v["evidence"].is_null() && v["samples"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hub_without_issue_support_answers_politely() {
+        struct Bare;
+        impl BotHub for Bare {
+            fn snapshots(&self) -> Vec<BotSnapshot> {
+                Vec::new()
+            }
+            fn detail(&self, _: u32) -> Option<BotDetail> {
+                None
+            }
+            fn stats(&self) -> HubStats {
+                HubStats::default()
+            }
+            fn markers(&self) -> Vec<Marker> {
+                Vec::new()
+            }
+            fn map_info(&self) -> MapInfo {
+                MapInfo::default()
+            }
+            fn map_image(&self) -> Option<Vec<u8>> {
+                None
+            }
+            fn command(&self, _: Option<u32>, _: Command) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        assert!(Bare.issues().is_empty());
+        assert!(Bare.issue("pb:00000000").is_none());
+        assert!(Bare
+            .issue_action("pb:00000000", IssueAction::Queue)
+            .is_err());
     }
 
     #[test]

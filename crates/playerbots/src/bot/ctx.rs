@@ -13,6 +13,7 @@ use super::state::BotState;
 use crate::archetype::Archetype;
 use crate::config::Config;
 use crate::hub::{Hub, Logger};
+use crate::issues::IssueReport;
 use crate::roster::Temperament;
 
 /// Who a bot is: fixed for the life of its task (a rename only changes the name).
@@ -135,6 +136,18 @@ impl Ctx<'_> {
             .debug(format!("gm {}: {}", self.persona.name, wire.line));
         self.out.push(out);
         true
+    }
+
+    /// Files a report of a problem with the server (see [`crate::issues`]). The bot's identity,
+    /// position, zone, goal and last log lines are attached unless the report has them; the hub
+    /// counts it and does the slow work in the background, so this never waits for I/O. Report an
+    /// episode once, not on every tick.
+    pub fn report_issue(&self, report: IssueReport) {
+        let (pos, char_id) = (self.state.me.pos, self.state.me.char_id);
+        let report = self
+            .log
+            .with_slot(|g| crate::issues::attach_context(report, g, char_id, Some(pos)));
+        self.hub.report_issue(report);
     }
 
     /// Whether GM commands may be used.

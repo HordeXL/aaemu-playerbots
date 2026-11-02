@@ -16,8 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, LlmStats, LogLine, MapInfo,
-    Marker, MarkerKind, QuestLine, WebConfig, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
+    IssueSample, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind, QuestLine,
+    WebConfig, WorldRect,
 };
 
 const AREA: (f32, f32, f32, f32) = (15000.0, 14800.0, 16200.0, 15800.0);
@@ -69,6 +70,7 @@ struct Inner {
 
 struct MockHub {
     inner: Mutex<Inner>,
+    issues: Mutex<Vec<IssueDetail>>,
     markers: Vec<Marker>,
     png: Option<Vec<u8>>,
 }
@@ -303,6 +305,133 @@ impl Inner {
     }
 }
 
+/// One fake issue for the issue panel.
+#[allow(clippy::too_many_arguments)]
+fn mock_issue(
+    fp: &str,
+    kind: &str,
+    title: &str,
+    suspect: &str,
+    severity: &str,
+    count: u64,
+    bots: u32,
+    state: &str,
+    reportable: bool,
+) -> IssueDetail {
+    let now = now_ms();
+    let sample = |age_s: u64, bot: &str, actual: &str| {
+        IssueSample {
+        at: now - age_s * 1000,
+        bot: bot.into(),
+        expected: "the quest log counts the kill within a few seconds".into(),
+        actual: actual.into(),
+        context: format!("bot {bot} (level 12 Elf Archery) doing quest (Quest 251: kill boars) at (15348, 15102, 120) in Solzreed"),
+        facts: vec![("quest".into(), "251".into()), ("npc".into(), "3475".into())],
+        trail: vec![
+            "-   900 ms  C2S L1 0x002c CSChangeTargetPacket".into(),
+            "-   410 ms  S2C L1 0x0123 SCUnitDeathPacket".into(),
+            "-    10 ms  S2C L1 0x0456 SCQuestContextUpdatedPacket".into(),
+            "packet head (6 bytes): 0a0b0c0d0e0f".into(),
+        ],
+        server_log: vec!["14:03:09 [WARN] aaemu_game::systems::quests::engine - no objective matches npc 3475".into()],
+        bot_log: vec!["14:03:05 killed Wild Boar".into(), "14:03:08 quest 251: waiting for credit".into()],
+    }
+    };
+    IssueDetail {
+        summary: IssueSummary {
+            fingerprint: fp.into(),
+            kind: kind.into(),
+            title: title.into(),
+            suspect: suspect.into(),
+            severity: severity.into(),
+            count,
+            bots,
+            first_seen: now - 3_600_000,
+            last_seen: now - 90_000,
+            state: state.into(),
+            reportable,
+        },
+        entry: [
+            format!("[2026-11-02 14:03:09 EST] {title} (playerbots)"),
+            format!("Observed by playerbots: the quest log did not change within 5 s. Expected: the quest log counts the kill. Seen {count} times by {bots} bots between 2026-11-02 13:03:09 and 2026-11-02 14:01:39."),
+            "Context: bot Aria (level 12 Elf Archery) doing quest (Quest 251: kill boars) at (15348, 15102, 120) in Solzreed; quest=251, npc=3475.".to_string(),
+            "Likely server area: rust/crates/aaemu-game/src/systems/quests/ (hint from the bot, not verified).".to_string(),
+            "Server log at the time: 14:03:09 [WARN] aaemu_game::systems::quests::engine - no objective matches npc 3475 (1 line in the evidence).".to_string(),
+            format!("Agent follow-up: reproduce from the packet trail in the evidence; verify against the server code before changing anything. This report comes from an automated client and may be a bot-side misunderstanding (suspect: {suspect})."),
+            format!("Evidence: C:/path/to/evidence/{fp} (report.json, trail.txt, server-log.txt, bot-log.txt). Marker {fp}."),
+        ]
+        .join("\r\n"),
+        area: Some("rust/crates/aaemu-game/src/systems/quests/".into()),
+        evidence: (state != "open").then(|| format!("C:/path/to/evidence/{fp}")),
+        queued_at: (state == "queued").then_some(now - 1_800_000),
+        samples: vec![
+            sample(3_600, "Aria", "the quest log did not change within 5 s"),
+            sample(300, "Bron", "no credit after 5 s; the server logged a warning"),
+            sample(90, "Aria", "the quest log did not change within 5 s"),
+        ],
+    }
+}
+
+fn mock_issues() -> Vec<IssueDetail> {
+    vec![
+        mock_issue(
+            "pb:6f3b2e1c",
+            "quest_credit_missing",
+            "Quest 251: killing NPC 3475 gives no credit",
+            "server",
+            "medium",
+            7,
+            3,
+            "open",
+            true,
+        ),
+        mock_issue(
+            "pb:a41c09d2",
+            "kicked",
+            "The server kicked a bot (reason 3)",
+            "server",
+            "high",
+            1,
+            1,
+            "queued",
+            true,
+        ),
+        mock_issue(
+            "pb:0c77be10",
+            "npc_missing",
+            "NPC 3512 is not at its spawn",
+            "data",
+            "low",
+            2,
+            1,
+            "open",
+            false,
+        ),
+        mock_issue(
+            "pb:92d0f3a8",
+            "death_without_packet",
+            "Bot looks dead but the server never said so",
+            "bot",
+            "high",
+            4,
+            2,
+            "open",
+            false,
+        ),
+        mock_issue(
+            "pb:e5a2177b",
+            "server_log_during_action",
+            "Server logged an error about a bot: house tax",
+            "server",
+            "high",
+            3,
+            2,
+            "resolved",
+            true,
+        ),
+    ]
+}
+
 impl MockHub {
     fn new(count: usize, with_image: bool) -> Self {
         let bots = (1..=count as u32).map(MockBot::new).collect();
@@ -354,6 +483,7 @@ impl MockHub {
                 started: Instant::now(),
                 tick: 0,
             }),
+            issues: Mutex::new(mock_issues()),
             markers,
             png: with_image.then(|| make_map_png(1024, 616)),
         }
@@ -433,6 +563,18 @@ impl BotHub for MockHub {
                 chat_replies: 3 + inner.tick / 40,
                 director_picks: 2 + inner.tick / 120,
             }),
+            open_issues: self
+                .issues
+                .lock()
+                .iter()
+                .filter(|i| i.summary.state == "open")
+                .count() as u32,
+            queued_issues: self
+                .issues
+                .lock()
+                .iter()
+                .filter(|i| i.summary.state == "queued")
+                .count() as u32,
             activity_counts: counts,
         }
     }
@@ -452,6 +594,45 @@ impl BotHub for MockHub {
 
     fn map_image(&self) -> Option<Vec<u8>> {
         self.png.clone()
+    }
+
+    fn issues(&self) -> Vec<IssueSummary> {
+        self.issues
+            .lock()
+            .iter()
+            .map(|i| i.summary.clone())
+            .collect()
+    }
+
+    fn issue(&self, fingerprint: &str) -> Option<IssueDetail> {
+        self.issues
+            .lock()
+            .iter()
+            .find(|i| i.summary.fingerprint == fingerprint)
+            .cloned()
+    }
+
+    fn issue_action(&self, fingerprint: &str, action: IssueAction) -> Result<(), String> {
+        let mut issues = self.issues.lock();
+        let issue = issues
+            .iter_mut()
+            .find(|i| i.summary.fingerprint == fingerprint)
+            .ok_or_else(|| format!("no issue {fingerprint}"))?;
+        let s = &mut issue.summary;
+        match action {
+            IssueAction::Queue if s.state == "queued" => return Err("already queued".into()),
+            IssueAction::Queue => {
+                s.state = "queued".into();
+                issue.queued_at = Some(now_ms());
+            }
+            IssueAction::Ignore => s.state = "ignored".into(),
+            IssueAction::Resolve => s.state = "resolved".into(),
+            IssueAction::Reopen => s.state = "open".into(),
+        }
+        if action != IssueAction::Queue {
+            issue.queued_at = None;
+        }
+        Ok(())
     }
 
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {

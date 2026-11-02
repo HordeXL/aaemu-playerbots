@@ -16,7 +16,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::types::{BotHub, Command};
+use crate::types::{BotHub, Command, IssueActionRequest};
 
 /// Header that carries the operator token on `POST` requests when one is configured.
 pub const TOKEN_HEADER: &str = "x-playerbots-token";
@@ -167,8 +167,11 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/markers", get(api_markers))
         .route("/api/map", get(api_map))
+        .route("/api/issues", get(api_issues))
+        .route("/api/issues/{fp}", get(api_issue))
         .route("/api/bots/{id}/command", post(api_bot_command))
         .route("/api/command", post(api_command))
+        .route("/api/issues/{fp}/action", post(api_issue_action))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -435,7 +438,63 @@ async fn api_map(State(st): State<Arc<AppState>>) -> Response {
     json_response(&info)
 }
 
+/// Issue fingerprints are `pb:` and eight hex digits; accept anything short and plain (the hub
+/// decides what exists) so odd input never reaches it.
+fn plain_fingerprint(fp: &str) -> bool {
+    !fp.is_empty()
+        && fp.len() <= 32
+        && fp
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
+async fn api_issues(State(st): State<Arc<AppState>>) -> Response {
+    json_response(&st.hub.issues())
+}
+
+async fn api_issue(State(st): State<Arc<AppState>>, Path(fp): Path<String>) -> Response {
+    if !plain_fingerprint(&fp) {
+        return ApiError::bad_request("not an issue fingerprint").into_response();
+    }
+    match st.hub.issue(&fp) {
+        Some(detail) => json_response(&detail),
+        None => ApiError::new(StatusCode::NOT_FOUND, format!("no issue {fp}")).into_response(),
+    }
+}
+
 // ---------------------------------------------------------------- commands (POST)
+
+async fn api_issue_action(
+    State(st): State<Arc<AppState>>,
+    Path(fp): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Authorize first so an unauthenticated caller learns nothing.
+    if let Err(e) = authorize(&st, &headers) {
+        return e.into_response();
+    }
+    if !plain_fingerprint(&fp) {
+        return ApiError::bad_request("not an issue fingerprint").into_response();
+    }
+    if !is_json(&headers) {
+        return ApiError::bad_request("send the action as Content-Type: application/json")
+            .into_response();
+    }
+    let req: IssueActionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::bad_request(format!(
+                "invalid action: {e}; expected {{\"action\":\"queue\"|\"ignore\"|\"resolve\"|\"reopen\"}}"
+            ))
+            .into_response()
+        }
+    };
+    match st.hub.issue_action(&fp, req.action) {
+        Ok(()) => json_response(&serde_json::json!({ "ok": true })),
+        Err(msg) => ApiError::bad_request(msg).into_response(),
+    }
+}
 
 async fn api_command(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
     run_command(&st, &headers, &body, None)

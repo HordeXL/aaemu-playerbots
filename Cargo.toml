@@ -51,6 +51,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 parking_lot = "0.12"
+# local time of the issue reports (header of a queue entry, evidence folder names)
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 smallvec = { version = "1", features = ["union"] }
 rustc-hash = "2"
 fastrand = "2"

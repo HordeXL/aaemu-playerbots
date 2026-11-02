@@ -119,6 +119,28 @@ never when they can mint goods).
   a skill id), zero-guarded HP percentages.
 - Optional LLM, rate-limited and budgeted, never on the tick path.
 
+## Server issue reports
+
+Bots are the first players of a new server, so they also find its bugs. `crates/playerbots/src/issues/`
+is the process-wide plumbing; the detectors (what counts as a problem) live in the bot loop and the
+goals and file an `IssueReport` through `Ctx::report_issue` / `Bot::file_issue` → `Hub::report_issue`.
+
+- `model.rs` the report (kind, stable key, title, expected/actual, suspect, severity, area hint, facts,
+  and the bot context, packet trail and logs the bot side attaches), the fingerprint `pb:<8 hex>` (FNV-1a
+  of kind and key; it is the marker in the team's queue file), `TrailRing`.
+- `book.rs` `IssueBook`: dedup by fingerprint, counts, distinct bots, three samples, state
+  (open / queued / ignored / resolved), the reportable policy, the queue rate limits, eviction at 500
+  issues, JSON persistence. Plain data and no clock: tested without a runtime.
+- `service.rs` `Issues`: the book behind a mutex (never held across an await) plus three background
+  tasks: the debounced saver, the sink (evidence folders and queue entries, recurrence checks) and the
+  server log tail. `report` never waits for I/O.
+- `queue.rs` / `evidence.rs` the append-only entry for the team's issue file and the evidence folders;
+  `logtail.rs` the server log follower and its bounded ring; `redact.rs` removes addresses and
+  credential values from every text; `timefmt.rs` local times; `view.rs` the web types.
+
+The web crate only knows `IssueSummary` / `IssueDetail` / `IssueAction` and three defaulted `BotHub`
+methods. Operator documentation: the README section "Server issue reports".
+
 ## Data directory
 
 `playerbots bake` writes (see `docs/DATA-FORMATS.md`):

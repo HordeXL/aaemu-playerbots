@@ -23,6 +23,7 @@ use playerbots::bot::coordinator::{self, Dispatch};
 use playerbots::bot::{Shared, LOGIN_PERMITS};
 use playerbots::config::Config;
 use playerbots::hub::{Hub, HubParams, SupCmd};
+use playerbots::issues::Issues;
 use playerbots::roster::{Roster, SharedRoster};
 use playerbots::secrets::{self, Source};
 use playerbots::supervisor::{ensure_roster, register_slots, Supervisor};
@@ -248,12 +249,17 @@ async fn run(
 
     let (sup_tx, sup_rx) = tokio::sync::mpsc::channel::<SupCmd>(16);
     let llm = pb_llm::Llm::from_config(&cfg.llm);
-    let hub = Arc::new(Hub::new(HubParams {
-        world: &world,
-        baked_dir: cfg.data.baked.as_deref(),
-        supervisor: sup_tx,
-        llm,
-    }));
+    let issues = Arc::new(Issues::open(&cfg.issues, &cfg.bots.roster));
+    let hub = Arc::new(
+        Hub::new(HubParams {
+            world: &world,
+            baked_dir: cfg.data.baked.as_deref(),
+            supervisor: sup_tx,
+            llm,
+        })
+        .with_issues(issues),
+    );
+    let issue_tasks = hub.start_issues();
 
     let cancel = CancellationToken::new();
     let (coord_handle, coordinator) = coordinator::channel(hub.clone() as Arc<dyn Dispatch>);
@@ -335,6 +341,7 @@ async fn run(
     let _ = ticker.await;
     // (the bots are gone: whatever they changed last is written now)
     saver.stop().await;
+    issue_tasks.stop().await;
     tracing::info!("bye");
     Ok(())
 }

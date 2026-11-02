@@ -51,6 +51,7 @@ use tracing::Instrument;
 use crate::archetype::{Archetype, Archetypes};
 use crate::config::{race_name, Config};
 use crate::hub::{Hub, Logger};
+use crate::issues::{IssueReport, LogLevel};
 use crate::roster::{RosterEntry, SharedRoster};
 use crate::secrets::Secret;
 
@@ -596,6 +597,7 @@ impl Bot {
             }
             BotCmd::DuelWith(other) => self.pair_with(*other, PairKind::Duel),
             BotCmd::TradeWith(other) => self.pair_with(*other, PairKind::Trade),
+            BotCmd::ServerLogLine { level, line } => self.on_server_log_line(*level, line),
             BotCmd::Goal(_) | BotCmd::Pair(_) => self.brain.command(&cmd),
         }
     }
@@ -617,6 +619,26 @@ impl Bot {
             PairKind::Trade => GoalKind::Trade,
         };
         self.brain.queue(goal, Some(order));
+    }
+
+    // ---- server issue reports ------------------------------------------------------------
+
+    /// Files `report` for this bot: the bot's identity, position, zone, goal and last log lines are
+    /// attached (unless the detector set them), then the hub counts it. Cheap, never waits for I/O.
+    /// A detector in the bot loop calls this; goals call [`Ctx::report_issue`].
+    fn file_issue(&self, report: IssueReport) {
+        let (pos, char_id) = (self.state.me.pos, self.state.me.char_id);
+        let report = self
+            .slot
+            .with(|g| crate::issues::attach_context(report, g, char_id, Some(pos)));
+        self.shared.hub.report_issue(report);
+    }
+
+    /// The server logged a warning or an error that names this bot's character: files a
+    /// `ServerLogDuringAction` report. (The bot has no packet trail to add yet.)
+    fn on_server_log_line(&mut self, level: LogLevel, line: &str) {
+        let report = crate::issues::server_log_report(level, line, &self.persona.name);
+        self.file_issue(report);
     }
 
     /// One brain tick: reactions, resurrection, goals, movement. Returns the reason to leave the

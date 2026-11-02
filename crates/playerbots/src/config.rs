@@ -36,6 +36,8 @@ pub struct Config {
     pub llm: pb_llm::LlmConfig,
     /// Chat: replies to players and bot-to-bot chatter.
     pub social: SocialCfg,
+    /// Server issue reports: what the bots tell the team about the server.
+    pub issues: IssuesCfg,
 }
 
 /// `[server]`: how to reach the login server and name the accounts.
@@ -253,6 +255,123 @@ impl Default for SocialCfg {
     }
 }
 
+/// What happens with an issue that is worth telling the team about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueMode {
+    /// A background task appends reportable issues to `queue_file`, within the rate limits.
+    #[default]
+    Auto,
+    /// Only the web/API "queue" action appends an entry.
+    Manual,
+    /// Never touch the queue file (issues are still collected, kept and shown in the web UI).
+    Off,
+}
+
+/// `[issues]`: server issue reports, see [`crate::issues`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssuesCfg {
+    /// Collect issue reports at all.
+    pub enabled: bool,
+    /// Where the book of issues (`issues.json`) lives; default `<directory of bots.roster>/issues`.
+    pub dir: Option<PathBuf>,
+    /// Where the evidence folders go; default `<dir>/evidence`.
+    pub evidence_dir: Option<PathBuf>,
+    /// The operator's issue queue (a text file the team works from); entries are appended to it.
+    pub queue_file: Option<PathBuf>,
+    /// What to do with reportable issues, see [`QueueMode`].
+    pub queue_mode: QueueMode,
+    /// Label of the time zone in a queue entry's header (`EST`); default `UTC±HH:MM`.
+    pub time_label: Option<String>,
+    /// The game server's log file, tailed to correlate issues with server warnings and errors.
+    pub server_log: Option<PathBuf>,
+    /// Occurrences after which an issue is reportable.
+    pub min_occurrences: u32,
+    /// Distinct bots after which an issue is reportable.
+    pub min_bots: u32,
+    /// At most this many queue entries per hour, all kinds together.
+    pub max_queue_per_hour: u32,
+    /// At most this many new queue entries per issue kind per 24 hours.
+    pub max_queue_per_kind_per_day: u32,
+}
+
+impl Default for IssuesCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+            evidence_dir: None,
+            queue_file: None,
+            queue_mode: QueueMode::Auto,
+            time_label: None,
+            server_log: None,
+            min_occurrences: 3,
+            min_bots: 2,
+            max_queue_per_hour: 6,
+            max_queue_per_kind_per_day: 2,
+        }
+    }
+}
+
+impl IssuesCfg {
+    /// The directory of the issue book: `issues.dir`, else `issues` next to the roster file.
+    pub fn resolved_dir(&self, roster: &Path) -> PathBuf {
+        match &self.dir {
+            Some(d) => d.clone(),
+            None => roster
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join("issues"),
+        }
+    }
+
+    /// The directory of the evidence folders: `issues.evidence_dir`, else `<dir>/evidence`.
+    pub fn resolved_evidence_dir(&self, roster: &Path) -> PathBuf {
+        match &self.evidence_dir {
+            Some(d) => d.clone(),
+            None => self.resolved_dir(roster).join("evidence"),
+        }
+    }
+
+    /// `time_label` without surrounding blanks; `None` when unset or blank.
+    pub fn label(&self) -> Option<&str> {
+        self.time_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+    }
+
+    /// Checks the values that would otherwise fail late and obscurely.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.min_occurrences >= 1,
+            "issues.min_occurrences must be at least 1"
+        );
+        ensure!(self.min_bots >= 1, "issues.min_bots must be at least 1");
+        for (name, p) in [
+            ("dir", &self.dir),
+            ("evidence_dir", &self.evidence_dir),
+            ("queue_file", &self.queue_file),
+            ("server_log", &self.server_log),
+        ] {
+            if let Some(p) = p {
+                ensure!(
+                    !p.as_os_str().is_empty(),
+                    "issues.{name} is empty (leave it out instead)"
+                );
+            }
+        }
+        if let Some(l) = self.label() {
+            ensure!(
+                l.chars().count() <= 16 && !l.chars().any(|c| c.is_control() || c == ']'),
+                "issues.time_label must be at most 16 characters without ']' or control characters"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     /// Reads, parses and validates `path`.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -371,6 +490,7 @@ impl Config {
             self.llm.director_interval_secs >= 30,
             "llm.director_interval_secs must be at least 30"
         );
+        self.issues.validate()?;
         Ok(())
     }
 }
@@ -493,6 +613,80 @@ mod tests {
         .unwrap();
         assert!(cfg.llm.director && !cfg.social.bot_chatter);
         assert_eq!(cfg.llm.director_interval_secs, 90);
+    }
+
+    #[test]
+    fn issue_reports_are_on_by_default_without_a_queue_file() {
+        let cfg = Config::parse("").unwrap();
+        let i = &cfg.issues;
+        assert!(i.enabled);
+        assert_eq!(i.queue_mode, QueueMode::Auto);
+        assert!(i.queue_file.is_none() && i.server_log.is_none() && i.time_label.is_none());
+        assert!(i.dir.is_none() && i.evidence_dir.is_none());
+        assert_eq!((i.min_occurrences, i.min_bots), (3, 2));
+        assert_eq!((i.max_queue_per_hour, i.max_queue_per_kind_per_day), (6, 2));
+        // the example file documents exactly the defaults
+        let ex = Config::parse(Config::example()).unwrap().issues;
+        assert_eq!(ex.enabled, i.enabled);
+        assert_eq!(ex.queue_mode, i.queue_mode);
+        assert_eq!((ex.min_occurrences, ex.min_bots), (3, 2));
+        assert_eq!(
+            (ex.max_queue_per_hour, ex.max_queue_per_kind_per_day),
+            (6, 2)
+        );
+        assert!(ex.queue_file.is_none() && ex.server_log.is_none() && ex.dir.is_none());
+    }
+
+    #[test]
+    fn issue_report_paths_default_next_to_the_roster() {
+        let cfg = Config::parse("").unwrap();
+        let roster = Path::new("data/roster.json");
+        assert_eq!(
+            cfg.issues.resolved_dir(roster),
+            PathBuf::from("data").join("issues")
+        );
+        assert_eq!(
+            cfg.issues.resolved_evidence_dir(roster),
+            PathBuf::from("data").join("issues").join("evidence")
+        );
+        let cfg = Config::parse(
+            "[issues]\ndir = \"state\"\nevidence_dir = \"ev\"\nqueue_file = \"q.txt\"\nqueue_mode = \"manual\"\ntime_label = \" EST \"\nserver_log = \"s.log\"\nmin_occurrences = 5\nmin_bots = 3\nmax_queue_per_hour = 1\nmax_queue_per_kind_per_day = 1\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.issues.resolved_dir(roster), PathBuf::from("state"));
+        assert_eq!(
+            cfg.issues.resolved_evidence_dir(roster),
+            PathBuf::from("ev")
+        );
+        assert_eq!(cfg.issues.queue_mode, QueueMode::Manual);
+        assert_eq!(cfg.issues.label(), Some("EST"));
+        assert_eq!(cfg.issues.queue_file.as_deref(), Some(Path::new("q.txt")));
+        assert_eq!(cfg.issues.min_occurrences, 5);
+    }
+
+    #[test]
+    fn bad_issue_settings_are_rejected() {
+        for bad in [
+            "[issues]\nqueue_mode = \"sometimes\"\n",
+            "[issues]\nmin_occurrences = 0\n",
+            "[issues]\nmin_bots = 0\n",
+            "[issues]\nqueue_file = \"\"\n",
+            "[issues]\nserver_log = \"\"\n",
+            "[issues]\ntime_label = \"this label is far too long\"\n",
+            "[issues]\ntime_label = \"E]T\"\n",
+            "[issues]\nqueu_file = \"q.txt\"\n",
+            "[issues]\nmax_queue_per_hour = -1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        for ok in [
+            "[issues]\nqueue_mode = \"off\"\n",
+            "[issues]\nenabled = false\n",
+            "[issues]\nmax_queue_per_hour = 0\n",
+            "[issues]\ntime_label = \"\"\n",
+        ] {
+            assert!(Config::parse(ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]

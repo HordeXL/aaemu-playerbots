@@ -21,6 +21,7 @@ pub mod config;
 pub mod contest;
 pub mod gm;
 pub mod hub;
+pub mod issues;
 pub mod names;
 pub mod roster;
 pub mod secrets;

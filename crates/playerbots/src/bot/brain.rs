@@ -231,7 +231,7 @@ impl Brain {
                 self.queued = Some((kind, Some(order.clone())));
             }
             BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) | BotCmd::Whisper { .. } => {}
-            BotCmd::DuelWith(_) | BotCmd::TradeWith(_) => {}
+            BotCmd::DuelWith(_) | BotCmd::TradeWith(_) | BotCmd::ServerLogLine { .. } => {}
         }
     }
 

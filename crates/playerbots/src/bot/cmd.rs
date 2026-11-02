@@ -1,6 +1,8 @@
 //! Commands a bot task receives on its command channel (from the web UI through the hub, and
 //! from the coordinator).
 
+use crate::issues::LogLevel;
+
 /// The goals a bot can pursue, as the web UI names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GoalKind {
@@ -142,6 +144,15 @@ pub enum BotCmd {
     TradeWith(u32),
     /// The coordinator found a partner.
     Pair(PairOrder),
+    /// A `WARN` or `ERROR` line of the game server's log mentions this bot's character (sent by
+    /// the hub when `issues.server_log` is set). The bot files a
+    /// [`crate::issues::IssueKind::ServerLogDuringAction`] report with its own context.
+    ServerLogLine {
+        /// The level of the line (`Warn` or `Error`).
+        level: LogLevel,
+        /// The line, without colour codes.
+        line: String,
+    },
 }
 
 #[cfg(test)]

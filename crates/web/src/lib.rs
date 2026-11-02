@@ -13,8 +13,11 @@
 //! GET  /api/stats              HubStats
 //! GET  /api/markers            [Marker]
 //! GET  /api/map                MapInfo
+//! GET  /api/issues             [IssueSummary]       (server problems the bots collected)
+//! GET  /api/issues/{fp}        IssueDetail          (404 if unknown; fp is `pb:` and 8 hex digits)
 //! POST /api/bots/{id}/command  Command as JSON      -> {"ok":true} or 400 {"error":"…"}
 //! POST /api/command            Command as JSON (global commands: spawn, despawn, pause all, …)
+//! POST /api/issues/{fp}/action {"action":"queue"|"ignore"|"resolve"|"reopen"} -> {"ok":true} or 400
 //! ```
 //!
 //! With [`WebConfig::token`] set, `POST`s need the header `x-playerbots-token: <token>` (401
@@ -38,6 +41,7 @@ mod types;
 
 pub use server::{router, serve, serve_listener, WebConfig, TOKEN_HEADER};
 pub use types::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, LlmStats, LogLine, MapInfo,
-    Marker, MarkerKind, QuestLine, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueActionRequest,
+    IssueDetail, IssueSample, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind,
+    QuestLine, WorldRect,
 };

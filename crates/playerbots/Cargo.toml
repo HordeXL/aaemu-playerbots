@@ -32,6 +32,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 parking_lot.workspace = true
+chrono.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 fastrand.workspace = true
