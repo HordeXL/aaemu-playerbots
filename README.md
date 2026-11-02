@@ -46,9 +46,14 @@ playerbots run --config playerbots.toml          # Ctrl+C logs the bots out
   `[data] baked` is the `--out` directory of `bake` (terrain heights, zones, housing areas, quest
   spheres, world map); without it the bots walk on flat ground and the map has no picture.
 * The login server must create unknown accounts (`AutoAccount`). Bot accounts are `<prefix><n>`
-  (`server.account_prefix`, default `pb`) with one shared password (`server.password`, else
-  `$PLAYERBOTS_PASSWORD`, else `playerbots`).
-* The web UI is on `http://127.0.0.1:8790/` (`[web] bind`, optional `token` for POST requests).
+  (`server.account_prefix`, default `pb`) with one shared password: `server.password`, else
+  `$PLAYERBOTS_PASSWORD`, else a random one that the first run generates and saves to
+  `roster.secrets.json` next to the roster (readable by the owner only, git-ignored; never shown
+  by the web API, the logs or `Debug`). Keep it together with `roster.json`. A roster that predates
+  the file keeps the old public default `playerbots` for its existing accounts, with a warning at
+  start-up; change the password of those accounts (and set `server.password`) or start over.
+* The web UI is on `http://127.0.0.1:8790/` (`[web] bind`, optional `token` for POST requests;
+  while it is bound to a loopback address every request must also carry a loopback `Host`).
 * `playerbots run --count 50 --duration-secs 600` overrides the bot count and stops after ten
   minutes.
 * Bots are started `bots.ramp_ms` apart; more can be started and stopped from the web UI.
@@ -62,11 +67,31 @@ The commands only work for accounts with access level 100. Print the SQL that gr
 the game database and restart the bots:
 
 ```sh
-playerbots grant-gm-sql --config playerbots.toml     # UPDATE aaemu_game.accounts SET access_level = 100 ...
+playerbots grant-gm-sql --config playerbots.toml     # UPDATE aaemu_game.accounts SET access_level = 100 WHERE username IN ('pb1', ...)
 ```
 
-Only the bots' own goals send GM commands, and only with `gm_bootstrap` on; chat lines written by
-players or by the LLM can never become commands (see "Safety").
+The statements name exactly the accounts of the roster (`--game-db` / `--login-db` name the
+databases when the server does not use `aaemu_game` / `aaemu_login`); nothing like a name pattern
+that a real player's account could match.
+
+Because these accounts are GM accounts, `gm_bootstrap = true` is refused while the bots use the
+public default password or none: give them a private one (the generated password does).
+
+Safety of the GM lines:
+
+* Only the bots' own goals send GM commands, and only with `gm_bootstrap` on; chat lines written by
+  players or by the LLM can never become commands (see "Safety"). Every plain chat line goes
+  through one guard that refuses a command, however it is hidden (leading blanks, NULs, invisible
+  or look-alike slashes); the GM path is a separate builder.
+* All GM lines go through `Ctx::gm`, which allows only a short list of commands and always
+  addresses the bot itself: `/level <own name> N`, `/labor <own name> N`, `/move <own name> x y z`,
+  `/item add self ...`, `/gold add self ...`. The server aims some commands at the sender's
+  target (or at the sender when it has none), so the target is cleared (`CSChangeTarget(0)`) in the
+  same flush before each of them, and after a fight against a character. `/build` is the one
+  command that needs a target (the house), and it is sent right after targeting that house.
+* `[behavior] trade_with_players = false` (default): a bot trades only with other bots of the
+  roster and declines the trade request of any other character, so nobody can farm the goods and
+  gold the bots mint for themselves. The option is ignored while `gm_bootstrap` is on.
 
 ## Chat and the LLM
 
@@ -139,7 +164,11 @@ searched; selecting a bot shows its state, quests, extra details, the last chat 
 said and its event log. Commands per bot: pause/resume, force a goal (quest, grind, duel, trade,
 trade run, housing, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
 line to a character. Global: spawn/despawn bots, pause or resume all. With `[web] token` set, POST
-requests need the header `x-playerbots-token`.
+requests need the header `x-playerbots-token`. While the UI is bound to a loopback address, every
+route (reads included) refuses a request whose `Host` is not a loopback name (a DNS-rebinding page
+in a browser can otherwise read the bots' state); a POST with the right token is exempt, as it
+cannot come from such a page. Despawning a bot keeps its slot, account and character: spawning
+again reuses the stopped bots first and creates a new roster entry only when none is free.
 
 ## Memory and scale
 

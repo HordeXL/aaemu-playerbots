@@ -491,6 +491,20 @@ fn trade_outlets(world: &aa_world::World) -> Vec<Marker> {
     out
 }
 
+/// `name` if it is a plain file name: one normal path component, so no separator, no `..`, no
+/// drive or root, nothing absolute. (`dir.join("/etc/passwd")` replaces `dir` altogether.)
+pub fn plain_file_name(name: &str) -> Option<&str> {
+    use std::path::Component;
+    if name.is_empty() || name.contains(['\0', '/', '\\', ':']) {
+        return None;
+    }
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(n)), None) if n == std::ffi::OsStr::new(name) => Some(name),
+        _ => None,
+    }
+}
+
 fn load_map(world: &aa_world::World, baked_dir: Option<&Path>) -> MapAsset {
     let Some(cal) = world.baked().map.as_ref() else {
         return MapAsset {
@@ -504,7 +518,15 @@ fn load_map(world: &aa_world::World, baked_dir: Option<&Path>) -> MapAsset {
         };
     };
     let png = baked_dir.and_then(|dir| {
-        let path = dir.join(&cal.image);
+        // (the calibration file is data from disk: it must not point outside the data directory)
+        let Some(name) = plain_file_name(&cal.image) else {
+            tracing::warn!(
+                "the baked map names its image {:?}, which is not a plain file name; no map image",
+                cal.image
+            );
+            return None;
+        };
+        let path = dir.join(name);
         match std::fs::read(&path) {
             Ok(bytes) => Some(Arc::new(bytes)),
             Err(e) => {
@@ -673,6 +695,32 @@ mod tests {
             id,
             name: format!("Bot{id}"),
             ..BotSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn the_map_image_must_be_a_plain_file_name() {
+        for ok in ["map_main_world.png", "map.png", "a b.png", "x"] {
+            assert_eq!(plain_file_name(ok), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../map.png",
+            "..\\map.png",
+            "sub/map.png",
+            "sub\\map.png",
+            "/etc/passwd",
+            "\\windows\\win.ini",
+            "C:\\windows\\win.ini",
+            "C:map.png",
+            "map.png:stream",
+            "\\\\server\\share\\x.png",
+            "map\0.png",
+            "./map.png",
+        ] {
+            assert_eq!(plain_file_name(bad), None, "{bad:?}");
         }
     }
 

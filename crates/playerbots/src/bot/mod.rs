@@ -52,6 +52,7 @@ use crate::archetype::{Archetype, Archetypes};
 use crate::config::{race_name, Config};
 use crate::hub::{Hub, Logger};
 use crate::roster::{RosterEntry, SharedRoster};
+use crate::secrets::Secret;
 
 use brain::Brain;
 use cmd::{BotCmd, GoalKind, PairKind, PairOrder, PairRole};
@@ -78,6 +79,16 @@ const WATCH_RADIUS: f32 = 150.0;
 const EXTRA_EVERY_SECS: u32 = 5;
 /// Lifetime of a bot between connects: the longest the connect step may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a bot waits for a free login slot before it counts as a failed attempt (and backs
+/// off). Long: a big roster starting up queues for a while.
+const PERMIT_WAIT: Duration = Duration::from_secs(180);
+/// The longest a bot holds a login slot (login server, connect and lobby together); the slot goes
+/// back to the others after that, whatever the individual steps are still doing.
+const PERMIT_HOLD: Duration = Duration::from_secs(120);
+/// A world session that has not heard a single packet from the server for this long is dead: the
+/// server answers every ping (every 3 s) within a moment, so silence means the connection is gone
+/// (a half-open TCP connection would otherwise sit there for hours).
+pub const READ_IDLE_LIMIT: Duration = Duration::from_secs(25);
 
 /// Everything the bot tasks share.
 pub struct Shared {
@@ -95,8 +106,8 @@ pub struct Shared {
     pub coord: CoordHandle,
     /// Limits concurrent logins.
     pub login_gate: tokio::sync::Semaphore,
-    /// The bot account password.
-    pub password: String,
+    /// The bot account password (never printed).
+    pub password: Secret,
 }
 
 /// Why a session ended.
@@ -153,6 +164,9 @@ struct Bot {
     real_near: bool,
     online_since: Option<Instant>,
     next_rez_ms: u64,
+    /// The combat target was a character at the last look: when that fight ends the server-side
+    /// target is cleared, so a duel opponent does not stay the bot's target.
+    char_target: bool,
     last_stats: ConnStats,
     zone_key: Option<u16>,
     detail: String,
@@ -194,6 +208,7 @@ impl Bot {
             real_near: false,
             online_since: None,
             next_rez_ms: 0,
+            char_target: false,
             last_stats: ConnStats::default(),
             zone_key: None,
             detail: String::new(),
@@ -279,25 +294,35 @@ impl Bot {
         let cfg = &shared.cfg;
         let permit = tokio::select! {
             _ = cancel.cancelled() => return SessionEnd::Shutdown,
-            p = shared.login_gate.acquire() => p.ok(),
+            p = tokio::time::timeout(PERMIT_WAIT, shared.login_gate.acquire()) => match p {
+                Ok(p) => p.ok(),
+                Err(_) => {
+                    return failed(SessionError::Timeout("a free login slot"), Duration::ZERO)
+                }
+            },
         };
+        // The slot is held until the bot is in the world, but not longer than PERMIT_HOLD.
+        let hold = Instant::now() + PERMIT_HOLD;
+        let held_too_long = || failed(SessionError::Timeout("the login slot"), Duration::ZERO);
         self.sessions += 1;
         let ticket = tokio::select! {
             _ = cancel.cancelled() => return SessionEnd::Shutdown,
-            r = session::login_server(
+            r = tokio::time::timeout_at(hold, session::login_server(
                 &cfg.server.login,
                 &self.entry.account,
-                &shared.password,
+                shared.password.expose(),
                 cfg.server.world_id,
-            ) => match r {
-                Ok(t) => t,
-                Err(e) => return failed(e, Duration::ZERO),
+            )) => match r {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => return failed(e, Duration::ZERO),
+                Err(_) => return held_too_long(),
             },
         };
         let connect = GameConn::connect(ticket.cookie.game_addr);
+        let connect_by = (Instant::now() + CONNECT_TIMEOUT).min(hold);
         let mut conn = tokio::select! {
             _ = cancel.cancelled() => return SessionEnd::Shutdown,
-            r = tokio::time::timeout(CONNECT_TIMEOUT, connect) => match r {
+            r = tokio::time::timeout_at(connect_by, connect) => match r {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => return failed(e.into(), Duration::ZERO),
                 Err(_) => return failed(SessionError::Timeout("the game server"), Duration::ZERO),
@@ -305,6 +330,7 @@ impl Bot {
         };
         self.state.reset();
         self.combat.reset();
+        self.char_target = false;
         self.last_stats = ConnStats::default();
         let name = self.entry.char_name.clone();
         let wish = Wish {
@@ -316,27 +342,34 @@ impl Bot {
         };
         let entered = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = conn.close().await;
+                session::close(&mut conn).await;
                 return SessionEnd::Shutdown;
             }
-            r = session::enter_game(
+            r = tokio::time::timeout_at(hold, session::enter_game(
                 &mut conn,
                 &mut self.state,
                 ticket.account_id,
                 ticket.cookie.cookie,
                 &wish,
                 self.clock,
-            ) => r,
+            )) => match r {
+                Ok(r) => r,
+                Err(_) => {
+                    session::close(&mut conn).await;
+                    return held_too_long();
+                }
+            },
         };
+        // The slot goes back as soon as the lobby is over, whatever its outcome.
         drop(permit);
         let entered = match entered {
             Ok(e) => e,
             Err(e) if e.is_name_rejected() => {
-                let _ = conn.close().await;
+                session::close(&mut conn).await;
                 return self.rename();
             }
             Err(e) => {
-                let _ = conn.close().await;
+                session::close(&mut conn).await;
                 return failed(e, Duration::ZERO);
             }
         };
@@ -356,7 +389,7 @@ impl Bot {
                 SessionEnd::Shutdown
             }
             WorldEnd::Lost(why) => {
-                let _ = conn.close().await;
+                session::close(&mut conn).await;
                 SessionEnd::Ended {
                     why,
                     permanent: false,
@@ -434,6 +467,7 @@ impl Bot {
         housekeeping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let tick = tokio::time::sleep(Duration::from_millis(self.shared.cfg.bots.tick_ms));
         tokio::pin!(tick);
+        let mut watch = session::ReadWatch::new(Instant::now(), READ_IDLE_LIMIT);
         loop {
             tokio::select! {
                 biased;
@@ -442,22 +476,29 @@ impl Bot {
                     if let Some(end) = self.on_tick() {
                         return end;
                     }
-                    if let Err(e) = session::flush_out(conn, &mut self.out).await {
-                        return WorldEnd::Lost(e.to_string());
+                    if let Some(end) = self.flush(conn, cancel).await {
+                        return end;
                     }
                     tick.as_mut().reset(Instant::now() + self.tick_period());
                 }
                 _ = housekeeping.tick() => {
+                    if let Some(quiet) = watch.expired(Instant::now()) {
+                        return WorldEnd::Lost(format!(
+                            "no packet from the server for {} s (the connection is dead)",
+                            quiet.as_secs()
+                        ));
+                    }
                     self.housekeeping(conn);
-                    if let Err(e) = session::flush_out(conn, &mut self.out).await {
-                        return WorldEnd::Lost(e.to_string());
+                    if let Some(end) = self.flush(conn, cancel).await {
+                        return end;
                     }
                 }
                 packet = conn.recv() => match packet {
                     Ok(p) => {
+                        watch.heard(Instant::now());
                         self.on_packet(&p);
-                        if let Err(e) = session::flush_out(conn, &mut self.out).await {
-                            return WorldEnd::Lost(e.to_string());
+                        if let Some(end) = self.flush(conn, cancel).await {
+                            return end;
                         }
                     }
                     Err(e) => return WorldEnd::Lost(e.to_string()),
@@ -468,6 +509,16 @@ impl Bot {
                     None => return WorldEnd::Shutdown,
                 },
             }
+        }
+    }
+
+    /// Writes the outbox. Gives up at once when `cancel` fires (a shutdown must not wait for a
+    /// dead connection) and treats a write that does not finish in time as a lost connection.
+    async fn flush(&mut self, conn: &mut GameConn, cancel: &CancellationToken) -> Option<WorldEnd> {
+        match session::flush_until_cancelled(conn, &mut self.out, cancel).await {
+            session::Flushed::Done => None,
+            session::Flushed::Cancelled => Some(WorldEnd::Shutdown),
+            session::Flushed::Failed(e) => Some(WorldEnd::Lost(e.to_string())),
         }
     }
 
@@ -499,6 +550,27 @@ impl Bot {
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
         self.pin_position(queued, now);
+        self.clear_target_after_player_fight();
+    }
+
+    /// When a fight against a character (a duel) is over, clears the server-side target: it would
+    /// stay the opponent, who may be a real player, and the server aims some commands at the
+    /// sender's target. (The GM lines name the bot themselves as well, see [`crate::gm`].)
+    fn clear_target_after_player_fight(&mut self) {
+        match self.combat.target() {
+            None => {
+                if self.char_target {
+                    self.out.push(cs::change_target(0));
+                }
+                self.char_target = false;
+            }
+            // (a target out of view: keep what we knew)
+            Some(o) => {
+                if let Some(u) = self.state.units.get(&o) {
+                    self.char_target = u.kind == UnitKind::Character;
+                }
+            }
+        }
     }
 
     /// Tells the server exactly where the bot is before the first packet at `out[queued..]`
@@ -599,6 +671,7 @@ impl Bot {
         };
         self.motion.tick(&mut env);
         self.state.me.pos = self.motion.pos();
+        self.clear_target_after_player_fight();
         None
     }
 
@@ -799,9 +872,10 @@ fn failed(e: SessionError, online: Duration) -> SessionEnd {
     }
 }
 
-/// `d` plus up to a quarter of it, so a restart does not reconnect everyone at the same second.
+/// `d` scaled by a random factor in `0.5..1.5`, so a restart (or a server coming back) does not
+/// reconnect everyone in the same second.
 fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
-    d + d.mul_f32(rng.f32() * 0.25)
+    d.mul_f32(0.5 + rng.f32())
 }
 
 /// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it.
@@ -845,12 +919,21 @@ mod tests {
     }
 
     #[test]
-    fn jitter_adds_at_most_a_quarter() {
+    fn jitter_spreads_the_wait_by_half_either_way() {
         let mut rng = fastrand::Rng::with_seed(3);
-        for _ in 0..200 {
+        let (mut lo, mut hi) = (Duration::MAX, Duration::ZERO);
+        for _ in 0..2000 {
             let d = jittered(Duration::from_secs(8), &mut rng);
-            assert!(d >= Duration::from_secs(8) && d <= Duration::from_secs(10));
+            assert!(
+                d >= Duration::from_secs(4) && d < Duration::from_secs(12),
+                "{d:?}"
+            );
+            lo = lo.min(d);
+            hi = hi.max(d);
         }
+        // the spread really is wide in both directions
+        assert!(lo < Duration::from_secs(5), "{lo:?}");
+        assert!(hi > Duration::from_secs(11), "{hi:?}");
     }
 
     #[test]

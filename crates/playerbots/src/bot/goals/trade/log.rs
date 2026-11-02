@@ -112,12 +112,42 @@ pub struct TradeLog {
     pub opened: u32,
     /// [`TradeLog::opened`] when [`TradeLog::outcome`] was set.
     pub outcome_seq: u32,
+    /// Cancels sent for the open window while no trade goal ran, see [`TradeLog::orphan_cancel_due`].
+    pub orphan_cancels: u8,
+    /// Bot clock (ms) of the last of them.
+    pub orphan_cancel_ms: u64,
 }
+
+/// Cancels the brain sends for a window nobody tends before it stops asking.
+pub const ORPHAN_CANCEL_TRIES: u8 = 4;
+/// Pause between two of them (ms).
+pub const ORPHAN_CANCEL_GAP_MS: u64 = 3_000;
 
 impl TradeLog {
     /// Whether a window is open or a request waits for an answer (the bot task ticks fast).
     pub fn active(&self) -> bool {
         self.window.is_some() || self.incoming.is_some()
+    }
+
+    /// Whether the brain should send `CSCancelTrade` for the open window now, with no trade goal
+    /// running: the first time at once, then at most every [`ORPHAN_CANCEL_GAP_MS`] and at most
+    /// [`ORPHAN_CANCEL_TRIES`] times (a window the server will not close is not worth a packet per
+    /// tick). Counts the call that returns `true`.
+    pub fn orphan_cancel_due(&mut self, now_ms: u64) -> bool {
+        let due = self.orphan_cancels < ORPHAN_CANCEL_TRIES
+            && (self.orphan_cancels == 0
+                || now_ms.saturating_sub(self.orphan_cancel_ms) >= ORPHAN_CANCEL_GAP_MS);
+        if due {
+            self.orphan_cancels += 1;
+            self.orphan_cancel_ms = now_ms;
+        }
+        due
+    }
+
+    /// Forgets the cancels counted by [`TradeLog::orphan_cancel_due`] (no window is open).
+    pub fn orphan_reset(&mut self) {
+        self.orphan_cancels = 0;
+        self.orphan_cancel_ms = 0;
     }
 
     /// Updates the log from one event; events other than trade packets are ignored.
@@ -129,6 +159,7 @@ impl TradeLog {
             }
             E::CannotStartTrade { reason, .. } => self.refused = Some(*reason),
             E::TradeStarted { peer_obj } => {
+                self.orphan_reset();
                 self.incoming = None;
                 self.refused = None;
                 self.outcome = None;
@@ -417,6 +448,33 @@ mod tests {
             10,
         );
         assert_eq!((t.made, t.outcome.is_none()), (0, true));
+    }
+
+    #[test]
+    fn a_window_nobody_tends_is_cancelled_a_few_times_at_a_leisurely_pace() {
+        let mut t = TradeLog::default();
+        // the first cancel goes out at once, then one per gap, then no more
+        assert!(t.orphan_cancel_due(10_000));
+        let mut sent = 1;
+        // the brain ticks every 250 ms for two minutes
+        for step in 1..=480u64 {
+            if t.orphan_cancel_due(10_000 + step * 250) {
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, ORPHAN_CANCEL_TRIES as u32, "a few, not one per tick");
+        // the cancels that did go out were spaced by the gap
+        let mut t = TradeLog::default();
+        assert!(t.orphan_cancel_due(1_000));
+        assert!(!t.orphan_cancel_due(1_250));
+        assert!(!t.orphan_cancel_due(1_000 + ORPHAN_CANCEL_GAP_MS - 1));
+        assert!(t.orphan_cancel_due(1_000 + ORPHAN_CANCEL_GAP_MS));
+        assert!(!t.orphan_cancel_due(1_000 + ORPHAN_CANCEL_GAP_MS + 1));
+        // a closed window resets the counter, and so does a new one
+        t.orphan_reset();
+        assert!(t.orphan_cancel_due(50_000));
+        t.apply(&ActivityEvent::TradeStarted { peer_obj: 3 }, 60_000);
+        assert_eq!((t.orphan_cancels, t.orphan_cancel_ms), (0, 0));
     }
 
     #[test]

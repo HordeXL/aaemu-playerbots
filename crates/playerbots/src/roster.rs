@@ -4,18 +4,31 @@
 //! archetype, temperament and, once the character exists on the server, its character id. It is
 //! written atomically (temp file + rename) whenever something changes (a character was created,
 //! a name was rejected and regenerated), so a restart finds the same bots again.
+//!
+//! Writing is off the hot path: [`SharedRoster::update`] only records the change. A saver task
+//! ([`SharedRoster::spawn_saver`]) writes the file at most every [`SAVE_INTERVAL`], however many
+//! changes came in (a hundred bots creating their characters is one write, not a hundred), on a
+//! blocking thread, and once more when it is stopped at shutdown.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::archetype::Archetype;
 use crate::names;
 
 /// File format version of the roster.
 pub const ROSTER_VERSION: u32 = 1;
+/// The roster file is written at most this often while bots change it.
+pub const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How much a bot cares about each kind of activity (0..=1). The brain scales the goal weights
 /// of the config with these.
@@ -117,6 +130,22 @@ struct RosterFile {
     bots: Vec<RosterEntry>,
 }
 
+/// The entries of a roster at one moment.
+#[derive(Debug, Clone)]
+pub struct Snapshot(Vec<RosterEntry>);
+
+impl Snapshot {
+    /// The roster file text.
+    pub fn to_json(&self) -> String {
+        let file = RosterFile {
+            version: ROSTER_VERSION,
+            bots: self.0.clone(),
+        };
+        // Serialising plain data cannot fail; an empty file would be detected on the next load.
+        serde_json::to_string_pretty(&file).unwrap_or_default()
+    }
+}
+
 /// What a new roster entry may be made of.
 pub struct RosterSpec<'a> {
     /// Account name prefix.
@@ -182,12 +211,13 @@ impl Roster {
 
     /// The roster file text.
     pub fn to_json(&self) -> String {
-        let file = RosterFile {
-            version: ROSTER_VERSION,
-            bots: self.entries.clone(),
-        };
-        // Serialising plain data cannot fail; an empty file would be detected on the next load.
-        serde_json::to_string_pretty(&file).unwrap_or_default()
+        self.snapshot().to_json()
+    }
+
+    /// A copy of the entries that can be turned into the file text without the roster (and its
+    /// lock) at hand.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot(self.entries.clone())
     }
 
     /// Writes the roster file atomically: a temp file next to it, then a rename.
@@ -353,31 +383,57 @@ pub fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The roster shared by the supervisor and the bot tasks: every change is written to disk.
+/// The roster shared by the supervisor and the bot tasks. A change is written to disk by the
+/// saver task a moment later (see the module docs), and when the roster is dropped.
 #[derive(Debug)]
 pub struct SharedRoster {
     inner: parking_lot::Mutex<Roster>,
     path: std::path::PathBuf,
+    /// Changed since the last successful write.
+    dirty: AtomicBool,
+    /// Wakes the saver.
+    wake: Notify,
+    /// Successful writes so far.
+    writes: AtomicU64,
+}
+
+/// The saver task of a [`SharedRoster`]; [`Saver::stop`] writes what is left and ends it.
+#[derive(Debug)]
+pub struct Saver {
+    stop: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl Saver {
+    /// Stops the saver after one last write of the roster, and waits for it.
+    pub async fn stop(self) {
+        self.stop.cancel();
+        if let Err(e) = self.handle.await {
+            tracing::warn!("roster saver: {e}");
+        }
+    }
 }
 
 impl SharedRoster {
-    /// Wraps `roster`, saved to `path` after each change.
+    /// Wraps `roster`, saved to `path` (see the module docs for when).
     pub fn new(roster: Roster, path: std::path::PathBuf) -> SharedRoster {
         SharedRoster {
             inner: parking_lot::Mutex::new(roster),
             path,
+            dirty: AtomicBool::new(false),
+            wake: Notify::new(),
+            writes: AtomicU64::new(0),
         }
     }
 
-    /// Runs `f` on the roster; when it returns `true` the roster is saved. A failed save is
-    /// logged, never fatal (the next change tries again).
+    /// Runs `f` on the roster; when it returns `true` the roster is marked changed and the saver
+    /// is told. Nothing is written here: the caller (a bot's tick, the supervisor) never waits for
+    /// the disk.
     pub fn update<R>(&self, f: impl FnOnce(&mut Roster) -> (R, bool)) -> R {
-        let mut g = self.inner.lock();
-        let (r, changed) = f(&mut g);
+        let (r, changed) = f(&mut self.inner.lock());
         if changed {
-            if let Err(e) = g.save(&self.path) {
-                tracing::warn!("saving the roster: {e:#}");
-            }
+            self.dirty.store(true, Ordering::Release);
+            self.wake.notify_one();
         }
         r
     }
@@ -390,6 +446,85 @@ impl SharedRoster {
     /// A copy of the entry of bot `id`.
     pub fn entry(&self, id: u32) -> Option<RosterEntry> {
         self.inner.lock().get(id).cloned()
+    }
+
+    /// Whether there are changes that are not on disk yet.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// How many times the file was written.
+    pub fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Writes the roster now, on this thread, if it changed. For startup and for the end of the
+    /// process; a failure is logged and the roster stays marked as changed.
+    pub fn flush_blocking(&self) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let text = self.inner.lock().to_json();
+        self.finish_write(write_atomic(&self.path, &text));
+    }
+
+    fn finish_write(&self, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!("saving the roster: {e:#}");
+                self.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Like [`SharedRoster::flush_blocking`], but the write runs on a blocking thread.
+    pub async fn flush(self: &Arc<Self>) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let snapshot = self.inner.lock().snapshot();
+        let path = self.path.clone();
+        let result = tokio::task::spawn_blocking(move || write_atomic(&path, &snapshot.to_json()))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("the writer thread failed: {e}")));
+        self.finish_write(result);
+    }
+
+    /// Starts the saver task: after a change it waits `interval` for more changes, then writes the
+    /// file once; when stopped it writes once more.
+    pub fn spawn_saver(self: &Arc<Self>, interval: Duration) -> Saver {
+        let stop = CancellationToken::new();
+        let me = self.clone();
+        let token = stop.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = me.wake.notified() => {}
+                }
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                me.flush().await;
+                if me.is_dirty() {
+                    // the write failed: try again after another interval
+                    me.wake.notify_one();
+                }
+            }
+            me.flush().await;
+        });
+        Saver { stop, handle }
+    }
+}
+
+impl Drop for SharedRoster {
+    fn drop(&mut self) {
+        // (a path out of a normal shutdown, e.g. an error in `main`, still keeps the changes)
+        self.flush_blocking();
     }
 }
 
@@ -536,6 +671,163 @@ mod tests {
         assert!(roster.adopt_name(1, &old));
         assert!(!roster.adopt_name(3, &new));
         assert_eq!(roster.get(1).unwrap().char_name, old);
+    }
+
+    fn shared(dir: &Path) -> Arc<SharedRoster> {
+        let arch = Archetypes::builtin().unwrap();
+        let any = |_: u8, _: u8| true;
+        let mut roster = Roster::new();
+        let mut rng = fastrand::Rng::with_seed(9);
+        roster
+            .ensure(3, &spec(&arch, &[1, 4], &any), &mut rng)
+            .unwrap();
+        Arc::new(SharedRoster::new(roster, dir.join("roster.json")))
+    }
+
+    /// Lets the saver and its blocking write run.
+    async fn settle(r: &SharedRoster, writes: u64) {
+        // (real sleeps: the write runs on a real thread even when the test clock is paused)
+        for _ in 0..400 {
+            if r.writes() >= writes {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the roster was not written {writes} times (writes = {})",
+            r.writes()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_does_not_touch_the_disk() {
+        let dir = temp_dir("roster-nowrite");
+        let r = shared(&dir);
+        assert!(r.update(|r| (r.set_char_id(1, 10), true)));
+        assert!(r.is_dirty());
+        assert!(
+            !dir.join("roster.json").exists(),
+            "no write on the caller's thread"
+        );
+        assert_eq!(r.writes(), 0);
+        // an update that changes nothing does not mark the roster
+        r.flush_blocking();
+        assert!(!r.is_dirty());
+        assert!(!r.update(|r| (r.set_char_id(1, 10), false)));
+        assert!(!r.is_dirty());
+        assert_eq!(r.writes(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_changes_in_a_window_are_one_write() {
+        let dir = temp_dir("roster-coalesce");
+        let r = shared(&dir);
+        let saver = r.spawn_saver(SAVE_INTERVAL);
+        for i in 0..50u32 {
+            r.update(|r| (r.set_char_id(1 + i % 3, 100 + i), true));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 1 s after the first change: still nothing on disk
+        assert!(!dir.join("roster.json").exists());
+        assert_eq!(r.writes(), 0);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        settle(&r, 1).await;
+        assert_eq!(r.writes(), 1, "all 50 changes in one write");
+        let on_disk = Roster::load(&dir.join("roster.json")).unwrap();
+        assert_eq!(on_disk.get(1).unwrap().char_id, Some(100 + 48));
+        assert_eq!(on_disk.get(2).unwrap().char_id, Some(100 + 49));
+        // quiet: no further writes
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(r.writes(), 1);
+        // the next change is written in the next window
+        r.update(|r| (r.set_char_id(3, 7), true));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(r.writes(), 1, "not before the interval is over");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        settle(&r, 2).await;
+        assert_eq!(
+            Roster::load(&dir.join("roster.json"))
+                .unwrap()
+                .get(3)
+                .unwrap()
+                .char_id,
+            Some(7)
+        );
+        saver.stop().await;
+        assert_eq!(r.writes(), 2, "nothing left to write at the end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_the_saver_writes_what_is_left() {
+        let dir = temp_dir("roster-final");
+        let r = shared(&dir);
+        let saver = r.spawn_saver(SAVE_INTERVAL);
+        r.update(|r| (r.set_char_id(2, 55), true));
+        // shut down inside the window: the pending change must not be lost
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!dir.join("roster.json").exists());
+        saver.stop().await;
+        assert!(!r.is_dirty());
+        let on_disk = Roster::load(&dir.join("roster.json")).unwrap();
+        assert_eq!(on_disk.get(2).unwrap().char_id, Some(55));
+        assert_eq!(r.writes(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_keeps_the_changes_for_the_next_try() {
+        let dir = temp_dir("roster-fail");
+        // the directory of the roster is a file: every write fails
+        std::fs::write(dir.join("blocker"), "x").unwrap();
+        let roster = Roster::new();
+        let r = Arc::new(SharedRoster::new(
+            roster,
+            dir.join("blocker").join("roster.json"),
+        ));
+        r.update(|r| {
+            r.entries.push(RosterEntry {
+                id: 1,
+                account: "pb1".into(),
+                char_name: "Aaa".into(),
+                race: 1,
+                gender: 1,
+                archetype: "X".into(),
+                temperament: Temperament::NEUTRAL,
+                char_id: None,
+            });
+            ((), true)
+        });
+        r.flush().await;
+        assert_eq!(r.writes(), 0);
+        assert!(r.is_dirty(), "the change is still owed");
+        // the problem goes away: the next flush writes it
+        std::fs::remove_file(dir.join("blocker")).unwrap();
+        r.flush().await;
+        assert_eq!(r.writes(), 1);
+        assert!(!r.is_dirty());
+        assert_eq!(
+            Roster::load(&dir.join("blocker").join("roster.json"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dropping_a_changed_roster_writes_it() {
+        let dir = temp_dir("roster-drop");
+        {
+            let r = shared(&dir);
+            r.update(|r| (r.set_char_id(1, 321), true));
+        }
+        assert_eq!(
+            Roster::load(&dir.join("roster.json"))
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .char_id,
+            Some(321)
+        );
     }
 
     #[test]

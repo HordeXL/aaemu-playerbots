@@ -327,13 +327,89 @@ fn chat() {
         &[0],
         &[0; 4],
     ]);
+    // the deliberate GM path is the only one that keeps a leading slash
     game(
-        cs::chat(cs::chat_type::SAY, "", "/x"),
+        cs::gm_command("/x").expect("a command line"),
         op::CSSendChatMessagePacket,
         &say,
     );
     assert_eq!(cs::chat_type::SHOUT, 1);
     assert_eq!(cs::chat_type::PARTY, 4);
+}
+
+/// The message string of a built chat packet (the body is `i16, i16, i32, str target, str msg, ..`).
+fn chat_message(out: &aa_proto::cs::Out) -> String {
+    let b = &out.body;
+    let tlen = u16::from_le_bytes([b[8], b[9]]) as usize;
+    let at = 10 + tlen;
+    let mlen = u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    String::from_utf8(b[at + 2..at + 2 + mlen].to_vec()).unwrap()
+}
+
+#[test]
+fn chat_never_carries_a_command() {
+    for text in [
+        "/x",
+        "  /x",
+        "\0/x",
+        "\0\0 \t/gold add self 999",
+        "\u{200b}/x",
+        "\u{feff}\u{ad}/x",
+        "\\x",
+        "\u{2044}x",
+        "\u{ff0f}shutdown",
+        "/",
+    ] {
+        for kind in [
+            cs::chat_type::SAY,
+            cs::chat_type::WHISPER,
+            cs::chat_type::SHOUT,
+            cs::chat_type::PARTY,
+        ] {
+            let out = cs::chat(kind, "Bob", text);
+            let sent = chat_message(&out);
+            assert!(!sent.is_empty(), "{text:?}");
+            assert!(!cs::is_command_like(&sent), "{text:?} -> {sent:?}");
+            assert!(!sent.chars().any(char::is_control), "{text:?} -> {sent:?}");
+            assert!(!sent.starts_with('/'), "{text:?} -> {sent:?}");
+            // and the strict builder refuses the same lines
+            assert!(cs::try_chat(kind, "Bob", text).is_none(), "{text:?}");
+        }
+    }
+    // the neutralised text keeps what followed the slash
+    assert_eq!(
+        chat_message(&cs::chat(0, "", "/hello there")),
+        "hello there"
+    );
+    // ordinary lines are untouched (apart from the trim)
+    assert_eq!(
+        chat_message(&cs::chat(0, "", "  hi / there ")),
+        "hi / there"
+    );
+    assert_eq!(chat_message(&cs::chat(0, "", "a/b")), "a/b");
+    assert!(cs::try_chat(0, "", "hi").is_some());
+    // overlong and multi-line text is cut or flattened, never sent as it was
+    let long = "x".repeat(500);
+    assert_eq!(chat_message(&cs::chat(0, "", &long)).chars().count(), 200);
+    assert_eq!(chat_message(&cs::chat(0, "", "a\nb")), "ab");
+    assert!(cs::try_chat(0, "", &long).is_none());
+}
+
+#[test]
+fn gm_command_accepts_only_clean_slash_lines() {
+    assert!(cs::gm_command("/level Bob 5").is_some());
+    for bad in [
+        "level Bob 5",
+        " /level",
+        "\0/level",
+        "/level\n/gold add self 1",
+        "/level\0",
+        "\u{ff0f}level",
+        "",
+    ] {
+        assert!(cs::gm_command(bad).is_none(), "{bad:?}");
+    }
+    assert!(cs::gm_command(&format!("/{}", "x".repeat(200))).is_none());
 }
 
 // ---- quests ---------------------------------------------------------------------------------

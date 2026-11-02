@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 /// Environment variable consulted when `server.password` is empty.
 pub const PASSWORD_ENV: &str = "PLAYERBOTS_PASSWORD";
-/// Password used when neither the config nor [`PASSWORD_ENV`] gives one.
+/// The password bots created by earlier versions use (the account password used to default to
+/// it). Never used for new bots, and `gm_bootstrap` refuses it.
 pub const DEFAULT_PASSWORD: &str = "playerbots";
 /// Most bots one process accepts (a sanity cap, not a performance claim).
 pub const MAX_BOTS: u32 = 5000;
@@ -48,8 +49,9 @@ pub struct ServerCfg {
     /// Accounts are `<prefix><bot id>` (`pb1`, `pb2`, ...). The login server creates unknown
     /// accounts on first login (`AutoAccount`).
     pub account_prefix: String,
-    /// Password of every bot account. Empty: the environment variable `PLAYERBOTS_PASSWORD`,
-    /// then `playerbots`. Never logged.
+    /// Password of every bot account. Empty: the environment variable `PLAYERBOTS_PASSWORD`, then
+    /// the generated password in the secrets file next to the roster (see [`crate::secrets`]).
+    /// Never logged.
     pub password: String,
 }
 
@@ -185,6 +187,10 @@ pub struct BehaviorCfg {
     pub wander: f32,
     /// 0 gives every bot the same temperament, 1 the full spread of the roster.
     pub persona_spread: f32,
+    /// Trade with real players too: the bots answer a trade request of a character that is not one
+    /// of ours. Off by default: a bot then only trades with other bots, and a real player can
+    /// neither farm the bots' (GM-minted) goods and gold nor hold them in a trade window.
+    pub trade_with_players: bool,
 }
 
 impl Default for BehaviorCfg {
@@ -199,6 +205,7 @@ impl Default for BehaviorCfg {
             rest: 0.4,
             wander: 0.5,
             persona_spread: 0.6,
+            trade_with_players: false,
         }
     }
 }
@@ -271,14 +278,15 @@ impl Config {
         include_str!("../../../playerbots.example.toml")
     }
 
-    /// The bot account password: `server.password`, else `$PLAYERBOTS_PASSWORD`, else `playerbots`.
-    pub fn password(&self) -> String {
+    /// The password the operator chose: `server.password`, else `$PLAYERBOTS_PASSWORD`; `None` when
+    /// neither is set (see [`crate::secrets`] for what happens then).
+    pub fn explicit_password(&self) -> Option<String> {
         if !self.server.password.is_empty() {
-            return self.server.password.clone();
+            return Some(self.server.password.clone());
         }
         match std::env::var(PASSWORD_ENV) {
-            Ok(p) if !p.is_empty() => p,
-            _ => DEFAULT_PASSWORD.to_string(),
+            Ok(p) if !p.is_empty() => Some(p),
+            _ => None,
         }
     }
 
@@ -513,14 +521,24 @@ mod tests {
         cfg.server.password = "hunter2".into();
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("hunter2"), "{shown}");
-        assert_eq!(cfg.password(), "hunter2");
+        assert_eq!(cfg.explicit_password().as_deref(), Some("hunter2"));
     }
 
     #[test]
-    fn the_password_falls_back_to_the_environment_then_the_default() {
-        // Only checks the config-set branch deterministically; the environment is process-wide.
-        let cfg = Config::default();
-        let p = cfg.password();
-        assert!(!p.is_empty());
+    fn trade_with_players_is_off_unless_asked_for() {
+        assert!(!Config::default().behavior.trade_with_players);
+        let cfg = Config::parse(
+            "[behavior]
+trade_with_players = true
+",
+        )
+        .unwrap();
+        assert!(cfg.behavior.trade_with_players);
+        assert!(
+            !Config::parse(Config::example())
+                .unwrap()
+                .behavior
+                .trade_with_players
+        );
     }
 }

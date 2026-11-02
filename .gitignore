@@ -6,5 +6,7 @@
 # local configuration, roster and secrets
 /playerbots.toml
 /roster.json
+# the generated bot password (next to the roster)
+*.secrets.json
 *.local.toml
 .env

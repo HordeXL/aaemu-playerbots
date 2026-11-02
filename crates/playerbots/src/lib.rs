@@ -23,6 +23,7 @@ pub mod gm;
 pub mod hub;
 pub mod names;
 pub mod roster;
+pub mod secrets;
 pub mod supervisor;
 
 #[cfg(test)]

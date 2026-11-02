@@ -54,6 +54,8 @@ parking_lot = "0.12"
 smallvec = { version = "1", features = ["union"] }
 rustc-hash = "2"
 fastrand = "2"
+# the operating system's random generator, for the generated bot password (already in Cargo.lock)
+getrandom = "0.4"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 [profile.dev]

@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -40,13 +41,29 @@ const CSP: &str =
 script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// Settings of the web server.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct WebConfig {
     /// Address to listen on. Default `127.0.0.1:8790`.
     pub bind: SocketAddr,
     /// When set, every `POST` must carry `x-playerbots-token: <token>`; `GET`s stay open.
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for WebConfig {
+    // Hand-written: the token must never end up in a log line or a panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebConfig")
+            .field("bind", &self.bind)
+            .field(
+                "token",
+                &self
+                    .token
+                    .as_ref()
+                    .map(|t| if t.is_empty() { "" } else { "<hidden>" }),
+            )
+            .finish()
+    }
 }
 
 impl Default for WebConfig {
@@ -153,7 +170,45 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/api/bots/{id}/command", post(api_bot_command))
         .route("/api/command", post(api_command))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            host_guard,
+        ))
         .with_state(state)
+}
+
+/// DNS-rebinding defence for every route, `GET`s included: on a loopback bind only requests whose
+/// `Host` is a loopback name are served. A page on `evil.example` that resolves to 127.0.0.1 is
+/// "same-origin" for the browser and could otherwise read the bots' state and chat. The one
+/// exception keeps the token semantics: a `POST` that carries the right token is the operator's
+/// own tool (a reverse proxy, a script) and needs no particular `Host`.
+async fn host_guard(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if st.loopback_only {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok());
+        let token_post = req.method() == Method::POST && token_matches(&st, req.headers());
+        if !host.is_some_and(is_loopback_host) && !token_post {
+            return ApiError::new(
+                StatusCode::FORBIDDEN,
+                "host name not allowed; use http://localhost or bind to a non-loopback address with a token",
+            )
+            .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Whether the request carries the configured token (false when there is none).
+fn token_matches(st: &AppState, headers: &HeaderMap) -> bool {
+    const TOKEN: HeaderName = HeaderName::from_static(TOKEN_HEADER);
+    match &st.token {
+        Some(want) => headers
+            .get(TOKEN)
+            .is_some_and(|got| ct_eq(got.as_bytes(), want)),
+        None => false,
+    }
 }
 
 /// Bind `cfg.bind` and serve until `shutdown` completes.
@@ -178,6 +233,9 @@ pub async fn serve_listener(
     let addr = listener
         .local_addr()
         .context("reading the web UI address")?;
+    // (what decides about the Host check is where the socket really listens)
+    let mut cfg = cfg;
+    cfg.bind = addr;
     let has_token = cfg.token.as_ref().is_some_and(|t| !t.is_empty());
     if !has_token && !addr.ip().is_loopback() {
         tracing::warn!(%addr, "web UI is reachable from the network and has no token: anyone can command the bots");
@@ -422,13 +480,9 @@ fn run_command(st: &AppState, headers: &HeaderMap, body: &[u8], bot: Option<u32>
 
 /// Token check for `POST`s. Without a token, refuse cross-site browser requests instead.
 fn authorize(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    const TOKEN: HeaderName = HeaderName::from_static(TOKEN_HEADER);
     match &st.token {
-        Some(want) => {
-            let ok = headers
-                .get(TOKEN)
-                .is_some_and(|got| ct_eq(got.as_bytes(), want));
-            if ok {
+        Some(_) => {
+            if token_matches(st, headers) {
                 Ok(())
             } else {
                 Err(ApiError::new(
@@ -542,6 +596,19 @@ mod tests {
         assert!(!etag_matches(&h, "\"c\""));
         h.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         assert!(etag_matches(&h, "\"anything\""));
+    }
+
+    #[test]
+    fn the_token_never_shows_in_debug_output() {
+        let cfg = WebConfig {
+            token: Some("s3kr1t-token".into()),
+            ..WebConfig::default()
+        };
+        let shown = format!("{cfg:?} {:#?}", cfg);
+        assert!(!shown.contains("s3kr1t"), "{shown}");
+        assert!(shown.contains("<hidden>"), "{shown}");
+        assert!(shown.contains("127.0.0.1:8790"));
+        assert!(!format!("{:?}", WebConfig::default()).contains("hidden"));
     }
 
     #[test]

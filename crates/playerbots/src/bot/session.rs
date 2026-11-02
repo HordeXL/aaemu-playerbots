@@ -18,11 +18,17 @@ use aa_proto::sc_world::{CharSummary, WorldEvent};
 use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::state::BotState;
 
 /// How long each lobby step may take.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long one packet may take to be written to the socket. A healthy connection takes
+/// microseconds; a dead one fills its send buffer and then blocks forever.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long closing the write half may take.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keep-alive interval (the server drops a connection that is silent for 30 s).
 /// Keep-alive cadence. The server closes any registered connection that has not pinged within
 /// its 30 s sweep — including one that entered the world a moment before the sweep and has not
@@ -53,9 +59,14 @@ pub enum SessionError {
     /// A step took too long.
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
-    /// `SCCharacterCreationFailed`: the name is taken or not allowed.
-    #[error("the server rejected the character (reason {0})")]
+    /// `SCCharacterCreationFailed` with a reason that is about the name: it is taken, not allowed
+    /// or waits for a deletion ([`NAME_ERRORS`]).
+    #[error("the server rejected the character name (reason {0})")]
     NameRejected(u8),
+    /// `SCCharacterCreationFailed` for any other reason (a server error, the character limit,
+    /// a race the server does not offer): another name would not help.
+    #[error("the server could not create the character (reason {0})")]
+    CreateFailed(u8),
     /// `SCKicked`.
     #[error("kicked by the server (reason {reason}): {msg}")]
     Kicked {
@@ -65,6 +76,11 @@ pub enum SessionError {
         msg: String,
     },
 }
+
+/// The `SCCharacterCreationFailed` reasons that are about the name (the server's
+/// `CharacterCreateError`: `NameAlreadyExists` = 4, `InvalidCharacters` = 5,
+/// `NamePendingDeletion` = 6). The others (`Failed` = 2, `WorldLimit` = 9, ...) are not.
+pub const NAME_ERRORS: [u8; 3] = [4, 5, 6];
 
 impl SessionError {
     /// The server rejected the character name: pick another one and retry at once.
@@ -93,16 +109,108 @@ pub fn decode(p: &Packet) -> Option<ServerEvent> {
     }
 }
 
-/// Sends and empties `out`.
+/// Sends and empties `out`. Every packet must be written within [`SEND_TIMEOUT`]: a connection
+/// that does not take data any more is a lost connection (`GameError::Io` with `TimedOut`).
 pub async fn flush_out<R, W>(conn: &mut GameConn<R, W>, out: &mut Vec<Out>) -> Result<(), GameError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    for o in out.drain(..) {
-        conn.send(&o).await?;
+    flush_out_within(conn, out, SEND_TIMEOUT).await
+}
+
+async fn flush_out_within<R, W>(
+    conn: &mut GameConn<R, W>,
+    out: &mut Vec<Out>,
+    limit: Duration,
+) -> Result<(), GameError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // (not `drain`: if the future is dropped half way, e.g. at shutdown, the rest stays queued)
+    while !out.is_empty() {
+        match tokio::time::timeout(limit, conn.send(&out[0])).await {
+            Ok(r) => r?,
+            Err(_) => return Err(timed_out()),
+        }
+        out.remove(0);
     }
     Ok(())
+}
+
+/// How a [`flush_until_cancelled`] ended.
+#[derive(Debug)]
+pub enum Flushed {
+    /// Everything was written.
+    Done,
+    /// The token fired first; what was not written yet stays in the queue.
+    Cancelled,
+    /// The write failed or timed out: the connection is lost.
+    Failed(GameError),
+}
+
+/// [`flush_out`] that gives up the moment `cancel` fires, so a shutdown never waits for a
+/// connection that has stopped taking data.
+pub async fn flush_until_cancelled<R, W>(
+    conn: &mut GameConn<R, W>,
+    out: &mut Vec<Out>,
+    cancel: &CancellationToken,
+) -> Flushed
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Flushed::Cancelled,
+        r = flush_out(conn, out) => match r {
+            Ok(()) => Flushed::Done,
+            Err(e) => Flushed::Failed(e),
+        },
+    }
+}
+
+/// Notices a world connection that went silent: the server answers every ping, so a connection
+/// that delivers nothing for `limit` is dead even though the socket still looks open.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadWatch {
+    last: Instant,
+    limit: Duration,
+}
+
+impl ReadWatch {
+    /// A watch that starts counting at `now`.
+    pub fn new(now: Instant, limit: Duration) -> ReadWatch {
+        ReadWatch { last: now, limit }
+    }
+
+    /// A packet arrived at `now`.
+    pub fn heard(&mut self, now: Instant) {
+        self.last = now;
+    }
+
+    /// How long the connection has been silent when that exceeds the limit.
+    pub fn expired(&self, now: Instant) -> Option<Duration> {
+        let quiet = now.saturating_duration_since(self.last);
+        (quiet > self.limit).then_some(quiet)
+    }
+}
+
+fn timed_out() -> GameError {
+    GameError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "writing to the game server timed out",
+    ))
+}
+
+/// Closes the write half of `conn`, but never waits long for a connection that is gone.
+pub async fn close<R, W>(conn: &mut GameConn<R, W>)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.close()).await;
 }
 
 /// What the login server gave: the open login connection and the ticket for the game server.
@@ -319,7 +427,11 @@ where
                 deadline = Instant::now() + STEP_TIMEOUT;
             }
             (Step::Create, WorldEvent::CharacterCreateFailed { reason }) => {
-                return Err(SessionError::NameRejected(*reason));
+                return Err(if NAME_ERRORS.contains(reason) {
+                    SessionError::NameRejected(*reason)
+                } else {
+                    SessionError::CreateFailed(*reason)
+                });
             }
             (Step::Select, WorldEvent::CharacterState(_)) => {
                 step = Step::Settle;
@@ -346,7 +458,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    if conn.send(&cs::leave_world(cs::LEAVE_QUIT)).await.is_ok() {
+    let sent = tokio::time::timeout(wait, conn.send(&cs::leave_world(cs::LEAVE_QUIT))).await;
+    if matches!(sent, Ok(Ok(()))) {
         let end = Instant::now() + wait;
         st.reactions.leave_granted = false;
         while !st.reactions.leave_granted {
@@ -364,7 +477,7 @@ where
             }
         }
     }
-    let _ = conn.close().await;
+    close(conn).await;
 }
 
 #[cfg(test)]
@@ -516,6 +629,164 @@ mod tests {
             .await
             .expect_err("silent server");
         assert!(matches!(err, SessionError::Timeout(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn only_name_errors_ask_for_a_new_name() {
+        for (reason, name_error) in [
+            (4u8, true),
+            (5, true),
+            (6, true),
+            (2, false),
+            (9, false),
+            (0, false),
+            (7, false),
+        ] {
+            let (a, b) = duplex(64 * 1024);
+            let mut client = GameConn::from_io(a);
+            let server = tokio::spawn(fake_server(GameConn::from_io(b), reason));
+            let mut st = BotState::new();
+            let wish = Wish {
+                name: "Tester",
+                char_id: None,
+                race: 1,
+                gender: 1,
+                ability: 1,
+            };
+            let err = enter_game(&mut client, &mut st, 42, 9, &wish, Instant::now())
+                .await
+                .expect_err("the fake server refuses the character");
+            assert_eq!(err.is_name_rejected(), name_error, "reason {reason}: {err}");
+            if name_error {
+                assert!(matches!(err, SessionError::NameRejected(r) if r == reason));
+            } else {
+                assert!(
+                    matches!(err, SessionError::CreateFailed(r) if r == reason),
+                    "{err}"
+                );
+                // another name would not help: the bot backs off like after any failure
+                assert!(!err.is_permanent());
+            }
+            drop(client);
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_stops_taking_data_times_out_instead_of_hanging() {
+        // a pipe with a tiny buffer and nobody reading: the third big packet cannot be written
+        let (a, _b) = duplex(256);
+        let mut client = GameConn::from_io(a);
+        let mut out: Vec<Out> = (0..4)
+            .map(|_| Out {
+                level: LEVEL_GAME,
+                opcode: cso::CSSendChatMessagePacket,
+                body: vec![b'x'; 200],
+            })
+            .collect();
+        let err = flush_out(&mut client, &mut out)
+            .await
+            .expect_err("nothing reads the other end");
+        match err {
+            GameError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("{other}"),
+        }
+        // the packets that were not written stay queued
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_does_not_wait_for_a_connection_that_stopped_taking_data() {
+        let (a, _b) = duplex(256);
+        let mut client = GameConn::from_io(a);
+        let mut out: Vec<Out> = (0..4)
+            .map(|_| Out {
+                level: LEVEL_GAME,
+                opcode: cso::CSSendChatMessagePacket,
+                body: vec![b'x'; 200],
+            })
+            .collect();
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            c2.cancel();
+        });
+        let started = Instant::now();
+        let r = flush_until_cancelled(&mut client, &mut out, &cancel).await;
+        assert!(matches!(r, Flushed::Cancelled), "{r:?}");
+        // the cancel won, well before the 10 s write timeout
+        assert!(started.elapsed() < SEND_TIMEOUT, "{:?}", started.elapsed());
+        // and a flush that was never stuck reports Done
+        let (a, b) = duplex(64 * 1024);
+        let mut client = GameConn::from_io(a);
+        let _srv = GameConn::from_io(b);
+        let mut out = vec![cs::ping(1)];
+        let fresh = CancellationToken::new();
+        assert!(matches!(
+            flush_until_cancelled(&mut client, &mut out, &fresh).await,
+            Flushed::Done
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_read_watch_expires_after_the_limit_and_resets_on_a_packet() {
+        let limit = Duration::from_secs(25);
+        let t0 = Instant::now();
+        let mut w = ReadWatch::new(t0, limit);
+        assert_eq!(w.expired(t0), None);
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(
+            w.expired(Instant::now()),
+            None,
+            "exactly the limit is still alive"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let quiet = w.expired(Instant::now()).expect("silent for 26 s");
+        assert!(quiet > limit);
+        // a packet resets it
+        w.heard(Instant::now());
+        assert_eq!(w.expired(Instant::now()), None);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(w.expired(Instant::now()), None);
+        // the pings (every 3 s) and their answers keep a healthy connection under the limit
+        assert!(super::super::READ_IDLE_LIMIT > PING_EVERY * 5);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_connection_flushes_everything() {
+        let (a, b) = duplex(64 * 1024);
+        let mut client = GameConn::from_io(a);
+        let mut srv = GameConn::from_io(b);
+        let mut out = vec![cs::ping(1), cs::ping(2), cs::ping(3)];
+        flush_out(&mut client, &mut out).await.unwrap();
+        assert!(out.is_empty());
+        for _ in 0..3 {
+            assert_eq!(srv.recv().await.unwrap().opcode, pp::PingPacket);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_a_dead_connection_does_not_hang() {
+        let (a, _b) = duplex(16);
+        let mut client = GameConn::from_io(a);
+        // fill the pipe so the leave packet cannot be written
+        let mut filler = vec![Out {
+            level: LEVEL_GAME,
+            opcode: cso::CSSendChatMessagePacket,
+            body: vec![b'x'; 8],
+        }];
+        let _ =
+            tokio::time::timeout(Duration::from_secs(1), flush_out(&mut client, &mut filler)).await;
+        let mut st = BotState::new();
+        // returns (instead of blocking for ever) within the wait plus the close timeout
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            leave(&mut client, &mut st, Duration::from_secs(2)),
+        )
+        .await
+        .expect("leave must return");
     }
 
     #[test]

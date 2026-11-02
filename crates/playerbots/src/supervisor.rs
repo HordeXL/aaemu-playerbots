@@ -4,19 +4,25 @@
 //! Bots are started `bots.ramp_ms` apart so the login server is not hit by hundreds of logins at
 //! once. A despawned bot logs out and stays in the roster (and as an offline entry in the UI), so
 //! a later `Spawn` brings the same character back.
+//!
+//! The bookkeeping lives in [`Book`], which knows nothing about tokio: a task that was told to
+//! stop stays in the book as *stopping* until it has finished. A stopping bot is free for the
+//! next `Spawn` (it is started again as soon as its old task is gone, so two tasks never share a
+//! slot), is never picked by a second `Despawn`, and never makes the roster grow.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::archetype::Archetypes;
 use crate::bot::{initial_snapshot, run_bot, Shared};
-use crate::config::Config;
+use crate::config::{Config, MAX_BOTS};
 use crate::hub::SupCmd;
 use crate::roster::{RosterSpec, SharedRoster};
 
@@ -76,30 +82,217 @@ pub fn register_slots(shared: &Shared) -> usize {
     n
 }
 
-/// The ids to start: the lowest `n` ids of `all` that are not running.
-pub fn pick_idle(
-    all: &[u32],
-    running: &BTreeMap<u32, impl Sized>,
-    pending: &VecDeque<u32>,
-    n: usize,
-) -> Vec<u32> {
-    all.iter()
-        .copied()
-        .filter(|id| !running.contains_key(id) && !pending.contains(id))
-        .take(n)
-        .collect()
+// ---- the bookkeeping -------------------------------------------------------------------------
+
+/// What [`Book`] needs to know about a bot task.
+pub trait Task {
+    /// Tells the task to log out and end.
+    fn cancel(&self);
+    /// Whether the task has ended.
+    fn finished(&self) -> bool;
 }
 
-/// The ids to stop: the highest `n` running ids.
-pub fn pick_despawn(running: &BTreeMap<u32, impl Sized>, n: usize) -> Vec<u32> {
-    running.keys().rev().copied().take(n).collect()
+impl Task for Running {
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn finished(&self) -> bool {
+        self.handle.is_finished()
+    }
 }
+
+struct Entry<T> {
+    task: T,
+    /// Told to stop; the task may still be logging out.
+    stopping: bool,
+}
+
+/// What [`Book::start`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// A new task was started.
+    Started,
+    /// The bot is running already.
+    AlreadyRunning,
+    /// The bot's old task is still logging out: try again later (it was queued again).
+    Waiting,
+}
+
+/// Which bots run, which are stopping and which wait for their start. See the module docs.
+pub struct Book<T> {
+    running: BTreeMap<u32, Entry<T>>,
+    pending: VecDeque<u32>,
+}
+
+impl<T: Task> Default for Book<T> {
+    fn default() -> Self {
+        Book {
+            running: BTreeMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl<T: Task> Book<T> {
+    /// Number of bot tasks (stopping ones included).
+    pub fn tasks(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Number of bots waiting for their start.
+    pub fn queued(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Bots that run and were not told to stop.
+    pub fn active(&self) -> usize {
+        self.running.values().filter(|e| !e.stopping).count()
+    }
+
+    /// Whether bot `id` has a task that was told to stop and is not gone yet.
+    pub fn is_stopping(&self, id: u32) -> bool {
+        self.running.get(&id).is_some_and(|e| e.stopping)
+    }
+
+    /// The ids to start: the lowest `n` ids of `all` that do not run (or are stopping) and do not
+    /// wait for their start already.
+    pub fn pick_idle(&self, all: &[u32], n: usize) -> Vec<u32> {
+        all.iter()
+            .copied()
+            .filter(|id| !self.running.get(id).is_some_and(|e| !e.stopping))
+            .filter(|id| !self.pending.contains(id))
+            .take(n)
+            .collect()
+    }
+
+    /// The ids to stop: the highest `n` bots that run and were not told to stop yet.
+    pub fn pick_despawn(&self, n: usize) -> Vec<u32> {
+        self.running
+            .iter()
+            .rev()
+            .filter(|(_, e)| !e.stopping)
+            .map(|(id, _)| *id)
+            .take(n)
+            .collect()
+    }
+
+    /// Queues `n` bots for a start. `ids` lists the roster; `grow(k)` is asked to add `k` roster
+    /// entries (never more than the roster has room for, see [`MAX_BOTS`]) when fewer than `n`
+    /// bots are free, and `ids` is read again afterwards. Returns how many were queued.
+    pub fn spawn(
+        &mut self,
+        n: usize,
+        ids: &mut dyn FnMut() -> Vec<u32>,
+        grow: &mut dyn FnMut(usize),
+    ) -> usize {
+        let all = ids();
+        let free = self.pick_idle(&all, n).len();
+        let missing = n.saturating_sub(free);
+        let room = (MAX_BOTS as usize).saturating_sub(all.len());
+        let add = missing.min(room);
+        let picked = if add > 0 {
+            grow(add);
+            self.pick_idle(&ids(), n)
+        } else {
+            self.pick_idle(&all, n)
+        };
+        let queued = picked.len();
+        self.pending.extend(picked);
+        queued
+    }
+
+    /// Tells the `n` highest running bots to stop; bots that never started leave the queue first.
+    /// Returns how many bots were dropped from the queue and how many tasks were told to stop.
+    pub fn despawn(&mut self, n: usize) -> (usize, usize) {
+        let mut left = n;
+        let mut unqueued = 0;
+        while left > 0 && self.pending.pop_back().is_some() {
+            left -= 1;
+            unqueued += 1;
+        }
+        let ids = self.pick_despawn(left);
+        for id in &ids {
+            if let Some(e) = self.running.get_mut(id) {
+                e.stopping = true;
+                e.task.cancel();
+            }
+        }
+        (unqueued, ids.len())
+    }
+
+    /// The next bot to start (queue order), or `None`.
+    pub fn next_pending(&mut self) -> Option<u32> {
+        self.pending.pop_front()
+    }
+
+    /// Starts bot `id` with `make` unless it runs. A bot whose old task is still logging out is
+    /// put back at the end of the queue.
+    pub fn start(&mut self, id: u32, make: impl FnOnce() -> T) -> Start {
+        match self.running.get(&id) {
+            Some(e) if e.stopping => {
+                self.pending.push_back(id);
+                Start::Waiting
+            }
+            Some(_) => Start::AlreadyRunning,
+            None => {
+                self.running.insert(
+                    id,
+                    Entry {
+                        task: make(),
+                        stopping: false,
+                    },
+                );
+                Start::Started
+            }
+        }
+    }
+
+    /// Removes the tasks that have ended and hands them back (with their bot id), so the caller
+    /// can look at how they ended.
+    pub fn reap(&mut self) -> Vec<(u32, T)> {
+        let done: Vec<u32> = self
+            .running
+            .iter()
+            .filter(|(_, e)| e.task.finished())
+            .map(|(id, _)| *id)
+            .collect();
+        done.into_iter()
+            .filter_map(|id| self.running.remove(&id).map(|e| (id, e.task)))
+            .collect()
+    }
+
+    /// Tells every task to stop and hands them all back.
+    pub fn take_all(&mut self) -> Vec<(u32, T)> {
+        for e in self.running.values() {
+            e.task.cancel();
+        }
+        self.pending.clear();
+        std::mem::take(&mut self.running)
+            .into_iter()
+            .map(|(id, e)| (id, e.task))
+            .collect()
+    }
+}
+
+/// What the panic of a bot task said.
+fn panic_text(e: tokio::task::JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(p) => p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_string()),
+        Err(e) => e.to_string(),
+    }
+}
+
+// ---- the supervisor --------------------------------------------------------------------------
 
 /// Owns the bot tasks.
 pub struct Supervisor {
     shared: Arc<Shared>,
-    running: BTreeMap<u32, Running>,
-    pending: VecDeque<u32>,
+    book: Book<Running>,
 }
 
 impl Supervisor {
@@ -107,72 +300,77 @@ impl Supervisor {
     pub fn new(shared: Arc<Shared>) -> Supervisor {
         Supervisor {
             shared,
-            running: BTreeMap::new(),
-            pending: VecDeque::new(),
+            book: Book::default(),
         }
     }
 
-    /// Number of running bot tasks.
+    /// Number of running bot tasks (stopping ones included).
     pub fn running(&self) -> usize {
-        self.running.len()
+        self.book.tasks()
     }
 
     fn start_bot(&mut self, id: u32, parent: &CancellationToken) {
-        if self.running.contains_key(&id) {
-            return;
+        let shared = self.shared.clone();
+        let started = self.book.start(id, || {
+            let cancel = parent.child_token();
+            let handle = tokio::spawn(run_bot(id, shared, cancel.clone()));
+            Running { cancel, handle }
+        });
+        if started == Start::Waiting {
+            tracing::debug!(bot = id, "still logging out; starting it again in a moment");
         }
-        let cancel = parent.child_token();
-        let handle = tokio::spawn(run_bot(id, self.shared.clone(), cancel.clone()));
-        self.running.insert(id, Running { cancel, handle });
     }
 
+    /// Cleans up finished tasks; a task that panicked is logged and its bot shown as offline.
     fn reap(&mut self) {
-        self.running.retain(|_, r| !r.handle.is_finished());
+        for (id, task) in self.book.reap() {
+            // (finished: this does not wait)
+            let Some(Err(e)) = task.handle.now_or_never() else {
+                continue;
+            };
+            let why = if e.is_panic() {
+                format!("crashed: {}", panic_text(e))
+            } else {
+                format!("task failed: {e}")
+            };
+            tracing::error!(bot = id, "bot task {why}");
+            self.shared.hub.contest.release_bot(id);
+            if let Some(slot) = self.shared.hub.slot(id) {
+                slot.set_offline();
+                slot.push_log(format!("bot task {why}"));
+            }
+        }
     }
 
     fn queue_spawn(&mut self, n: usize) {
-        let all: Vec<u32> = self
-            .shared
-            .roster
-            .read(|r| r.entries().iter().map(|e| e.id).collect());
-        let missing = n.saturating_sub(pick_idle(&all, &self.running, &self.pending, n).len());
-        if missing > 0 {
-            let target = all.len() + missing;
-            let w = self.shared.world.clone();
+        let shared = self.shared.clone();
+        let mut ids = || -> Vec<u32> {
+            shared
+                .roster
+                .read(|r| r.entries().iter().map(|e| e.id).collect())
+        };
+        let mut grow = |k: usize| {
+            let target = shared.roster.read(|r| r.len()) + k;
+            let w = shared.world.clone();
             let creatable = move |r: u8, g: u8| w.creatable(r, g);
             if let Err(e) = ensure_roster(
-                &self.shared.roster,
-                &self.shared.cfg,
-                &self.shared.archetypes,
+                &shared.roster,
+                &shared.cfg,
+                &shared.archetypes,
                 &creatable,
                 target,
             ) {
                 tracing::warn!("cannot add bots: {e:#}");
             }
-            register_slots(&self.shared);
-        }
-        let all: Vec<u32> = self
-            .shared
-            .roster
-            .read(|r| r.entries().iter().map(|e| e.id).collect());
-        let ids = pick_idle(&all, &self.running, &self.pending, n);
-        tracing::info!(requested = n, queued = ids.len(), "starting bots");
-        self.pending.extend(ids);
+            register_slots(&shared);
+        };
+        let queued = self.book.spawn(n, &mut ids, &mut grow);
+        tracing::info!(requested = n, queued, "starting bots");
     }
 
     fn despawn(&mut self, n: usize) {
-        // Pending bots that never started go first.
-        let mut left = n;
-        while left > 0 && self.pending.pop_back().is_some() {
-            left -= 1;
-        }
-        let ids = pick_despawn(&self.running, left);
-        tracing::info!(requested = n, stopping = ids.len(), "stopping bots");
-        for id in ids {
-            if let Some(r) = self.running.get(&id) {
-                r.cancel.cancel();
-            }
-        }
+        let (unqueued, stopping) = self.book.despawn(n);
+        tracing::info!(requested = n, unqueued, stopping, "stopping bots");
     }
 
     /// Runs the supervisor: starts `initial` bots (ramped), serves `rx` and, when `cancel` fires,
@@ -192,8 +390,9 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = ramp_timer.tick(), if !self.pending.is_empty() => {
-                    if let Some(id) = self.pending.pop_front() {
+                _ = ramp_timer.tick(), if self.book.queued() > 0 => {
+                    if let Some(id) = self.book.next_pending() {
+                        self.reap();
                         self.start_bot(id, &cancel);
                     }
                 }
@@ -210,16 +409,17 @@ impl Supervisor {
 
     /// Stops every bot and waits for the logouts.
     async fn shutdown(&mut self) {
-        let n = self.running.len();
-        tracing::info!(bots = n, "shutting down");
-        for r in self.running.values() {
-            r.cancel.cancel();
-        }
+        let tasks = self.book.take_all();
+        tracing::info!(bots = tasks.len(), "shutting down");
         let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
-        for (id, r) in std::mem::take(&mut self.running) {
+        for (id, r) in tasks {
             let mut handle = r.handle;
             match tokio::time::timeout_at(deadline, &mut handle).await {
-                Ok(_) => {}
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.is_panic() => {
+                    tracing::error!(bot = id, "bot task crashed: {}", panic_text(e));
+                }
+                Ok(Err(_)) => {}
                 Err(_) => {
                     tracing::warn!(bot = id, "did not log out in time; aborting");
                     handle.abort();
@@ -233,27 +433,284 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
-    fn running(ids: &[u32]) -> BTreeMap<u32, ()> {
-        ids.iter().map(|i| (*i, ())).collect()
+    /// A bot task that ends when the test says so (or, once told to stop, when `finish` is called).
+    #[derive(Clone)]
+    struct Fake {
+        cancelled: Rc<Cell<bool>>,
+        done: Rc<Cell<bool>>,
+        generation: u32,
+    }
+
+    impl Fake {
+        fn new(generation: u32) -> Fake {
+            Fake {
+                cancelled: Rc::new(Cell::new(false)),
+                done: Rc::new(Cell::new(false)),
+                generation,
+            }
+        }
+    }
+
+    impl Task for Fake {
+        fn cancel(&self) {
+            self.cancelled.set(true);
+        }
+
+        fn finished(&self) -> bool {
+            self.done.get()
+        }
+    }
+
+    /// A book with the bots `ids` running, remembering each started task.
+    struct Rig {
+        book: Book<Fake>,
+        tasks: Rc<RefCell<Vec<(u32, Fake)>>>,
+        roster: Rc<RefCell<Vec<u32>>>,
+        grown: Rc<Cell<usize>>,
+    }
+
+    impl Rig {
+        fn new(roster_len: u32, running: &[u32]) -> Rig {
+            let mut rig = Rig {
+                book: Book::default(),
+                tasks: Rc::default(),
+                roster: Rc::new(RefCell::new((1..=roster_len).collect())),
+                grown: Rc::default(),
+            };
+            for &id in running {
+                assert_eq!(rig.start(id), Start::Started);
+            }
+            rig
+        }
+
+        fn start(&mut self, id: u32) -> Start {
+            let tasks = self.tasks.clone();
+            let generation = tasks.borrow().iter().filter(|(i, _)| *i == id).count() as u32 + 1;
+            self.book.start(id, move || {
+                let f = Fake::new(generation);
+                tasks.borrow_mut().push((id, f.clone()));
+                f
+            })
+        }
+
+        fn spawn(&mut self, n: usize) -> usize {
+            let (roster, grown) = (self.roster.clone(), self.grown.clone());
+            let r2 = self.roster.clone();
+            self.book.spawn(n, &mut || r2.borrow().clone(), &mut |k| {
+                grown.set(grown.get() + k);
+                let mut r = roster.borrow_mut();
+                let next = r.last().copied().unwrap_or(0);
+                r.extend(next + 1..=next + k as u32);
+            })
+        }
+
+        /// Starts everything in the queue the way the ramp timer does.
+        fn ramp(&mut self) -> Vec<(u32, Start)> {
+            let mut out = Vec::new();
+            for _ in 0..self.book.queued() {
+                let Some(id) = self.book.next_pending() else {
+                    break;
+                };
+                self.reap();
+                out.push((id, self.start(id)));
+            }
+            out
+        }
+
+        fn reap(&mut self) -> Vec<u32> {
+            self.book.reap().into_iter().map(|(id, _)| id).collect()
+        }
+
+        /// The task of bot `id` finishes (it has logged out).
+        fn finish(&self, id: u32) {
+            for (i, f) in self.tasks.borrow().iter() {
+                if *i == id && f.cancelled.get() {
+                    f.done.set(true);
+                }
+            }
+        }
+
+        fn current(&self, id: u32) -> Fake {
+            self.tasks
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(i, _)| *i == id)
+                .map(|(_, f)| f.clone())
+                .expect("a task")
+        }
     }
 
     #[test]
     fn idle_bots_start_lowest_first_and_skip_running_and_pending() {
-        let all = [1, 2, 3, 4, 5, 6];
-        let run = running(&[2, 3]);
-        let pending: VecDeque<u32> = [4].into_iter().collect();
-        assert_eq!(pick_idle(&all, &run, &pending, 2), vec![1, 5]);
-        assert_eq!(pick_idle(&all, &run, &pending, 10), vec![1, 5, 6]);
-        assert!(pick_idle(&all, &run, &pending, 0).is_empty());
+        let mut rig = Rig::new(6, &[2, 3]);
+        rig.book.pending.push_back(4);
+        let all: Vec<u32> = (1..=6).collect();
+        assert_eq!(rig.book.pick_idle(&all, 2), vec![1, 5]);
+        assert_eq!(rig.book.pick_idle(&all, 10), vec![1, 5, 6]);
+        assert!(rig.book.pick_idle(&all, 0).is_empty());
     }
 
     #[test]
     fn despawn_takes_the_highest_ids() {
-        let run = running(&[1, 5, 9, 12]);
-        assert_eq!(pick_despawn(&run, 2), vec![12, 9]);
-        assert_eq!(pick_despawn(&run, 10), vec![12, 9, 5, 1]);
-        assert!(pick_despawn(&run, 0).is_empty());
+        let rig = Rig::new(12, &[1, 5, 9, 12]);
+        assert_eq!(rig.book.pick_despawn(2), vec![12, 9]);
+        assert_eq!(rig.book.pick_despawn(10), vec![12, 9, 5, 1]);
+        assert!(rig.book.pick_despawn(0).is_empty());
+    }
+
+    #[test]
+    fn a_stopping_bot_is_free_for_the_next_spawn_and_does_not_grow_the_roster() {
+        let mut rig = Rig::new(6, &[1, 2, 3, 4, 5, 6]);
+        // despawn 3: 6, 5 and 4 are told to stop but are still logging out
+        assert_eq!(rig.book.despawn(3), (0, 3));
+        assert_eq!(rig.book.active(), 3);
+        assert_eq!(rig.book.tasks(), 6);
+        assert!([6, 5, 4].iter().all(|id| rig.book.is_stopping(*id)));
+        assert!(rig.current(6).cancelled.get());
+        assert!(!rig.current(1).cancelled.get());
+        // spawn 3 right away: the same three bots are queued, no roster entry is added
+        assert_eq!(rig.spawn(3), 3);
+        assert_eq!(rig.grown.get(), 0);
+        assert_eq!(rig.roster.borrow().len(), 6);
+        assert_eq!(rig.book.pending, VecDeque::from([4, 5, 6]));
+        // their old tasks are still alive: nothing starts yet, the ids stay queued
+        let first = rig.ramp();
+        assert!(first.iter().all(|(_, s)| *s == Start::Waiting), "{first:?}");
+        assert_eq!(rig.book.queued(), 3);
+        assert_eq!(rig.tasks.borrow().len(), 6, "no second task for a busy bot");
+        // the old tasks end; the next ramp starts the same bots again
+        for id in [4, 5, 6] {
+            rig.finish(id);
+        }
+        let second = rig.ramp();
+        assert_eq!(second.len(), 3);
+        assert!(
+            second.iter().all(|(_, s)| *s == Start::Started),
+            "{second:?}"
+        );
+        assert_eq!(rig.book.queued(), 0);
+        assert_eq!(rig.book.active(), 6);
+        assert_eq!(rig.tasks.borrow().len(), 9);
+        assert_eq!(rig.current(5).generation, 2);
+        assert_eq!(rig.roster.borrow().len(), 6, "still the same six bots");
+    }
+
+    #[test]
+    fn a_second_despawn_does_not_cancel_the_same_bots_again() {
+        let mut rig = Rig::new(6, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(rig.book.despawn(2), (0, 2));
+        // 6 and 5 are stopping: the next two go to 4 and 3, not to 6 and 5 again
+        assert_eq!(rig.book.pick_despawn(2), vec![4, 3]);
+        assert_eq!(rig.book.despawn(2), (0, 2));
+        assert_eq!(rig.book.active(), 2);
+        assert!([4, 3].iter().all(|id| rig.book.is_stopping(*id)));
+        // asking for more than is left stops what is left, once
+        assert_eq!(rig.book.despawn(10), (0, 2));
+        assert_eq!(rig.book.despawn(10), (0, 0));
+        assert_eq!(rig.book.active(), 0);
+    }
+
+    #[test]
+    fn despawn_takes_bots_that_never_started_out_of_the_queue_first() {
+        let mut rig = Rig::new(5, &[1, 2]);
+        assert_eq!(rig.spawn(3), 3);
+        assert_eq!(rig.book.pending, VecDeque::from([3, 4, 5]));
+        assert_eq!(rig.book.despawn(4), (3, 1));
+        assert_eq!(rig.book.queued(), 0);
+        assert!(rig.book.is_stopping(2));
+        assert!(!rig.book.is_stopping(1));
+    }
+
+    #[test]
+    fn spawn_adds_roster_entries_only_for_bots_that_do_not_exist() {
+        let mut rig = Rig::new(3, &[1, 2, 3]);
+        assert_eq!(rig.spawn(2), 2);
+        assert_eq!(rig.grown.get(), 2);
+        assert_eq!(rig.book.pending, VecDeque::from([4, 5]));
+        // asking again while they wait adds two more: nobody is free
+        assert_eq!(rig.spawn(2), 2);
+        assert_eq!(rig.grown.get(), 4);
+        // an offline bot of the roster is used before the roster grows
+        let mut rig = Rig::new(5, &[1, 2, 3]);
+        assert_eq!(rig.spawn(2), 2);
+        assert_eq!(rig.grown.get(), 0);
+        assert_eq!(rig.book.pending, VecDeque::from([4, 5]));
+    }
+
+    #[test]
+    fn the_roster_never_grows_past_the_bot_limit() {
+        let limit = MAX_BOTS;
+        let mut rig = Rig::new(limit - 2, &[]);
+        // a huge request adds the two entries that fit and queues every bot once
+        let queued = rig.spawn(u32::MAX as usize);
+        assert_eq!(rig.grown.get(), 2);
+        assert_eq!(rig.roster.borrow().len(), limit as usize);
+        assert_eq!(queued, limit as usize);
+        // at the limit nothing more is added
+        assert_eq!(rig.spawn(100), 0);
+        assert_eq!(rig.grown.get(), 2);
+        assert_eq!(rig.roster.borrow().len(), limit as usize);
+    }
+
+    #[test]
+    fn a_running_bot_is_not_started_twice() {
+        let mut rig = Rig::new(3, &[2]);
+        assert_eq!(rig.start(2), Start::AlreadyRunning);
+        assert_eq!(rig.tasks.borrow().len(), 1);
+    }
+
+    #[test]
+    fn finished_tasks_are_handed_back_by_reap_and_everything_else_stays() {
+        let mut rig = Rig::new(4, &[1, 2, 3]);
+        rig.book.despawn(1);
+        rig.finish(3);
+        assert_eq!(rig.reap(), vec![3]);
+        assert_eq!(rig.book.tasks(), 2);
+        assert!(!rig.book.is_stopping(3));
+        // a task that ended on its own (not told to stop) is reaped too
+        rig.current(1).done.set(true);
+        assert_eq!(rig.reap(), vec![1]);
+        assert_eq!(rig.book.tasks(), 1);
+    }
+
+    #[test]
+    fn shutdown_cancels_every_task_and_forgets_the_queue() {
+        let mut rig = Rig::new(5, &[1, 2, 3]);
+        rig.spawn(2);
+        let all = rig.book.take_all();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|(_, f)| f.cancelled.get()));
+        assert_eq!(rig.book.tasks(), 0);
+        assert_eq!(rig.book.queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_is_reported_with_its_message() {
+        let h = tokio::spawn(async {
+            panic!("boom in a bot");
+        });
+        let mut h = h;
+        // wait for it to end
+        while !h.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let err = (&mut h)
+            .now_or_never()
+            .expect("finished")
+            .expect_err("panicked");
+        assert!(err.is_panic());
+        assert_eq!(panic_text(err), "boom in a bot");
+
+        let h = tokio::spawn(async {
+            let n = 3;
+            panic!("formatted {n}");
+        });
+        let err = h.await.expect_err("panicked");
+        assert_eq!(panic_text(err), "formatted 3");
     }
 
     #[test]

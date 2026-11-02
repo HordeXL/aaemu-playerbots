@@ -90,8 +90,22 @@ character does not have. With `gm_bootstrap = true` and access level 100 on the 
 give themselves exactly what the goal needs (`/item add self …`, `/labor …`, `/gold add self …`)
 and may use `/move` for long travel. Without it those goals are skipped with a visible reason.
 `playerbots grant-gm-sql` prints the SQL that grants access level 100 to the bot accounts
-(`--game-db` / `--login-db` name the MySQL databases when the server does not use `aaemu_game` /
-`aaemu_login`).
+(`WHERE username IN (...)` with exactly the accounts of the roster; `--game-db` / `--login-db` name
+the MySQL databases when the server does not use `aaemu_game` / `aaemu_login`). The bot accounts
+are GM accounts then, so `gm_bootstrap` is refused with the public default or an empty password;
+without an explicit `server.password` / `$PLAYERBOTS_PASSWORD` the first run generates a random
+one into `roster.secrets.json` (`secrets.rs`).
+
+The server runs some GM commands on the sender's target and falls back to the sender only when
+there is none, and a bot can end up targeting a real player (a duel). So every GM line is written
+through `Ctx::gm` (`gm.rs`): an allowlist that rewrites `/level`, `/labor` and `/move` into the
+explicit own-name form, passes only the `self` forms of `/item add` and `/gold add`, refuses
+everything else, and puts `CSChangeTarget(0)` in front in the same flush. `/build` (which needs the
+house as target) has its own entry point that targets the house first. The target is also cleared
+when a fight against a character ends. Plain chat goes through `cs::chat`, which turns a
+command-like text into nothing; `cs::gm_command` is the only builder that keeps a leading `/`.
+Bots also decline trade requests from real players unless `behavior.trade_with_players` is on (and
+never when they can mint goods).
 
 ## Improvements over the original (from the audit)
 

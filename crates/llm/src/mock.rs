@@ -16,6 +16,8 @@ pub(crate) struct Reply {
     pub body: String,
     pub delay: Duration,
     pub headers: Vec<(String, String)>,
+    /// Send the body with `Transfer-Encoding: chunked` (no `Content-Length`).
+    pub chunked: bool,
 }
 
 impl Reply {
@@ -29,11 +31,17 @@ impl Reply {
             body: body.into(),
             delay: Duration::ZERO,
             headers: Vec::new(),
+            chunked: false,
         }
     }
 
     pub fn delayed(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    pub fn chunked(mut self) -> Self {
+        self.chunked = true;
         self
     }
 
@@ -183,16 +191,32 @@ async fn serve(
     let reply = replies[n.min(replies.len() - 1)].clone();
 
     tokio::time::sleep(reply.delay).await;
+    let framing = if reply.chunked {
+        "Transfer-Encoding: chunked".to_string()
+    } else {
+        format!("Content-Length: {}", reply.body.len())
+    };
     let mut out = format!(
-        "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\n{framing}\r\nConnection: close\r\n",
         reply.status,
-        reply.body.len()
     );
     for (k, v) in &reply.headers {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("\r\n");
-    out.push_str(&reply.body);
-    stream.write_all(out.as_bytes()).await?;
+    if reply.chunked {
+        stream.write_all(out.as_bytes()).await?;
+        for part in reply.body.as_bytes().chunks(16 * 1024) {
+            stream
+                .write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                .await?;
+            stream.write_all(part).await?;
+            stream.write_all(b"\r\n").await?;
+        }
+        stream.write_all(b"0\r\n\r\n").await?;
+    } else {
+        out.push_str(&reply.body);
+        stream.write_all(out.as_bytes()).await?;
+    }
     stream.shutdown().await
 }

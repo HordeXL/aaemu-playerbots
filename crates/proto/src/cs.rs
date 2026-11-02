@@ -629,12 +629,73 @@ pub mod chat_type {
     pub const PARTY: i16 = 4;
 }
 
-/// `CSSendChatMessagePacket`. Server read: `packets/c2g_world.rs:260`.
-///
-/// Body: `i16 chat_type, i16 0, i32 0, str target, str message, u8 0 language, i32 0 ability`.
-/// `target` is the recipient of a [`chat_type::WHISPER`], empty otherwise. Lines starting with
-/// `/` are GM commands.
-pub fn chat(chat_type: i16, target: &str, message: &str) -> Out {
+/// Longest chat line (in characters) the builders accept.
+pub const MAX_CHAT_CHARS: usize = 200;
+
+/// Characters the server (or a client) could take for the command slash.
+pub fn is_slash_like(c: char) -> bool {
+    matches!(
+        c,
+        '/' | '\\'
+            | '\u{2044}'
+            | '\u{2215}'
+            | '\u{2216}'
+            | '\u{29F5}'
+            | '\u{29F8}'
+            | '\u{2571}'
+            | '\u{2572}'
+            | '\u{27CB}'
+            | '\u{27CD}'
+            | '\u{2AFB}'
+            | '\u{2AFD}'
+            | '\u{FF0F}'
+            | '\u{FF3C}'
+    )
+}
+
+/// A character the command check looks past: whitespace, control characters (the server strips
+/// NULs at both ends of a string before it looks for the slash) and invisible format characters.
+fn is_ignorable(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{ad}')
+}
+
+/// Whether the first visible character of `text` is a slash (or looks like one): the server
+/// would run the line as a GM command, whatever the chat type.
+pub fn is_command_like(text: &str) -> bool {
+    text.chars()
+        .find(|c| !is_ignorable(*c))
+        .is_some_and(is_slash_like)
+}
+
+/// `text` as a plain chat line, or `None` when it must not be sent: empty, longer than
+/// [`MAX_CHAT_CHARS`], with a control character (a NUL could hide a leading slash from a check)
+/// or command-like. Returns the trimmed text.
+pub fn plain_chat_text(text: &str) -> Option<&str> {
+    let t = text.trim();
+    let ok = !t.is_empty()
+        && t.chars().count() <= MAX_CHAT_CHARS
+        && !t.chars().any(char::is_control)
+        && !is_command_like(t);
+    ok.then_some(t)
+}
+
+/// What a refused chat line is turned into: control characters removed, the leading run of
+/// invisible and slash-like characters dropped, cut to [`MAX_CHAT_CHARS`]; "." if nothing is left.
+fn neutralize(text: &str) -> String {
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+    let rest = cleaned
+        .trim_start_matches(|c: char| is_ignorable(c) || is_slash_like(c))
+        .trim_end();
+    if rest.is_empty() {
+        ".".to_string()
+    } else {
+        rest.chars().take(MAX_CHAT_CHARS).collect()
+    }
+}
+
+fn chat_packet(chat_type: i16, target: &str, message: &str) -> Out {
     game(cs::CSSendChatMessagePacket, |s| {
         s.write_i16(chat_type)
             .write_i16(0)
@@ -644,6 +705,39 @@ pub fn chat(chat_type: i16, target: &str, message: &str) -> Out {
             .write_u8(0)
             .write_i32(0);
     })
+}
+
+/// `CSSendChatMessagePacket`. Server read: `packets/c2g_world.rs:260`.
+///
+/// Body: `i16 chat_type, i16 0, i32 0, str target, str message, u8 0 language, i32 0 ability`.
+/// `target` is the recipient of a [`chat_type::WHISPER`], empty otherwise.
+///
+/// The server runs every line that starts with `/` (after it stripped the NULs at both ends of
+/// the string) as a GM command, in any chat type. This builder is for *chat*: a command-like
+/// `message` (see [`is_command_like`]) is neutralised into plain text and control characters are
+/// removed, so no caller can turn text into a command by accident. The deliberate command path is
+/// [`gm_command`]; a caller that must know whether the line was acceptable uses [`try_chat`].
+pub fn chat(chat_type: i16, target: &str, message: &str) -> Out {
+    match plain_chat_text(message) {
+        Some(plain) => chat_packet(chat_type, target, plain),
+        None => chat_packet(chat_type, target, &neutralize(message)),
+    }
+}
+
+/// Like [`chat`], but `None` where [`chat`] would neutralise the line (see [`plain_chat_text`]).
+pub fn try_chat(chat_type: i16, target: &str, message: &str) -> Option<Out> {
+    Some(chat_packet(chat_type, target, plain_chat_text(message)?))
+}
+
+/// A GM command line (`/item add self 1 1`) as local chat: the only builder that lets a message
+/// start with `/`. `None` unless `line` starts with an ASCII `/`, has at most [`MAX_CHAT_CHARS`]
+/// characters and no control character. Which commands are sent, and who they are addressed to,
+/// is the caller's decision (`playerbots::gm`).
+pub fn gm_command(line: &str) -> Option<Out> {
+    let ok = line.starts_with('/')
+        && line.chars().count() <= MAX_CHAT_CHARS
+        && !line.chars().any(char::is_control);
+    ok.then(|| chat_packet(chat_type::SAY, "", line))
 }
 
 // ---- quests ---------------------------------------------------------------------------------

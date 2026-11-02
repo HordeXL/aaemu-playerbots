@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use aa_proto::cs::Out;
+use aa_proto::cs::{self, Out};
 use aa_proto::opcodes::cs as op;
 use aa_proto::sc::ServerEvent;
 use aa_proto::sc_activity::ActivityEvent;
@@ -26,6 +26,7 @@ use playerbots::bot::ctx::{Ctx, Persona};
 use playerbots::bot::motion::{Motion, MotionCfg, MotionEnv};
 use playerbots::bot::state::{BotState, Unit, UnitKind};
 use playerbots::config::Config;
+use playerbots::gm::{GmWire, Pre};
 use playerbots::hub::{Hub, HubParams, Logger};
 use playerbots::roster::Temperament;
 
@@ -201,6 +202,27 @@ impl Rig {
             real_player_near: false,
         };
         playerbots::bot::brain::gate(&ctx)
+    }
+
+    /// A tick context around the rig's parts, for calling `Ctx` methods directly.
+    fn with_ctx<R>(&mut self, f: impl FnOnce(&mut Ctx<'_>) -> R) -> R {
+        let mut ctx = Ctx {
+            world: &self.world,
+            cfg: &self.cfg,
+            persona: &self.persona,
+            state: &mut self.state,
+            motion: &mut self.motion,
+            combat: &mut self.combat,
+            out: &mut self.out,
+            coord: &self.coord,
+            hub: &self.hub,
+            log: &self.log,
+            rng: &mut self.rng,
+            now: tokio::time::Instant::now(),
+            now_ms: self.now_ms,
+            real_player_near: false,
+        };
+        f(&mut ctx)
     }
 
     /// Whether the bot's event log (the web UI's) has a line with `needle`.
@@ -1027,4 +1049,275 @@ fn a_defence_against_a_unit_nobody_can_hurt_is_not_taken_up_again() {
     threaten(&mut rig);
     rig.tick(250);
     assert_eq!(rig.combat.target(), Some(mob), "defends when hurt");
+}
+
+// ---- GM lines: who they hit -------------------------------------------------------------------
+
+/// The message of a chat packet (`i16 type, i16, i32, str target, str message, ..`).
+fn chat_message(o: &Out) -> Option<String> {
+    if o.opcode != op::CSSendChatMessagePacket {
+        return None;
+    }
+    let b = &o.body;
+    let tlen = u16::from_le_bytes([b[8], b[9]]) as usize;
+    let at = 10 + tlen;
+    let mlen = u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    Some(String::from_utf8_lossy(&b[at + 2..at + 2 + mlen]).into_owned())
+}
+
+/// What precedes the GM line at `wire[i]`: a cleared target, a targeted house, or nothing.
+fn pre_of(wire: &[Out], i: usize, line: &str) -> Pre {
+    let prev = i.checked_sub(1).map(|j| &wire[j]);
+    match prev {
+        Some(p) if p.opcode == op::CSChangeTargetPacket && p.body == cs::change_target(0).body => {
+            Pre::ClearTarget
+        }
+        Some(p) if p.opcode == op::CSChangeTargetPacket && line.starts_with("/build") => {
+            Pre::HouseTarget
+        }
+        _ => Pre::None,
+    }
+}
+
+/// The GM lines of `wire` with what precedes each.
+fn gm_wires(wire: &[Out]) -> Vec<GmWire> {
+    wire.iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            let line = chat_message(o).filter(|m| m.starts_with('/'))?;
+            let pre = pre_of(wire, i, &line);
+            Some(GmWire { line, pre })
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn every_gm_line_the_goals_write_names_the_bot_and_follows_a_cleared_target() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let mut rig = Rig::new(world.clone(), "Reaper", 61);
+    rig.cfg.bots.gm_bootstrap = true;
+    rig.cfg.bots.long_travel_teleport_m = 100.0;
+    let mut wire: Vec<Out> = Vec::new();
+    for goal in [GoalKind::TradeRun, GoalKind::Trade, GoalKind::Housing] {
+        rig.force(goal);
+        for _ in 0..(4 * 90) {
+            rig.tick(250);
+            wire.append(&mut rig.out);
+        }
+    }
+    let lines = gm_wires(&wire);
+    let seen: BTreeSet<&str> = lines
+        .iter()
+        .map(|w| w.line.split_whitespace().next().unwrap())
+        .collect();
+    println!("{} GM lines, commands seen: {seen:?}", lines.len());
+    for w in lines.iter().take(12) {
+        println!("  {:?} {}", w.pre, w.line);
+    }
+    assert!(!lines.is_empty(), "the goals wrote no GM line at all");
+    assert!(seen.contains("/item"), "{seen:?}");
+    for w in &lines {
+        assert!(
+            w.is_self_only("Tester"),
+            "this line could hit somebody else: {w:?}"
+        );
+    }
+    // nothing else on the wire looks like a command
+    for o in &wire {
+        if let Some(m) = chat_message(o) {
+            if m.starts_with('/') {
+                continue;
+            }
+            assert!(!cs::is_command_like(&m), "{m:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn the_ctx_entry_points_make_only_self_addressed_gm_lines_and_plain_chat() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let mut rig = Rig::new(world, "Reaper", 62);
+    // GM commands are off: nothing is sent
+    assert!(!rig.with_ctx(|c| c.gm("/level 36")));
+    assert!(!rig.with_ctx(|c| c.gm_build(0x123, 3)));
+    assert!(rig.out.is_empty());
+
+    rig.cfg.bots.gm_bootstrap = true;
+    // /level and friends: the target is cleared first, the bot is named
+    assert!(rig.with_ctx(|c| c.gm("/level 36")));
+    assert_eq!(rig.out.len(), 2);
+    assert_eq!(rig.out[0], cs::change_target(0));
+    assert_eq!(
+        chat_message(&rig.out[1]).as_deref(),
+        Some("/level Tester 36")
+    );
+    rig.out.clear();
+    assert!(rig.with_ctx(|c| c.gm("/labor 500")));
+    assert!(rig.with_ctx(|c| c.gm("/move 100.5 200.5 130.0")));
+    let lines = gm_wires(&rig.out);
+    assert_eq!(
+        lines.iter().map(|w| w.line.as_str()).collect::<Vec<_>>(),
+        ["/labor Tester 500", "/move Tester 100.5 200.5 130.0"]
+    );
+    assert!(lines.iter().all(|w| w.pre == Pre::ClearTarget));
+    rig.out.clear();
+    // the explicit self forms need no clearing
+    assert!(rig.with_ctx(|c| c.gm("/item add self 8000 5")));
+    assert!(rig.with_ctx(|c| c.gm("/gold add self 2")));
+    assert_eq!(rig.out.len(), 2);
+    assert!(rig
+        .out
+        .iter()
+        .all(|o| o.opcode == op::CSSendChatMessagePacket));
+    rig.out.clear();
+    // /build targets the house right in front of the command
+    assert!(rig.with_ctx(|c| c.gm_build(0x123, 5)));
+    assert_eq!(rig.out.len(), 2);
+    assert_eq!(rig.out[0], cs::change_target(0x123));
+    assert_eq!(chat_message(&rig.out[1]).as_deref(), Some("/build 5"));
+    rig.out.clear();
+    assert!(!rig.with_ctx(|c| c.gm_build(0, 5)), "no house, no build");
+
+    // everything that could reach somebody else is refused
+    for line in [
+        "/level Bob 36",
+        "/gold add Bob 5",
+        "/gold add target 5",
+        "/item add target 1 1",
+        "/build 5",
+        "/kick Bob",
+        "/shutdown",
+        "/move tome",
+        "\0/level 5",
+        "/level 5\n/kill",
+    ] {
+        assert!(!rig.with_ctx(|c| c.gm(line)), "{line:?} was sent");
+    }
+    assert!(rig.out.is_empty(), "{:?}", rig.out);
+
+    // a bot whose name cannot be an argument sends no target-or-self command at all
+    rig.persona.name = "Two Words".into();
+    assert!(!rig.with_ctx(|c| c.gm("/level 36")));
+    assert!(rig.with_ctx(|c| c.gm("/item add self 1 1")));
+    rig.out.clear();
+
+    // chat: a command never goes out as chat, however it is hidden
+    for text in [
+        "/gold add self 99999",
+        " /gold add self 1",
+        "\0/gold add self 1",
+        "\0\0/shutdown",
+        "\u{200b}/x",
+        "\u{ff0f}x",
+        "",
+        "a\nb",
+    ] {
+        rig.with_ctx(|c| c.say(text));
+        assert!(rig.out.is_empty(), "{text:?} -> {:?}", rig.out);
+    }
+    rig.with_ctx(|c| c.say("hello there"));
+    assert_eq!(rig.out.len(), 1);
+    assert_eq!(chat_message(&rig.out[0]).as_deref(), Some("hello there"));
+}
+
+// ---- trade requests ---------------------------------------------------------------------------
+
+/// A character `char_id` in view as unit `obj`, asking the bot for a trade.
+fn trade_request_from(rig: &mut Rig, obj: u32, char_id: u32) {
+    // something to put up, so that a goal that is started does not give up at once
+    rig.state.bag.insert(
+        30,
+        playerbots::bot::state::Item {
+            id: 77,
+            template: 8001,
+            count: 10,
+        },
+    );
+    let me = rig.state.me.pos;
+    rig.state.units.insert(
+        obj,
+        Unit {
+            kind: UnitKind::Character,
+            id: char_id,
+            pos: [me[0] + 3.0, me[1], me[2]],
+            hp: 1000,
+            faction: rig.state.me.faction,
+            level: 1,
+            flags: 0,
+            name: Some("Visitor".into()),
+        },
+    );
+    rig.feed_activity(ActivityEvent::CanStartTrade { requester_obj: obj });
+}
+
+fn declines(rig: &Rig, obj: u32) -> bool {
+    rig.out.iter().any(|o| {
+        o.opcode == op::CSCannotStartTradePacket && o.body == cs::cannot_start_trade(obj, 0).body
+    })
+}
+
+fn accepts(rig: &Rig, obj: u32) -> bool {
+    rig.out
+        .iter()
+        .any(|o| o.opcode == op::CSStartTradePacket && o.body == cs::start_trade(obj).body)
+}
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_real_player_cannot_open_a_trade_with_a_bot_unless_the_operator_allows_it() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let foe = 0x600;
+    let run = |rig: &mut Rig| {
+        for _ in 0..8 {
+            rig.tick(250);
+        }
+    };
+    // default: a stranger is declined and never answered with a start
+    let mut rig = Rig::new(world.clone(), "Reaper", 63);
+    trade_request_from(&mut rig, foe, 9001);
+    run(&mut rig);
+    assert!(
+        declines(&rig, foe),
+        "the request of a real player must be declined"
+    );
+    assert!(!accepts(&rig, foe), "a real player got a trade window");
+
+    // one of our own bots is welcome
+    let mut rig = Rig::new(world.clone(), "Reaper", 64);
+    rig.hub.mark_bot_char(9002);
+    trade_request_from(&mut rig, foe, 9002);
+    run(&mut rig);
+    assert!(!declines(&rig, foe), "a bot's request is not declined");
+    assert!(accepts(&rig, foe), "a bot's request is accepted");
+
+    // the operator may let players in ...
+    let mut rig = Rig::new(world.clone(), "Reaper", 65);
+    rig.cfg.behavior.trade_with_players = true;
+    trade_request_from(&mut rig, foe, 9003);
+    run(&mut rig);
+    assert!(!declines(&rig, foe));
+    assert!(accepts(&rig, foe), "trade_with_players lets a player in");
+
+    // ... but never to a bot whose bag may hold GM-made goods
+    let mut rig = Rig::new(world, "Reaper", 66);
+    rig.cfg.behavior.trade_with_players = true;
+    rig.cfg.bots.gm_bootstrap = true;
+    trade_request_from(&mut rig, foe, 9004);
+    run(&mut rig);
+    assert!(
+        declines(&rig, foe),
+        "no trade with players while the bot can mint goods"
+    );
+    assert!(!accepts(&rig, foe));
 }

@@ -73,23 +73,67 @@ impl Ctx<'_> {
         self.out.push(out);
     }
 
-    /// Says a line in local chat. Lines starting with `/` are refused (the server would run them
-    /// as GM commands); use [`Ctx::gm`] for those.
+    /// Says a line in local chat. A line the server could take for a GM command (a leading `/`,
+    /// also behind NULs, spaces or invisible characters) or that is empty, too long or has control
+    /// characters is dropped; GM commands go through [`Ctx::gm`].
     pub fn say(&mut self, text: &str) {
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('/') {
-            return;
+        if let Some(p) = super::goals::social::say_packet(text) {
+            self.out.push(p);
         }
-        self.out.push(cs::chat(cs::chat_type::SAY, "", text));
     }
 
-    /// Sends a GM command (`/item add self ...`). Only when `bots.gm_bootstrap` is on; returns
-    /// whether it was sent.
+    /// Clears the server-side target (`CSChangeTarget(0)`) and tells the combat controller, which
+    /// re-announces its target when it fights on.
+    pub fn clear_target(&mut self) {
+        self.out.push(cs::change_target(0));
+        self.combat.target_cleared();
+    }
+
+    /// Sends a GM command. Only when `bots.gm_bootstrap` is on; returns whether it was sent.
+    ///
+    /// The one place a bot's GM lines are made (see [`crate::gm`]): `line` is one of the short
+    /// forms the goals write (`/level 36`, `/labor 100`, `/move x y z`, `/item add self ...`,
+    /// `/gold add self ...`); it is rewritten so that it names the bot itself and the server-side
+    /// target is cleared in front of it in the same flush, so a target left over from a duel can
+    /// never be the victim. Anything else is refused. Logged at debug level.
     pub fn gm(&mut self, line: &str) -> bool {
-        if !self.cfg.bots.gm_bootstrap || !line.starts_with('/') {
+        if !self.cfg.bots.gm_bootstrap {
             return false;
         }
-        self.out.push(cs::chat(cs::chat_type::SAY, "", line));
+        let wire = match crate::gm::plan(line, &self.persona.name) {
+            Ok(w) => w,
+            Err(e) => {
+                self.log.debug(format!(
+                    "gm: refused {line:?} for {}: {e}",
+                    self.persona.name
+                ));
+                return false;
+            }
+        };
+        self.send_gm(wire)
+    }
+
+    /// Advances the bot's house `house_obj` by `steps` build steps (`/build`, which works on the
+    /// targeted house): the house is targeted in front of the command, in the same flush.
+    pub fn gm_build(&mut self, house_obj: u32, steps: u32) -> bool {
+        if !self.cfg.bots.gm_bootstrap || house_obj == 0 {
+            return false;
+        }
+        self.out.push(cs::change_target(house_obj));
+        self.combat.target_cleared();
+        self.send_gm(crate::gm::plan_build(steps))
+    }
+
+    fn send_gm(&mut self, wire: crate::gm::GmWire) -> bool {
+        if wire.pre == crate::gm::Pre::ClearTarget {
+            self.clear_target();
+        }
+        let Some(out) = cs::gm_command(&wire.line) else {
+            return false;
+        };
+        self.log
+            .debug(format!("gm {}: {}", self.persona.name, wire.line));
+        self.out.push(out);
         true
     }
 
@@ -114,8 +158,14 @@ impl Ctx<'_> {
             send_gap_ms: 0,
             combat: false,
         };
-        self.motion
+        let jump = self
+            .motion
             .travel_to(x, y, radius, pace, teleport, &mut env);
+        if let Some([jx, jy, jz]) = jump {
+            if self.gm(&format!("/move {jx:.1} {jy:.1} {jz:.1}")) {
+                self.motion.begin_teleport(self.now_ms);
+            }
+        }
     }
 
     /// Whether `bots.gm_bootstrap` lets this bot use `/move` for a trip of `dist` metres.

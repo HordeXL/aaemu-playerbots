@@ -431,7 +431,7 @@ impl Trade {
         if self.plan.is_empty() {
             return None;
         }
-        if !self.requester_ok(ctx.state, obj) {
+        if !self.requester_ok(ctx, obj) {
             ctx.send(cs::cannot_start_trade(obj, 0));
             ctx.state.trade.incoming = None;
             return None;
@@ -451,10 +451,12 @@ impl Trade {
         Some(GoalStatus::Running)
     }
 
-    /// Whether the unit `obj` is the partner of the order (anyone, without an order).
-    fn requester_ok(&self, st: &BotState, obj: u32) -> bool {
+    /// Whether the unit `obj` is the partner of the order (without an order: any unit this bot may
+    /// trade with, see [`may_trade_with`]).
+    fn requester_ok(&self, ctx: &Ctx<'_>, obj: u32) -> bool {
+        let st = &*ctx.state;
         let Some(o) = &self.order else {
-            return true;
+            return may_trade_with(ctx, obj);
         };
         match st.units.get(&obj) {
             Some(u) => is_partner(u, o),
@@ -631,7 +633,7 @@ impl Trade {
         let peer_obj = self.find_peer(ctx.state).map(|(o, _)| o);
         let incoming_ok = match ctx.state.trade.incoming {
             Some((obj, at)) => {
-                now.saturating_sub(at) <= INVITE_TTL_MS && self.requester_ok(ctx.state, obj)
+                now.saturating_sub(at) <= INVITE_TTL_MS && self.requester_ok(ctx, obj)
             }
             None => false,
         };
@@ -931,6 +933,27 @@ fn set_partner(ctx: &Ctx<'_>, bot: Option<u32>) {
     }
 }
 
+/// Whether real players (characters that are not our bots) may trade with this bot: only with
+/// `behavior.trade_with_players`, and never while `bots.gm_bootstrap` is on, because what the bot
+/// holds may then be GM-made goods and gold that no player should be able to collect.
+pub fn players_may_trade(cfg: &crate::config::Config) -> bool {
+    cfg.behavior.trade_with_players && !cfg.bots.gm_bootstrap
+}
+
+/// Whether the unit `obj` is a character of one of our bots (known by the hub).
+fn is_bot_unit(ctx: &Ctx<'_>, obj: u32) -> bool {
+    ctx.state
+        .units
+        .get(&obj)
+        .is_some_and(|u| u.kind == UnitKind::Character && ctx.hub.is_bot_char(u.id))
+}
+
+/// Whether this bot may trade with the unit `obj` when no pairing order names the partner: another
+/// bot of ours, or anybody if [`players_may_trade`]. A unit the bot cannot see is not a known bot.
+pub fn may_trade_with(ctx: &Ctx<'_>, obj: u32) -> bool {
+    players_may_trade(ctx.cfg) || is_bot_unit(ctx, obj)
+}
+
 /// What the brain does with a trade request nobody asked the bot's goals for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
@@ -983,18 +1006,23 @@ pub fn unsolicited(
         return false;
     }
     if ctx.state.trade.window.is_some() {
-        // a window without a goal (the goal ended in the middle of it): do not leave it hanging
-        ctx.send(cs::cancel_trade(0));
+        // a window without a goal (the goal ended in the middle of it): do not leave it hanging,
+        // but ask a few times at a leisurely pace, not once per tick
+        if ctx.state.trade.orphan_cancel_due(ctx.now_ms) {
+            ctx.send(cs::cancel_trade(0));
+        }
         return false;
     }
+    ctx.state.trade.orphan_reset();
     let Some((obj, at)) = ctx.state.trade.incoming else {
         return false;
     };
+    let allowed = may_trade_with(ctx, obj);
     let age = ctx.now_ms.saturating_sub(at);
     let reply = decide(
         running,
         weight,
-        disabled,
+        disabled || !allowed,
         ctx.combat.busy(),
         ctx.state.me.dead,
         age,
@@ -1604,6 +1632,26 @@ mod tests {
         assert_eq!(
             ok(Some(G::Trade), 0.2, false, false, false, 100),
             Reply::None
+        );
+    }
+
+    #[test]
+    fn real_players_may_trade_only_when_asked_for_and_never_with_gm_goods() {
+        use crate::config::Config;
+        let mut cfg = Config::default();
+        assert!(!players_may_trade(&cfg), "off by default");
+        cfg.behavior.trade_with_players = true;
+        assert!(players_may_trade(&cfg));
+        // what a GM-bootstrapped bot holds may be minted: nothing of it goes to a player
+        cfg.bots.gm_bootstrap = true;
+        assert!(!players_may_trade(&cfg));
+        cfg.behavior.trade_with_players = false;
+        assert!(!players_may_trade(&cfg));
+        // a request from a player the gate does not allow is declined by the brain
+        assert_eq!(
+            decide(None, 0.2, true, false, false, 100),
+            Reply::Decline,
+            "`disabled` is how the brain passes a requester the gate refused"
         );
     }
 

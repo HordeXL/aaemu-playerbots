@@ -19,7 +19,9 @@
 //!
 //! With [`WebConfig::token`] set, `POST`s need the header `x-playerbots-token: <token>` (401
 //! otherwise); `GET`s stay open. Without a token, `POST`s must be same-origin and carry
-//! `Content-Type: application/json`.
+//! `Content-Type: application/json`. When the server listens on a loopback address, *every* route
+//! (`GET`s included) only answers requests whose `Host` is a loopback name (DNS-rebinding
+//! defence; a `POST` with the right token is exempt).
 //!
 //! ```no_run
 //! # async fn demo(hub: std::sync::Arc<dyn pb_web::BotHub>) -> anyhow::Result<()> {

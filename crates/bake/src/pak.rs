@@ -48,6 +48,8 @@ pub struct PakEntry {
 pub struct Pak {
     path: PathBuf,
     file: File,
+    /// Length of the pak file: no entry may reach past it.
+    len: u64,
     /// Lower-case name (forward slashes) -> location.
     entries: HashMap<String, PakEntry>,
 }
@@ -200,6 +202,7 @@ impl Pak {
         Ok(Pak {
             path: path.to_path_buf(),
             file,
+            len,
             entries,
         })
     }
@@ -243,6 +246,17 @@ impl Pak {
         let Some(e) = self.entry(name) else {
             return Ok(None);
         };
+        // A damaged or hostile file table could name any size: check the range against the pak
+        // before a buffer of that size is allocated.
+        let end = e.offset.checked_add(e.size);
+        ensure!(
+            end.is_some_and(|end| end <= self.len),
+            "{name}: its entry ({} bytes at {}) reaches past the end of {} ({} bytes)",
+            e.size,
+            e.offset,
+            self.path.display(),
+            self.len
+        );
         let size = usize::try_from(e.size).context("file too large")?;
         self.file.seek(SeekFrom::Start(e.offset))?;
         let mut out = vec![0u8; size];
@@ -358,6 +372,48 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         drop(pak);
         drop(filtered);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_entry_that_reaches_past_the_pak_is_an_error_not_an_allocation() {
+        let dir = crate::test_dir("pak-range");
+        let path = dir.join("ranges.pak");
+        std::fs::write(
+            &path,
+            build_pak(&[("game/a.txt", b"hello"), ("game/b.txt", b"xy")]),
+        )
+        .unwrap();
+        let mut pak = Pak::open(&path).unwrap();
+        assert_eq!(pak.read("game/a.txt").unwrap().unwrap(), b"hello");
+        let len = pak.len;
+        // sizes that would be terabytes (or wrap around) if they were trusted
+        for (offset, size) in [
+            (0, len + 1),
+            (0, u64::MAX),
+            (0, 1 << 40),
+            (len - 1, 2),
+            (len, 1),
+            (u64::MAX, 1),
+            (u64::MAX - 2, 8),
+            (1 << 62, 1 << 62),
+        ] {
+            *pak.entries.get_mut("game/a.txt").unwrap() = PakEntry { offset, size };
+            let err = pak.read("game/a.txt").expect_err("must be refused");
+            assert!(format!("{err:#}").contains("past the end"), "{err:#}");
+        }
+        // an entry that ends exactly at the end of the file is fine, so is an empty one at the end
+        *pak.entries.get_mut("game/a.txt").unwrap() = PakEntry {
+            offset: len - 4,
+            size: 4,
+        };
+        assert_eq!(pak.read("game/a.txt").unwrap().unwrap().len(), 4);
+        *pak.entries.get_mut("game/a.txt").unwrap() = PakEntry {
+            offset: len,
+            size: 0,
+        };
+        assert!(pak.read("game/a.txt").unwrap().unwrap().is_empty());
+        drop(pak);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

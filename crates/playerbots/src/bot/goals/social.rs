@@ -87,48 +87,10 @@ const MAX_TARGET_CHARS: usize = 32;
 
 // ---- the send path ---------------------------------------------------------------------------
 
-/// Characters the server (or a client) could take for the command slash.
-fn is_slash_like(c: char) -> bool {
-    matches!(
-        c,
-        '/' | '\\'
-            | '\u{2044}'
-            | '\u{2215}'
-            | '\u{2216}'
-            | '\u{29F5}'
-            | '\u{29F8}'
-            | '\u{2571}'
-            | '\u{2572}'
-            | '\u{27CB}'
-            | '\u{27CD}'
-            | '\u{2AFB}'
-            | '\u{2AFD}'
-            | '\u{FF0F}'
-            | '\u{FF3C}'
-    )
-}
-
-/// Whether the first visible character of `text` is a slash (or looks like one): the server would
-/// run the line as a GM command.
-fn command_like(text: &str) -> bool {
-    text.chars()
-        .find(|c| {
-            !c.is_whitespace()
-                && !c.is_control()
-                && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{ad}')
-        })
-        .is_some_and(is_slash_like)
-}
-
 /// The line as it may go on the wire: trimmed, one line, not empty, at most 200 characters, and
-/// never command-like. `None` means "do not send".
-fn wire_text(text: &str) -> Option<&str> {
-    let t = text.trim();
-    if t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control) || command_like(t)
-    {
-        return None;
-    }
-    Some(t)
+/// never command-like (see [`cs::plain_chat_text`]). `None` means "do not send".
+pub fn wire_text(text: &str) -> Option<&str> {
+    cs::plain_chat_text(text)
 }
 
 /// The packet for a local chat line, or `None` when the line must not be sent (empty, too long,

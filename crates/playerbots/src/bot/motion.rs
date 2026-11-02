@@ -357,9 +357,11 @@ impl Motion {
         };
     }
 
-    /// Like [`Motion::go_to`], but a trip longer than `teleport_over_m` (when positive) is a GM
-    /// `/move` instead; if the server does not move the bot within [`TELEPORT_WAIT_MS`] the bot
-    /// walks. Only call with `teleport_over_m > 0` when the account may use GM commands.
+    /// Like [`Motion::go_to`], but a trip longer than `teleport_over_m` (when positive) asks for a
+    /// GM `/move`: the destination `[x, y, z]` is returned and the caller sends the command (all
+    /// GM lines are made in one place, `Ctx::gm`) and then calls [`Motion::begin_teleport`]; if
+    /// the server does not move the bot within [`TELEPORT_WAIT_MS`] the bot walks. Only call with
+    /// `teleport_over_m > 0` when the account may use GM commands.
     pub fn travel_to(
         &mut self,
         x: f32,
@@ -368,22 +370,24 @@ impl Motion {
         pace: Pace,
         teleport_over_m: f32,
         env: &mut MotionEnv<'_>,
-    ) {
+    ) -> Option<[f32; 3]> {
         self.go_to(x, y, radius, pace, env.now_ms);
         if teleport_over_m > 0.0 && dist2d(self.pos, [x, y, 0.0]) > teleport_over_m {
             let z = env
                 .ground
                 .ground_z(x, y)
                 .map_or(self.pos[2], |g| surface_z(Some(g), self.pos[2]) + 1.0);
-            env.out.push(cs::chat(
-                cs::chat_type::SAY,
-                "",
-                &format!("/move {x:.1} {y:.1} {z:.1}"),
-            ));
-            self.pending_tp = Some(PendingTeleport {
-                deadline_ms: env.now_ms + TELEPORT_WAIT_MS,
-            });
+            return Some([x, y, z]);
         }
+        None
+    }
+
+    /// The `/move` asked for by [`Motion::travel_to`] was sent: wait for the server to move the
+    /// bot instead of walking.
+    pub fn begin_teleport(&mut self, now_ms: u64) {
+        self.pending_tp = Some(PendingTeleport {
+            deadline_ms: now_ms + TELEPORT_WAIT_MS,
+        });
     }
 
     /// Stops walking; a stopped update follows on the next tick.
@@ -1099,8 +1103,10 @@ mod tests {
                 combat: false,
             };
             // short trips walk
-            rig.motion
+            let jump = rig
+                .motion
                 .travel_to(30.0, 10.0, 0.0, Pace::Run, 100.0, &mut env);
+            assert_eq!(jump, None);
         }
         assert!(rig.out.is_empty());
         assert_eq!(rig.motion.status(), MotionStatus::Moving);
@@ -1113,13 +1119,16 @@ mod tests {
                 send_gap_ms: 250,
                 combat: false,
             };
-            rig.motion
+            let jump = rig
+                .motion
                 .travel_to(200.0, 10.0, 2.0, Pace::Run, 100.0, &mut env);
+            // the motion controller sends no chat itself: it names the destination and the
+            // caller (Ctx::gm) makes the safe GM line
+            let [jx, jy, _] = jump.expect("a long trip asks for a teleport");
+            assert_eq!((jx, jy), (200.0, 10.0));
         }
-        assert_eq!(rig.out.len(), 1);
-        assert_eq!(rig.out[0].opcode, op::CSSendChatMessagePacket);
-        let text = String::from_utf8_lossy(&rig.out[0].body);
-        assert!(text.contains("/move 200.0 10.0 "), "{text}");
+        assert!(rig.out.is_empty());
+        rig.motion.begin_teleport(now);
         // while the teleport is pending the bot does not walk
         rig.tick(&t, 250, 250);
         assert_eq!(rig.motion.pos()[0], 10.0);
@@ -1140,9 +1149,12 @@ mod tests {
                 send_gap_ms: 250,
                 combat: false,
             };
-            rig.motion
+            let jump = rig
+                .motion
                 .travel_to(200.0, 10.0, 0.0, Pace::Run, 100.0, &mut env);
+            assert!(jump.is_some());
         }
+        rig.motion.begin_teleport(now);
         for _ in 0..5 {
             rig.tick(&t, 2500, 250);
         }

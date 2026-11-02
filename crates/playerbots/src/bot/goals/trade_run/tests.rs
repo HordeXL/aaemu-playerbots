@@ -233,6 +233,11 @@ impl Env for Fake {
     }
     fn gm(&mut self, line: &str) -> bool {
         if self.gm {
+            // every line the goal writes must plan into a form that can only hit the bot itself
+            // (the live `Ctx::gm` does exactly this)
+            let wire = crate::gm::plan(line, "Tester")
+                .unwrap_or_else(|e| panic!("the goal wrote {line:?}: {e}"));
+            assert!(wire.is_self_only("Tester"), "{line:?} -> {wire:?}");
             self.gm_lines.push(line.to_owned());
         }
         self.gm

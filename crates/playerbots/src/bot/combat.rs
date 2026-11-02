@@ -575,6 +575,12 @@ impl Combat {
         self.next_kite_ms = 0;
     }
 
+    /// The server-side target was cleared (or replaced) by someone else: announce the target
+    /// afresh before the next cast.
+    pub fn target_cleared(&mut self) {
+        self.announced = false;
+    }
+
     /// Stops fighting (a running loot job continues).
     pub fn disengage(&mut self) {
         self.target = None;

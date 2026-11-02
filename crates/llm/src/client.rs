@@ -25,6 +25,9 @@ const JSON_TEMPERATURE_CAP: f32 = 0.5;
 /// Minimum reply budget for `choose` so the JSON object is not cut off.
 const CHOOSE_MIN_TOKENS: u32 = 60;
 const ERROR_TEXT_CAP: usize = 200;
+/// The longest response body read: a chat completion of a few hundred tokens is a few KiB, so
+/// anything near this is a misbehaving (or hostile) endpoint, not an answer.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
 struct Counters {
@@ -60,7 +63,7 @@ impl fmt::Debug for Llm {
     // Hand-written so the API key can never end up in a log line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Llm")
-            .field("url", &self.url)
+            .field("host", &url_host(&self.url))
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
@@ -97,13 +100,20 @@ impl Llm {
         }
         match Self::try_build(cfg, key) {
             Ok(llm) => {
+                // (the host only: the URL may carry a user name, a password or a key in its path)
                 tracing::info!(
                     "LLM add-on on: model {} at {} ({} req/min, {} tokens/day)",
                     llm.model,
-                    cfg.base_url,
+                    url_host(&cfg.base_url),
                     cfg.max_requests_per_minute,
                     cfg.daily_token_budget
                 );
+                if is_plain_http_remote(&cfg.base_url) {
+                    tracing::warn!(
+                        "llm.base_url uses plain http:// to {}: the API key and every chat line travel unencrypted; use https://",
+                        url_host(&cfg.base_url)
+                    );
+                }
                 Some(Arc::new(llm))
             }
             Err(e) => {
@@ -307,7 +317,7 @@ impl Llm {
             }),
         };
 
-        let response = self
+        let mut response = self
             .client
             .post(&self.url)
             .bearer_auth(&self.key)
@@ -326,7 +336,7 @@ impl Llm {
         if !status.is_success() {
             return Err(LlmError::Http(status.as_u16()));
         }
-        let bytes = response.bytes().await.map_err(map_transport)?;
+        let bytes = read_capped(&mut response, MAX_RESPONSE_BYTES).await?;
         let parsed: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| LlmError::BadResponse(format!("invalid JSON: {e}")))?;
 
@@ -383,6 +393,44 @@ fn system_text(req: &ChatRequest) -> Cow<'_, str> {
 /// Rough token count (about four characters per token) for answers without `usage`.
 fn estimate_tokens(chars: usize) -> u64 {
     (chars as u64).div_ceil(4)
+}
+
+/// The body of `response`, at most `cap` bytes: a longer one (announced by `Content-Length` or
+/// found while reading) is a [`LlmError::BadResponse`] and nothing more of it is read.
+async fn read_capped(response: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, LlmError> {
+    let too_big = || LlmError::BadResponse(format!("response body over {cap} bytes"));
+    if response.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_transport)? {
+        if body.len() + chunk.len() > cap {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The host (and port) of `url`, without scheme, user info, path, query or fragment; what is safe
+/// to put in a log line. Not a URL parser: just enough to cut the secrets off.
+pub(crate) fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if host.is_empty() {
+        "<no host>".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Whether `url` is `http://` (not `https://`) to a host other than this machine.
+pub(crate) fn is_plain_http_remote(url: &str) -> bool {
+    let url = url.trim_start();
+    url.get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+        && !is_loopback_url(url)
 }
 
 fn map_transport(e: reqwest::Error) -> LlmError {
@@ -495,6 +543,45 @@ mod unit_tests {
             "http://10.0.0.5:8000/v1",
         ] {
             assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn only_the_host_of_the_url_is_ever_logged() {
+        assert_eq!(url_host("https://api.deepseek.com"), "api.deepseek.com");
+        assert_eq!(
+            url_host("https://api.deepseek.com/v1/chat/completions"),
+            "api.deepseek.com"
+        );
+        let secret_url = "https://user:p4ss@example.com:8443/v1?key=sk-secret#frag";
+        assert_eq!(url_host(secret_url), "example.com:8443");
+        assert_eq!(url_host("http://u@[::1]:9000/x"), "[::1]:9000");
+        assert_eq!(url_host("host.only/path?q=1"), "host.only");
+        assert_eq!(url_host("https://"), "<no host>");
+        for secret in ["p4ss", "sk-secret", "user", "/v1", "frag"] {
+            assert!(!url_host(secret_url).contains(secret), "{secret}");
+        }
+    }
+
+    #[test]
+    fn plain_http_to_another_machine_is_flagged() {
+        for url in [
+            "http://api.example.com/v1",
+            "HTTP://10.0.0.5:8000/v1",
+            "http://user:pw@llm.lan",
+            " http://llm.lan",
+        ] {
+            assert!(is_plain_http_remote(url), "{url}");
+        }
+        for url in [
+            "https://api.deepseek.com",
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:8080",
+            "http://[::1]:9000",
+            "https://10.0.0.5/v1",
+            "",
+        ] {
+            assert!(!is_plain_http_remote(url), "{url}");
         }
     }
 

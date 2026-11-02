@@ -14,7 +14,10 @@ world_id = 0
 # accounts on first login (AutoAccount = true in its Config.json).
 account_prefix = "pb"
 # Password of every bot account. Empty = the environment variable PLAYERBOTS_PASSWORD, and if
-# that is not set either, "playerbots". The password is never logged.
+# that is not set either, a random password generated on the first run and kept in
+# roster.secrets.json next to the roster (owner-only; never in the web API or the logs). Keep that
+# file together with the roster. A roster from before this feature has none: its accounts keep the
+# old public default "playerbots" (with a warning), which gm_bootstrap refuses.
 password = ""
 
 [data]
@@ -70,6 +73,10 @@ rest = 0.4
 wander = 0.5
 # 0 = every bot has the same temperament, 1 = the full spread stored in the roster.
 persona_spread = 0.6
+# Let bots trade with real players too. Off: a bot only trades with other bots and declines every
+# trade request of a character that is not one of ours, so nobody can farm the goods and gold the
+# bots mint for themselves (gm_bootstrap).
+trade_with_players = false
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

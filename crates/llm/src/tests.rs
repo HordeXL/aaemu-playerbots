@@ -34,6 +34,50 @@ fn options(n: usize) -> Vec<String> {
 // ---- chat ------------------------------------------------------------------------------------
 
 #[tokio::test]
+async fn a_huge_response_is_refused_without_being_read_to_the_end() {
+    use crate::client::MAX_RESPONSE_BYTES;
+    // a valid-looking completion whose content alone is over the cap
+    let big = "x".repeat(MAX_RESPONSE_BYTES + 1024);
+    let mock = MockServer::start(vec![Reply::ok(completion(&big, 5, 5))]).await;
+    let llm1 = llm(&mock);
+    let err = llm1
+        .chat(ChatRequest::simple("be brief", "hi"))
+        .await
+        .expect_err("over the cap");
+    match &err {
+        LlmError::BadResponse(m) => assert!(m.contains("over"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(llm1.usage().failures, 1);
+    // nothing was charged for an answer that was thrown away
+    assert_eq!(llm1.usage().tokens_today, 0);
+
+    // the same without a Content-Length: the cap is enforced while reading
+    let mock = MockServer::start(vec![Reply::ok(completion(&big, 5, 5)).chunked()]).await;
+    let llm2 = llm(&mock);
+    let err = llm2
+        .chat(ChatRequest::simple("be brief", "hi"))
+        .await
+        .expect_err("over the cap");
+    assert!(matches!(err, LlmError::BadResponse(_)), "{err:?}");
+
+    // one just under the cap still works, with or without a Content-Length
+    let fits = "y".repeat(MAX_RESPONSE_BYTES - 4096);
+    for reply in [
+        Reply::ok(completion(&fits, 5, 5)),
+        Reply::ok(completion(&fits, 5, 5)).chunked(),
+    ] {
+        let mock = MockServer::start(vec![reply]).await;
+        let llm3 = llm(&mock);
+        let ok = llm3
+            .chat(ChatRequest::simple("be brief", "hi"))
+            .await
+            .expect("under the cap");
+        assert_eq!(ok.text.len(), fits.len());
+    }
+}
+
+#[tokio::test]
 async fn chat_parses_the_reply_and_accounts_usage() {
     let mock = mock_ok("hey there, wolves quest anyone?").await;
     let llm = llm(&mock);

@@ -280,7 +280,6 @@ pub struct Housing {
     build_ms: u64,
     build_left: i32,
     build_started_ms: u64,
-    target_ms: u64,
     stay_ms: u64,
     moved: bool,
     last_x: f32,
@@ -744,7 +743,6 @@ impl Housing {
         self.build_left = left;
         self.build_n = (left.max(1) as u32).min(20);
         self.build_ms = 0;
-        self.target_ms = 0;
     }
 
     fn build(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
@@ -768,15 +766,9 @@ impl Housing {
         let Some(obj) = ctx.state.house_log.obj_of(self.tl) else {
             return GoalStatus::Running;
         };
-        // the GM build command works on the targeted house
-        if self.target_ms == 0 || now.saturating_sub(self.target_ms) > 20_000 {
-            ctx.send(cs::change_target(obj));
-            self.target_ms = now;
-            return GoalStatus::Running;
-        }
-        if now.saturating_sub(self.target_ms) < 700
-            || now.saturating_sub(self.build_ms) < BUILD_EVERY_MS
-        {
+        // (the GM build command works on the targeted house: `gm_build` targets it right
+        // before the command)
+        if self.build_ms != 0 && now.saturating_sub(self.build_ms) < BUILD_EVERY_MS {
             return GoalStatus::Running;
         }
         // Did the last batch advance? If not, the batch was too big for the current step.
@@ -787,7 +779,7 @@ impl Housing {
         }
         self.build_left = h.build_left;
         let n = self.build_n.min(h.build_left.max(1) as u32);
-        ctx.gm(&format!("/build {n}"));
+        ctx.gm_build(obj, n);
         self.build_ms = now;
         GoalStatus::Running
     }

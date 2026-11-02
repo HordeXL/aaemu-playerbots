@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The API key is **never** part of the config: it is read from the environment variable named by
 /// [`api_key_env`](Self::api_key_env), so the config file can be shared and committed.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct LlmConfig {
     /// Master switch. When `false` the add-on does not exist: `Llm::from_config` returns `None`.
@@ -36,6 +36,26 @@ pub struct LlmConfig {
     pub director_interval_secs: u64,
 }
 
+impl std::fmt::Debug for LlmConfig {
+    // Hand-written: a base URL may carry a user name, a password or a key; only its host is shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url_host", &crate::client::url_host(&self.base_url))
+            .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("max_requests_per_minute", &self.max_requests_per_minute)
+            .field("daily_token_budget", &self.daily_token_budget)
+            .field("temperature", &self.temperature)
+            .field("max_reply_tokens", &self.max_reply_tokens)
+            .field("director", &self.director)
+            .field("director_interval_secs", &self.director_interval_secs)
+            .finish()
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -58,6 +78,19 @@ impl Default for LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_shows_the_host_of_the_url_and_nothing_secret() {
+        let cfg = LlmConfig {
+            base_url: "https://user:p4ss@api.example.com/v1/sk-secret-key".into(),
+            ..LlmConfig::default()
+        };
+        let shown = format!("{cfg:?}");
+        assert!(shown.contains("api.example.com"), "{shown}");
+        for secret in ["p4ss", "user", "sk-secret-key", "/v1"] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+    }
 
     #[test]
     fn empty_table_gives_defaults_and_disabled() {

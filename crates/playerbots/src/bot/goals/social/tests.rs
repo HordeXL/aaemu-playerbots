@@ -559,6 +559,11 @@ fn a_line_that_starts_with_a_slash_is_never_put_on_the_wire() {
         "\\gm",
         "\u{ff0f}gold",
         "\u{2215}gold",
+        // the server strips NULs at both ends of a string before it looks for the slash
+        "\0/gold add self 99999",
+        "\0\0/shutdown",
+        " \0 /x",
+        "\u{feff}\0/x",
         "",
         "   ",
         &"x".repeat(201),

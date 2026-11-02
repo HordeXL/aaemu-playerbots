@@ -123,15 +123,21 @@ struct Server {
 
 impl Server {
     async fn start(token: Option<&str>, with_image: bool) -> Server {
+        Server::start_on("127.0.0.1", token, with_image).await
+    }
+
+    /// Listens on `ip` (port 0); requests are made to 127.0.0.1 on the port that was given.
+    async fn start_on(ip: &str, token: Option<&str>, with_image: bool) -> Server {
         let hub = Arc::new(TestHub {
             with_image,
             ..TestHub::default()
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind(format!("{ip}:0")).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], bound.port()));
         let (stop, stopped) = oneshot::channel::<()>();
         let cfg = WebConfig {
-            bind: addr,
+            bind: bound,
             token: token.map(str::to_string),
         };
         let task = tokio::spawn(pb_web::serve_listener(listener, hub.clone(), cfg, async {
@@ -632,23 +638,120 @@ async fn rebound_host_names_are_refused_on_loopback_without_a_token() {
         ("Origin", "http://evil.example:8790"),
     ];
     assert_eq!(s.post("/api/command", &host, body).await.status, 403);
-    // GETs do not change anything and stay readable
-    assert_eq!(
-        s.request("GET", "/api/bots", &[("Host", "evil.example")], None)
-            .await
-            .status,
-        200
+    // ... and it must not read anything either: every route refuses the foreign Host
+    for path in [
+        "/",
+        "/index.html",
+        "/app.js",
+        "/style.css",
+        "/map.png",
+        "/api/bots",
+        "/api/bots/1",
+        "/api/stats",
+        "/api/markers",
+        "/api/map",
+    ] {
+        let r = s
+            .request("GET", path, &[("Host", "evil.example")], None)
+            .await;
+        assert_eq!(r.status, 403, "GET {path}");
+        let leaked = r.text();
+        assert!(!leaked.contains("Bot "), "GET {path} leaked: {leaked}");
+        // the same for a Host with a loopback look-alike
+        let r = s
+            .request("GET", path, &[("Host", "localhost.evil.example")], None)
+            .await;
+        assert_eq!(r.status, 403, "GET {path} look-alike");
+    }
+    // a request without a Host header (HTTP/1.0 style) is refused as well
+    let mut stream = TcpStream::connect(s.addr).await.unwrap();
+    stream
+        .write_all(b"GET /api/bots HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 400")
+            || String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 403"),
+        "{}",
+        String::from_utf8_lossy(&raw)
     );
-    // localhost by name works
+    assert_eq!(s.hub.commands.lock().unwrap().len(), 0);
+    // loopback names by name or number work for reads and writes
+    for h in [
+        "localhost:8790",
+        "127.0.0.1:8790",
+        "[::1]:8790",
+        "bots.localhost",
+    ] {
+        let r = s.request("GET", "/api/bots", &[("Host", h)], None).await;
+        assert_eq!(r.status, 200, "{h}");
+    }
+    assert_eq!(s.get("/api/bots").await.status, 200);
     let local = [("Host", "localhost:8790")];
     assert_eq!(s.post("/api/command", &local, body).await.status, 200);
     assert_eq!(s.hub.commands.lock().unwrap().len(), 1);
     s.shutdown().await;
+}
 
-    // with a token the host name does not matter
+#[tokio::test]
+async fn with_a_token_the_reads_still_check_the_host_but_a_token_post_does_not() {
     let s = Server::start(Some("t"), false).await;
+    let body = r#"{"type":"pause"}"#;
+    // the token protects the commands; it does not make a rebound page a reader
+    for path in ["/api/bots", "/api/stats", "/"] {
+        let r = s
+            .request("GET", path, &[("Host", "bots.example")], None)
+            .await;
+        assert_eq!(r.status, 403, "GET {path}");
+    }
+    let r = s
+        .request(
+            "GET",
+            "/api/bots",
+            &[("Host", "bots.example"), ("x-playerbots-token", "t")],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 403, "a GET is never exempt");
+    assert_eq!(s.get("/api/bots").await.status, 200);
+    // a POST with the token works whatever the host name is called (a proxy, a script) ...
     let h = [("Host", "bots.example"), ("x-playerbots-token", "t")];
     assert_eq!(s.post("/api/command", &h, body).await.status, 200);
+    // ... and without it, or with a wrong one, it does not
+    let no = [("Host", "bots.example")];
+    assert_eq!(s.post("/api/command", &no, body).await.status, 403);
+    let wrong = [("Host", "bots.example"), ("x-playerbots-token", "nope")];
+    assert_eq!(s.post("/api/command", &wrong, body).await.status, 403);
+    // on a loopback Host the old rules hold: no token, no command
+    assert_eq!(s.post("/api/command", &[], body).await.status, 401);
+    assert_eq!(
+        s.post("/api/command", &[("x-playerbots-token", "t")], body)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(s.hub.commands.lock().unwrap().len(), 2);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_non_loopback_bind_does_not_check_the_host_name() {
+    // listening on every interface: the Host is whatever the operator's name for the machine is;
+    // the token (and the operator's network) protect it
+    let s = Server::start_on("0.0.0.0", Some("t"), false).await;
+    let r = s
+        .request("GET", "/api/bots", &[("Host", "bots.example:8790")], None)
+        .await;
+    assert_eq!(r.status, 200);
+    let h = [("Host", "bots.example:8790"), ("x-playerbots-token", "t")];
+    assert_eq!(
+        s.post("/api/command", &h, r#"{"type":"pause"}"#)
+            .await
+            .status,
+        200
+    );
     s.shutdown().await;
 }
 

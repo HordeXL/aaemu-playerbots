@@ -24,6 +24,7 @@ use playerbots::bot::{Shared, LOGIN_PERMITS};
 use playerbots::config::Config;
 use playerbots::hub::{Hub, HubParams, SupCmd};
 use playerbots::roster::{Roster, SharedRoster};
+use playerbots::secrets::{self, Source};
 use playerbots::supervisor::{ensure_roster, register_slots, Supervisor};
 
 /// Headless ArcheAge 1.2 player bots for the AAEmu Rust server.
@@ -101,8 +102,22 @@ fn main() -> anyhow::Result<()> {
             login_db,
         } => {
             let cfg = Config::load(&config)?;
-            let sql = playerbots::gm::grant_sql(&cfg.server.account_prefix, &game_db, &login_db)
+            // The accounts are the roster's, named one by one: a pattern like `pb[0-9]+` would
+            // also grant GM to whoever registers `pb99999` on a server with AutoAccount.
+            let roster = Roster::load(&cfg.bots.roster)?;
+            let accounts: Vec<String> =
+                roster.entries().iter().map(|e| e.account.clone()).collect();
+            let sql = playerbots::gm::grant_sql(&accounts, &game_db, &login_db)
                 .map_err(anyhow::Error::msg)?;
+            let resolved =
+                secrets::resolve_from_config(&cfg, &cfg.bots.roster, !roster.is_empty())?;
+            if resolved.password.is_weak() {
+                eprintln!(
+                    "warning: the bot accounts use the public default password; anybody who knows it can log in \
+                     as a GM once the SQL below is applied. Set server.password (or ${}) first.",
+                    playerbots::config::PASSWORD_ENV
+                );
+            }
             print!("{sql}");
             Ok(())
         }
@@ -146,6 +161,34 @@ fn bake(
     Ok(())
 }
 
+/// Says where the bot password comes from (never the password itself).
+fn announce_password(resolved: &secrets::Resolved, roster: &std::path::Path) {
+    match resolved.source {
+        Source::Config => tracing::info!("bot accounts use the password from server.password"),
+        Source::Env => tracing::info!(
+            "bot accounts use the password from ${}",
+            playerbots::config::PASSWORD_ENV
+        ),
+        Source::SecretsFile => tracing::info!(
+            "bot accounts use the generated password in {}",
+            secrets::secrets_path(roster).display()
+        ),
+        Source::Generated => tracing::info!(
+            "generated a private password for the bot accounts and saved it to {} (keep that file next to the roster)",
+            secrets::secrets_path(roster).display()
+        ),
+        Source::LegacyDefault => tracing::warn!(
+            "the roster {} lists bots but there is no {}: their accounts were created with the old public \
+             default password and keep using it. Anyone who knows it can log in as one of the bots. Set \
+             server.password (or ${}) and change the accounts' password in the login database, or start over \
+             with a new roster (then a private password is generated)",
+            roster.display(),
+            secrets::secrets_path(roster).display(),
+            playerbots::config::PASSWORD_ENV
+        ),
+    }
+}
+
 async fn run(
     config: PathBuf,
     count: Option<u32>,
@@ -178,6 +221,16 @@ async fn run(
 
     let roster_path = cfg.bots.roster.clone();
     let roster = Roster::load(&roster_path)?;
+    // (decided before the roster grows: a roster that already lists bots has accounts on the
+    // login server under the password of the version that created them)
+    let resolved = secrets::resolve_from_config(&cfg, &roster_path, !roster.is_empty())?;
+    secrets::check_gm_password(&cfg, &resolved)?;
+    if cfg.behavior.trade_with_players && cfg.bots.gm_bootstrap {
+        tracing::warn!(
+            "behavior.trade_with_players is ignored while bots.gm_bootstrap is on: what the bots hold may be GM-made, so real players cannot trade with them"
+        );
+    }
+    announce_password(&resolved, &roster_path);
     let roster = Arc::new(SharedRoster::new(roster, roster_path));
     let wanted = cfg.bots.count as usize;
     let creatable = {
@@ -188,6 +241,10 @@ async fn run(
     if added > 0 {
         tracing::info!(added, "new bots in the roster");
     }
+    // The roster is on disk before the first bot logs in (the login server creates the accounts
+    // then); from here on the saver task writes the changes, a moment after they happen.
+    roster.flush_blocking();
+    let saver = roster.spawn_saver(playerbots::roster::SAVE_INTERVAL);
 
     let (sup_tx, sup_rx) = tokio::sync::mpsc::channel::<SupCmd>(16);
     let llm = pb_llm::Llm::from_config(&cfg.llm);
@@ -210,7 +267,7 @@ async fn run(
         archetypes,
         coord: coord_handle,
         login_gate: tokio::sync::Semaphore::new(LOGIN_PERMITS),
-        password: cfg.password(),
+        password: resolved.password,
     });
     let registered = register_slots(&shared);
     tracing::info!(
@@ -276,6 +333,8 @@ async fn run(
     }
     let _ = coord_task.await;
     let _ = ticker.await;
+    // (the bots are gone: whatever they changed last is written now)
+    saver.stop().await;
     tracing::info!("bye");
     Ok(())
 }
