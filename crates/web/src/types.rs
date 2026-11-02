@@ -122,6 +122,11 @@ pub struct BotDetail {
     /// The last chat lines the bot heard or said, oldest first (`t` is unix milliseconds).
     #[serde(default)]
     pub chat: Vec<LogLine>,
+    /// The route the bot is walking, as map-plane `[x, y]` points in metres, nearest waypoint
+    /// first (empty when it is not following one). Filled by the motion controller; the UI does
+    /// not draw it yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<[f32; 2]>,
 }
 
 /// Token-budget numbers of the optional LLM.
@@ -253,13 +258,15 @@ pub enum Command {
 
 impl Command {
     /// Values accepted by [`Command::Goal`].
-    pub const GOALS: [&'static str; 9] = [
+    pub const GOALS: [&'static str; 11] = [
         "quest",
         "grind",
         "duel",
         "trade",
         "trade_run",
         "housing",
+        "dungeon",
+        "sail",
         "rest",
         "wander",
         "auto",
@@ -555,6 +562,8 @@ mod tests {
             .is_err());
         assert!(whisper("Bob", "  ").validate(Some(1)).is_err());
         assert!(g("wander").validate(Some(1)).is_ok());
+        assert!(g("dungeon").validate(Some(1)).is_ok());
+        assert!(g("sail").validate(Some(1)).is_ok());
 
         assert!(Command::Spawn { count: 10 }.validate(None).is_ok());
         assert!(Command::Spawn { count: 0 }.validate(None).is_err());
@@ -678,5 +687,25 @@ mod tests {
         )
         .unwrap();
         assert!(detail.chat.is_empty());
+        assert!(detail.path.is_empty());
+    }
+
+    #[test]
+    fn the_path_of_a_detail_is_left_out_when_empty_and_round_trips_otherwise() {
+        let mut d = BotDetail {
+            snapshot: BotSnapshot::default(),
+            log: Vec::new(),
+            quests: Vec::new(),
+            extra: Vec::new(),
+            chat: Vec::new(),
+            path: Vec::new(),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("path").is_none(), "{v}");
+        d.path = vec![[1.5, 2.0], [3.0, -4.25]];
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""path":[[1.5,2.0],[3.0,-4.25]]"#), "{json}");
+        let back: BotDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
     }
 }

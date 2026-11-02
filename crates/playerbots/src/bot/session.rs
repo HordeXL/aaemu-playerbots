@@ -146,6 +146,15 @@ impl SessionError {
 pub enum Decoded {
     /// A packet the bots use, parsed.
     Event(ServerEvent),
+    /// A ship's movement packet, parsed twice: `moved` is the ordinary position event
+    /// ([`WorldEvent::UnitMoved`]), `motion` the ship's heading, speed and helm
+    /// ([`WorldEvent::ShipMoved`]). Apply both, `moved` first.
+    Ship {
+        /// The position event, as for any other mover.
+        moved: ServerEvent,
+        /// The ship event, from [`sc::parse_ship`].
+        motion: ServerEvent,
+    },
     /// A packet the bots do not need.
     Ignored,
     /// A packet the parser rejects; the text is the parser's message.
@@ -156,21 +165,33 @@ pub enum Decoded {
 /// [`Decoded::Malformed`] (a bot must survive whatever the server sends, and the bot loop files a
 /// report about it).
 pub fn decode_checked(p: &Packet) -> Decoded {
-    match sc::parse(p.level, p.opcode, &p.body) {
-        Ok(Some(ev)) => Decoded::Event(ev),
-        Ok(None) => Decoded::Ignored,
-        Err(e) => {
-            tracing::debug!(packet = p.name(), "undecodable packet: {e}");
-            Decoded::Malformed(e.to_string())
-        }
+    let parsed = match sc::parse(p.level, p.opcode, &p.body) {
+        Ok(ev) => ev,
+        Err(e) => return malformed(p, &e),
+    };
+    // A ship's movement is also a heading, a speed and a helm: `parse_ship` is a cheap `None`
+    // for every other packet. Its failure is a malformed packet like any other.
+    let ship = match sc::parse_ship(p.level, p.opcode, &p.body) {
+        Ok(ev) => ev,
+        Err(e) => return malformed(p, &e),
+    };
+    match (parsed, ship) {
+        (Some(moved), Some(motion)) => Decoded::Ship { moved, motion },
+        (Some(ev), None) | (None, Some(ev)) => Decoded::Event(ev),
+        (None, None) => Decoded::Ignored,
     }
+}
+
+fn malformed(p: &Packet, e: &aa_proto::MarshalError) -> Decoded {
+    tracing::debug!(packet = p.name(), "undecodable packet: {e}");
+    Decoded::Malformed(e.to_string())
 }
 
 /// Decodes a packet into an event; a packet that does not match its layout is logged at debug
 /// level and dropped (a bot must survive whatever the server sends).
 pub fn decode(p: &Packet) -> Option<ServerEvent> {
     match decode_checked(p) {
-        Decoded::Event(ev) => Some(ev),
+        Decoded::Event(ev) | Decoded::Ship { moved: ev, .. } => Some(ev),
         Decoded::Ignored | Decoded::Malformed(_) => None,
     }
 }
@@ -1024,6 +1045,104 @@ mod tests {
         };
         assert!(matches!(decode_checked(&bad), Decoded::Malformed(_)));
         assert!(decode(&bad).is_none());
+    }
+
+    /// The head of a move packet (`SCOneUnitMovementPacket`): bc object id, move type, u32 time,
+    /// flags and the position.
+    fn move_head(obj: u32, kind: u8) -> aa_proto::PacketStream {
+        let mut s = aa_proto::PacketStream::new();
+        s.write_bc(obj)
+            .write_u8(kind)
+            .write_u32(5_000)
+            .write_u8(0)
+            .write_position(10_000.5, 9_500.25, 100.0);
+        s
+    }
+
+    /// A ship move: the head, then velocity (3 x i16), rotation (3 x i16), angular velocity
+    /// (3 x f32), steering, throttle, zone and the stuck flag.
+    fn ship_packet(obj: u32) -> Packet {
+        let mut s = move_head(obj, 3);
+        for v in [0i16, 1092, 0, 0, 0, 11_468] {
+            s.write_i16(v);
+        }
+        s.write_f32(0.0)
+            .write_f32(0.25)
+            .write_f32(-0.5)
+            .write_i8(-20)
+            .write_i8(60)
+            .write_u16(0x0101)
+            .write_u8(0);
+        Packet {
+            level: LEVEL_GAME,
+            opcode: sco::SCOneUnitMovementPacket,
+            body: bytes::Bytes::copy_from_slice(s.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn a_ships_move_decodes_to_its_position_and_its_helm() {
+        let p = ship_packet(0x0500);
+        let Decoded::Ship { moved, motion } = decode_checked(&p) else {
+            panic!("a ship move is two events");
+        };
+        let ServerEvent::World(WorldEvent::UnitMoved { obj, kind, pos, .. }) = moved else {
+            panic!("the position event comes first: {moved:?}");
+        };
+        assert_eq!((obj, kind), (0x0500, 3));
+        assert!((pos.0 - 10_000.5).abs() < 0.01);
+        let ServerEvent::World(WorldEvent::ShipMoved(m)) = motion else {
+            panic!("the helm event comes second: {motion:?}");
+        };
+        assert_eq!(
+            (m.obj, m.steering, m.throttle, m.zone),
+            (0x0500, -20, 60, 0x0101)
+        );
+        assert!((m.speed - 1.0).abs() < 1e-3, "{}", m.speed);
+        // the lobby's one-event decode keeps the position event
+        assert!(matches!(
+            decode(&p),
+            Some(ServerEvent::World(WorldEvent::UnitMoved { kind: 3, .. }))
+        ));
+    }
+
+    #[test]
+    fn other_moves_stay_one_event_and_a_cut_ship_move_is_malformed() {
+        // a vehicle move (type 2) has no helm: one event, as before
+        let vehicle = Packet {
+            level: LEVEL_GAME,
+            opcode: sco::SCOneUnitMovementPacket,
+            body: bytes::Bytes::copy_from_slice(move_head(0x0501, 2).as_bytes()),
+        };
+        assert!(matches!(
+            decode_checked(&vehicle),
+            Decoded::Event(ServerEvent::World(WorldEvent::UnitMoved { kind: 2, .. }))
+        ));
+        // a ship move that ends after the position still parses as a position event, but
+        // not as a ship move: the packet is malformed like any other that does not parse
+        let cut = Packet {
+            level: LEVEL_GAME,
+            opcode: sco::SCOneUnitMovementPacket,
+            body: bytes::Bytes::copy_from_slice(move_head(0x0500, 3).as_bytes()),
+        };
+        assert!(sc::parse(cut.level, cut.opcode, &cut.body)
+            .unwrap()
+            .is_some());
+        assert!(matches!(decode_checked(&cut), Decoded::Malformed(_)));
+        assert!(decode(&cut).is_none());
+        // every prefix of a ship move is either malformed or ignored, never a panic
+        let full = ship_packet(0x0500);
+        for end in 0..full.body.len() {
+            let prefix = Packet {
+                level: full.level,
+                opcode: full.opcode,
+                body: full.body.slice(..end),
+            };
+            assert!(
+                !matches!(decode_checked(&prefix), Decoded::Ship { .. }),
+                "a prefix of {end} bytes decoded as a ship move"
+            );
+        }
     }
 
     #[test]

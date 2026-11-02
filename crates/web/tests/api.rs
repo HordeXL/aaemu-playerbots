@@ -82,6 +82,7 @@ impl BotHub for TestHub {
                 t: 1_700_000_001_000,
                 text: "Bob: hi there".into(),
             }],
+            path: Vec::new(),
         })
     }
 

@@ -530,6 +530,7 @@ impl BotHub for MockHub {
                 .filter(|l| l.text.starts_with("says:") || l.text.starts_with("whispers"))
                 .cloned()
                 .collect(),
+            path: Vec::new(),
         })
     }
 

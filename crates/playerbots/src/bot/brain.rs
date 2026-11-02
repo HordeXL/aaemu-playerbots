@@ -7,6 +7,9 @@
 //! [`FailReason::NotImplemented`] are switched off for good, goals that fail otherwise rest for a
 //! while ([`FAIL_COOLDOWN_MS`]).
 //!
+//! The dungeon and sail goals are the exception: the features that own them score them from the
+//! whole tick context (`own_scores`), 0 until they exist, with none of the factors above.
+//!
 //! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
 //! pack recipe, housing without GM help or a design item) are left out of the draw up front
 //! ([`gate`]); the answer is reused for [`GATE_TTL_MS`] and asked again after a level-up.
@@ -26,6 +29,7 @@ use super::ctx::Ctx;
 use super::director::{self, Director, Pick, Situation};
 use super::goals::social::{self, ChatEvent, Social};
 use super::goals::{FailReason, Goal, GoalStatus};
+use super::party::{PartyOrder, PartyPurpose};
 use super::state::UnitKind;
 use crate::config::BehaviorCfg;
 use crate::roster::Temperament;
@@ -81,7 +85,41 @@ pub fn base_weights(b: &BehaviorCfg, t: &Temperament) -> [f32; GoalKind::COUNT] 
     w[GoalKind::Housing.index()] = b.housing * (0.4 + 1.2 * t.homebody);
     w[GoalKind::Rest.index()] = b.rest * (0.5 + t.homebody);
     w[GoalKind::Wander.index()] = b.wander * (0.6 + 0.8 * t.homebody);
+    // (the travel goals own their weights, see `own_scores`)
+    w[GoalKind::Dungeon.index()] = super::goals::dungeon::base_weight(b, t);
+    w[GoalKind::Sail.index()] = super::goals::sail::base_weight(b, t);
     w
+}
+
+/// Goals that score themselves from the whole tick context: the dungeons and sailing features
+/// own their eligibility (a party, a boat scroll, the `behavior.dungeons` and `behavior.sailing`
+/// switches), so the brain applies none of its factors to them. A goal that is blocked (switched
+/// off, cooling down, gated) is not asked; a score that is not a positive number is 0.
+fn own_scores(
+    ctx: &Ctx<'_>,
+    base: &[f32; GoalKind::COUNT],
+    blocked: u16,
+    s: &mut [f32; GoalKind::COUNT],
+) {
+    let dungeon = GoalKind::Dungeon.index();
+    let sail = GoalKind::Sail.index();
+    s[dungeon] = own_score(blocked, dungeon, || {
+        super::goals::dungeon::score(ctx, base[dungeon])
+    });
+    s[sail] = own_score(blocked, sail, || super::goals::sail::score(ctx, base[sail]));
+}
+
+/// `raw()` unless goal `index` is in `blocked` or the value is not a positive number.
+fn own_score(blocked: u16, index: usize, raw: impl FnOnce() -> f32) -> f32 {
+    if blocked & (1 << index) != 0 {
+        return 0.0;
+    }
+    let v = raw();
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        0.0
+    }
 }
 
 /// The score of every goal. A blocked goal or a weight of 0 scores 0.
@@ -155,6 +193,9 @@ pub struct Brain {
     next_think_ms: u64,
     /// A goal to start at the next tick (operator command, pairing, recovery after death).
     queued: Option<(GoalKind, Option<PairOrder>)>,
+    /// The party order that goes with a queued [`GoalKind::Dungeon`]; set only by
+    /// [`BotCmd::Party`] and dropped by every other way of queueing.
+    party: Option<Box<PartyOrder>>,
     forced_fails: u8,
     /// The last answer of [`gate`]: the bot clock it is good until, the level it was asked at and
     /// the goals it blocks.
@@ -175,6 +216,7 @@ impl Brain {
             cooldown_until: [0; GoalKind::COUNT],
             next_think_ms: 0,
             queued: None,
+            party: None,
             forced_fails: 0,
             gated: Cell::new((0, 0, 0)),
             ext: None,
@@ -219,7 +261,7 @@ impl Brain {
                 self.choice = *choice;
                 self.forced_fails = 0;
                 match choice {
-                    GoalChoice::Forced(kind) => self.queued = Some((*kind, None)),
+                    GoalChoice::Forced(kind) => self.queue(*kind, None),
                     GoalChoice::Auto => {}
                 }
             }
@@ -228,16 +270,27 @@ impl Brain {
                     PairKind::Duel => GoalKind::Duel,
                     PairKind::Trade => GoalKind::Trade,
                 };
-                self.queued = Some((kind, Some(order.clone())));
+                self.queue(kind, Some(order.clone()));
+            }
+            BotCmd::Party(order) => {
+                let kind = match order.purpose {
+                    PartyPurpose::Dungeon { .. } => GoalKind::Dungeon,
+                };
+                self.queue(kind, None);
+                self.party = Some(order.clone());
             }
             BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) | BotCmd::Whisper { .. } => {}
             BotCmd::DuelWith(_) | BotCmd::TradeWith(_) | BotCmd::ServerLogLine { .. } => {}
+            // (the nav result belongs to the motion controller)
+            BotCmd::PathReady { .. } => {}
         }
     }
 
-    /// Queues `kind` to start at the next tick, replacing the running goal.
+    /// Queues `kind` to start at the next tick, replacing the running goal. Drops a party order
+    /// that was waiting.
     pub fn queue(&mut self, kind: GoalKind, order: Option<PairOrder>) {
         self.queued = Some((kind, order));
+        self.party = None;
     }
 
     /// One brain tick.
@@ -308,7 +361,8 @@ impl Brain {
         if self.goal.is_some() {
             self.end_goal(ctx, None);
         }
-        let mut goal = Goal::new(kind, order);
+        let party = self.party.take();
+        let mut goal = Goal::with_party(kind, order, party);
         goal.start(ctx);
         ctx.log.say(format!("goal: {}", kind.name()));
         self.goal = Some(goal);
@@ -409,7 +463,9 @@ impl Brain {
             last: self.last,
             blocked,
         };
-        scores(&self.base, &input)
+        let mut s = scores(&self.base, &input);
+        own_scores(ctx, &self.base, blocked, &mut s);
+        s
     }
 
     /// The goals [`gate`] blocks, asked again when the last answer is old or the level changed.
@@ -519,7 +575,7 @@ impl Brain {
         if between {
             self.apply_pick(ctx, &pick);
             if self.goal.as_ref().map(Goal::kind) != Some(pick.kind) {
-                self.queued = Some((pick.kind, None));
+                self.queue(pick.kind, None);
             }
         } else {
             let interval = ctx.cfg.llm.director_interval_secs;
@@ -753,5 +809,70 @@ mod tests {
         }
         assert_eq!(brain.goal_name(), "-");
         assert!(!brain.is_disabled(GoalKind::Quest));
+    }
+
+    #[test]
+    fn the_travel_goals_are_never_drawn_by_weight() {
+        // the stubs' weights are 0, so the table alone never picks them ...
+        let w = base();
+        assert_eq!(w[GoalKind::Dungeon.index()], 0.0);
+        assert_eq!(w[GoalKind::Sail.index()], 0.0);
+        // ... the other goals' numbers are what they were
+        assert_eq!(w[GoalKind::Quest.index()], 1.0 * (0.4 + 1.2 * 0.5));
+        assert_eq!(w[GoalKind::Wander.index()], 0.5 * (0.6 + 0.8 * 0.5));
+        let s = scores(&w, &input(100));
+        assert_eq!(s[GoalKind::Dungeon.index()], 0.0);
+        assert_eq!(s[GoalKind::Sail.index()], 0.0);
+        let mut rng = fastrand::Rng::with_seed(5);
+        for _ in 0..5000 {
+            let g = choose(&s, &mut rng).unwrap();
+            assert!(g != GoalKind::Dungeon && g != GoalKind::Sail, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_goal_that_scores_itself_is_blocked_or_cleaned_up_but_not_scaled() {
+        let dungeon = GoalKind::Dungeon.index();
+        // the feature's number comes through as it is
+        assert_eq!(own_score(0, dungeon, || 2.5), 2.5);
+        // not asked at all while switched off, cooling down or gated
+        assert_eq!(
+            own_score(1 << dungeon, dungeon, || panic!("asked while blocked")),
+            0.0
+        );
+        // another goal's bit does not block it
+        assert_eq!(own_score(1 << GoalKind::Sail.index(), dungeon, || 1.0), 1.0);
+        // nonsense is 0
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(own_score(0, dungeon, || bad), 0.0, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_party_order_queues_the_dungeon_goal_with_its_order() {
+        use crate::bot::party::PartyPurpose;
+        let order = PartyOrder {
+            party_id: 4,
+            leader: 1,
+            members: [1, 2, 3].into_iter().collect(),
+            purpose: PartyPurpose::Dungeon { zone_group: 9 },
+        };
+        let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
+        brain.command(&BotCmd::Party(Box::new(order.clone())));
+        assert!(matches!(brain.queued, Some((GoalKind::Dungeon, None))));
+        assert_eq!(brain.party.as_deref(), Some(&order));
+        // any other way of queueing a goal drops the waiting order
+        brain.command(&BotCmd::Goal(GoalChoice::Forced(GoalKind::Dungeon)));
+        assert!(matches!(brain.queued, Some((GoalKind::Dungeon, None))));
+        assert!(brain.party.is_none());
+        brain.command(&BotCmd::Party(Box::new(order)));
+        brain.queue(GoalKind::Rest, None);
+        assert!(brain.party.is_none());
+        // the nav answer is the motion controller's, not the brain's
+        brain.command(&BotCmd::PathReady {
+            ticket: 1,
+            result: Box::new(aa_world::nav::PathResult::Unreachable),
+        });
+        assert!(matches!(brain.queued, Some((GoalKind::Rest, None))));
     }
 }

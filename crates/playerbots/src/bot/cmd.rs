@@ -1,6 +1,7 @@
 //! Commands a bot task receives on its command channel (from the web UI through the hub, and
 //! from the coordinator).
 
+use super::party::PartyOrder;
 use crate::issues::LogLevel;
 
 /// The goals a bot can pursue, as the web UI names them.
@@ -22,11 +23,15 @@ pub enum GoalKind {
     TradeRun,
     /// Build and use a house.
     Housing,
+    /// Enter an instance dungeon with a party (owned by the dungeons feature).
+    Dungeon,
+    /// Summon a boat and sail (owned by the sailing feature).
+    Sail,
 }
 
 impl GoalKind {
     /// Every goal.
-    pub const ALL: [GoalKind; 8] = [
+    pub const ALL: [GoalKind; 10] = [
         GoalKind::Wander,
         GoalKind::Rest,
         GoalKind::Grind,
@@ -35,6 +40,8 @@ impl GoalKind {
         GoalKind::Trade,
         GoalKind::TradeRun,
         GoalKind::Housing,
+        GoalKind::Dungeon,
+        GoalKind::Sail,
     ];
 
     /// Number of goals.
@@ -56,6 +63,8 @@ impl GoalKind {
             GoalKind::Trade => "trade",
             GoalKind::TradeRun => "trade_run",
             GoalKind::Housing => "housing",
+            GoalKind::Dungeon => "dungeon",
+            GoalKind::Sail => "sail",
         }
     }
 
@@ -144,6 +153,18 @@ pub enum BotCmd {
     TradeWith(u32),
     /// The coordinator found a partner.
     Pair(PairOrder),
+    /// The coordinator formed a party and this bot is a member (owned by the dungeons feature;
+    /// the brain queues [`GoalKind::Dungeon`] and hands the order to the goal). Boxed: an order is
+    /// 48 bytes and would make every command (and every command channel slot) 8 bytes larger.
+    Party(Box<PartyOrder>),
+    /// A path search finished (owned by the motion feature): the answer to the request with
+    /// this `ticket`, delivered to [`Motion::on_path_ready`](super::motion::Motion::on_path_ready).
+    PathReady {
+        /// The ticket the request was made with.
+        ticket: u32,
+        /// What the nav search found.
+        result: Box<aa_world::nav::PathResult>,
+    },
     /// A `WARN` or `ERROR` line of the game server's log mentions this bot's character (sent by
     /// the hub when `issues.server_log` is set). The bot files a
     /// [`crate::issues::IssueKind::ServerLogDuringAction`] report with its own context.
@@ -174,5 +195,24 @@ mod tests {
             }
         }
         assert_eq!(GoalChoice::parse("fly"), None);
+    }
+
+    #[test]
+    fn dungeon_and_sail_are_goals_the_web_ui_can_force() {
+        assert_eq!(GoalKind::parse("dungeon"), Some(GoalKind::Dungeon));
+        assert_eq!(GoalKind::parse("sail"), Some(GoalKind::Sail));
+        assert_eq!(GoalKind::Dungeon.name(), "dungeon");
+        assert_eq!(GoalKind::Sail.name(), "sail");
+        assert_eq!(
+            GoalChoice::parse("sail"),
+            Some(GoalChoice::Forced(GoalKind::Sail))
+        );
+        // and the other way round: every goal here is on the web UI's list
+        for g in GoalKind::ALL {
+            assert!(
+                pb_web::Command::GOALS.contains(&g.name()),
+                "the web UI does not offer {g:?}"
+            );
+        }
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
-//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`] and [`Housing`]. A goal that reports
+//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`] and [`Sail`] (the last
+//! two are stubs the dungeons and sailing features fill in). A goal that reports
 //! [`FailReason::NotImplemented`] is switched off for good by the brain.
 //!
 //! # Writing a goal
@@ -19,10 +20,12 @@
 //! * Do not keep borrows of `ctx` between ticks and do not allocate per tick.
 
 pub mod duel;
+pub mod dungeon;
 pub mod grind;
 pub mod housing;
 pub mod quest;
 pub mod rest;
+pub mod sail;
 pub mod social;
 pub mod trade;
 pub mod trade_run;
@@ -31,10 +34,12 @@ pub mod wander;
 use pb_web::Activity;
 
 pub use duel::Duel;
+pub use dungeon::Dungeon;
 pub use grind::Grind;
 pub use housing::Housing;
 pub use quest::Quest;
 pub use rest::Rest;
+pub use sail::Sail;
 pub use trade::Trade;
 pub use trade_run::TradeRun;
 pub use wander::Wander;
@@ -43,6 +48,7 @@ use super::cmd::{GoalKind, PairOrder};
 use super::combat::CombatStatus;
 use super::ctx::Ctx;
 use super::motion::SWIM_THRESHOLD;
+use super::party::PartyOrder;
 
 /// Why a goal gave up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,11 +95,25 @@ pub enum Goal {
     TradeRun(TradeRun),
     /// Build and use a house.
     Housing(Housing),
+    /// Clear an instance dungeon with a party.
+    Dungeon(Dungeon),
+    /// Summon a boat and sail.
+    Sail(Sail),
 }
 
 impl Goal {
     /// A fresh goal of `kind`; `order` is the coordinator's pairing for duels and trades.
     pub fn new(kind: GoalKind, order: Option<PairOrder>) -> Goal {
+        Goal::with_party(kind, order, None)
+    }
+
+    /// Like [`Goal::new`], with the coordinator's party order for a dungeon (any other goal
+    /// ignores it).
+    pub fn with_party(
+        kind: GoalKind,
+        order: Option<PairOrder>,
+        party: Option<Box<PartyOrder>>,
+    ) -> Goal {
         match kind {
             GoalKind::Wander => Goal::Wander(Wander::default()),
             GoalKind::Rest => Goal::Rest(Rest::default()),
@@ -103,6 +123,8 @@ impl Goal {
             GoalKind::Trade => Goal::Trade(Trade::new(order)),
             GoalKind::TradeRun => Goal::TradeRun(TradeRun::default()),
             GoalKind::Housing => Goal::Housing(Housing::default()),
+            GoalKind::Dungeon => Goal::Dungeon(Dungeon::new(party)),
+            GoalKind::Sail => Goal::Sail(Sail),
         }
     }
 
@@ -117,13 +139,20 @@ impl Goal {
             Goal::Trade(_) => GoalKind::Trade,
             Goal::TradeRun(_) => GoalKind::TradeRun,
             Goal::Housing(_) => GoalKind::Housing,
+            Goal::Dungeon(_) => GoalKind::Dungeon,
+            Goal::Sail(_) => GoalKind::Sail,
         }
     }
 
     /// Whether the goal drives the combat controller itself. For every other goal the brain lets
     /// the controller defend the bot and pauses the goal while a fight or a loot job is on.
     pub fn owns_combat(&self) -> bool {
-        matches!(self, Goal::Grind(_) | Goal::Quest(_) | Goal::Duel(_))
+        match self {
+            Goal::Grind(_) | Goal::Quest(_) | Goal::Duel(_) => true,
+            Goal::Dungeon(g) => g.owns_combat(),
+            Goal::Sail(g) => g.owns_combat(),
+            _ => false,
+        }
     }
 
     /// Called once when the brain picks the goal.
@@ -137,6 +166,8 @@ impl Goal {
             Goal::Trade(g) => g.start(ctx),
             Goal::TradeRun(g) => g.start(ctx),
             Goal::Housing(g) => g.start(ctx),
+            Goal::Dungeon(g) => g.start(ctx),
+            Goal::Sail(g) => g.start(ctx),
         }
     }
 
@@ -154,6 +185,8 @@ impl Goal {
             Goal::Trade(g) => return g.tick(ctx),
             Goal::TradeRun(g) => return g.tick(ctx),
             Goal::Housing(g) => return g.tick(ctx),
+            Goal::Dungeon(g) => return g.tick(ctx),
+            Goal::Sail(g) => return g.tick(ctx),
         };
         if !resume {
             return GoalStatus::Done;
@@ -177,6 +210,8 @@ impl Goal {
             Goal::Trade(g) => g.stop(ctx),
             Goal::TradeRun(g) => g.stop(ctx),
             Goal::Housing(g) => g.stop(ctx),
+            Goal::Dungeon(g) => g.stop(ctx),
+            Goal::Sail(g) => g.stop(ctx),
         }
     }
 
@@ -203,6 +238,8 @@ impl Goal {
             Goal::Trade(_) => Activity::Trading,
             Goal::TradeRun(_) => Activity::TradeRun,
             Goal::Housing(_) => Activity::Housing,
+            Goal::Dungeon(g) => g.activity(moving, fighting),
+            Goal::Sail(g) => g.activity(moving, fighting),
         }
     }
 
@@ -217,6 +254,8 @@ impl Goal {
             Goal::Trade(g) => g.describe(out),
             Goal::Housing(g) => g.describe(out),
             Goal::TradeRun(g) => g.describe(out),
+            Goal::Dungeon(g) => g.describe(out),
+            Goal::Sail(g) => g.describe(out),
         }
     }
 }
@@ -308,5 +347,32 @@ mod tests {
         for kind in GoalKind::ALL {
             assert_eq!(Goal::new(kind, None).kind(), kind);
         }
+    }
+
+    #[test]
+    fn the_dungeon_and_sail_stubs_are_goals_that_own_nothing() {
+        for kind in [GoalKind::Dungeon, GoalKind::Sail] {
+            let g = Goal::new(kind, None);
+            assert_eq!(g.kind(), kind);
+            assert!(!g.owns_combat());
+            let mut text = String::new();
+            g.describe(&mut text);
+            assert!(text.starts_with(kind.name()), "{text}");
+        }
+        // only a dungeon keeps the party order it is started with
+        let order = crate::bot::party::PartyOrder {
+            party_id: 1,
+            leader: 4,
+            members: [4, 5].into_iter().collect(),
+            purpose: crate::bot::party::PartyPurpose::Dungeon { zone_group: 2 },
+        };
+        match Goal::with_party(GoalKind::Dungeon, None, Some(Box::new(order.clone()))) {
+            Goal::Dungeon(d) => assert_eq!(d.order(), Some(&order)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            Goal::with_party(GoalKind::Sail, None, Some(Box::new(order))),
+            Goal::Sail(_)
+        ));
     }
 }

@@ -403,6 +403,43 @@ fn the_automatic_brain_runs_for_half_an_hour_without_trouble() {
     }
 }
 
+/// The dungeon and sail goals are stubs until their features land: the operator can force them
+/// (the web UI offers both) without harm, the brain switches them off, and the automatic choice
+/// never comes near them.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn forcing_a_travel_goal_that_is_not_implemented_yet_falls_back_to_auto() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    for kind in [GoalKind::Dungeon, GoalKind::Sail] {
+        let mut rig = Rig::new(world.clone(), "Darkrunner", 11);
+        rig.force(kind);
+        for _ in 0..16 {
+            rig.tick(250);
+            rig.out.clear();
+        }
+        assert!(rig.brain.is_disabled(kind), "{kind:?} was not switched off");
+        assert_eq!(rig.brain.choice(), GoalChoice::Auto);
+        assert!(rig.said("not implemented"), "{kind:?}: no line in the log");
+        // switched off for good, and never picked by the scoring in the first place
+        for _ in 0..(10 * 60 * 4) {
+            rig.tick(250);
+            rig.out.clear();
+            assert_ne!(rig.brain.goal().map(|g| g.kind()), Some(kind));
+        }
+    }
+    // an automatic bot never starts either of them
+    let mut rig = Rig::new(world, "Reaper", 12);
+    for _ in 0..(10 * 60 * 4) {
+        rig.tick(250);
+        rig.out.clear();
+        let name = rig.brain.goal_name();
+        assert!(name != "dungeon" && name != "sail", "{name}");
+    }
+}
+
 #[test]
 #[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
 fn a_rest_that_cut_a_trade_run_short_gives_it_back_while_a_pack_is_carried() {

@@ -92,6 +92,12 @@ Safety of the GM lines:
 * `[behavior] trade_with_players = false` (default): a bot trades only with other bots of the
   roster and declines the trade request of any other character, so nobody can farm the goods and
   gold the bots mint for themselves. The option is ignored while `gm_bootstrap` is on.
+* `[behavior] portals = true` (default): bots may travel by portal (teleport book, recall points,
+  gates); `false` keeps them off portals.
+* `[behavior] dungeons = true` (default): bots may form parties and enter instance dungeons (goal
+  `dungeon`); `false` keeps them out of both.
+* `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
+  them on land.
 
 ## Chat and the LLM
 
@@ -162,7 +168,7 @@ playerbots run --config playerbots.toml
 The map shows every bot by activity, with houses, duel flags and trade outlets; the list can be
 searched; selecting a bot shows its state, quests, extra details, the last chat lines it heard or
 said and its event log. Commands per bot: pause/resume, force a goal (quest, grind, duel, trade,
-trade run, housing, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
+trade run, housing, dungeon, sail, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
 line to a character. Global: spawn/despawn bots, pause or resume all. With `[web] token` set, POST
 requests need the header `x-playerbots-token`. While the UI is bound to a loopback address, every
 route (reads included) refuses a request whose `Host` is not a loopback name (a DNS-rebinding page

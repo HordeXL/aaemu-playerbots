@@ -61,6 +61,8 @@ pub fn option_text(kind: GoalKind) -> &'static str {
         GoalKind::Trade => "trade: swap items with another player",
         GoalKind::TradeRun => "trade_run: craft a trade pack and carry it to a buyer",
         GoalKind::Housing => "housing: build or tend a house",
+        GoalKind::Dungeon => "dungeon: join a party and clear an instance dungeon",
+        GoalKind::Sail => "sail: summon a boat and sail across the water",
         GoalKind::Rest => "rest: sit down and recover",
         GoalKind::Wander => "wander: stroll around and see the sights",
     }
@@ -346,7 +348,10 @@ mod tests {
         assert!(without.contains(&GoalKind::Quest) && without.contains(&GoalKind::Wander));
         let with = eligible_goals(&s, true);
         assert!(with.contains(&GoalKind::TradeRun) && with.contains(&GoalKind::Housing));
-        assert_eq!(with.len(), GoalKind::COUNT);
+        // (the dungeon and sail goals score themselves from the whole context, see
+        // `brain::own_scores`: this table leaves them at 0)
+        assert_eq!(with.len(), GoalKind::COUNT - 2);
+        assert!(!with.contains(&GoalKind::Dungeon) && !with.contains(&GoalKind::Sail));
     }
 
     #[test]

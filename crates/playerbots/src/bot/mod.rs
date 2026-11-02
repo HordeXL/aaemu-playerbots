@@ -28,9 +28,13 @@ pub mod ctx;
 pub mod director;
 pub mod goals;
 pub mod motion;
+pub mod party;
+pub mod place;
 pub mod rotation;
 pub mod session;
 pub mod state;
+pub mod travel;
+pub mod vehicle;
 pub mod watch;
 
 use std::fmt::Write as _;
@@ -607,8 +611,9 @@ impl Bot {
         if p.level == LEVEL_PROXY && p.opcode == pp::PongPacket {
             self.on_pong(p, now);
         }
-        let mut ev = match session::decode_checked(p) {
-            Decoded::Event(ev) => ev,
+        let (mut ev, ship) = match session::decode_checked(p) {
+            Decoded::Event(ev) => (ev, None),
+            Decoded::Ship { moved, motion } => (moved, Some(motion)),
             Decoded::Ignored => return,
             Decoded::Malformed(err) => {
                 self.on_malformed(p, &err);
@@ -626,6 +631,12 @@ impl Bot {
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
+        // (a ship's heading and helm follow its position event through the same path)
+        if let Some(ship) = &ship {
+            self.state.apply(ship);
+            self.combat
+                .on_event(ship, self.state.me.obj, now, &mut self.out);
+        }
         self.pin_position(queued, now);
         self.clear_target_after_player_fight();
         self.drain_findings();
@@ -707,6 +718,14 @@ impl Bot {
     }
 
     fn on_command(&mut self, cmd: BotCmd) {
+        // (the nav result is moved into the motion controller, not borrowed)
+        let cmd = match cmd {
+            BotCmd::PathReady { ticket, result } => {
+                self.motion.on_path_ready(ticket, *result);
+                return;
+            }
+            other => other,
+        };
         match &cmd {
             BotCmd::Pause => {
                 self.paused = true;
@@ -722,7 +741,8 @@ impl Bot {
             BotCmd::DuelWith(other) => self.pair_with(*other, PairKind::Duel),
             BotCmd::TradeWith(other) => self.pair_with(*other, PairKind::Trade),
             BotCmd::ServerLogLine { level, line } => self.on_server_log_line(*level, line),
-            BotCmd::Goal(_) | BotCmd::Pair(_) => self.brain.command(&cmd),
+            BotCmd::Goal(_) | BotCmd::Pair(_) | BotCmd::Party(_) => self.brain.command(&cmd),
+            BotCmd::PathReady { .. } => {}
         }
     }
 
@@ -812,7 +832,7 @@ impl Bot {
             1000
         };
         let mut env = MotionEnv {
-            ground: &*self.shared.world,
+            ground: self.state.place.ground(&self.shared.world),
             now_ms,
             out: &mut self.out,
             rng: &mut self.rng,
@@ -834,8 +854,16 @@ impl Bot {
             self.out.push(cs::teleport_ended(p[0], p[1], p[2]));
         }
         if r.load_instance {
+            if self.state.place.needs_resolve() {
+                self.state.place.resolve(&self.shared.world);
+            }
+            if r.world_changed {
+                // (the target and the loot job belonged to the world the bot left)
+                self.combat.reset();
+            }
             self.motion.teleported(self.state.me.pos);
             self.out.push(cs::instance_loaded());
+            self.state.place.loaded();
         }
         if r.died {
             self.motion.stop();
@@ -1095,6 +1123,8 @@ mod tests {
             ("Combat", size_of::<Combat>()),
             ("Brain", size_of::<Brain>()),
             ("Goal", size_of::<goals::Goal>()),
+            ("Place", size_of::<place::Place>()),
+            ("BotCmd", size_of::<BotCmd>()),
             ("Persona", size_of::<Persona>()),
             ("Unit", size_of::<state::Unit>()),
             ("Doodad", size_of::<state::Doodad>()),
@@ -1107,6 +1137,13 @@ mod tests {
         // pointer the behaviour fixes added (about 100 bytes).
         assert!(size_of::<Bot>() < 3200, "Bot is {} bytes", size_of::<Bot>());
         assert!(size_of::<goals::Goal>() <= 160);
+        // the command channel slot: boxed orders keep it at the size it had before the travel
+        // commands (a `PartyOrder` unboxed would add 8 bytes)
+        assert!(
+            size_of::<BotCmd>() <= 48,
+            "BotCmd is {}",
+            size_of::<BotCmd>()
+        );
         assert!(size_of::<state::Unit>() <= 64);
     }
 

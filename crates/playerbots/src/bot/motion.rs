@@ -432,6 +432,10 @@ impl Motion {
         self.stop_due = false;
     }
 
+    /// A navigation mesh search finished (owned by the motion feature): `result` answers the
+    /// request that was made with `ticket`. Delivered by `BotCmd::PathReady`; does nothing yet.
+    pub fn on_path_ready(&mut self, _ticket: u32, _result: aa_world::nav::PathResult) {}
+
     /// Integrates the position by the time since the last tick and sends the packets.
     pub fn tick(&mut self, env: &mut MotionEnv<'_>) -> MotionStatus {
         let now = env.now_ms;

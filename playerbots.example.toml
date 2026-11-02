@@ -77,6 +77,12 @@ persona_spread = 0.6
 # trade request of a character that is not one of ours, so nobody can farm the goods and gold the
 # bots mint for themselves (gm_bootstrap).
 trade_with_players = false
+# Travel. Bots may use portals (teleport book, recall points, gates).
+portals = true
+# Bots may form parties and enter instance dungeons (goal "dungeon").
+dungeons = true
+# Bots may summon boats and sail (goal "sail").
+sailing = true
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

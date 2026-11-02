@@ -33,7 +33,8 @@ ACTIVITIES.forEach((a, i) => { ACT_INDEX[a] = i; });
 const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 
 const GOALS = [['auto', 'Auto'], ['quest', 'Quest'], ['grind', 'Grind'], ['duel', 'Duel'], ['trade', 'Trade'],
-  ['trade_run', 'Trade run'], ['housing', 'Housing'], ['rest', 'Rest'], ['wander', 'Wander']];
+  ['trade_run', 'Trade run'], ['housing', 'Housing'], ['dungeon', 'Dungeon'], ['sail', 'Sail'],
+  ['rest', 'Rest'], ['wander', 'Wander']];
 
 const MARKER = {
   house:        { label: 'House',        color: '#a0693a', minScale: 0 },

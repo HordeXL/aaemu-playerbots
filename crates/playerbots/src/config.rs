@@ -193,6 +193,15 @@ pub struct BehaviorCfg {
     /// of ours. Off by default: a bot then only trades with other bots, and a real player can
     /// neither farm the bots' (GM-minted) goods and gold nor hold them in a trade window.
     pub trade_with_players: bool,
+    /// Bots may travel by portal: the teleport book, recall points and gates (the portals
+    /// feature). Off: no bot uses a portal.
+    pub portals: bool,
+    /// Bots may form parties and enter instance dungeons (the dungeons feature, goal `dungeon`).
+    /// Off: no bot picks the goal or joins a party for it.
+    pub dungeons: bool,
+    /// Bots may summon boats and sail (the sailing feature, goal `sail`). Off: no bot picks the
+    /// goal or boards a boat.
+    pub sailing: bool,
 }
 
 impl Default for BehaviorCfg {
@@ -208,6 +217,9 @@ impl Default for BehaviorCfg {
             wander: 0.5,
             persona_spread: 0.6,
             trade_with_players: false,
+            portals: true,
+            dungeons: true,
+            sailing: true,
         }
     }
 }
@@ -734,5 +746,62 @@ trade_with_players = true
                 .behavior
                 .trade_with_players
         );
+    }
+
+    #[test]
+    fn the_travel_features_are_on_unless_switched_off() {
+        let b = Config::default().behavior;
+        assert!(b.portals && b.dungeons && b.sailing);
+        // the example file documents all three and keeps the defaults
+        let ex = Config::parse(Config::example()).unwrap().behavior;
+        assert!(ex.portals && ex.dungeons && ex.sailing);
+        for key in ["portals", "dungeons", "sailing"] {
+            assert!(
+                Config::example().contains(&format!(
+                    "
+{key} = true"
+                )),
+                "{key}"
+            );
+        }
+        // each one switches off on its own
+        let cfg = Config::parse(
+            "[behavior]
+portals = false
+",
+        )
+        .unwrap();
+        assert!(!cfg.behavior.portals && cfg.behavior.dungeons && cfg.behavior.sailing);
+        let cfg = Config::parse(
+            "[behavior]
+dungeons = false
+",
+        )
+        .unwrap();
+        assert!(cfg.behavior.portals && !cfg.behavior.dungeons && cfg.behavior.sailing);
+        let cfg = Config::parse(
+            "[behavior]
+sailing = false
+",
+        )
+        .unwrap();
+        assert!(cfg.behavior.portals && cfg.behavior.dungeons && !cfg.behavior.sailing);
+        // they are switches, not weights, and a typo is not silently ignored
+        for bad in [
+            "[behavior]
+portals = 0.5
+",
+            "[behavior]
+dungeons = \"no\"
+",
+            "[behavior]
+sailing = 1
+",
+            "[behavior]
+sail = true
+",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -20,6 +20,9 @@ use smallvec::SmallVec;
 
 use super::goals::trade::Outcome;
 use super::goals::trade_run::Ledger;
+use super::place::Place;
+use super::travel::TravelState;
+use super::vehicle::VehicleState;
 use super::watch::classify;
 use super::watch::{Finding, Watch};
 
@@ -335,6 +338,9 @@ pub struct Reactions {
     pub teleport: Option<[f32; 3]>,
     /// `SCLoadInstance`: answer `CSInstanceLoaded`.
     pub load_instance: bool,
+    /// The `SCLoadInstance` moved the bot to another world ([`Place::on_load`]): the entity view
+    /// was dropped, and the bot task drops the combat target and loot job that belonged to it.
+    pub world_changed: bool,
     /// The bot was resurrected here.
     pub resurrected: Option<[f32; 3]>,
     /// The bot died.
@@ -398,6 +404,48 @@ pub struct BotState {
     /// The detectors that tell the team about server problems (packet trail, requests waiting for
     /// an answer, findings), see [`super::watch`]. One allocation per bot.
     pub watch: Box<Watch>,
+    /// Which world the bot is in (main world or an instance), kept by `SCProcessingInstance` and
+    /// `SCLoadInstance`.
+    pub place: Place,
+    /// What the bot knows about portals; gets the portal events (owned by the portals feature).
+    pub travel: TravelState,
+    /// What the bot knows about its boat; gets the slave events (owned by the sailing feature).
+    pub vehicle: VehicleState,
+}
+
+/// The module that follows an event besides the general bookkeeping of
+/// [`BotState::apply`]: the routing table of the travel features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Portal events, followed by [`TravelState::on_event`].
+    Travel,
+    /// Slave and ship events, followed by [`VehicleState::on_event`].
+    Vehicle,
+    /// Instance events, followed by [`Place`] (`SCProcessingInstance`, `SCLoadInstance`).
+    Place,
+    /// Everything else: only the general bookkeeping.
+    Other,
+}
+
+/// Where `ev` is routed. Listed variant by variant, so a new travel event has to be placed here.
+pub fn route(ev: &WorldEvent) -> Route {
+    match ev {
+        WorldEvent::PortalBook(_)
+        | WorldEvent::ReturnDistricts { .. }
+        | WorldEvent::PortalSaved(_)
+        | WorldEvent::PortalDeleted { .. }
+        | WorldEvent::PortalUsed { .. } => Route::Travel,
+        WorldEvent::SlaveCreated { .. }
+        | WorldEvent::MySlave(_)
+        | WorldEvent::SlaveBound { .. }
+        | WorldEvent::UnitAttached { .. }
+        | WorldEvent::UnitDetached { .. }
+        | WorldEvent::SlaveDespawned { .. }
+        | WorldEvent::SlaveRemoved { .. }
+        | WorldEvent::ShipMoved(_) => Route::Vehicle,
+        WorldEvent::ProcessingInstance { .. } | WorldEvent::LoadInstance { .. } => Route::Place,
+        _ => Route::Other,
+    }
 }
 
 impl BotState {
@@ -536,6 +584,11 @@ impl BotState {
     }
 
     fn apply_world(&mut self, ev: &WorldEvent) {
+        match route(ev) {
+            Route::Travel => return self.travel.on_event(ev),
+            Route::Vehicle => return self.vehicle.on_event(ev, self.me.obj),
+            Route::Place | Route::Other => {}
+        }
         match ev {
             WorldEvent::CharacterState(own) => {
                 let me = &mut self.me;
@@ -579,11 +632,22 @@ impl BotState {
                 self.me.pos = [pos.0, pos.1, pos.2];
                 self.reactions.teleport = Some(self.me.pos);
             }
-            WorldEvent::LoadInstance { pos, yaw, .. } => {
+            WorldEvent::LoadInstance {
+                instance_id,
+                zone_id,
+                pos,
+                yaw,
+                ..
+            } => {
                 self.me.pos = [pos.0, pos.1, pos.2];
                 self.me.yaw = *yaw;
                 self.reactions.load_instance = true;
+                if self.place.on_load(*instance_id, *zone_id, self.now_ms) {
+                    self.reactions.world_changed = true;
+                    self.clear_view();
+                }
             }
+            WorldEvent::ProcessingInstance { .. } => self.place.on_processing(self.now_ms),
             WorldEvent::UnitPoints { obj, hp, mp } => {
                 if *obj == self.me.obj && self.me.obj != 0 {
                     if *hp < self.me.hp {
@@ -789,6 +853,18 @@ impl BotState {
             // combat controller and the goals that watch them.
             _ => {}
         }
+    }
+
+    /// Drops the picture of the world the bot left: the server shows the new one afresh once the
+    /// load is answered, and nothing the old one held (units, doodads, who targets the bot, whom
+    /// it killed or could not reach) is valid in it. The combat target is the bot task's to drop
+    /// ([`Reactions::world_changed`]).
+    fn clear_view(&mut self) {
+        self.units = FxHashMap::default();
+        self.doodads = FxHashMap::default();
+        self.threats.clear();
+        self.kills.clear();
+        self.avoid = None;
     }
 
     fn apply_unit_state(&mut self, info: &UnitInfo) {
@@ -1499,6 +1575,220 @@ mod tests {
         assert_eq!(me.hp_pct(), 100, "hit points without a known maximum");
         // mana without a maximum stays 100: many builds have none
         assert_eq!(me.mp_pct(), 100);
+    }
+
+    fn travel_events() -> Vec<WorldEvent> {
+        use aa_proto::sc_travel::PortalEntry;
+        let entry = PortalEntry {
+            id: 4,
+            name: "Home".into(),
+            zone_id: 7,
+            off_x: 1.0,
+            off_y: 2.0,
+            z: 100.0,
+            z_rot: 0.0,
+        };
+        vec![
+            WorldEvent::PortalBook(Box::new([entry.clone()])),
+            WorldEvent::ReturnDistricts {
+                portals: Box::new([entry.clone()]),
+                bound: 4,
+            },
+            WorldEvent::PortalSaved(Box::new(entry)),
+            WorldEvent::PortalDeleted { kind: 0, id: 4 },
+            WorldEvent::PortalUsed { gate: 0x500 },
+        ]
+    }
+
+    fn vehicle_events() -> Vec<WorldEvent> {
+        use aa_proto::sc_travel::{MySlaveInfo, ShipMotion};
+        vec![
+            WorldEvent::SlaveCreated {
+                owner_obj: 0x400,
+                tl: 3,
+                slave_obj: 0x600,
+                hide_effect: false,
+                creator: "Aria".into(),
+            },
+            WorldEvent::MySlave(Box::new(MySlaveInfo {
+                obj: 0x600,
+                tl: 3,
+                name: "Boat".into(),
+                template: 9,
+                hp: 10,
+                max_hp: 10,
+                pos: (1.0, 2.0, 3.0),
+            })),
+            WorldEvent::SlaveBound {
+                master_id: 500,
+                slave_obj: 0x600,
+            },
+            WorldEvent::UnitAttached {
+                child: 0x400,
+                point: 1,
+                parent: 0x600,
+                reason: 6,
+            },
+            WorldEvent::UnitDetached {
+                obj: 0x400,
+                reason: 5,
+            },
+            WorldEvent::SlaveDespawned { obj: 0x600 },
+            WorldEvent::SlaveRemoved { obj: 0x400, tl: 3 },
+            WorldEvent::ShipMoved(Box::new(ShipMotion {
+                obj: 0x600,
+                time: 1,
+                pos: (1.0, 2.0, 3.0),
+                velocity: [0.0; 3],
+                speed: 0.0,
+                yaw: 0.0,
+                ang_vel: [0.0; 3],
+                steering: 0,
+                throttle: 0,
+                zone: 1,
+                stuck: false,
+            })),
+        ]
+    }
+
+    #[test]
+    fn travel_events_are_routed_to_their_features() {
+        for ev in travel_events() {
+            assert_eq!(route(&ev), Route::Travel, "{ev:?}");
+        }
+        for ev in vehicle_events() {
+            assert_eq!(route(&ev), Route::Vehicle, "{ev:?}");
+        }
+        for ev in [
+            WorldEvent::ProcessingInstance { zone_id: 3 },
+            load_instance(1, 2, (0.0, 0.0, 0.0)),
+        ] {
+            assert_eq!(route(&ev), Route::Place, "{ev:?}");
+        }
+        // a ship's position event is the ordinary mover event, its helm is the vehicle's
+        let moved = WorldEvent::UnitMoved {
+            obj: 0x600,
+            kind: 3,
+            pos: (0.0, 0.0, 0.0),
+            yaw: 0,
+            stance: 0,
+        };
+        assert_eq!(route(&moved), Route::Other);
+        assert_eq!(route(&WorldEvent::LeaveWorldCanceled), Route::Other);
+    }
+
+    #[test]
+    fn forwarded_events_change_nothing_else_yet() {
+        let mut s = in_world();
+        s.apply(&world(WorldEvent::UnitState(Box::new(unit_info(
+            0x401,
+            unit_type::NPC,
+            3475,
+        )))));
+        let (pos, units, reactions) = (s.me.pos, s.units.len(), format!("{:?}", s.reactions));
+        for ev in travel_events().into_iter().chain(vehicle_events()) {
+            s.apply(&world(ev));
+        }
+        assert_eq!((s.me.pos, s.units.len()), (pos, units));
+        assert_eq!(format!("{:?}", s.reactions), reactions);
+        assert!(!s.place.in_instance() && !s.place.loading());
+    }
+
+    fn load_instance(instance_id: u32, zone_id: u32, pos: (f32, f32, f32)) -> WorldEvent {
+        WorldEvent::LoadInstance {
+            instance_id,
+            zone_id,
+            pos,
+            yaw: 1.5,
+            ang_x: 0.0,
+            ang_y: 0.0,
+        }
+    }
+
+    /// A state with a monster in view, a doodad, a threat, a kill and an unreachable monster.
+    fn busy_state() -> BotState {
+        let mut s = in_world();
+        s.apply(&world(WorldEvent::UnitState(Box::new(unit_info(
+            0x401,
+            unit_type::NPC,
+            3475,
+        )))));
+        s.apply(&world(WorldEvent::DoodadsCreated(
+            [DoodadInfo {
+                obj: 0x800,
+                template: 7,
+                pos: (1.0, 2.0, 3.0),
+                owner_obj: 0,
+                parent_obj: 0,
+                phase: 1,
+                owner_id: 0,
+                quest_glow: 0,
+                has_loot: false,
+            }]
+            .into_iter()
+            .collect(),
+        )));
+        s.threats.push((0x401, 5));
+        s.kills.push((0x402, 5));
+        s.avoid_mut().ignore_obj(0x401, 100_000);
+        assert!(!s.units.is_empty() && !s.doodads.is_empty() && s.avoid.is_some());
+        s
+    }
+
+    #[test]
+    fn a_dungeon_entry_moves_the_place_and_drops_the_old_view() {
+        let mut s = busy_state();
+        s.now_ms = 7_000;
+        s.apply(&world(WorldEvent::ProcessingInstance { zone_id: 301 }));
+        assert!(s.place.loading() && !s.place.in_instance());
+        assert_eq!(s.place.loading_since_ms(), Some(7_000));
+        // the old world is still the picture until the load arrives
+        assert!(!s.units.is_empty());
+
+        s.now_ms = 9_000;
+        s.apply(&world(load_instance(12, 301, (50.0, 60.0, 70.0))));
+        assert!(s.place.in_instance() && s.place.loading());
+        assert_eq!((s.place.instance_id(), s.place.zone_key()), (12, 301));
+        assert_eq!(s.me.pos, [50.0, 60.0, 70.0]);
+        assert!(s.reactions.load_instance && s.reactions.world_changed);
+        assert!(s.units.is_empty() && s.doodads.is_empty());
+        assert!(s.threats.is_empty() && s.kills.is_empty() && s.avoid.is_none());
+        // what the server shows afterwards is the new world
+        s.apply(&world(WorldEvent::UnitState(Box::new(unit_info(
+            0x700,
+            unit_type::NPC,
+            9,
+        )))));
+        assert_eq!(s.units.len(), 1);
+        // the bot task answers the load and says so
+        s.place.loaded();
+        assert!(s.place.in_instance() && !s.place.loading());
+
+        // and back out
+        s.reactions = Reactions::default();
+        s.apply(&world(load_instance(0, 5, (1.0, 2.0, 3.0))));
+        assert!(!s.place.in_instance() && s.reactions.world_changed);
+        assert!(s.units.is_empty());
+    }
+
+    #[test]
+    fn a_load_of_the_world_the_bot_is_in_keeps_its_view() {
+        let mut s = busy_state();
+        // a teleport the server announces as a load, inside the main world
+        s.apply(&world(load_instance(0, 5, (1.0, 2.0, 3.0))));
+        assert!(s.reactions.load_instance, "the load is still answered");
+        assert!(!s.reactions.world_changed);
+        assert!(!s.units.is_empty() && !s.doodads.is_empty() && s.avoid.is_some());
+        assert!(!s.place.in_instance() && s.place.loading());
+    }
+
+    #[test]
+    fn a_new_session_starts_in_the_main_world() {
+        let mut s = busy_state();
+        s.apply(&world(load_instance(12, 301, (50.0, 60.0, 70.0))));
+        assert!(s.place.in_instance());
+        s.reset();
+        assert!(!s.place.in_instance() && !s.place.loading());
     }
 
     #[test]

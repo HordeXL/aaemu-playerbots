@@ -161,6 +161,25 @@ Nothing runs per tick except a few comparisons; an episode is reported once.
 The web crate only knows `IssueSummary` / `IssueDetail` / `IssueAction` and three defaulted `BotHub`
 methods. Operator documentation: the README section "Server issue reports".
 
+## Travel hooks (navigation motion, portals, dungeons, sailing)
+
+The four travel features plug into the bot through fixed hooks, so each one edits only its own
+files. Until a feature fills its hook it does nothing and the bots behave as before.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `Motion::on_path_ready(ticket, PathResult)`, fed by `BotCmd::PathReady`; `BotDetail::path` (hub slot `path`) | `bot/motion.rs`, `bot/cmd.rs`, `hub.rs`, pb-web `types.rs` | navigation motion |
+| `TravelState::on_event` (`BotState::travel`): the portal events | `bot/travel/` | portals |
+| `Dungeon` goal, `goals::dungeon::{base_weight, score}`, `PartyOrder` / `BotCmd::Party` | `bot/goals/dungeon.rs`, `bot/party.rs` | dungeons |
+| `Sail` goal, `goals::sail::{base_weight, score}`, `VehicleState::on_event` (`BotState::vehicle`): the slave and ship events | `bot/goals/sail.rs`, `bot/vehicle/` | sailing |
+| `Place` (`BotState::place`): main world or instance world, `loading` between `SCProcessingInstance` / `SCLoadInstance` and the bot's `CSInstanceLoaded`; a change of world drops the entity view and the combat target; inside an instance motion gets no terrain heights (`Place::ground`) | `bot/place.rs` | shared (done) |
+
+`[behavior] portals`, `dungeons` and `sailing` (default on) are read from `ctx.cfg.behavior` by the
+features. `GoalKind::Dungeon` and `GoalKind::Sail` are scored only by their own `score` functions
+(0 while they are stubs, so no bot picks them); forcing one from the web UI makes it fail with
+`NotImplemented`, which switches it off for that bot. A ship's `SCOneUnitMovement` is decoded twice
+(`Decoded::Ship`): the ordinary position event and `WorldEvent::ShipMoved` (heading, speed, helm).
+
 ## Data directory
 
 `playerbots bake` writes (see `docs/DATA-FORMATS.md`):

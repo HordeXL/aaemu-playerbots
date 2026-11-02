@@ -192,7 +192,7 @@ impl Ctx<'_> {
             0.0
         };
         let mut env = MotionEnv {
-            ground: self.world,
+            ground: self.state.place.ground(self.world),
             now_ms: self.now_ms,
             out: &mut *self.out,
             rng: &mut *self.rng,
