@@ -22,8 +22,8 @@ and an operator web UI, which the original does not have.
 | Crate | Path | Role |
 | --- | --- | --- |
 | `aa-proto` | `crates/proto` | Wire protocol: framing, `PacketStream`, position codec, opcode tables, login client, game connection, CS packet builders, SC packet parsers → `ServerEvent`. No game logic. |
-| `aa-world` | `crates/world` | Static world knowledge, loaded once and shared read-only (`Arc<World>`): compact.sqlite3 subset (NPCs, factions, quests and their start requirements, skills with mana by level, doodad and item use skills, crafts with their requirements, specialty buyers and pack prices, housing with garden radii), server spawn files, spatial index, terrain heights (mmap of the baked grid), baked extras (housing areas, quest spheres, zones, map calibration). |
-| `aa-bake` | `crates/bake` | One-off extraction from the 1.2 client `game_pak` into the data dir: height grid, world map PNG + calibration, housing area polygons, quest sign spheres, zone sector grid. |
+| `aa-world` | `crates/world` | Static world knowledge, loaded once and shared read-only (`Arc<World>`): compact.sqlite3 subset (NPCs, factions, quests and their start requirements, skills with mana by level, doodad and item use skills, crafts with their requirements, specialty buyers and pack prices, housing with garden radii), server spawn files, spatial index, terrain heights (mmap of the baked grid), the navigation meshes (`nav`: locate, weighted A* + funnel, component tables; the main world's and the lazily opened instance worlds'), baked extras (housing areas, quest spheres, zones, map calibration). |
+| `aa-bake` | `crates/bake` | One-off extraction from the 1.2 client `game_pak` into the data dir: height grid, world map PNG + calibration, housing area polygons, quest sign spheres, zone sector grid, navigation meshes (the client's `.bai` navmesh as one memory-mappable file per world). |
 | `pb-web` | `crates/web` | Operator web UI (axum): JSON API + an embedded single-page map UI. Knows nothing about bots except the `BotHub` trait and snapshot types it defines. |
 | `pb-llm` | `crates/llm` | Optional OpenAI-compatible chat client with rate limit, concurrency cap and daily token budget. |
 | `playerbots` | `crates/playerbots` | The binary: config, roster, bot runtime (connection lifecycle, world view, movement, combat), goals (quest, grind, duel, trade, trade run, housing, rest), coordinator, web hub, CLI (`run`, `bake`, `grant-gm-sql`). |
@@ -153,6 +153,8 @@ data/
   housing_areas.json       # polygons per housing area id
   quest_spheres.json       # quest sign spheres (quest id, component id, pos, radius)
   zones_main_world.bin     # zone key per 64 m sector (optional)
+  nav_main_world.bin       # navigation mesh for path finding (mmap'd), one more per instance world
+  nav_<instance>.bin
 ```
 
 Runtime also reads the server's `compact.sqlite3` (read-only) and `app/Data/Worlds/*/` spawn

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p aa-bake --release --example bake -- --pak D:\AA1.2\game_pak --out D:\aaemu-playerbots-data \
-//!     --world main_world --step 4 --compact <server>\app\Data\compact.sqlite3 [--only heights,zones,housing,spheres,map]
+//!     --world main_world --step 4 --compact <server>\app\Data\compact.sqlite3 [--only heights,zones,housing,spheres,map,nav,nav_instances]
 //! ```
 
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
             "--compact" => compact = Some(PathBuf::from(value("--compact")?)),
             "--only" => only = Some(value("--only")?),
             other => anyhow::bail!(
-                "unknown argument {other}; usage: --pak <game_pak> --out <dir> [--world main_world] [--step 4] [--compact <compact.sqlite3>] [--only heights,zones,housing,spheres,map]"
+                "unknown argument {other}; usage: --pak <game_pak> --out <dir> [--world main_world] [--step 4] [--compact <compact.sqlite3>] [--only heights,zones,housing,spheres,map,nav,nav_instances]"
             ),
         }
     }
@@ -51,6 +51,8 @@ fn main() -> anyhow::Result<()> {
                 "housing" => steps.housing = true,
                 "spheres" => steps.spheres = true,
                 "map" => steps.map = true,
+                "nav" => steps.nav = true,
+                "nav_instances" => steps.nav_instances = true,
                 other => anyhow::bail!("unknown step {other}"),
             }
         }
