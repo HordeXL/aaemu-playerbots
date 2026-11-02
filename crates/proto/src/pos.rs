@@ -50,7 +50,6 @@ pub fn encode_position(x: f32, y: f32, z: f32) -> [u8; 9] {
     ]
 }
 
-
 /// Fixed point (`<< 32`, 1/4096 units) to float, as used by `fx64` coordinates.
 pub fn convert_long_to_coord(v: i64) -> f32 {
     long_to_coord(v)

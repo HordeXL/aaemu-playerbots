@@ -14,7 +14,7 @@ World coordinates: metres, x east, y north, z up; `main_world` spans 35×38 cell
 | 16 | f32 | `origin_x` — world x of sample column 0 |
 | 20 | f32 | `origin_y` — world y of sample row 0 |
 | 24 | f32 | `step` — metres between samples (default 4.0; the server's native grid is 2.0) |
-| 28 | f32 | `scale` — metres per raw unit (1/64, same quantisation as the server) |
+| 28 | f32 | `scale` — metres per raw unit (1/32, so heights up to 2047.97 m fit; the server itself uses 1/64) |
 | 32 | f32 | `offset` — metres added after scaling (0.0) |
 | 36 | u32 | `flags` — bit 0: cells without terrain hold raw 0 |
 | 40 | `[u8; 24]` | reserved, zero |

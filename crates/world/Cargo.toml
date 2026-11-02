@@ -14,3 +14,6 @@ anyhow.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

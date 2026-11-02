@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Playerbots</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <h1>Playerbots</h1>
+    <span id="conn" class="conn" title="Connection to the bot process"><i></i><span id="conn-text">connecting</span></span>
+    <span class="spacer"></span>
+    <button id="btn-panel" type="button" aria-controls="sidebar" aria-expanded="true" title="Show or hide the side panel">Panel</button>
+  </header>
+
+  <main id="mapwrap">
+    <canvas id="map" tabindex="0" aria-label="World map of all bots"></canvas>
+    <div id="tools" role="toolbar" aria-label="Map tools">
+      <button id="z-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
+      <button id="z-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>
+      <button id="z-fit" type="button" aria-label="Fit all bots" title="Fit all bots (F)">Fit</button>
+      <label title="Keep the selected bot in the centre"><input id="o-follow" type="checkbox"> Follow</label>
+      <label title="Show houses, duel flags and trade outlets"><input id="o-markers" type="checkbox" checked> Markers</label>
+      <label title="Draw lines between duel and trade partners"><input id="o-lines" type="checkbox" checked> Pairs</label>
+      <label title="Show bot names when zoomed in"><input id="o-names" type="checkbox" checked> Names</label>
+    </div>
+    <div id="legend" aria-label="Legend"></div>
+    <div id="coords" aria-hidden="true" hidden></div>
+    <div id="tip" role="tooltip" hidden><b id="tip-name"></b><span id="tip-sub"></span><span id="tip-goal"></span></div>
+    <div id="empty" hidden>No bots reported yet.</div>
+  </main>
+
+  <aside id="sidebar" aria-label="Bots">
+    <section id="stats" aria-label="Statistics">
+      <div class="tile"><span class="k">Online</span><b id="st-online">-</b></div>
+      <div class="tile"><span class="k">Memory</span><b id="st-mem">-</b></div>
+      <div class="tile"><span class="k">Packets/s</span><b id="st-pkt">-</b></div>
+      <div class="tile"><span class="k">Uptime</span><b id="st-up">-</b></div>
+      <div class="tile wide" id="st-llm-tile" hidden><span class="k">LLM</span><b id="st-llm">-</b></div>
+    </section>
+
+    <section id="filters">
+      <div id="chips" role="group" aria-label="Filter by activity"></div>
+      <input id="search" type="search" placeholder="Search name, class, zone, goal&hellip;" autocomplete="off" spellcheck="false" aria-label="Search bots">
+    </section>
+
+    <section id="listbox">
+      <div id="list-head" role="row">
+        <button type="button" data-sort="name">Name</button>
+        <button type="button" data-sort="level" class="num">Lv</button>
+        <button type="button" data-sort="class">Class</button>
+        <button type="button" data-sort="activity">Activity</button>
+        <button type="button" data-sort="zone">Zone</button>
+      </div>
+      <div id="list" role="listbox" aria-label="Bot list" tabindex="0"><div id="list-spacer"></div></div>
+      <div id="list-foot"></div>
+    </section>
+
+    <section id="detail" hidden aria-label="Selected bot">
+      <div class="d-head">
+        <div>
+          <h2 id="d-name"></h2>
+          <div id="d-sub" class="muted"></div>
+        </div>
+        <button id="d-close" type="button" aria-label="Deselect bot" title="Deselect (Esc)">&times;</button>
+      </div>
+      <div class="hp" title="Health"><div class="hp-bar"><div id="d-hp"></div></div><span id="d-hp-text"></span></div>
+      <dl id="d-fields" class="kv"></dl>
+
+      <h3>Commands</h3>
+      <div class="cmd-row">
+        <button id="c-pause" type="button">Pause</button>
+        <select id="c-goal" aria-label="Goal"></select>
+        <button id="c-goal-set" type="button">Set goal</button>
+      </div>
+      <div class="cmd-row">
+        <select id="c-duel" aria-label="Duel partner"></select>
+        <button id="c-duel-go" type="button">Duel</button>
+      </div>
+      <div class="cmd-row">
+        <select id="c-trade" aria-label="Trade partner"></select>
+        <button id="c-trade-go" type="button">Trade</button>
+      </div>
+      <form id="c-say-form" class="cmd-row" autocomplete="off">
+        <input id="c-say" type="text" maxlength="200" placeholder="Say in local chat&hellip;" aria-label="Chat line">
+        <button type="submit">Say</button>
+      </form>
+      <div id="c-status" class="status" role="status"></div>
+
+      <h3>Quests</h3>
+      <ul id="d-quests" class="plain"></ul>
+      <div id="d-extra-wrap" hidden>
+        <h3>Details</h3>
+        <dl id="d-extra" class="kv"></dl>
+      </div>
+      <h3>Log <span class="muted">(newest first)</span></h3>
+      <ol id="d-log" class="log"></ol>
+    </section>
+
+    <details id="global">
+      <summary>Global controls</summary>
+      <div class="cmd-row">
+        <input id="g-count" type="number" min="1" max="1000" value="5" aria-label="Number of bots">
+        <button id="g-spawn" type="button">Spawn</button>
+        <button id="g-despawn" type="button">Despawn</button>
+      </div>
+      <div class="cmd-row">
+        <button id="g-pause" type="button">Pause all</button>
+        <button id="g-resume" type="button">Resume all</button>
+      </div>
+      <form class="cmd-row" id="token-row" autocomplete="off">
+        <input id="g-token" type="password" placeholder="API token (if the server needs one)" autocomplete="off" aria-label="API token">
+      </form>
+      <div id="g-status" class="status" role="status"></div>
+    </details>
+  </aside>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
