@@ -1,0 +1,19 @@
+[package]
+name = "pb-web"
+description = "Operator web UI for aaemu-playerbots: JSON API and an embedded live world map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+fastrand.workspace = true
+parking_lot.workspace = true

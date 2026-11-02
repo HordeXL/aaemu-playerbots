@@ -1,0 +1,18 @@
+[package]
+name = "aa-proto"
+description = "ArcheAge 1.2 (r208022) client-side wire protocol for AAEmu: framing, packet codec, login and game connections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+miniz_oxide.workspace = true
+sha2.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+smallvec.workspace = true

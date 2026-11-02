@@ -1,0 +1,10 @@
+/target/
+# machine-local cargo settings (target-dir on another drive, jobs)
+/.cargo/config.toml
+# baked world data (heights, map, polygons) - produced by `playerbots bake`
+/data/
+# local configuration, roster and secrets
+/playerbots.toml
+/roster.json
+*.local.toml
+.env

@@ -1,0 +1,16 @@
+[package]
+name = "pb-llm"
+description = "Optional OpenAI-compatible LLM client (e.g. DeepSeek) with rate limits and a token budget"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true

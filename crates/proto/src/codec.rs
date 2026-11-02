@@ -1,0 +1,49 @@
+// Vendored from AAEmu-1.2-Rust rust/crates/aaemu-commons/src/net.rs (GPL-3.0-or-later).
+//! TCP framing shared by every AAEmu protocol (replaces NetCoreServer + the hand-rolled
+//! reassembly in each `*ProtocolHandler.OnReceive`).
+//!
+//! Every frame on the wire is `[u16 LE length][payload]`, where `length` counts the payload only.
+
+use bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
+
+/// Splits a byte stream into length-prefixed frames. Yields the payload with the length removed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FrameCodec;
+
+impl Decoder for FrameCodec {
+    type Item = Vec<u8>;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 2 {
+            return Ok(None);
+        }
+        let len = usize::from(u16::from_le_bytes([src[0], src[1]]));
+        if src.len() < 2 + len {
+            src.reserve(2 + len - src.len());
+            return Ok(None);
+        }
+        src.advance(2);
+        Ok(Some(src.split_to(len).to_vec()))
+    }
+}
+
+impl<T: AsRef<[u8]>> Encoder<T> for FrameCodec {
+    type Error = std::io::Error;
+
+    /// Prepends the `u16` length to `payload` (a `Vec<u8>`, or a shared `Bytes` frame).
+    fn encode(&mut self, payload: T, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let payload = payload.as_ref();
+        let len = u16::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "frame exceeds 65535 bytes",
+            )
+        })?;
+        dst.reserve(2 + payload.len());
+        dst.put_u16_le(len);
+        dst.extend_from_slice(payload);
+        Ok(())
+    }
+}

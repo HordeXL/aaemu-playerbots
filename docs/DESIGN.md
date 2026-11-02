@@ -1,0 +1,116 @@
+# aaemu-playerbots — design
+
+Player bots for the AAEmu Rust server (ArcheAge 1.2, r208022). Every bot is a **headless network
+client**: it logs in through the login server, creates/selects a character and plays over the
+normal client protocol. The server needs no changes; to it a bot is an ordinary player.
+
+The behaviour is a re-implementation of the logic of
+[NulightJens/ArcheAge-PlayerBots](https://github.com/NulightJens/ArcheAge-PlayerBots) (a C#
+server-side mod, GPL-3.0-or-later) for a client-side bot, plus housing, trade runs, player trade
+and an operator web UI, which the original does not have.
+
+## Goals
+
+- Hundreds of bots in one process, small memory per bot (target < 256 KiB of bot-side state).
+- Bots quest, grind, duel each other, trade with each other, run trade packs and own houses.
+- A web UI shows every bot on the world map with its activity, and accepts commands.
+- An optional cheap LLM (any OpenAI-compatible endpoint, e.g. DeepSeek) gives bots chat replies
+  and occasional high-level goal choices. Everything works without it.
+
+## Crates
+
+| Crate | Path | Role |
+| --- | --- | --- |
+| `aa-proto` | `crates/proto` | Wire protocol: framing, `PacketStream`, position codec, opcode tables, login client, game connection, CS packet builders, SC packet parsers → `ServerEvent`. No game logic. |
+| `aa-world` | `crates/world` | Static world knowledge, loaded once and shared read-only (`Arc<World>`): compact.sqlite3 subset (NPCs, factions, quests, skills, crafts, specialty, housing), server spawn files, spatial index, terrain heights (mmap of the baked grid), baked extras (housing areas, quest spheres, zones, map calibration). |
+| `aa-bake` | `crates/bake` | One-off extraction from the 1.2 client `game_pak` into the data dir: height grid, world map PNG + calibration, housing area polygons, quest sign spheres, zone sector grid. |
+| `pb-web` | `crates/web` | Operator web UI (axum): JSON API + an embedded single-page map UI. Knows nothing about bots except the `BotHub` trait and snapshot types it defines. |
+| `pb-llm` | `crates/llm` | Optional OpenAI-compatible chat client with rate limit, concurrency cap and daily token budget. |
+| `playerbots` | `crates/playerbots` | The binary: config, roster, bot runtime (connection lifecycle, world view, movement, combat), goals (quest, grind, duel, trade, trade run, housing, rest), coordinator, web hub, CLI (`run`, `bake`, `grant-gm-sql`). |
+
+Dependency direction: `playerbots → {aa-proto, aa-world, aa-bake, pb-web, pb-llm}`; `aa-bake →
+aa-world` (only for shared baked file types); nothing else depends on anything internal.
+
+## Runtime model
+
+- One tokio multi-thread runtime (2–4 workers). **One task per bot** owns its TCP connection and
+  all its mutable state; it `select!`s over (a) the next server packet, (b) its brain tick timer,
+  (c) its command channel. No per-bot reader task, no locks on the hot path.
+- `Arc<World>` is shared read-only by all bots.
+- Each bot publishes a small `BotSnapshot` (≈100 bytes) into the hub about once per second; the
+  web UI only ever reads snapshots.
+- Bots that need a partner (duel, trade, party) ask the **coordinator** (one task) over a channel;
+  it pairs bots and sends both a command. Web UI commands go through the same per-bot command
+  channels.
+- Ticks are adaptive with jitter (combat 250 ms, moving 250 ms, idle 1–3 s, far from any real
+  player and idle: 5 s), which avoids the C# version's 10-phase thundering herd and its serial
+  loop over all bots.
+- Bounded everything: entity view (only what the server shows), event log ring (32 lines),
+  channels (small capacities).
+
+## Protocol facts (verified against the server source)
+
+- Frames: `[u16 LE len][payload]`. C→S level 1: `DD 01 00 <count> <u16 op> body`; level 2 (proxy):
+  `DD 02 <u16 op> body`. No encryption, no checksum. S→C level 4 `DD 04 <u16 n> <deflate>` batches.
+- Keep-alive: proxy `PingPacket` at least every 30 s (bots: every 5 s).
+- Login: Trion ticket (XML, SHA-256 hex password), `AutoAccount` creates unknown accounts.
+- Movement is not validated by the server (no speed clamp or collision check; > 25 m/s is only
+  audit-logged). Bots must still move plausibly: run speed ≈ 5.4 m/s, Z from the terrain grid.
+- GM commands are chat lines starting with `/`; the effective access level is
+  max(account, character); most useful commands need 100. Bots use them only when
+  `gm_bootstrap = true` (see "GM bootstrap").
+
+## Goals and behaviour
+
+Each bot has a **persona**: an archetype (class + rotation, from the original's
+`BotArchetypes.json`/`BotRotations`) and temperament weights (quester, duelist, trader, merchant,
+homebody). A utility scorer picks the next goal when the current one finishes or fails; the
+optional LLM director may choose among the same eligible goals instead.
+
+| Goal | Summary |
+| --- | --- |
+| Quest | Pick an eligible quest (story first, then nearest side quest), walk to the giver, accept, do the objectives (talk, kill, gather from loot, use item, interact with doodad, reach sphere), turn in. Failures back off; repeated failures quarantine the quest (typed reasons, not strings). |
+| Grind | Kill level-appropriate hostile NPCs near the bot (fallback when no quest is eligible). |
+| Duel | Coordinator pairs two idle bots; they meet, challenge/accept, fight with their PvP rotation, end on the server's `SCDuelEnded`. |
+| Trade | Coordinator pairs two bots; they meet, open a trade window, put up an item and/or money, lock, confirm. |
+| Trade run | Walk to a specialty workbench, craft a trade pack (`CSExecuteCraft`), carry it to a specialty NPC that buys it, sell (`CSSellBackpackGoods`), collect the payment mail. |
+| Housing | Get a design (and tax certificates), walk to a free spot inside a housing area, quote (`CSConstructHouseTax`) and place (`CSCreateHouse`); later "go home" when resting. |
+| Rest | Stand still out of combat until HP/MP recover. |
+| Social | Reply to whispers/local chat from real players (LLM if enabled, canned lines otherwise). |
+
+### GM bootstrap
+
+Trade runs and housing need materials, labor, tax certificates or gold that a fresh level-1
+character does not have. With `gm_bootstrap = true` and access level 100 on the bot accounts, bots
+give themselves exactly what the goal needs (`/item add self …`, `/labor …`, `/gold add self …`)
+and may use `/move` for long travel. Without it those goals are skipped with a visible reason.
+`playerbots grant-gm-sql` prints the SQL that grants access level 100 to the bot accounts.
+
+## Improvements over the original (from the audit)
+
+- Immutable, shared compiled rotations (`Arc`) with a tiny per-bot state, instead of per-bot
+  compiled object graphs with embedded mutable state.
+- No per-tick allocation in the brain; no world scans (the bot's entity view is maintained
+  incrementally from spawn/despawn/move packets; static lookups use a grid index).
+- Scheduler with per-bot jittered deadlines instead of one serial loop with 10 phases.
+- Typed failure reasons instead of string matching for quest quarantine.
+- Buff checks keyed by buff ids actually observed (fixes `buffMissing` comparing a buff id with
+  a skill id), zero-guarded HP percentages.
+- Optional LLM, rate-limited and budgeted, never on the tick path.
+
+## Data directory
+
+`playerbots bake` writes (see `docs/DATA-FORMATS.md`):
+
+```
+data/
+  heights_main_world.bin   # u16 grid, header + samples, mmap'd at runtime
+  map_main_world.png       # painted world map (or relief fallback)
+  map_main_world.json      # calibration: world rect covered by the image
+  housing_areas.json       # polygons per housing area id
+  quest_spheres.json       # quest sign spheres (quest id, component id, pos, radius)
+  zones_main_world.bin     # zone key per 64 m sector (optional)
+```
+
+Runtime also reads the server's `compact.sqlite3` (read-only) and `app/Data/Worlds/*/` spawn
+files, paths given in `playerbots.toml`.

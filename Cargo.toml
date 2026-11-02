@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/world",
+    "crates/bake",
+    "crates/web",
+    "crates/llm",
+    "crates/playerbots",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/AAEmu/aaemu-playerbots"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+aa-proto = { path = "crates/proto" }
+aa-world = { path = "crates/world" }
+aa-bake = { path = "crates/bake" }
+pb-web = { path = "crates/web" }
+pb-llm = { path = "crates/llm" }
+
+# async / net
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+memmap2 = "0.9"
+miniz_oxide = "0.8"
+png = "0.17"
+roxmltree = "0.20"
+aes = "0.8"
+sha2 = "0.10"
+
+# util
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+smallvec = { version = "1", features = ["union"] }
+rustc-hash = "2"
+fastrand = "2"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

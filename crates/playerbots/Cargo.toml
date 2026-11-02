@@ -1,0 +1,33 @@
+[package]
+name = "playerbots"
+description = "Headless ArcheAge 1.2 player bots for the AAEmu Rust server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "playerbots"
+path = "src/main.rs"
+
+[dependencies]
+aa-proto.workspace = true
+aa-world.workspace = true
+aa-bake.workspace = true
+pb-web.workspace = true
+pb-llm.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+fastrand.workspace = true
+sysinfo.workspace = true
