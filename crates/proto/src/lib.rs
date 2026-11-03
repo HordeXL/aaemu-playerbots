@@ -19,6 +19,7 @@
 //!   `cs::ship_request`, and the skill casts with a skill object
 //!   (`cs::record_portal`, `cs::rename_portal`, `cs::open_portal`, `cs::start_skill_*_with`).
 
+pub mod auction;
 pub mod codec;
 pub mod cs;
 pub mod game;

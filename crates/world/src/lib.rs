@@ -6,6 +6,7 @@
 //! bot-friendly steps, skills, crafts and trade-pack buyers, housing designs and areas, zone
 //! names and terrain heights. Wrap it in an `Arc` and hand it to every bot.
 
+pub mod auctioneers;
 pub mod baked;
 pub mod nav;
 pub mod terrain;
@@ -31,6 +32,7 @@ pub mod uses;
 pub mod water;
 mod world;
 
+pub use auctioneers::{Auctioneer, Auctioneers};
 pub use chars::CharRow;
 pub use doodad::{DoodadFlags, DoodadTemplate};
 pub use economy::Craft;
