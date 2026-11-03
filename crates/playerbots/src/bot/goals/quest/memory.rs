@@ -195,6 +195,15 @@ impl Memory {
             .is_none_or(|e| now_ms >= e.until_ms)
     }
 
+    /// How long until a quest that is merely backing off (not quarantined) may be tried again,
+    /// `None` when it may be tried now or is quarantined.
+    pub fn retry_in(&self, quest: u32, now_ms: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|e| e.quest == quest && !e.quarantined && now_ms < e.until_ms)
+            .map(|e| e.until_ms - now_ms)
+    }
+
     /// Whether the quest is quarantined (not merely backing off) at `now_ms`.
     pub fn quarantined(&self, quest: u32, now_ms: u64) -> bool {
         self.entries
@@ -301,6 +310,26 @@ mod tests {
         assert_eq!(m.last_failure(5), Some(Failure::Unsupported("craft")));
         assert!(Failure::Unsupported("x").permanent());
         assert!(!Failure::NoProgress.permanent());
+    }
+
+    #[test]
+    fn a_backing_off_quest_says_when_it_may_be_tried_again() {
+        let mut m = Memory::default();
+        assert_eq!(m.retry_in(7, 0), None);
+        m.fail(7, Failure::NoProgress, false, 1_000);
+        assert_eq!(m.retry_in(7, 11_000), Some(BACKOFF_MS - 10_000));
+        assert_eq!(m.retry_in(7, 1_000 + BACKOFF_MS), None);
+        // a quarantined quest is out, not about to come back
+        for _ in 0..FAILS_TO_QUARANTINE {
+            m.fail(8, Failure::NoProgress, false, 0);
+        }
+        assert!(m.quarantined(8, 1));
+        assert_eq!(m.retry_in(8, 1), None);
+        // a story quest rests instead
+        for _ in 0..FAILS_TO_QUARANTINE {
+            m.fail(9, Failure::NoProgress, true, 0);
+        }
+        assert_eq!(m.retry_in(9, 1), Some(STORY_COOLDOWN_MS - 1));
     }
 
     #[test]

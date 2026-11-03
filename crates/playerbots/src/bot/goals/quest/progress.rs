@@ -55,6 +55,9 @@ pub const NO_DEST_MS: u64 = 120_000;
 pub const SETTLE_MS: u64 = 600_000;
 /// A scan this soon after arriving that finds nothing means the destination was empty.
 pub const BARREN_MS: u64 = 90_000;
+/// A quest in the journal that may be tried again within this long keeps the bot where it is: it
+/// is only resting, not gone.
+pub const RETRY_WAIT_MS: u64 = 120_000;
 /// Deaths during one trip after which it is given up.
 pub const MAX_DEATHS: u8 = 2;
 /// Hostile aggressive monsters this many levels above the bot make a destination risky.

@@ -605,6 +605,8 @@ impl Inner {
     fn pick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
         if let Some((quest, mode)) = self.best_active(ctx) {
+            // (work in the journal is not an empty scan)
+            prog(ctx.state).fruitful();
             self.begin(ctx, quest, mode, None);
             return GoalStatus::Running;
         }
@@ -625,6 +627,12 @@ impl Inner {
                 // Only quests far below the bot's level are near: a place with better ones is
                 // worth the walk, else they are better than nothing.
                 prog(ctx.state).fruitful();
+                if self.retry_soon(ctx) {
+                    // a quest in the journal comes back soon: neither a trip nor a trivial quest,
+                    // the brain fills the time
+                    mem(ctx.state).next_scan_ms = now + SCAN_GAP_MS;
+                    return GoalStatus::Failed(FailReason::NoTarget);
+                }
                 if !self.start_trip(ctx) {
                     self.accept_candidate(ctx, c);
                 }
@@ -669,13 +677,31 @@ impl Inner {
             );
         }
         mem(ctx.state).next_scan_ms = now + SCAN_GAP_MS;
-        if empty >= progress::EMPTY_SCANS && self.start_trip(ctx) {
-            return GoalStatus::Running;
-        }
         if empty < progress::EMPTY_SCANS {
             return GoalStatus::Running;
         }
+        if !self.retry_soon(ctx) && self.start_trip(ctx) {
+            return GoalStatus::Running;
+        }
         GoalStatus::Failed(FailReason::NoTarget)
+    }
+
+    /// Whether a quest in the journal is only resting after a failure and may be tried again
+    /// within [`progress::RETRY_WAIT_MS`]: the bot stays near it instead of going on a trip.
+    fn retry_soon(&self, ctx: &Ctx<'_>) -> bool {
+        let now = ctx.now_ms;
+        let Some(m) = ctx.state.quest_mem.as_ref() else {
+            return false;
+        };
+        ctx.state
+            .quests
+            .active
+            .iter()
+            .filter(|row| row.status != quest_status::FAILED)
+            .any(|row| {
+                m.retry_in(row.template, now)
+                    .is_some_and(|t| t <= progress::RETRY_WAIT_MS)
+            })
     }
 
     // ---- trips --------------------------------------------------------------------------
