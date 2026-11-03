@@ -116,6 +116,40 @@ fn a_bigger_stack_wins_the_tie_by_id() {
 }
 
 #[test]
+fn a_bot_that_cannot_pay_the_fees_does_not_go() {
+    // 20 ore at 40 / 20: asked halfway (30 each) = 600 copper, 4 % for 48 hours = 24 copper
+    let bag = bag_of(&[(0, item(10, ORE, 20)), (1, item(12, 99, 5))]);
+    let f = |t: u32| match t {
+        ORE => Some(facts(40, 20)),
+        99 => Some(facts(500, 300)),
+        _ => None,
+    };
+    let both = pick_stacks([(ORE, 20), (99, 5)].into_iter(), &bag, f, |_| false, 4);
+    assert_eq!(both.len(), 2);
+    assert_eq!(
+        estimated_fee(&both[1], facts(40, 20)),
+        24,
+        "the ore costs 24 copper to list"
+    );
+    assert!(
+        affordable(both.clone(), 0, f).is_empty(),
+        "no gold, no trip"
+    );
+    // the bigger stack (5 x 400 = 2000 copper, a fee of 80) first, the ore (24) after it
+    let fees = |m| {
+        affordable(both.clone(), m, f)
+            .iter()
+            .map(|s| s.template)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fees(23), Vec::<u32>::new());
+    assert_eq!(fees(24), [ORE]);
+    assert_eq!(fees(80), [99]);
+    assert_eq!(fees(104), [99, ORE]);
+    assert_eq!(fees(1_000_000), [99, ORE]);
+}
+
+#[test]
 fn bigger_goods_weigh_more_and_merchants_like_the_house() {
     let t = Temperament::NEUTRAL;
     assert!(weight_for(300, &t) < weight_for(3_000, &t));

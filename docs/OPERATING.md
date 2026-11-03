@@ -178,10 +178,11 @@ a state machine that lasts a few minutes:
 3. **Price and post.** For each honest surplus stack (see [Selling](#selling-market)) the bot looks
    at the five cheapest buyouts of the item, takes their median per item as the going rate and asks
    95 to 99 % of it; with no market it asks between the vendor price and the item's base price. The
-   fee (1 % of the buyout per day plus one, 48 hours is chosen) is not refunded and the seller gets
-   90 % of the price by mail, so a stack is listed only when that net beats the vendor refund by 8 %.
-   Up to four whole stacks are listed per visit (the bot cannot split stacks) and the start price
-   is 90 % of the buyout.
+   fee (1 % of the buyout for 6 hours up to 4 % for the 48 hours the bot chooses, paid in cash) is
+   not refunded and the seller gets 90 % of the price by mail, so a stack is listed only when that
+   net beats the vendor refund by 8 %. Up to four whole stacks are listed per visit (the bot cannot
+   split stacks), a bot that cannot pay the expected fees does not go, and the start price is 90 %
+   of the buyout.
 4. **Cancel and relist.** Now and then (35 %) a lot older than 90 minutes that has been undercut
    by more than 20 % is looked at again and cancelled; the item comes back by mail and is priced
    again.

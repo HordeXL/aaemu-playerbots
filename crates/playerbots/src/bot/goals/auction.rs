@@ -274,13 +274,46 @@ fn buy_budget_of(ctx: &Ctx<'_>) -> Option<i64> {
 /// The stacks of the bag worth listing for `ctx`'s bot, see [`pick_stacks`].
 fn sell_stacks_of(ctx: &Ctx<'_>, max: usize) -> SmallVec<[Stack; MAX_LISTINGS]> {
     let (now, mem) = (ctx.now_ms, ctx.state.market.get());
-    pick_stacks(
+    let picked = pick_stacks(
         ctx.state.market.sellable_surplus(ctx.world, &ctx.state.bag),
         &ctx.state.bag,
         |t| facts_of(ctx.world, t),
         |t| mem.is_some_and(|m| m.auction.skipped(t, now) || m.auction.has_lot_of(t)),
         max,
-    )
+    );
+    affordable(picked, ctx.state.me.money, |t| facts_of(ctx.world, t))
+}
+
+/// The listing fee a stack is expected to cost: the fee of the price asked without a market
+/// (halfway between what a vendor pays and asks), for the usual duration.
+fn estimated_fee(stack: &Stack, facts: Facts) -> i64 {
+    let each = (u64::from(facts.price) + u64::from(facts.refund)) / 2;
+    let buyout = each.max(u64::from(facts.refund)) * u64::from(stack.count);
+    let buyout = i32::try_from(buyout).unwrap_or(i32::MAX);
+    i64::from(aa_proto::auction::listing_fee(
+        buyout,
+        aa_proto::auction::duration::H48,
+    ))
+}
+
+/// The leading stacks of `stacks` (best first) whose expected listing fees together fit into
+/// `money`: the fee is paid in cash when a lot is posted, so a bot that cannot pay it does not
+/// walk to the auctioneer for nothing.
+pub fn affordable(
+    stacks: SmallVec<[Stack; MAX_LISTINGS]>,
+    money: i64,
+    facts: impl Fn(u32) -> Option<Facts>,
+) -> SmallVec<[Stack; MAX_LISTINGS]> {
+    let mut left = money.max(0);
+    let mut kept = SmallVec::new();
+    for s in stacks {
+        let fee = facts(s.template).map_or(i64::MAX, |f| estimated_fee(&s, f));
+        if fee <= left {
+            left -= fee;
+            kept.push(s);
+        }
+    }
+    kept
 }
 
 /// The stacks to list: of every `(template, surplus)` the biggest whole bag stack that does not
