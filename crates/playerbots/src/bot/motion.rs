@@ -12,6 +12,12 @@
 //! a packet whose range the server checks (loot, talk, sell, craft, cast) the caller asks
 //! [`Motion::pin`] for an exact update.
 //!
+//! A bot that has a [`NavLink`] ([`Motion::attach_nav`]) does not walk the straight line when the
+//! navigation mesh knows the way: its [`NavState`] plans the trip and the controller integrates
+//! the position along the route instead (see [`super::nav`]). The packets, the stopped update on
+//! arrival, the stuck detector and [`Motion::pin`] work the same in both cases, and every
+//! situation the mesh cannot help with (unreachable goal, planner late) is the straight line.
+//!
 //! Nothing here reads a clock or talks to a socket: the caller passes the bot clock and an
 //! outbox ([`MotionEnv`]), which keeps the controller testable.
 
@@ -20,6 +26,8 @@ use aa_proto::game::LEVEL_GAME;
 use aa_proto::opcodes::cs as op;
 use smallvec::SmallVec;
 
+use super::nav::{NavLink, NavState, NavStep, StepIn, TripEnd};
+use super::place::Place;
 use super::state::{dist2d, dist3d};
 
 /// Sea level of the 1.2 world in metres.
@@ -145,6 +153,14 @@ pub struct MotionEnv<'a> {
     pub combat: bool,
 }
 
+/// What the navigation state did with a tick.
+enum NavOutcome {
+    /// A search runs: the bot stands.
+    Wait,
+    /// The bot walked; the direction and speed to announce.
+    Moved { heading: (f32, f32), speed: f32 },
+}
+
 /// Verdict of the stuck detector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StuckVerdict {
@@ -236,6 +252,8 @@ pub struct Motion {
     /// Where the last `CSMoveUnit` (or the server's own placement) put the bot, as the server
     /// knows it.
     sent_pos: [f32; 3],
+    /// Navigation mesh routes; `None`: every trip is the straight line.
+    nav: Option<Box<NavState>>,
 }
 
 impl Motion {
@@ -259,6 +277,51 @@ impl Motion {
             stuck: Stuck::default(),
             pending_tp: None,
             sent_pos: [0.0; 3],
+            nav: None,
+        }
+    }
+
+    /// Lets this controller walk navmesh routes (see [`super::nav`]). Without it every trip is
+    /// the straight line.
+    pub fn attach_nav(&mut self, link: NavLink) {
+        self.nav = Some(Box::new(NavState::new(link)));
+    }
+
+    /// Tells the controller which world the bot is in (the main world's mesh, an instance
+    /// world's, or none). Call once per tick before the goals run; cheap.
+    pub fn sync_place(&mut self, place: &Place) {
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.set_scope(place.in_instance(), place.world_name());
+        }
+    }
+
+    /// How long (metres) a walk should be cut into legs by the goals that do: much longer than
+    /// the straight line's 90 s when the mesh plans the way.
+    pub fn leg_m(&self) -> f32 {
+        self.nav
+            .as_ref()
+            .map_or(super::nav::trip::LEGACY_LEG_M, |n| n.leg_m())
+    }
+
+    /// The rest of the trip as map points (at most `max`, nearest first), empty when the bot is
+    /// not moving. The route being followed, or the straight line to the destination.
+    pub fn route_points(&self, out: &mut Vec<[f32; 2]>, max: usize) {
+        if self.status != MotionStatus::Moving {
+            return;
+        }
+        if self.nav.as_ref().is_some_and(|n| n.route_points(out, max)) {
+            return;
+        }
+        if let Some(&(x, y)) = self.path.last() {
+            out.push([self.pos[0], self.pos[1]]);
+            out.push([x, y]);
+        }
+    }
+
+    /// Ends the navigation trip, if any, and counts it as `how`.
+    fn nav_end(&mut self, how: TripEnd) {
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.end(how);
         }
     }
 
@@ -269,6 +332,7 @@ impl Motion {
         self.sent_pos = pos;
         self.yaw = yaw;
         self.path.clear();
+        self.nav_end(TripEnd::Cancelled);
         self.status = MotionStatus::Idle;
         self.moving_sent = false;
         self.stop_due = false;
@@ -280,6 +344,7 @@ impl Motion {
     pub fn leave_world(&mut self) {
         self.obj = 0;
         self.path.clear();
+        self.nav_end(TripEnd::Cancelled);
         self.status = MotionStatus::Idle;
         self.moving_sent = false;
         self.stop_due = false;
@@ -355,6 +420,14 @@ impl Motion {
         } else {
             MotionStatus::Moving
         };
+        let pos = self.pos;
+        let single = (self.path.len() == 1).then(|| self.path[0]);
+        if let Some(n) = self.nav.as_deref_mut() {
+            match single {
+                Some((x, y)) => n.begin(pos, [x, y], self.radius, now_ms),
+                None => n.end(TripEnd::Cancelled),
+            }
+        }
     }
 
     /// Like [`Motion::go_to`], but a trip longer than `teleport_over_m` (when positive) asks for a
@@ -398,6 +471,10 @@ impl Motion {
         self.path.clear();
         self.pending_tp = None;
         self.status = MotionStatus::Idle;
+        let pos = self.pos;
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.stopped_at(pos);
+        }
     }
 
     /// Turns towards (x, y); a stopped update with the new facing follows if the bot stands.
@@ -416,6 +493,7 @@ impl Motion {
     pub fn teleported(&mut self, pos: [f32; 3]) {
         self.pos = pos;
         self.sent_pos = pos;
+        self.nav_end(TripEnd::Cancelled);
         if self.pending_tp.take().is_some() {
             if let Some(&(x, y)) = self.path.last() {
                 if dist2d(pos, [x, y, 0.0]) <= self.radius + 10.0 {
@@ -432,9 +510,15 @@ impl Motion {
         self.stop_due = false;
     }
 
-    /// A navigation mesh search finished (owned by the motion feature): `result` answers the
-    /// request that was made with `ticket`. Delivered by `BotCmd::PathReady`; does nothing yet.
-    pub fn on_path_ready(&mut self, _ticket: u32, _result: aa_world::nav::PathResult) {}
+    /// A navigation mesh search finished: `result` answers the request that was made with
+    /// `ticket`. Delivered by `BotCmd::PathReady`; an answer for a request the trip no longer
+    /// waits for is dropped.
+    pub fn on_path_ready(&mut self, ticket: u32, result: aa_world::nav::PathResult) {
+        let now = self.last_tick_ms;
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.on_result(ticket, result, now);
+        }
+    }
 
     /// Integrates the position by the time since the last tick and sends the packets.
     pub fn tick(&mut self, env: &mut MotionEnv<'_>) -> MotionStatus {
@@ -461,16 +545,111 @@ impl Motion {
             }
             return self.status;
         }
-        if now.saturating_sub(self.started_ms) > TRIP_TIMEOUT_MS {
+        // (a route from the mesh may be much longer than the 90 s of the straight line)
+        let limit = TRIP_TIMEOUT_MS.max(self.nav.as_ref().map_or(0, |n| n.limit_ms()));
+        if now.saturating_sub(self.started_ms) > limit {
             return self.fail(env, MoveFailure::Timeout);
         }
         match self.stuck.observe(now, self.pos) {
             StuckVerdict::Fine => {}
-            StuckVerdict::GiveUp => return self.fail(env, MoveFailure::Stuck),
-            StuckVerdict::Sidestep => self.sidestep(env),
+            StuckVerdict::GiveUp => {
+                if let Some(n) = self.nav.as_deref() {
+                    n.note_stuck();
+                }
+                return self.fail(env, MoveFailure::Stuck);
+            }
+            StuckVerdict::Sidestep => {
+                // a route is searched again first; the straight line side-steps
+                let pos = self.pos;
+                let replanned = self
+                    .nav
+                    .as_deref_mut()
+                    .is_some_and(|n| n.on_stuck(pos, now));
+                if !replanned {
+                    self.sidestep(env);
+                }
+            }
         }
 
+        let (heading, speed) = match self.nav_step(env, dt_ms) {
+            Some(NavOutcome::Wait) => return self.wait_for_plan(env),
+            Some(NavOutcome::Moved { heading, speed }) => (heading, speed),
+            None => self.walk_straight(env, dt_ms),
+        };
+        if heading != (0.0, 0.0) {
+            self.yaw = cs::yaw_towards((0.0, 0.0), heading);
+        }
+
+        if self.status == MotionStatus::Arrived {
+            self.nav_end(TripEnd::Arrived);
+            self.send(env, false, (0.0, 0.0));
+        } else if heading != (0.0, 0.0) {
+            let due = self.force_send
+                || !self.moving_sent
+                || now.saturating_sub(self.last_send_ms) >= env.send_gap_ms;
+            if due {
+                self.send(env, true, (heading.0 * speed, heading.1 * speed));
+            }
+        }
+        self.status
+    }
+
+    /// Lets the navigation state move the bot for this tick. `None`: the straight line does.
+    fn nav_step(&mut self, env: &MotionEnv<'_>, dt_ms: u64) -> Option<NavOutcome> {
+        let nav = self.nav.as_deref_mut()?;
+        let step = nav.step(&StepIn {
+            now_ms: env.now_ms,
+            dt_s: dt_ms as f32 / 1000.0,
+            pos: self.pos,
+            pace: self.pace,
+            run: self.cfg.run_speed,
+            walk: self.cfg.walk_speed,
+            ground: env.ground,
+        });
+        match step {
+            NavStep::Legacy => None,
+            NavStep::Wait => Some(NavOutcome::Wait),
+            NavStep::Moved {
+                pos,
+                heading,
+                speed,
+                arrived,
+            } => {
+                self.pos = pos;
+                if arrived {
+                    self.path.clear();
+                    self.status = MotionStatus::Arrived;
+                }
+                Some(NavOutcome::Moved { heading, speed })
+            }
+        }
+    }
+
+    /// The bot stands while a search runs: it turns towards the goal and, if the server last
+    /// heard it moving, says that it stopped.
+    fn wait_for_plan(&mut self, env: &mut MotionEnv<'_>) -> MotionStatus {
+        self.stuck.reset(env.now_ms, self.pos);
+        if let Some(&(gx, gy)) = self.path.last() {
+            let yaw = cs::yaw_towards((self.pos[0], self.pos[1]), (gx, gy));
+            if (yaw - self.yaw).abs() > FACE_EPSILON {
+                self.yaw = yaw;
+                self.stop_due = true;
+            }
+        }
+        if self.moving_sent {
+            self.stop_due = true;
+        }
+        if self.stop_due {
+            self.send(env, false, (0.0, 0.0));
+        }
+        self.status
+    }
+
+    /// The straight line: integrates the position along the waypoints for `dt_ms` and puts the
+    /// bot on the terrain. Returns the heading (zero when it did not move) and the speed.
+    fn walk_straight(&mut self, env: &MotionEnv<'_>, dt_ms: u64) -> ((f32, f32), f32) {
         let speed = self.speed(self.pace);
+        let from = self.pos;
         let mut budget = speed * dt_ms as f32 / 1000.0;
         let mut heading = (0.0f32, 0.0f32);
         while budget > 0.0 {
@@ -506,26 +685,16 @@ impl Motion {
                 self.path.remove(0);
             }
         }
-        if heading != (0.0, 0.0) {
-            self.yaw = cs::yaw_towards((0.0, 0.0), heading);
-        }
         self.pos[2] = surface_z(env.ground.ground_z(self.pos[0], self.pos[1]), self.pos[2]);
-
-        if self.status == MotionStatus::Arrived {
-            self.send(env, false, (0.0, 0.0));
-        } else if heading != (0.0, 0.0) {
-            let due = self.force_send
-                || !self.moving_sent
-                || now.saturating_sub(self.last_send_ms) >= env.send_gap_ms;
-            if due {
-                self.send(env, true, (heading.0 * speed, heading.1 * speed));
-            }
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.walked(dist2d(from, self.pos));
         }
-        self.status
+        (heading, speed)
     }
 
     fn fail(&mut self, env: &mut MotionEnv<'_>, why: MoveFailure) -> MotionStatus {
         self.path.clear();
+        self.nav_end(TripEnd::Failed);
         self.status = MotionStatus::Failed(why);
         self.stop_due = self.moving_sent;
         if self.stop_due {
@@ -594,13 +763,22 @@ impl Motion {
         if self.obj == 0 || self.pending_tp.is_some() {
             return None;
         }
-        let moving = self.is_moving();
+        // (a bot that waits for a search stands, although its trip is under way)
+        let waiting = self.nav.as_ref().is_some_and(|n| n.waiting());
+        let moving = self.is_moving() && !waiting;
         let off = dist3d(self.sent_pos, self.pos) > PIN_EPSILON_M;
         if !off && self.moving_sent == moving {
             return None;
         }
         let mut vel = (0.0, 0.0);
-        if moving {
+        let on_route = self.nav.as_ref().and_then(|n| n.velocity());
+        if let Some((vx, vy)) = on_route.filter(|_| moving) {
+            let len = (vx * vx + vy * vy).sqrt();
+            if len > 1e-3 {
+                vel = (vx, vy);
+                self.yaw = cs::yaw_towards((0.0, 0.0), (vx / len, vy / len));
+            }
+        } else if moving {
             if let Some(&(tx, ty)) = self.path.first() {
                 let (dx, dy) = (tx - self.pos[0], ty - self.pos[1]);
                 let len = (dx * dx + dy * dy).sqrt();

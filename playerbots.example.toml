@@ -83,6 +83,9 @@ portals = true
 dungeons = true
 # Bots may summon boats and sail (goal "sail").
 sailing = true
+# Bots walk routes on the navigation mesh (nav_<world>.bin in the baked data): around walls and
+# water, along roads, with rounded corners. false = straight lines, as before the mesh existed.
+navmesh = true
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

@@ -202,6 +202,9 @@ pub struct BehaviorCfg {
     /// Bots may summon boats and sail (the sailing feature, goal `sail`). Off: no bot picks the
     /// goal or boards a boat.
     pub sailing: bool,
+    /// Bots walk routes on the navigation mesh (`nav_<world>.bin` in the baked data) instead of
+    /// straight lines. Off: every trip is the straight line, as before the mesh existed.
+    pub navmesh: bool,
 }
 
 impl Default for BehaviorCfg {
@@ -220,6 +223,7 @@ impl Default for BehaviorCfg {
             portals: true,
             dungeons: true,
             sailing: true,
+            navmesh: true,
         }
     }
 }
@@ -751,11 +755,11 @@ trade_with_players = true
     #[test]
     fn the_travel_features_are_on_unless_switched_off() {
         let b = Config::default().behavior;
-        assert!(b.portals && b.dungeons && b.sailing);
-        // the example file documents all three and keeps the defaults
+        assert!(b.portals && b.dungeons && b.sailing && b.navmesh);
+        // the example file documents all four and keeps the defaults
         let ex = Config::parse(Config::example()).unwrap().behavior;
-        assert!(ex.portals && ex.dungeons && ex.sailing);
-        for key in ["portals", "dungeons", "sailing"] {
+        assert!(ex.portals && ex.dungeons && ex.sailing && ex.navmesh);
+        for key in ["portals", "dungeons", "sailing", "navmesh"] {
             assert!(
                 Config::example().contains(&format!(
                     "
@@ -786,6 +790,13 @@ sailing = false
         )
         .unwrap();
         assert!(cfg.behavior.portals && cfg.behavior.dungeons && !cfg.behavior.sailing);
+        let cfg = Config::parse(
+            "[behavior]
+navmesh = false
+",
+        )
+        .unwrap();
+        assert!(!cfg.behavior.navmesh && cfg.behavior.portals && cfg.behavior.sailing);
         // they are switches, not weights, and a typo is not silently ignored
         for bad in [
             "[behavior]

@@ -1333,6 +1333,33 @@ function drawLines() {
   ctx.setLineDash([]);
 }
 
+// The route the selected bot is walking (BotDetail.path: world [x, y] points, the bot first): a thin
+// line with a dot at the far end. Nothing is drawn while the bot stands or walks the straight line
+// without a route.
+function drawPath() {
+  const d = S.detail;
+  if (S.sel == null || !d || !d.snapshot || d.snapshot.id !== S.sel) return;
+  const p = Array.isArray(d.path) ? d.path : [];
+  if (p.length < 2) return;
+  const W = S.W, H = S.H, sc = S.scale, cx = S.cx, cy = S.cy;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = C.accent;
+  ctx.globalAlpha = 0.85;
+  ctx.beginPath();
+  for (let i = 0; i < p.length; i++) {
+    const x = (num(p[i][0]) - cx) * sc + W / 2, y = (cy - num(p[i][1])) * sc + H / 2;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  const e = p[p.length - 1];
+  ctx.beginPath();
+  ctx.arc((num(e[0]) - cx) * sc + W / 2, (cy - num(e[1])) * sc + H / 2, 3, 0, TAU);
+  ctx.fillStyle = C.accent;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
 function drawBots() {
   const W = S.W, H = S.H, sc = S.scale, cx = S.cx, cy = S.cy;
   const n = S.list.length;
@@ -1463,6 +1490,7 @@ function draw(now) {
   drawBackdrop();
   if (S.showMarkers) drawMarkers();
   if (S.showLines) drawLines();
+  drawPath();
   drawBots();
   drawFlash(now);
   updateHover();
@@ -1715,7 +1743,7 @@ async function pollDetail() {
   last.detail = performance.now();
   try {
     const d = await fetchJson('/api/bots/' + id);
-    if (S.sel === id) { S.detail = d; renderDetail(); }
+    if (S.sel === id) { S.detail = d; renderDetail(); requestDraw(); }
   } catch (e) {
     if (S.sel === id && e && e.status === 404) {
       select(null);

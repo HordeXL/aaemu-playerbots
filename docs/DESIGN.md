@@ -168,7 +168,7 @@ files. Until a feature fills its hook it does nothing and the bots behave as bef
 
 | Hook | Where | Owner |
 | --- | --- | --- |
-| `Motion::on_path_ready(ticket, PathResult)`, fed by `BotCmd::PathReady`; `BotDetail::path` (hub slot `path`) | `bot/motion.rs`, `bot/cmd.rs`, `hub.rs`, pb-web `types.rs` | navigation motion |
+| `Motion::on_path_ready(ticket, PathResult)`, fed by `BotCmd::PathReady`; `BotDetail::path` (hub slot `path`) | `bot/motion.rs`, `bot/nav/`, `bot/cmd.rs`, `hub.rs`, pb-web `types.rs` | navigation motion (done) |
 | `TravelState::on_event` (`BotState::travel`): the portal events | `bot/travel/` | portals |
 | `Dungeon` goal, `goals::dungeon::{base_weight, score}`, `PartyOrder` / `BotCmd::Party` | `bot/goals/dungeon.rs`, `bot/party.rs` | dungeons |
 | `Sail` goal, `goals::sail::{base_weight, score}`, `VehicleState::on_event` (`BotState::vehicle`): the slave and ship events | `bot/goals/sail.rs`, `bot/vehicle/` | sailing |
@@ -179,6 +179,46 @@ features. `GoalKind::Dungeon` and `GoalKind::Sail` are scored only by their own 
 (0 while they are stubs, so no bot picks them); forcing one from the web UI makes it fail with
 `NotImplemented`, which switches it off for that bot. A ship's `SCOneUnitMovement` is decoded twice
 (`Decoded::Ship`): the ordinary position event and `WorldEvent::ShipMoved` (heading, speed, helm).
+
+## Navigation motion (`bot/nav/`)
+
+Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight lines;
+`[behavior] navmesh = false` brings the straight lines back.
+
+- **Where it plugs in.** `Motion` keeps its straight-line walker, the stuck detector, the stopped update
+  on arrival and `Motion::pin`. A bot has a `NavLink` (`Motion::attach_nav`, built by
+  `nav::link_for_bot`) and `Motion::go_to` starts a `NavState` trip; each tick the trip either moves
+  the bot along its route or says "walk the straight line" (`NavStep::Legacy`). The goals' API
+  (`go_to`, `travel_to`, `stop`, `face`, `status`, `remaining`, `pin`) did not change; `sync_place`
+  tells the controller which world's mesh to use (main, instance, or none).
+- **Planning** (`trip.rs`, `planner.rs`). A trip whose goal is within 150 m is searched on the bot's
+  own task (cap 12k expansions). A longer one goes to the planner pool: one or two `std` threads and
+  a bounded queue (512), owned by the hub (`Hub::nav`, started with the first bot). The answer
+  comes back as `BotCmd::PathReady { ticket }` on the bot's own command channel. A full queue, an
+  answer later than 1.5 s, `Unreachable`, `NoMesh` (after a second try that snaps from 24 m) all
+  mean the straight line. While it waits the bot stands and faces the goal. A partial answer, or a
+  goal beyond 2 km, is walked in pieces: the search for the next piece starts the moment a route is
+  installed, from its end (at most 10 pieces). Tickets make stale answers harmless.
+- **Walking** (`follow.rs`). `Route` is a parametric curve over the path's corners: outdoor corners
+  are rounded by a quadratic fillet (start up to 2 m before, never more than 0.3 m inside the
+  corner, because the funnel's agent-radius clearance must survive), indoor and waypoint corners are
+  exact, long stretches get a small per-bot lateral offset that fades at both ends and is only used
+  where the mesh has room beside the line. Heights come from the terrain outdoors and from the
+  path indoors and in instances. Run outdoors, walk indoor segments (unless longer than 25 m), slow
+  to walk speed over the last 5 m before the stop point. The stop point is the circle of the stop
+  radius around the goal, like the straight line.
+- **Stuck.** The old detector (under 0.3 m in 3 s) first re-plans twice with the nodes on and
+  ahead of the bot made expensive, then falls back to the straight line's side steps and finally
+  `Failed(Stuck)`.
+- **Time limits.** A planned route may take `elapsed + length / 3 m/s + 30 s` (never less than the
+  90 s of the straight line), so legs of 1.5 km work; goals that cut walks into legs
+  (`trade_run`) ask `Motion::leg_m()` (1500 m with the mesh, 280 m without).
+- **Numbers.** `NavMetrics` (atomics in `Hub::nav`): searches inline / pooled, outcomes, latency
+  histograms (p50 / p99), replans, stuck events, straight-line fallbacks by cause, queue depth,
+  trips and how they ended, detour ratio. They are in `HubStats::nav` (`/api/stats`) and logged
+  once a minute.
+- **Web.** `Bot::publish` writes the rest of the route (at most 32 points, Ramer-Douglas-Peucker
+  decimated) into the hub slot; the map draws it for the selected bot.
 
 ## Data directory
 

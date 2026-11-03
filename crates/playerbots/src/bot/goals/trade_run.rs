@@ -159,6 +159,11 @@ pub trait Env {
     fn gm(&mut self, line: &str) -> bool;
     /// Starts a trip to (x, y), stopping `radius` metres short (a GM `/move` when long).
     fn travel(&mut self, x: f32, y: f32, radius: f32);
+    /// How long (metres) a leg of a walk is: the straight line cannot do much more than
+    /// [`LEG_M`] in the 90 s a trip may take, a route planned on the navigation mesh can.
+    fn leg_m(&self) -> f32 {
+        LEG_M
+    }
     /// Stops walking.
     fn stop(&mut self);
     /// Turns towards (x, y).
@@ -291,6 +296,10 @@ impl Env for Live<'_, '_> {
 
     fn travel(&mut self, x: f32, y: f32, radius: f32) {
         self.0.travel(x, y, radius, Pace::Run);
+    }
+
+    fn leg_m(&self) -> f32 {
+        self.0.motion.leg_m()
     }
 
     fn stop(&mut self) {
@@ -955,10 +964,11 @@ impl TradeRun {
             MotionStatus::Idle | MotionStatus::Arrived => {}
         }
         // A new leg: the whole way when it is short or a `/move`, else a stretch of it.
-        if d <= LEG_M + 20.0 || env.would_teleport(d) {
+        let leg = env.leg_m();
+        if d <= leg + 20.0 || env.would_teleport(d) {
             env.travel(dest[0], dest[1], radius);
         } else {
-            let k = LEG_M / d;
+            let k = leg / d;
             env.travel(
                 me[0] + (dest[0] - me[0]) * k,
                 me[1] + (dest[1] - me[1]) * k,

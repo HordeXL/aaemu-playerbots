@@ -575,6 +575,7 @@ impl BotHub for MockHub {
             open_issues,
             queued_issues,
             activity_counts: counts,
+            nav: None,
         }
     }
 

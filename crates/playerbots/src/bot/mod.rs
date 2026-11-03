@@ -28,6 +28,7 @@ pub mod ctx;
 pub mod director;
 pub mod goals;
 pub mod motion;
+pub mod nav;
 pub mod party;
 pub mod place;
 pub mod rotation;
@@ -87,6 +88,8 @@ const RESURRECT_RETRY_MS: u64 = 5_000;
 const WATCH_RADIUS: f32 = 150.0;
 /// The bot's detail panel is refreshed this often.
 const EXTRA_EVERY_SECS: u32 = 5;
+/// The most points of the route the web UI gets for a bot.
+const PATH_POINTS_MAX: usize = 32;
 /// Lifetime of a bot between connects: the longest the connect step may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a bot waits for a free login slot before it counts as a failed attempt (and backs
@@ -202,10 +205,17 @@ impl Bot {
             temper,
         };
         let brain = Brain::new(&cfg.behavior, &persona.temper);
-        let motion = Motion::new(MotionCfg {
+        let mut motion = Motion::new(MotionCfg {
             run_speed: cfg.bots.move_speed,
             walk_speed: cfg.bots.walk_speed,
         });
+        motion.attach_nav(nav::link_for_bot(
+            &shared.hub,
+            &shared.world,
+            cfg,
+            slot.clone(),
+            entry.id,
+        ));
         Bot {
             log: Logger::new(slot.clone()),
             slot,
@@ -806,6 +816,7 @@ impl Bot {
             self.next_rez_ms = now_ms + RESURRECT_RETRY_MS;
         }
         let queued = self.out.len();
+        self.motion.sync_place(&self.state.place);
         if !self.paused || self.state.me.dead {
             let mut ctx = Ctx {
                 world: &self.shared.world,
@@ -996,6 +1007,8 @@ impl Bot {
         let has_house = !self.state.houses.is_empty();
         let (level, hp, pos, money) = (me.level, me.hp_pct(), me.pos, me.money);
         self.slot.with(|g| {
+            g.path.clear();
+            self.motion.route_points(&mut g.path, PATH_POINTS_MAX);
             let s = &mut g.snap;
             s.level = level;
             s.hp_pct = hp;
