@@ -414,6 +414,16 @@ impl NavState {
         (t.phase == Phase::Following && t.route.is_some()).then_some(t.vel)
     }
 
+    /// Metres of straight route ahead of the bot before the next corner, while it follows a
+    /// route; `None` on the controller's straight line.
+    pub fn straight_left(&self) -> Option<f32> {
+        let t = self.trip.as_ref()?;
+        if t.phase != Phase::Following {
+            return None;
+        }
+        t.route.as_ref().map(|r| r.straight_left())
+    }
+
     /// Whether the bot stands and waits for a search to finish.
     pub fn waiting(&self) -> bool {
         self.trip

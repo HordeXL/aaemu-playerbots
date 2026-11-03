@@ -26,6 +26,7 @@ use aa_proto::game::LEVEL_GAME;
 use aa_proto::opcodes::cs as op;
 use smallvec::SmallVec;
 
+use super::manner::{self, AirStep, Life, Look};
 use super::nav::{NavLink, NavState, NavStep, StepIn, TripEnd};
 use super::place::Place;
 use super::state::{dist2d, dist3d};
@@ -84,6 +85,17 @@ pub fn surface_z(ground: Option<f32>, fallback: f32) -> f32 {
         Some(g) if g < SWIM_THRESHOLD => SWIM_Z,
         Some(g) => g,
         None => fallback,
+    }
+}
+
+/// `a` folded into `(-π, π]`.
+fn wrap_pi(a: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    let r = (a + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+    if r <= -std::f32::consts::PI {
+        r + tau
+    } else {
+        r
     }
 }
 
@@ -254,6 +266,8 @@ pub struct Motion {
     sent_pos: [f32; 3],
     /// Navigation mesh routes; `None`: every trip is the straight line.
     nav: Option<Box<NavState>>,
+    /// Life-like movement (jumps, mannerisms, pauses; see [`super::manner`]); `None`: off.
+    life: Option<Box<Life>>,
 }
 
 impl Motion {
@@ -278,6 +292,99 @@ impl Motion {
             pending_tp: None,
             sent_pos: [0.0; 3],
             nav: None,
+            life: None,
+        }
+    }
+
+    /// Makes the bot move like a person (see [`super::manner`]). Without it the controller walks
+    /// and stands exactly as it always did.
+    pub fn attach_life(&mut self, life: Life) {
+        self.life = Some(Box::new(life));
+    }
+
+    /// The life-like state, when the bot has one.
+    pub fn life(&self) -> Option<&Life> {
+        self.life.as_deref()
+    }
+
+    /// The life-like state, when the bot has one.
+    pub fn life_mut(&mut self) -> Option<&mut Life> {
+        self.life.as_deref_mut()
+    }
+
+    /// The object id the controller moves (0 before the bot is in the world).
+    pub fn obj(&self) -> u32 {
+        self.obj
+    }
+
+    /// Asks for an update that says where and how the bot stands (the stopped update that
+    /// shows a bot getting up from a sit), unless it walks.
+    pub fn announce(&mut self) {
+        if self.obj != 0 && !self.is_moving() {
+            self.stop_due = true;
+        }
+    }
+
+    /// How long (ms) the bot loop may sleep at most before the controller needs it again: the
+    /// next packet of a jump in progress.
+    pub fn wake_in(&self, now_ms: u64) -> Option<u64> {
+        self.life
+            .as_ref()?
+            .wake_at()
+            .map(|t| t.saturating_sub(now_ms))
+    }
+
+    /// The factor on the tick period of a bot that walks in front of a player: the movement
+    /// updates then come at an uneven pace, 20 % either way, like a person's.
+    pub fn period_scale(&self, rng: &mut fastrand::Rng) -> f32 {
+        match self.life.as_deref() {
+            Some(l) if l.gate.show() && self.is_moving() => 0.8 + 0.4 * rng.f32(),
+            _ => 1.0,
+        }
+    }
+
+    /// The idle mannerisms of a bot that stands and may show off: a turn on the spot, now and
+    /// then a small shuffle at walk pace. Called every tick by the goals that stand (rest,
+    /// wander pauses); it does nothing while the bot walks, has no audience or is busy.
+    pub fn fidget_tick(&mut self, now_ms: u64, rng: &mut fastrand::Rng, ground: &dyn Ground) {
+        let Some(life) = self.life.as_deref_mut() else {
+            return;
+        };
+        if self.obj == 0
+            || self.status == MotionStatus::Moving
+            || self.stop_due
+            || self.pending_tp.is_some()
+            || life.jump.is_some()
+            || !life.gate.show()
+        {
+            return;
+        }
+        let step = life.fidget.step(now_ms, life.traits.fidget, rng);
+        match step {
+            manner::Fid::None => {}
+            manner::Fid::Turn(by) => {
+                self.yaw = wrap_pi(self.yaw + by);
+                self.stop_due = true;
+            }
+            manner::Fid::Shuffle { len, rel } => {
+                // (counter-clockwise from +Y: the heading is (-sin, cos))
+                let a = self.yaw + rel;
+                let (x, y) = (self.pos[0] - a.sin() * len, self.pos[1] + a.cos() * len);
+                let (here, there) = (
+                    ground.ground_z(self.pos[0], self.pos[1]),
+                    ground.ground_z(x, y),
+                );
+                // only over level, dry ground
+                let flat = matches!((here, there), (Some(h), Some(t))
+                    if h >= SWIM_THRESHOLD && t >= SWIM_THRESHOLD && (t - h).abs() <= 0.25);
+                if flat {
+                    self.go_via_counted(&[(x, y)], 0.0, Pace::Walk, now_ms, false);
+                    // (a shuffle ends the mannerisms until the next command)
+                    if let Some(l) = self.life.as_deref_mut() {
+                        l.fidget = manner::Fidget::finished();
+                    }
+                }
+            }
         }
     }
 
@@ -338,6 +445,7 @@ impl Motion {
         self.stop_due = false;
         self.pending_tp = None;
         self.last_tick_ms = now_ms;
+        self.life_reset();
     }
 
     /// Takes the bot out of the world (disconnect).
@@ -349,6 +457,7 @@ impl Motion {
         self.moving_sent = false;
         self.stop_due = false;
         self.pending_tp = None;
+        self.life_reset();
     }
 
     /// Current position.
@@ -389,9 +498,10 @@ impl Motion {
 
     /// Speed of a pace in m/s.
     pub fn speed(&self, pace: Pace) -> f32 {
+        let k = self.life.as_ref().map_or(1.0, |l| l.traits.speed_k);
         match pace {
-            Pace::Run => self.cfg.run_speed,
-            Pace::Walk => self.cfg.walk_speed,
+            Pace::Run => self.cfg.run_speed * k,
+            Pace::Walk => self.cfg.walk_speed * k,
         }
     }
 
@@ -422,6 +532,13 @@ impl Motion {
         now_ms: u64,
         counted: bool,
     ) {
+        let pace = self.life_pace(points, pace, counted, now_ms);
+        if let Some(l) = self.life.as_deref_mut() {
+            l.fidget.reset();
+            l.dawdle.reset();
+            l.pause_until_ms = 0;
+            l.cosmetic = counted;
+        }
         self.path.clear();
         self.path.extend(
             points
@@ -492,6 +609,7 @@ impl Motion {
         }
         self.pos[2] = z;
         self.force_send = true;
+        self.life_end_jump();
         if !self.is_moving() {
             self.stop_due = true;
         }
@@ -501,6 +619,14 @@ impl Motion {
     pub fn stop(&mut self) {
         if self.status == MotionStatus::Moving || self.moving_sent {
             self.stop_due = true;
+        }
+        if self.life_end_jump() {
+            // (the bot is in the air: the server has to hear that it stands)
+            self.stop_due = true;
+        }
+        if let Some(l) = self.life.as_deref_mut() {
+            l.fidget.reset();
+            l.pause_until_ms = 0;
         }
         self.path.clear();
         self.pending_tp = None;
@@ -527,6 +653,7 @@ impl Motion {
     pub fn teleported(&mut self, pos: [f32; 3]) {
         self.pos = pos;
         self.sent_pos = pos;
+        self.life_reset();
         self.nav_end(TripEnd::Cancelled);
         if self.pending_tp.take().is_some() {
             if let Some(&(x, y)) = self.path.last() {
@@ -554,6 +681,130 @@ impl Motion {
         }
     }
 
+    /// Ends a jump in progress. `true` when the bot was in the air.
+    fn life_end_jump(&mut self) -> bool {
+        match self.life.as_deref_mut() {
+            Some(l) => {
+                let was = l.jump.is_some();
+                l.end_jump();
+                was
+            }
+            None => false,
+        }
+    }
+
+    /// Forgets everything life-like that belonged to the place the bot was at.
+    fn life_reset(&mut self) {
+        if let Some(l) = self.life.as_deref_mut() {
+            l.end_jump();
+            l.fidget.reset();
+            l.dawdle.reset();
+            l.pause_until_ms = 0;
+            l.pace_memo = None;
+        }
+    }
+
+    /// The pace of a new trip: in a town, in front of a player, some short trips are walked.
+    /// The same goal started again keeps the pace it got.
+    fn life_pace(&mut self, points: &[(f32, f32)], pace: Pace, counted: bool, now_ms: u64) -> Pace {
+        /// Chance that a short trip in a town is walked.
+        const TOWN_WALK: f32 = 0.25;
+        /// Only trips this short (m) are walked for the looks.
+        const TOWN_WALK_MAX_M: f32 = 60.0;
+        let (Some(l), Some(&(gx, gy))) = (self.life.as_deref_mut(), points.last()) else {
+            return pace;
+        };
+        if pace != Pace::Run || !counted || !l.gate.show() || !l.gate.town {
+            return pace;
+        }
+        if let Some((g, until, walk)) = l.pace_memo {
+            if now_ms < until && (g[0] - gx).abs() < 3.0 && (g[1] - gy).abs() < 3.0 {
+                return if walk { Pace::Walk } else { Pace::Run };
+            }
+        }
+        let near = dist2d(self.pos, [gx, gy, 0.0]) <= TOWN_WALK_MAX_M;
+        let walk = near && l.rng.f32() < TOWN_WALK;
+        l.pace_memo = Some(([gx, gy], now_ms + 60_000, walk));
+        if walk {
+            Pace::Walk
+        } else {
+            pace
+        }
+    }
+
+    /// Straight way ahead before the next corner or the end of the trip (m).
+    fn straight_ahead(&self) -> f32 {
+        if let Some(s) = self.nav.as_ref().and_then(|n| n.straight_left()) {
+            return s;
+        }
+        match self.path.first() {
+            Some(&(x, y)) => {
+                let stop_short = if self.path.len() == 1 {
+                    self.radius
+                } else {
+                    0.0
+                };
+                (dist2d(self.pos, [x, y, 0.0]) - stop_short).max(0.0)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Decides whether the bot jumps now, and starts the jump. Called once per tick while no
+    /// jump is in progress.
+    fn consider_jump(&mut self, env: &mut MotionEnv<'_>, heading: (f32, f32), speed: f32) {
+        let now = env.now_ms;
+        let moving = !self.path.is_empty() && heading != (0.0, 0.0);
+        let Some(l) = self.life.as_deref_mut() else {
+            return;
+        };
+        if l.rejump_ms != 0 {
+            // the second jump of a double
+            if now >= l.rejump_ms {
+                l.rejump_ms = 0;
+                if moving && l.gate.show() && l.jump.is_none() {
+                    l.jump = Some(manner::Jump::start(now, manner::JumpKind::Full));
+                }
+            }
+            return;
+        }
+        if l.jump.is_some()
+            || l.traits.jump_mult <= 0.0
+            || !l.gate.show()
+            || l.emotes.sitting
+            || env.combat
+            || self.pending_tp.is_some()
+            || self.pos[2] == SWIM_Z
+            || env.out.iter().any(range_checked)
+        {
+            return;
+        }
+        let running = moving && speed > 3.0;
+        let step_up = running && {
+            let (x, y) = (
+                self.pos[0] + heading.0 * manner::LOOKAHEAD_M,
+                self.pos[1] + heading.1 * manner::LOOKAHEAD_M,
+            );
+            manner::is_step(
+                env.ground.ground_z(self.pos[0], self.pos[1]),
+                env.ground.ground_z(x, y),
+            )
+        };
+        let look = Look {
+            moving,
+            running,
+            straight_m: if running { self.straight_ahead() } else { 0.0 },
+            step_up,
+        };
+        let Some(l) = self.life.as_deref_mut() else {
+            return;
+        };
+        let mult = l.traits.jump_mult;
+        if let Some(kind) = l.sched.decide(now, &look, mult, env.rng) {
+            l.jump = Some(manner::Jump::start(now, kind));
+        }
+    }
+
     /// Integrates the position by the time since the last tick and sends the packets.
     pub fn tick(&mut self, env: &mut MotionEnv<'_>) -> MotionStatus {
         let now = env.now_ms;
@@ -576,6 +827,8 @@ impl Motion {
         if self.path.is_empty() {
             if self.stop_due {
                 self.send(env, false, (0.0, 0.0));
+            } else {
+                self.stand_jump(env);
             }
             return self.status;
         }
@@ -602,6 +855,24 @@ impl Motion {
                 if !replanned {
                     self.sidestep(env);
                 }
+                if let Some(l) = self.life.as_deref_mut() {
+                    l.sched.stuck();
+                }
+            }
+        }
+
+        // a pause at a corner: the bot stands, the trip waits
+        if let Some(until) = self.life.as_deref().map(|l| l.pause_until_ms) {
+            if until != 0 {
+                if now < until {
+                    self.started_ms += dt_ms;
+                    self.stuck.reset(now, self.pos);
+                    return self.status;
+                }
+                if let Some(l) = self.life.as_deref_mut() {
+                    l.pause_until_ms = 0;
+                }
+                self.force_send = true;
             }
         }
 
@@ -618,26 +889,136 @@ impl Motion {
             self.nav_end(TripEnd::Arrived);
             self.send(env, false, (0.0, 0.0));
         } else if heading != (0.0, 0.0) {
-            let due = self.force_send
-                || !self.moving_sent
-                || now.saturating_sub(self.last_send_ms) >= env.send_gap_ms;
-            if due {
-                self.send(env, true, (heading.0 * speed, heading.1 * speed));
-            }
+            self.moving_tick(env, heading, speed);
         }
         self.status
     }
 
+    /// The packets of a tick in which the bot walked: the ordinary moving update, a packet of a
+    /// jump in progress, or the stopped update that starts a pause at a corner.
+    fn moving_tick(&mut self, env: &mut MotionEnv<'_>, heading: (f32, f32), speed: f32) {
+        let now = env.now_ms;
+        let vel = (heading.0 * speed, heading.1 * speed);
+        let mut jumping = self.life.as_deref().is_some_and(|l| l.jump.is_some());
+        if !jumping && self.life_trip() {
+            if self.pause_at_corner(env, heading) {
+                self.send(env, false, (0.0, 0.0));
+                return;
+            }
+            self.consider_jump(env, heading, speed);
+            jumping = self.life.as_deref().is_some_and(|l| l.jump.is_some());
+        }
+        if jumping {
+            if self.jump_ready(now) {
+                self.send_air(env, true, vel);
+            }
+            return;
+        }
+        // (in front of a player the updates go out every tick, which is uneven by design)
+        let gap = if self.life.as_deref().is_some_and(|l| l.gate.show()) {
+            env.send_gap_ms * 3 / 4
+        } else {
+            env.send_gap_ms
+        };
+        let due =
+            self.force_send || !self.moving_sent || now.saturating_sub(self.last_send_ms) >= gap;
+        if due {
+            self.send(env, true, vel);
+        }
+    }
+
+    /// Whether the trip is a walk for its own sake (not a chase, a loot walk or a shuffle), the
+    /// only kind the bot shows off on.
+    fn life_trip(&self) -> bool {
+        self.life.as_deref().is_some_and(|l| l.cosmetic)
+    }
+
+    /// Whether the packet of the jump in progress is due (the server needs the `time` of two
+    /// packets to differ).
+    fn jump_ready(&self, now_ms: u64) -> bool {
+        now_ms > self.last_send_ms && self.life.as_deref().is_some_and(|l| l.jump_due(now_ms))
+    }
+
+    /// Looks at the corner the bot just took and decides whether to pause there.
+    fn pause_at_corner(&mut self, env: &MotionEnv<'_>, heading: (f32, f32)) -> bool {
+        let now = env.now_ms;
+        let far = self.remaining().is_some_and(|r| r >= 15.0);
+        let Some(l) = self.life.as_deref_mut() else {
+            return false;
+        };
+        if !l.gate.show() || env.combat || !far {
+            l.dawdle.reset();
+            return false;
+        }
+        let dawdle = l.traits.dawdle;
+        match l.dawdle.on_heading(now, heading, dawdle, &mut l.rng) {
+            Some(ms) => {
+                l.pause_until_ms = now + ms;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A standing bot: maybe a jump in place, and the packets of one in progress.
+    fn stand_jump(&mut self, env: &mut MotionEnv<'_>) {
+        let now = env.now_ms;
+        if self.life.is_none() {
+            return;
+        }
+        if self.life.as_deref().is_some_and(|l| l.jump.is_none()) {
+            self.consider_jump(env, (0.0, 0.0), 0.0);
+        }
+        if self.jump_ready(now) {
+            self.send_air(env, false, (0.0, 0.0));
+        }
+    }
+
+    /// Sends the packet of the jump in progress that is due. The touchdown packet is followed by
+    /// an ordinary ground update that ends the jump (a double jump takes off again a moment after
+    /// the touchdown instead).
+    fn send_air(&mut self, env: &mut MotionEnv<'_>, moving: bool, vel: (f32, f32)) {
+        let now = env.now_ms;
+        let step = self
+            .life
+            .as_deref_mut()
+            .and_then(|l| l.jump.as_mut().and_then(|j| j.step(now)));
+        let Some(step) = step else {
+            return;
+        };
+        let end = step == AirStep::Settle
+            || (step == AirStep::Land
+                && self
+                    .life
+                    .as_deref()
+                    .is_some_and(|l| l.jump.is_some_and(|j| j.again())));
+        let air = (step != AirStep::Settle).then_some(step);
+        if end {
+            if let Some(l) = self.life.as_deref_mut() {
+                let again = l.jump.is_some_and(|j| j.again());
+                l.jump = None;
+                l.rejump_ms = if again {
+                    now + manner::DOUBLE_GAP_MS
+                } else {
+                    0
+                };
+            }
+        }
+        let packet = self.packet(now, env.combat, moving, vel, air);
+        env.out.push(packet);
+    }
+
     /// Lets the navigation state move the bot for this tick. `None`: the straight line does.
     fn nav_step(&mut self, env: &MotionEnv<'_>, dt_ms: u64) -> Option<NavOutcome> {
+        let (run, walk) = (self.speed(Pace::Run), self.speed(Pace::Walk));
         let nav = self.nav.as_deref_mut()?;
         let step = nav.step(&StepIn {
             now_ms: env.now_ms,
             dt_s: dt_ms as f32 / 1000.0,
             pos: self.pos,
             pace: self.pace,
-            run: self.cfg.run_speed,
-            walk: self.cfg.walk_speed,
+            run,
+            walk,
             ground: env.ground,
         });
         match step {
@@ -753,22 +1134,39 @@ impl Motion {
         self.force_send = true;
     }
 
-    /// Queues one `CSMoveUnit` and updates the bookkeeping.
+    /// Queues one `CSMoveUnit` on the ground and updates the bookkeeping. A ground update ends
+    /// a jump in progress (the bot lands where it is).
     fn send(&mut self, env: &mut MotionEnv<'_>, moving: bool, vel: (f32, f32)) {
-        let packet = self.packet(env.now_ms, env.combat, moving, vel);
+        self.life_end_jump();
+        let packet = self.packet(env.now_ms, env.combat, moving, vel, None);
         env.out.push(packet);
     }
 
-    /// Builds one `CSMoveUnit` for the current position and updates the bookkeeping.
-    fn packet(&mut self, now_ms: u64, combat: bool, moving: bool, vel: (f32, f32)) -> Out {
+    /// Builds one `CSMoveUnit` for the current position and updates the bookkeeping. `air` is
+    /// the packet of a jump: the height above the ground and the vertical speed.
+    fn packet(
+        &mut self,
+        now_ms: u64,
+        combat: bool,
+        moving: bool,
+        vel: (f32, f32),
+        air: Option<AirStep>,
+    ) -> Out {
+        let swimming = self.pos[2] == SWIM_Z;
+        let (lift, vz, jump) = air.map_or((0.0, 0.0, cs::JumpPhase::None), |a| {
+            (a.lift(), a.vz(), a.phase())
+        });
+        let z = self.pos[2] + lift;
         let packet = cs::move_unit(&MoveUnit {
             obj: self.obj,
             time: now_ms as u32,
-            pos: (self.pos[0], self.pos[1], self.pos[2]),
-            vel: (vel.0, vel.1, 0.0),
+            pos: (self.pos[0], self.pos[1], z),
+            vel: (vel.0, vel.1, vz),
             yaw: self.yaw,
             moving,
-            stance: if combat {
+            stance: if swimming {
+                cs::STANCE_SWIM
+            } else if combat {
                 cs::STANCE_COMBAT
             } else {
                 cs::STANCE_RELAXED
@@ -778,12 +1176,13 @@ impl Motion {
             } else {
                 cs::ALERT_IDLE
             },
+            jump,
         });
         self.moving_sent = moving;
         self.stop_due = false;
         self.force_send = false;
         self.last_send_ms = now_ms;
-        self.sent_pos = self.pos;
+        self.sent_pos = [self.pos[0], self.pos[1], z];
         packet
     }
 
@@ -799,9 +1198,15 @@ impl Motion {
         }
         // (a bot that waits for a search stands, although its trip is under way)
         let waiting = self.nav.as_ref().is_some_and(|n| n.waiting());
-        let moving = self.is_moving() && !waiting;
+        let paused = self
+            .life
+            .as_deref()
+            .is_some_and(|l| l.pause_until_ms > now_ms);
+        let moving = self.is_moving() && !waiting && !paused;
         let off = dist3d(self.sent_pos, self.pos) > PIN_EPSILON_M;
-        if !off && self.moving_sent == moving {
+        // (a bot in the air lands: the server is told where it stands)
+        let airborne = self.life_end_jump();
+        if !off && !airborne && self.moving_sent == moving {
             return None;
         }
         let mut vel = (0.0, 0.0);
@@ -823,7 +1228,7 @@ impl Motion {
                 }
             }
         }
-        Some(self.packet(now_ms, combat, moving && vel != (0.0, 0.0), vel))
+        Some(self.packet(now_ms, combat, moving && vel != (0.0, 0.0), vel, None))
     }
 }
 
@@ -1016,9 +1421,9 @@ mod tests {
             first.body[26] as i8,
             cs::yaw_to_direction(-std::f32::consts::FRAC_PI_2)
         );
-        // velocity x is the run speed in mm/s
+        // velocity x is the run speed in the client's units (32767 / 60 per m/s)
         let vx = i16::from_le_bytes([first.body[18], first.body[19]]);
-        assert_eq!(vx, 5400);
+        assert_eq!(vx, (5.4f32 * 32767.0 / 60.0).round() as i16);
     }
 
     /// The exact stopped update the bot would send now.
@@ -1036,6 +1441,7 @@ mod tests {
             moving: false,
             stance: cs::STANCE_RELAXED,
             alertness: cs::ALERT_IDLE,
+            jump: cs::JumpPhase::None,
         })
     }
 

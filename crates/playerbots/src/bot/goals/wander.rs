@@ -7,6 +7,7 @@
 use std::fmt::Write;
 
 use crate::bot::ctx::Ctx;
+use crate::bot::manner;
 use crate::bot::motion::{MotionStatus, Pace};
 
 use super::{jitter_ms, random_point, FailReason, GoalStatus};
@@ -69,6 +70,8 @@ impl Wander {
             return GoalStatus::Done;
         }
         if now < self.pause_until_ms {
+            // (in front of a player the bot looks around while it pauses)
+            manner::wander_pause(ctx);
             return GoalStatus::Running;
         }
         match random_point(ctx.world, ctx.rng, self.home, LEG_MIN_M, LEG_MAX_M, 8) {

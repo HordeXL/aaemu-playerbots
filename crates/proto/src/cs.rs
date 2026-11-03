@@ -245,27 +245,49 @@ pub fn teleport_ended(x: f32, y: f32, z: f32) -> Out {
 pub const STANCE_COMBAT: u8 = 0;
 /// `GameStanceType` Relaxed (the normal out-of-combat stance).
 pub const STANCE_RELAXED: u8 = 1;
+/// `GameStanceType` Swim (in the water).
+pub const STANCE_SWIM: u8 = 2;
 /// `MoveTypeAlertness` Idle.
 pub const ALERT_IDLE: u8 = 0;
 /// `MoveTypeAlertness` Combat.
 pub const ALERT_COMBAT: u8 = 2;
 
-/// `MoveTypeFlags.Moving`.
+/// `MoveTypeFlags.Moving`: a movement input is held.
 const FLAGS_MOVING: u8 = 0x02;
-/// `MoveTypeFlags.Stopping`.
-const FLAGS_STOPPING: u8 = 0x04;
-/// `MoveTypeActorFlags.StandingOnSolid` (running).
-const ACTOR_RUNNING: u8 = 0x04;
-/// `FLAG1 | StandingOnSolid` (walking).
-const ACTOR_WALKING: u8 = 0x05;
+/// `MoveTypeFlags.Stopping`: a one-shot event (a stop, a stance change, a jump).
+const FLAGS_EVENT: u8 = 0x04;
+/// `MoveTypeActorFlags` bit: walking (the remote client halves the speed factor).
+const ACTOR_WALK: u8 = 0x01;
+/// `MoveTypeActorFlags.StandingOnSolid`: the unit stands on the ground.
+const ACTOR_GROUND: u8 = 0x04;
+/// `MoveTypeActorFlags.Jumping`: the jump was executed (the remote client plays the jump).
+const ACTOR_JUMP: u8 = 0x10;
 /// Horizontal speed above which a moving update is announced as running (m/s).
 const RUN_SPEED: f32 = 3.0;
-/// `DeltaMovement` of a unit pushing the stick fully forward (`[0, 127, 0]`).
-const DELTA_FORWARD: i8 = 127;
-/// Wire units per m/s of a unit's velocity shorts.
-const VELOCITY_WIRE_PER_MPS: f32 = 1000.0;
+/// `DeltaMovement` of a unit running (the stick fully forward, `[0, 127, 0]`).
+const DELTA_RUN: i8 = 127;
+/// `DeltaMovement` of a unit walking (the stick half forward).
+const DELTA_WALK: i8 = 63;
+/// Wire units per m/s of a unit's velocity shorts: the 1.2 client reads `wire * 60 / 32767`
+/// (`x2game.dll` `sub_397C0470`, the type-1 branch).
+const VELOCITY_WIRE_PER_MPS: f32 = 32767.0 / 60.0;
 /// Degrees per step of the direction byte (`360 / 128`).
 const DIRECTION_STEP_DEG: f64 = 360.0 / 128.0;
+
+/// Where a unit is in a jump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JumpPhase {
+    /// On the ground.
+    #[default]
+    None,
+    /// The update that executes the jump: `vel.z` is the take-off speed.
+    TakeOff,
+    /// An update on the way up or down: `pos.z` is the height, `vel.z` the vertical speed.
+    Air,
+    /// The update at touchdown: on the ground, the jump flag still set, no vertical speed (the
+    /// real client sends it once, then continues with ordinary ground updates).
+    Land,
+}
 
 /// One `CSMoveUnitPacket` for a unit the bot controls (its own character).
 ///
@@ -275,20 +297,33 @@ const DIRECTION_STEP_DEG: f64 = 360.0 / 128.0;
 /// i16 vel x3, i8 rotation x3, i8 delta movement x3, u8 stance, u8 alertness, u8 actor flags`
 /// (server read: `packets/c2g_world.rs:224`, `MoveType::read` `models/movement.rs:261`,
 /// `UnitMove::read` `models/movement.rs:418`). The server broadcasts it unchanged as
-/// `SCOneUnitMovementPacket` to real clients, so the values follow what the server's own NPC
-/// and skill-controller movement sends (`systems/ai/simulation.rs:521-560`,
-/// `systems/ai/npc.rs:370-430`, stop: `:592-606`) and what the C# PlayerBots broadcaster
-/// announced for bots:
+/// `SCOneUnitMovementPacket` to real clients, so the values follow what the 1.2 client itself
+/// sends (`x2game.dll` `sub_397C0470`) and what the server's own NPC and skill-controller
+/// movement sends (`systems/ai/simulation.rs:521-560`, `systems/ai/npc.rs:370-430`):
 ///
-/// | | moving (`moving = true`) | stopped |
-/// | --- | --- | --- |
-/// | header flags | `0x02` Moving | `0x04` Stopping |
-/// | velocity shorts | `round(v * 1000)` per axis, clamped to `i16` (m/s) | 0 |
-/// | actor flags | `0x04` when speed > 3 m/s (running), else `0x05` (walking) | 0 |
-/// | delta movement | `[0, 127, 0]` (forward) | `[0, 0, 0]` |
+/// | | running | walking | stopped |
+/// | --- | --- | --- | --- |
+/// | header flags | `0x02` Moving | `0x02` | `0x04` event |
+/// | velocity shorts | `round(v * 546.1)` per axis (`32767 / 60` per m/s) | same | 0 |
+/// | delta movement | `[0, 127, 0]` | `[0, 63, 0]` | `[0, 0, 0]` |
+/// | actor flags | `0x04` on the ground | `0x05` | `0x04` |
 ///
-/// The server only needs the position (`systems/skills::on_move_request` treats a non-zero
-/// velocity as "moving" for buff removal); the rest makes the bot look right to real players.
+/// A speed of at most 3 m/s (horizontal) is a walk. A standing real client reports the ground
+/// (`0x04`); actor flags 0 mean airborne to the server (`skills::on_actor_move` fires a landing
+/// on the next update that stands again).
+///
+/// # Jumps
+///
+/// The shape follows the real client as far as it is known (see `docs/DESIGN.md`, life-like
+/// movement): the take-off update ([`JumpPhase::TakeOff`]) carries the event flag (header `0x06`
+/// while a stick is held, `0x04` standing) and actor flag `0x10`; the updates in the air
+/// ([`JumpPhase::Air`]) carry the height in `pos.z`, the vertical speed in `vel.z` (the
+/// velocity shorts are written whenever the unit is moving or in the air), header `0x02` (`0x00`
+/// without input) and no ground flag; the touchdown ([`JumpPhase::Land`]) is the event flag
+/// again (`0x04`, `0x06` with input) with actor flags `0x14` (ground and jump) and no vertical
+/// speed, as the real client sends it, and an ordinary ground update follows. The fall
+/// velocity (actor flag `0x80`, fall damage) is never sent.
+///
 /// `time` must change from packet to packet; the server's NPCs send milliseconds of the day.
 ///
 /// # Yaw
@@ -298,7 +333,7 @@ const DIRECTION_STEP_DEG: f64 = 360.0 / 128.0;
 /// has `yaw = atan2(dy, dx) - π/2`); [`yaw_towards`] computes it. The direction byte is
 /// `round(yaw / (2π / 128))` taken modulo 128 into `-42..=85` ([`yaw_to_direction`]), written
 /// as rotation z; rotation x and y (roll, pitch) are 0.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MoveUnit {
     /// Object id of the moved unit (the bot's character).
     pub obj: u32,
@@ -306,35 +341,49 @@ pub struct MoveUnit {
     pub time: u32,
     /// World position `(x, y, z)`.
     pub pos: (f32, f32, f32),
-    /// Velocity in m/s; ignored when `moving` is false.
+    /// Velocity in m/s; ignored when the unit neither `moving` nor jumps.
     pub vel: (f32, f32, f32),
     /// Facing in radians, see the type docs.
     pub yaw: f32,
     /// Whether this update announces motion or a stop.
     pub moving: bool,
-    /// `GameStanceType`: [`STANCE_RELAXED`] or [`STANCE_COMBAT`].
+    /// `GameStanceType`: [`STANCE_RELAXED`], [`STANCE_COMBAT`] or [`STANCE_SWIM`].
     pub stance: u8,
     /// `MoveTypeAlertness`: [`ALERT_IDLE`] or [`ALERT_COMBAT`].
     pub alertness: u8,
+    /// Where the unit is in a jump.
+    pub jump: JumpPhase,
 }
 
 /// Builds the `CSMoveUnitPacket` of `m`; see [`MoveUnit`] for the encoding.
 pub fn move_unit(m: &MoveUnit) -> Out {
     let wire = |v: f32| (v * VELOCITY_WIRE_PER_MPS).round().clamp(-32768.0, 32767.0) as i16;
-    let (flags, vel, actor, delta) = if m.moving {
-        let speed = (m.vel.0 * m.vel.0 + m.vel.1 * m.vel.1 + m.vel.2 * m.vel.2).sqrt();
-        (
-            FLAGS_MOVING,
-            [wire(m.vel.0), wire(m.vel.1), wire(m.vel.2)],
-            if speed > RUN_SPEED {
-                ACTOR_RUNNING
-            } else {
-                ACTOR_WALKING
-            },
-            DELTA_FORWARD,
-        )
+    let walking = m.vel.0.hypot(m.vel.1) <= RUN_SPEED;
+    let flags = match (m.jump, m.moving) {
+        (JumpPhase::None, true) | (JumpPhase::Air, true) => FLAGS_MOVING,
+        (JumpPhase::None, false) | (JumpPhase::TakeOff, false) | (JumpPhase::Land, false) => {
+            FLAGS_EVENT
+        }
+        (JumpPhase::TakeOff, true) | (JumpPhase::Land, true) => FLAGS_MOVING | FLAGS_EVENT,
+        (JumpPhase::Air, false) => 0,
+    };
+    let walk = if m.moving && walking { ACTOR_WALK } else { 0 };
+    let actor = match m.jump {
+        JumpPhase::None if m.moving && walking => ACTOR_GROUND | ACTOR_WALK,
+        JumpPhase::None => ACTOR_GROUND,
+        JumpPhase::TakeOff => ACTOR_JUMP | walk,
+        JumpPhase::Air => walk,
+        JumpPhase::Land => ACTOR_GROUND | ACTOR_JUMP | walk,
+    };
+    let vel = if m.moving || m.jump != JumpPhase::None {
+        [wire(m.vel.0), wire(m.vel.1), wire(m.vel.2)]
     } else {
-        (FLAGS_STOPPING, [0; 3], 0, 0)
+        [0; 3]
+    };
+    let delta = match (m.moving, walking) {
+        (false, _) => 0,
+        (true, true) => DELTA_WALK,
+        (true, false) => DELTA_RUN,
     };
     game(cs::CSMoveUnitPacket, |s| {
         s.write_bc(m.obj)
@@ -383,6 +432,53 @@ pub fn yaw_to_direction(yaw: f32) -> i8 {
     let steps = (f64::from(yaw).to_degrees() / DIRECTION_STEP_DEG).round() as i64;
     let n = steps.rem_euclid(128);
     (if n > 85 { n - 128 } else { n }) as i8
+}
+
+// ---- emotes ---------------------------------------------------------------------------------
+
+/// Emotion ids of `express_texts` (the server broadcasts the id; the client maps it to an
+/// animation). The ones bots use.
+pub mod emotion {
+    /// Thanks (a short bow).
+    pub const THANKS: u32 = 1;
+    /// Joy.
+    pub const HAPPY: u32 = 2;
+    /// Applause.
+    pub const CLAP: u32 = 10;
+    /// Pay respects (a salute).
+    pub const SALUTE: u32 = 11;
+    /// Greet (the wave).
+    pub const GREET: u32 = 12;
+    /// A broad laugh.
+    pub const LAUGH: u32 = 13;
+    /// A deep bow.
+    pub const BOW: u32 = 20;
+    /// A sigh.
+    pub const SIGH: u32 = 25;
+    /// Stretch.
+    pub const STRETCH: u32 = 26;
+    /// Yawn.
+    pub const YAWN: u32 = 27;
+    /// Sit on the ground (a pose that lasts until the unit moves).
+    pub const SIT: u32 = 48;
+    /// Scatter petals (the celebration).
+    pub const CELEBRATE: u32 = 62;
+    /// Show affection.
+    pub const HEART: u32 = 68;
+}
+
+/// `CSExpressEmotionPacket` (0x0ad): plays an emotion; the server broadcasts it as
+/// `SCEmotionExpressed` to everyone in view. Server read: `systems/services/express_text.rs:77`
+/// (a packet whose first object is not the sender's character is ignored; the server logs every
+/// emote at WARN, so emotes are rare).
+///
+/// Body: `bc self_obj, bc target_obj (0 = none), u32 emotion_id`.
+pub fn express_emotion(self_obj: u32, target_obj: u32, emotion_id: u32) -> Out {
+    game(cs::CSExpressEmotionPacket, |s| {
+        s.write_bc(self_obj)
+            .write_bc(target_obj)
+            .write_u32(emotion_id);
+    })
 }
 
 // ---- combat and interaction -----------------------------------------------------------------

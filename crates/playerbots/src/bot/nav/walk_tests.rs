@@ -158,7 +158,11 @@ fn flags(p: &Out) -> u8 {
 fn velocity(p: &Out) -> (f32, f32) {
     let vx = i16::from_le_bytes([p.body[18], p.body[19]]);
     let vy = i16::from_le_bytes([p.body[20], p.body[21]]);
-    (f32::from(vx) / 1000.0, f32::from(vy) / 1000.0)
+    // (the 1.2 client reads wire * 60 / 32767 m/s)
+    (
+        f32::from(vx) * 60.0 / 32767.0,
+        f32::from(vy) * 60.0 / 32767.0,
+    )
 }
 
 fn path_len(points: &[[f32; 3]]) -> f32 {

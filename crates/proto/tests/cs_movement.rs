@@ -6,7 +6,7 @@
 
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
-use aa_proto::cs::{self, MoveUnit};
+use aa_proto::cs::{self, JumpPhase, MoveUnit};
 use aa_proto::game::LEVEL_GAME;
 use aa_proto::opcodes::cs as op;
 use aa_proto::pos::encode_position;
@@ -21,7 +21,13 @@ fn base() -> MoveUnit {
         moving: false,
         stance: cs::STANCE_RELAXED,
         alertness: cs::ALERT_IDLE,
+        jump: JumpPhase::None,
     }
+}
+
+/// Wire units of a velocity of `v` m/s: the 1.2 client reads `wire * 60 / 32767`.
+fn wire(v: f32) -> i16 {
+    (v * 32767.0 / 60.0).round() as i16
 }
 
 /// `bc obj, u8 1, u32 time, u8 flags, position, 3 x i16 vel, 3 x i8 rot, 3 x i8 delta,
@@ -59,20 +65,37 @@ fn check(m: &MoveUnit, body: Vec<u8>) {
 
 #[test]
 fn running_forward_along_y() {
-    // 5.4 m/s north: velocity 5400, running actor flags 4, forward stick.
+    // 5.4 m/s north: velocity 2949 (546.1 wire units per m/s), running actor flags 4, forward
+    // stick fully pushed.
     let m = MoveUnit {
         vel: (0.0, 5.4, 0.0),
         moving: true,
         ..base()
     };
+    assert_eq!(wire(5.4), 2949);
     check(
         &m,
-        expected(0x02, m.pos, [0, 5400, 0], 0, [0, 127, 0], 1, 0, 4),
+        expected(0x02, m.pos, [0, 2949, 0], 0, [0, 127, 0], 1, 0, 4),
     );
 }
 
 #[test]
-fn walking_is_announced_with_actor_flags_5() {
+fn the_velocity_scale_is_the_clients_sixty_over_32767() {
+    // What a watching 1.2 client decodes (`wire * 60 / 32767`) is what the bot walks.
+    for v in [0.5f32, 1.8, 3.0, 5.4, 5.9, 8.06, 20.0] {
+        let m = MoveUnit {
+            vel: (v, 0.0, 0.0),
+            moving: true,
+            ..base()
+        };
+        let body = cs::move_unit(&m).body;
+        let got = i16::from_le_bytes([body[18], body[19]]) as f32 * 60.0 / 32767.0;
+        assert!((got - v).abs() < 0.002, "{v} m/s decodes as {got}");
+    }
+}
+
+#[test]
+fn walking_is_announced_with_actor_flags_5_and_half_the_stick() {
     let m = MoveUnit {
         vel: (1.0, 0.0, 0.0),
         yaw: -FRAC_PI_2,
@@ -81,7 +104,7 @@ fn walking_is_announced_with_actor_flags_5() {
     };
     check(
         &m,
-        expected(0x02, m.pos, [1000, 0, 0], -32, [0, 127, 0], 1, 0, 5),
+        expected(0x02, m.pos, [wire(1.0), 0, 0], -32, [0, 63, 0], 1, 0, 5),
     );
     // 3.0 m/s exactly is still a walk, anything above runs.
     let at_threshold = MoveUnit {
@@ -89,13 +112,22 @@ fn walking_is_announced_with_actor_flags_5() {
         moving: true,
         ..base()
     };
-    assert_eq!(cs::move_unit(&at_threshold).body[32], 5);
+    let b = cs::move_unit(&at_threshold).body;
+    assert_eq!((b[32], b[28] as i8), (5, 63));
     let above = MoveUnit {
         vel: (3.01, 0.0, 0.0),
         moving: true,
         ..base()
     };
-    assert_eq!(cs::move_unit(&above).body[32], 4);
+    let b = cs::move_unit(&above).body;
+    assert_eq!((b[32], b[28] as i8), (4, 127));
+    // the vertical speed of a jump does not turn a walk into a run
+    let slow_up = MoveUnit {
+        vel: (1.0, 0.0, 8.0),
+        moving: true,
+        ..base()
+    };
+    assert_eq!(cs::move_unit(&slow_up).body[32], 5);
 }
 
 #[test]
@@ -105,10 +137,10 @@ fn negative_and_clamped_velocities() {
         moving: true,
         ..base()
     };
-    // -2000 = 0xF830; +/- 100 m/s saturate the i16.
+    // -2 m/s = -1092; +/- 100 m/s saturate the i16.
     check(
         &m,
-        expected(0x02, m.pos, [-2000, 32767, -32768], 0, [0, 127, 0], 1, 0, 4),
+        expected(0x02, m.pos, [-1092, 32767, -32768], 0, [0, 127, 0], 1, 0, 4),
     );
 }
 
@@ -121,7 +153,8 @@ fn a_stop_has_no_velocity_and_no_input() {
         moving: false,
         ..base()
     };
-    check(&m, expected(0x04, m.pos, [0, 0, 0], 32, [0, 0, 0], 1, 0, 0));
+    // a standing real client reports the ground (actor flag 4), not "airborne"
+    check(&m, expected(0x04, m.pos, [0, 0, 0], 32, [0, 0, 0], 1, 0, 4));
 }
 
 #[test]
@@ -131,7 +164,174 @@ fn combat_stance_and_alertness_are_passed_through() {
         alertness: cs::ALERT_COMBAT,
         ..base()
     };
-    check(&m, expected(0x04, m.pos, [0, 0, 0], 0, [0, 0, 0], 0, 2, 0));
+    check(&m, expected(0x04, m.pos, [0, 0, 0], 0, [0, 0, 0], 0, 2, 4));
+}
+
+#[test]
+fn swimming_is_the_swim_stance() {
+    let m = MoveUnit {
+        vel: (0.0, 3.5, 0.0),
+        moving: true,
+        stance: cs::STANCE_SWIM,
+        ..base()
+    };
+    let body = cs::move_unit(&m).body;
+    assert_eq!(body[30], 2, "stance");
+    assert_eq!(body[8], 0x02);
+}
+
+#[test]
+fn a_standing_jump_is_an_event_with_the_jump_actor_flag() {
+    // take-off, standing: header 0x04, actor 0x10, vel.z = the take-off speed
+    let up = MoveUnit {
+        vel: (0.0, 0.0, 8.06),
+        jump: JumpPhase::TakeOff,
+        ..base()
+    };
+    check(
+        &up,
+        expected(0x04, up.pos, [0, 0, wire(8.06)], 0, [0, 0, 0], 1, 0, 0x10),
+    );
+    // in the air, standing: no input, no ground, the height and vertical speed are sent
+    let air = MoveUnit {
+        pos: (100.0, 200.0, 51.2),
+        vel: (0.0, 0.0, -2.0),
+        jump: JumpPhase::Air,
+        ..base()
+    };
+    check(
+        &air,
+        expected(0x00, air.pos, [0, 0, wire(-2.0)], 0, [0, 0, 0], 1, 0, 0),
+    );
+}
+
+#[test]
+fn a_running_jump_keeps_the_stick_and_loses_the_ground() {
+    let up = MoveUnit {
+        vel: (0.0, 5.4, 8.06),
+        moving: true,
+        jump: JumpPhase::TakeOff,
+        ..base()
+    };
+    check(
+        &up,
+        expected(
+            0x06,
+            up.pos,
+            [0, wire(5.4), wire(8.06)],
+            0,
+            [0, 127, 0],
+            1,
+            0,
+            0x10,
+        ),
+    );
+    let air = MoveUnit {
+        pos: (100.0, 201.0, 51.0),
+        vel: (0.0, 5.4, 1.0),
+        moving: true,
+        jump: JumpPhase::Air,
+        ..base()
+    };
+    check(
+        &air,
+        expected(
+            0x02,
+            air.pos,
+            [0, wire(5.4), wire(1.0)],
+            0,
+            [0, 127, 0],
+            1,
+            0,
+            0,
+        ),
+    );
+    // the landing is an ordinary running update again: ground flag, no vertical speed
+    let down = MoveUnit {
+        vel: (0.0, 5.4, 0.0),
+        moving: true,
+        ..base()
+    };
+    check(
+        &down,
+        expected(0x02, down.pos, [0, wire(5.4), 0], 0, [0, 127, 0], 1, 0, 4),
+    );
+    // a walking hop keeps the walk bit in the air
+    let hop = MoveUnit {
+        vel: (1.8, 0.0, 5.0),
+        moving: true,
+        jump: JumpPhase::Air,
+        ..base()
+    };
+    assert_eq!(cs::move_unit(&hop).body[32], 1);
+    let hop_up = MoveUnit {
+        jump: JumpPhase::TakeOff,
+        ..hop
+    };
+    assert_eq!(cs::move_unit(&hop_up).body[32], 0x11);
+}
+
+#[test]
+fn the_touchdown_is_ground_plus_jump_with_the_event_flag() {
+    // standing: header 0x04, actor 0x14 (ground and jump), no vertical speed
+    let down = MoveUnit {
+        jump: JumpPhase::Land,
+        ..base()
+    };
+    check(
+        &down,
+        expected(0x04, down.pos, [0, 0, 0], 0, [0, 0, 0], 1, 0, 0x14),
+    );
+    // running: the stick is still held, the horizontal speed goes on
+    let run = MoveUnit {
+        vel: (0.0, 5.4, 0.0),
+        moving: true,
+        jump: JumpPhase::Land,
+        ..base()
+    };
+    check(
+        &run,
+        expected(0x06, run.pos, [0, wire(5.4), 0], 0, [0, 127, 0], 1, 0, 0x14),
+    );
+    let walk = MoveUnit {
+        vel: (0.0, 1.8, 0.0),
+        moving: true,
+        jump: JumpPhase::Land,
+        ..base()
+    };
+    assert_eq!(cs::move_unit(&walk).body[32], 0x15);
+}
+
+#[test]
+fn the_fall_velocity_is_never_sent() {
+    for jump in [
+        JumpPhase::None,
+        JumpPhase::TakeOff,
+        JumpPhase::Air,
+        JumpPhase::Land,
+    ] {
+        for moving in [false, true] {
+            let m = MoveUnit {
+                vel: (0.0, 5.4, -30.0),
+                moving,
+                jump,
+                ..base()
+            };
+            let body = cs::move_unit(&m).body;
+            assert_eq!(body.len(), 33, "no fall velocity short follows");
+            assert_eq!(body[32] & 0x80, 0);
+        }
+    }
+}
+
+#[test]
+fn the_emote_packet_is_two_object_ids_and_the_emotion() {
+    let out = cs::express_emotion(0x03_0201, 0, cs::emotion::GREET);
+    assert_eq!(out.level, LEVEL_GAME);
+    assert_eq!(out.opcode, op::CSExpressEmotionPacket);
+    assert_eq!(out.body, vec![1, 2, 3, 0, 0, 0, 12, 0, 0, 0]);
+    let out = cs::express_emotion(7, 0x01_0000, 62);
+    assert_eq!(out.body, vec![7, 0, 0, 0, 0, 1, 62, 0, 0, 0]);
 }
 
 #[test]
