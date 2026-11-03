@@ -127,6 +127,29 @@ pub enum Speech {
     Cancel,
 }
 
+impl Speech {
+    /// The item the speech is about, if it names one.
+    pub fn template(&self) -> Option<u32> {
+        match self {
+            Speech::AdSell { template, .. }
+            | Speech::AdBuy { template, .. }
+            | Speech::Ask { template }
+            | Speech::Quote { template, .. }
+            | Speech::Offer { template, .. }
+            | Speech::Confirm { template, .. } => Some(*template),
+            _ => None,
+        }
+    }
+
+    /// The place the speech names, if it names one.
+    pub fn meet(&self) -> Option<Meet> {
+        match self {
+            Speech::Confirm { meet, .. } | Speech::Place { meet } => Some(*meet),
+            _ => None,
+        }
+    }
+}
+
 /// The words a [`Speech`] needs from the world.
 #[derive(Debug, Clone, Copy)]
 pub struct Words<'a> {

@@ -231,6 +231,14 @@ pub struct AdState {
     /// Bot clock before which no advertisement is posted.
     next_ad_ms: u64,
     last_say_ms: u64,
+    /// Bot clock of the next look at the surroundings ([`AdState::check_due`]).
+    check_ms: u64,
+    /// Bot clock of the next report of the bot's place to the board ([`AdState::report_due`]).
+    report_ms: u64,
+    /// Bot clock of the last whisper the bot sent (0 = none).
+    whisper_ms: u64,
+    /// Bot clock of the last chat refusal that was reported.
+    chat_err_ms: u64,
     /// Advertisements posted.
     pub posted: u32,
     /// Deals agreed.
@@ -326,6 +334,71 @@ impl AdState {
     /// Forgets the standing advertisement.
     pub fn withdraw(&mut self) {
         self.listing = None;
+    }
+
+    /// Whether the duty should look at its surroundings now: lines wait to be read or said, or
+    /// `gap_ms` passed since the last look.
+    pub fn check_due(&mut self, now_ms: u64, gap_ms: u64) -> bool {
+        if self.busy() || now_ms >= self.check_ms {
+            self.check_ms = now_ms + gap_ms;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the bot should tell the board where it is (every `gap_ms`).
+    pub fn report_due(&mut self, now_ms: u64, gap_ms: u64) -> bool {
+        if now_ms >= self.report_ms {
+            self.report_ms = now_ms + gap_ms;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The bot sent a whisper at `now_ms`.
+    pub fn note_whisper(&mut self, now_ms: u64) {
+        self.whisper_ms = now_ms.max(1);
+    }
+
+    /// Bot clock of the last whisper sent (0 = none).
+    pub fn last_whisper_ms(&self) -> u64 {
+        self.whisper_ms
+    }
+
+    /// The server's refusal of a whisper at `at_ms` was reported.
+    pub fn note_chat_error(&mut self, at_ms: u64) {
+        self.chat_err_ms = at_ms;
+    }
+
+    /// Bot clock of the last refusal that was reported.
+    pub fn chat_error_seen_ms(&self) -> u64 {
+        self.chat_err_ms
+    }
+
+    /// Lets the next step post an advertisement without waiting for the interval.
+    pub fn post_now(&mut self) {
+        self.next_ad_ms = 0;
+    }
+
+    /// Says `speech` to the other side of the agreed deal, in the medium the negotiation used.
+    pub fn tell_peer(&mut self, speech: Speech, now_ms: u64, delay_ms: u64) {
+        let Some(d) = self.deal.as_ref() else { return };
+        let medium = self
+            .talks
+            .iter()
+            .find(|t| same(&t.peer, &d.peer))
+            .map_or(Medium::Whisper, |t| t.medium);
+        let to = d.peer.clone();
+        if self.due.len() < MAX_DUE + 2 {
+            self.due.push(Due {
+                at_ms: now_ms + delay_ms,
+                medium,
+                to,
+                speech,
+            });
+        }
     }
 
     /// The speech that is ready to be said at `now_ms` (one line per [`SAY_GAP_MS`]).
