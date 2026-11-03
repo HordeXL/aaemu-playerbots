@@ -68,6 +68,15 @@ pub enum Problem<'a> {
         /// Seconds since the bot arrived.
         waited_s: u64,
     },
+    /// A monster stands far above or below the height of its spawn point.
+    MonsterHeight {
+        /// NPC template of the monster seen.
+        template: u32,
+        /// Height of its spawn point (metres, rounded).
+        spawn_z: i32,
+        /// Height it stands at (metres, rounded).
+        seen_z: i32,
+    },
     /// The exit doodad was cast on and nothing happened.
     ExitStuck {
         /// Exit doodad template.
@@ -198,6 +207,27 @@ pub fn build(at: Where<'_>, problem: Problem<'_>) -> IssueReport {
         .fact("listed", listed)
         .fact("seen_npcs", seen_npcs)
         .fact("seen_characters", seen_characters),
+        Problem::MonsterHeight {
+            template,
+            spawn_z,
+            seen_z,
+        } => base(
+            IssueKind::NpcMissing,
+            "monster-height".into(),
+            format!("{name}: the monsters stand far from the height of their spawn points"),
+        )
+        .expected(format!(
+            "monsters on the floor of their spawn points (npc {template}: spawn height {spawn_z} m)"
+        ))
+        .actual(format!(
+            "npc {template} stands at {seen_z} m, {} m {} its spawn point; the party cannot reach it",
+            (seen_z - spawn_z).abs(),
+            if seen_z < spawn_z { "below" } else { "above" }
+        ))
+        .suspect(Suspect::Server)
+        .fact("npc", template)
+        .fact("spawn_z", spawn_z)
+        .fact("seen_z", seen_z),
         Problem::ExitStuck { doodad, skill } => base(
             IssueKind::NoResponse,
             format!("exit doodad={doodad}"),
@@ -305,6 +335,16 @@ mod tests {
                 IssueKind::NpcMissing,
                 Suspect::Data,
                 "dungeon=50 boss=12188",
+            ),
+            (
+                Problem::MonsterHeight {
+                    template: 11358,
+                    spawn_z: 167,
+                    seen_z: 110,
+                },
+                IssueKind::NpcMissing,
+                Suspect::Server,
+                "dungeon=50 monster-height",
             ),
             (
                 Problem::NoMonsters {

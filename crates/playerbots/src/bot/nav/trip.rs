@@ -311,8 +311,9 @@ impl NavState {
 
     // ---- the trip -------------------------------------------------------------------------
 
-    /// Starts a trip from `pos` to the stop point `radius` metres short of `goal`.
-    pub fn begin(&mut self, pos: [f32; 3], goal: [f32; 2], radius: f32, now_ms: u64) {
+    /// Starts a trip from `pos` to the stop point `radius` metres short of `goal`. A trip that is
+    /// not `count`ed (the combat controller's) stays out of the trip statistics.
+    pub fn begin(&mut self, pos: [f32; 3], goal: [f32; 2], radius: f32, now_ms: u64, count: bool) {
         // The same goal again (a goal that asks every tick, the chase of a monster that stands
         // still): the trip goes on with its route and its search.
         if let Some(t) = self.trip.as_mut() {
@@ -328,7 +329,7 @@ impl NavState {
         }
         self.end(TripEnd::Cancelled);
         let straight = (d2(pos, goal) - radius).max(0.0);
-        let counted = straight >= COUNTED_TRIP_M;
+        let counted = count && straight >= COUNTED_TRIP_M;
         if counted {
             self.link
                 .metrics

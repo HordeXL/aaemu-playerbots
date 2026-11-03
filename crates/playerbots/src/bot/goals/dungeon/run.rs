@@ -28,8 +28,14 @@ pub const DOOR_RANGE: f32 = 3.5;
 pub const DOOR_STOP: f32 = 2.0;
 /// Monsters this far (metres) from the bot are looked at.
 const VIEW_M: f32 = 70.0;
-/// Monsters this far above or below the bot are on another floor.
+/// Monsters this far above or below the bot cannot be fought from where it stands (the melee
+/// reach and the range of most skills are measured in three dimensions).
 const FLOOR_REACH_M: f32 = 12.0;
+/// The bot follows the height of its target when the target is this near (horizontally).
+const FOLLOW_XY_M: f32 = 45.0;
+/// Monsters farther than this above or below the bot are no monsters of this dungeon (a unit
+/// that fell out of the world).
+const FLOOR_LIMIT_M: f32 = 150.0;
 /// A leg whose end is higher or lower than the bot by more than this starts at the height of its
 /// end (inside an instance the bot has no ground under it, see [`match_floor`]).
 const FLOOR_FIX_M: f32 = 4.0;
@@ -56,6 +62,7 @@ const T_NO_ENTRANCE: u16 = 1 << 6;
 const T_REFUSED: u16 = 1 << 7;
 const T_ERROR: u16 = 1 << 8;
 const T_BOSS: u16 = 1 << 9;
+const T_MONSTER_Z: u16 = 1 << 10;
 
 /// A doodad the run uses: the entrance or an exit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +132,10 @@ pub struct Run {
     /// Refusals of the exit skill seen, and the bot clock of the last one.
     exit_refused: (u8, u64),
     exit_noted: bool,
+    /// How far above (+) or below (-) the spawn points the server keeps the monsters of this
+    /// dungeon (0 until a monster was seen off its spawn height), see
+    /// [`Run::follow_target_floor`].
+    mob_dz: f32,
 }
 
 impl Run {
@@ -158,6 +169,7 @@ impl Run {
             exit_cast: (0, 0),
             exit_refused: (0, 0),
             exit_noted: false,
+            mob_dz: 0.0,
         }
     }
 
@@ -337,7 +349,8 @@ impl Run {
         };
         // the entrance
         if let Some(door) = self.door {
-            f.at_door = flat(me, door.pos) <= DOOR_RANGE;
+            f.door_dist = flat(me, door.pos);
+            f.at_door = f.door_dist <= DOOR_RANGE;
             f.door_in_view = find_doodad(ctx, door.template, door.pos).is_some();
             let near = crew
                 .iter()
@@ -347,6 +360,11 @@ impl Run {
                 })
                 .count();
             f.muster_near = near.min(255) as u8;
+            f.muster_far = crew
+                .iter()
+                .filter(|m| m.online)
+                .map(|m| flat([m.pos[0], m.pos[1], 0.0], [door.pos[0], door.pos[1], 0.0]))
+                .fold(0.0, f32::max);
             f.muster_ready = crew.iter().filter(|m| m.online).all(|m| {
                 flat([m.pos[0], m.pos[1], 0.0], [door.pos[0], door.pos[1], 0.0]) <= MUSTER_M
             });
@@ -780,7 +798,7 @@ impl Run {
             .destination()
             .is_none_or(|(x, y)| flat([x, y, 0.0], [door.pos[0], door.pos[1], 0.0]) > 3.0);
         if !ctx.motion.is_moving() || moved {
-            match_floor(ctx, door.pos[2]);
+            match_floor(ctx, door.pos);
             ctx.motion
                 .go_to(door.pos[0], door.pos[1], DOOR_STOP, Pace::Run, now);
         }
@@ -817,6 +835,7 @@ impl Run {
 
     fn clear_step(&mut self, ctx: &mut Ctx<'_>, order: Option<&PartyOrder>) {
         let Some(order) = order else { return };
+        self.follow_target_floor(ctx);
         let leader = order.is_leader(ctx.persona.id);
         // what the fight that just ended came to
         if let CombatStatus::TargetDead { obj } = ctx.combat.status() {
@@ -895,12 +914,12 @@ impl Run {
                         self.route
                             .iter()
                             .find(|s| flat([s.x, s.y, 0.0], [x, y, 0.0]) < 1.0)
-                            .map(|s| s.z)
+                            .map(|s| s.z + self.mob_dz)
                     } else {
                         leader_pos.map(|p| p[2])
                     };
                     if let Some(z) = floor {
-                        match_floor(ctx, z);
+                        match_floor(ctx, [x, y, z]);
                     }
                     ctx.motion.go_to(x, y, radius, Pace::Run, now);
                 }
@@ -925,6 +944,65 @@ impl Run {
                 }
             }
         }
+    }
+
+    /// Puts the bot at the height of the monster it fights when that stands too far above or below
+    /// for a skill to reach it. The server takes the client's position at its word, and the 1.2
+    /// server of the first live runs keeps the monsters of an instance on another height than
+    /// their spawn points (Sharpwind Mines: spawns at 167 m, monsters at 109.9 m, all of them),
+    /// which left the whole party "fighting" 57 m above its targets for minutes. The offset is
+    /// remembered for the legs to the next stops and filed once as a server finding.
+    fn follow_target_floor(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(obj) = ctx.combat.target() else {
+            return;
+        };
+        let Some(u) = ctx.state.units.get(&obj) else {
+            return;
+        };
+        if u.kind != UnitKind::Npc {
+            return;
+        }
+        let (me, upos, template) = (ctx.state.me.pos, u.pos, u.id);
+        let Some(z) = floor_to_follow(me, upos) else {
+            return;
+        };
+        if let Some(spawn_z) = self.spawn_height(ctx, template, upos) {
+            let off = upos[2] - spawn_z;
+            if off.abs() > FLOOR_REACH_M {
+                self.mob_dz = off;
+                self.tell(
+                    ctx,
+                    T_MONSTER_Z,
+                    Problem::MonsterHeight {
+                        template,
+                        spawn_z: spawn_z.round() as i32,
+                        seen_z: upos[2].round() as i32,
+                    },
+                );
+            }
+        }
+        // Only the server's misplaced monsters are followed up or down: a monster that stands at
+        // its own spawn height on another floor is reached on foot (the instance navmesh routes
+        // over its stairs, with their heights), never by a jump through the floor.
+        if self.mob_dz == 0.0 {
+            return;
+        }
+        ctx.motion.set_height(z);
+        ctx.state.me.pos[2] = z;
+    }
+
+    /// The height of the spawn point of `template` nearest to `pos` (within 12 m, horizontally).
+    fn spawn_height(&self, ctx: &Ctx<'_>, template: u32, pos: [f32; 3]) -> Option<f32> {
+        let w = self
+            .dungeon_ref(ctx)
+            .and_then(|d| ctx.world.dungeon_world(d))?;
+        w.npcs()
+            .iter()
+            .filter(|n| n.template == template)
+            .map(|n| (flat(pos, [n.pos.x, n.pos.y, 0.0]), n.pos.z))
+            .filter(|(d, _)| *d <= 12.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, z)| z)
     }
 
     fn note_kill(&mut self, ctx: &mut Ctx<'_>, obj: u32) {
@@ -954,7 +1032,9 @@ impl Run {
             if u.kind != UnitKind::Npc || u.dist2d(me) > VIEW_M {
                 continue;
             }
-            if (u.pos[2] - me[2]).abs() > FLOOR_REACH_M {
+            // (the monsters of another floor are fought too: the bot follows its target's height,
+            // see `follow_target_floor`)
+            if (u.pos[2] - me[2]).abs() > FLOOR_LIMIT_M {
                 continue;
             }
             let Some(t) = combat::attackable(ctx.world, faction, u) else {
@@ -1288,14 +1368,45 @@ fn drop_stale_load(ctx: &mut Ctx<'_>) {
     }
 }
 
+/// The height the bot takes to fight a monster at `target` from `me`: the monster's, when that is
+/// more than [`FLOOR_REACH_M`] above or below and the monster is within [`FOLLOW_XY_M`] on the map.
+fn floor_to_follow(me: [f32; 3], target: [f32; 3]) -> Option<f32> {
+    let off_floor = (target[2] - me[2]).abs() > FLOOR_REACH_M;
+    (off_floor && target[2].is_finite() && flat(me, target) <= FOLLOW_XY_M).then_some(target[2])
+}
+
 /// Inside an instance the bot has no ground under it: it keeps the height it arrived at, so the
 /// mobs of another floor stay out of reach. A leg to another floor therefore starts at the height
 /// of its end (the server takes the position the client reports).
-fn match_floor(ctx: &mut Ctx<'_>, z: f32) {
+fn match_floor(ctx: &mut Ctx<'_>, dest: [f32; 3]) {
     let me = ctx.state.me.pos;
-    if (z - me[2]).abs() > FLOOR_FIX_M {
-        ctx.motion.teleported([me[0], me[1], z]);
-        ctx.state.me.pos[2] = z;
+    let z = dest[2];
+    if (z - me[2]).abs() <= FLOOR_FIX_M || routed_on_mesh(ctx, me, dest) {
+        return;
+    }
+    ctx.motion.teleported([me[0], me[1], z]);
+    ctx.state.me.pos[2] = z;
+}
+
+/// Whether the walk from `from` to `to` goes over the instance's navmesh: both ends lie in the
+/// same connected part of it, so the route carries the heights of its stairs and ramps and the
+/// bot walks up or down them instead of changing floors on the spot.
+fn routed_on_mesh(ctx: &Ctx<'_>, from: [f32; 3], to: [f32; 3]) -> bool {
+    if !ctx.cfg.behavior.navmesh {
+        return false;
+    }
+    let Some(mesh) = ctx
+        .state
+        .place
+        .world_name()
+        .and_then(|w| ctx.world.nav_of(w))
+    else {
+        return false;
+    };
+    let at = |p: [f32; 3]| mesh.locate(aa_world::Vec3::new(p[0], p[1], p[2]), 8.0);
+    match (at(from), at(to)) {
+        (Some(a), Some(b)) => mesh.same_component(a, b),
+        _ => false,
     }
 }
 
@@ -1320,4 +1431,27 @@ pub fn reject_strays(ctx: &mut Ctx<'_>, leader_char: Option<u32>) {
         "dungeon: turned down the team invitation of {}",
         inv.from_name
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bot_takes_the_height_of_a_monster_it_cannot_reach_from_its_own() {
+        let me = [450.0, 298.0, 150.0];
+        // Palace Cellar: the monsters 29.7 m below the entrance, 4 m away on the map
+        assert_eq!(floor_to_follow(me, [454.0, 298.0, 120.3]), Some(120.3));
+        // Sharpwind Mines: spawn points at 167 m, monsters at 109.9 m
+        let me = [628.0, 324.0, 167.5];
+        assert_eq!(floor_to_follow(me, [613.4, 324.4, 109.9]), Some(109.9));
+        // the same floor (stairs, a slope) is walked
+        assert_eq!(floor_to_follow(me, [613.4, 324.4, 160.0]), None);
+        assert_eq!(floor_to_follow(me, [613.4, 324.4, 175.0]), None);
+        // a monster far away on the map is not followed yet
+        assert_eq!(floor_to_follow(me, [700.0, 324.0, 109.9]), None);
+        // a height that is no number is ignored
+        assert_eq!(floor_to_follow(me, [613.4, 324.4, f32::NAN]), None);
+        assert_eq!(floor_to_follow(me, [613.4, 324.4, f32::INFINITY]), None);
+    }
 }

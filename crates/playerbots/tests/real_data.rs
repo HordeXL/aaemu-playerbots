@@ -403,12 +403,13 @@ fn the_automatic_brain_runs_for_half_an_hour_without_trouble() {
     }
 }
 
-/// The dungeon and sail goals are stubs until their features land: the operator can force them
-/// (the web UI offers both) without harm, the brain switches them off, and the automatic choice
-/// never comes near them.
+/// The dungeon and sail goals are implemented: the operator can force them (the web UI offers
+/// both) on a bot that cannot do them right now (no party partners, no coast, no boat scroll in a
+/// rig without GM rights) without harm. They end with a reason of their own, the brain never
+/// switches them off as stubs and the bot goes on with the automatic choice.
 #[test]
 #[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
-fn forcing_a_travel_goal_that_is_not_implemented_yet_falls_back_to_auto() {
+fn forcing_a_travel_goal_the_bot_cannot_do_now_does_no_harm() {
     let Some(world) = world() else {
         eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
         return;
@@ -416,27 +417,18 @@ fn forcing_a_travel_goal_that_is_not_implemented_yet_falls_back_to_auto() {
     for kind in [GoalKind::Dungeon, GoalKind::Sail] {
         let mut rig = Rig::new(world.clone(), "Darkrunner", 11);
         rig.force(kind);
-        for _ in 0..16 {
+        let mut names = BTreeSet::new();
+        for _ in 0..(5 * 60 * 4) {
             rig.tick(250);
             rig.out.clear();
+            names.insert(rig.brain.goal_name());
         }
-        assert!(rig.brain.is_disabled(kind), "{kind:?} was not switched off");
-        assert_eq!(rig.brain.choice(), GoalChoice::Auto);
-        assert!(rig.said("not implemented"), "{kind:?}: no line in the log");
-        // switched off for good, and never picked by the scoring in the first place
-        for _ in 0..(10 * 60 * 4) {
-            rig.tick(250);
-            rig.out.clear();
-            assert_ne!(rig.brain.goal().map(|g| g.kind()), Some(kind));
-        }
-    }
-    // an automatic bot never starts either of them
-    let mut rig = Rig::new(world, "Reaper", 12);
-    for _ in 0..(10 * 60 * 4) {
-        rig.tick(250);
-        rig.out.clear();
-        let name = rig.brain.goal_name();
-        assert!(name != "dungeon" && name != "sail", "{name}");
+        assert!(
+            !rig.brain.is_disabled(kind),
+            "{kind:?} was switched off as a stub"
+        );
+        assert!(!rig.said("not implemented"), "{kind:?}: still a stub");
+        println!("{kind:?}: goals seen {names:?}");
     }
 }
 

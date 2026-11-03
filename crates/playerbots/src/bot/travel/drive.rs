@@ -75,6 +75,9 @@ const NO_ROUTE_MS: u64 = 30_000;
 const OPEN_OFF_MS: u64 = 180_000;
 /// After a failed recall none is tried for this long, ms.
 const RECALL_OFF_MS: u64 = 30 * 60_000;
+/// After a journey was blocked by a buff of the bot (the resurrection sickness lasts minutes) no
+/// gate is opened and no recall is tried for this long, ms.
+const BLOCKED_OFF_MS: u64 = 60_000;
 /// Implicit journeys that no goal asked for within this long are dropped, ms.
 const STALE_MS: u64 = 20_000;
 /// Gates not in the unit view and older than this are forgotten, ms.
@@ -334,6 +337,32 @@ fn run(j: &mut Journey, ctx: &mut Ctx<'_>, inner: &mut Inner) -> JourneyStatus {
     st
 }
 
+/// Pauses the portal use the failed journey `why` shows to be pointless for a while.
+fn back_off(inner: &mut Inner, why: JourneyFail, recall: bool, now: u64) {
+    match why {
+        JourneyFail::OpenRefused(_)
+        | JourneyFail::OpenError(_)
+        | JourneyFail::NoGate
+        | JourneyFail::UseRefused(_)
+        | JourneyFail::NoTeleport
+        | JourneyFail::NoReply
+            if !recall =>
+        {
+            inner.open_off_until_ms = now + OPEN_OFF_MS;
+        }
+        JourneyFail::RecallRefused(_) | JourneyFail::NoTeleport if recall => {
+            inner.recall_off_until_ms = now + RECALL_OFF_MS;
+        }
+        // The buff is the bot's, not the destination's: asking again for the next destination
+        // (the quest goal picks a new one every few seconds) fails the same way, once per ask.
+        JourneyFail::Blocked(_) => {
+            inner.open_off_until_ms = inner.open_off_until_ms.max(now + BLOCKED_OFF_MS);
+            inner.recall_off_until_ms = inner.recall_off_until_ms.max(now + BLOCKED_OFF_MS);
+        }
+        _ => {}
+    }
+}
+
 /// What the finished journey changes for the next ones, and the log line.
 fn settle(ctx: &mut Ctx<'_>, inner: &mut Inner, j: &Journey, st: JourneyStatus) {
     let now = ctx.now_ms;
@@ -353,22 +382,7 @@ fn settle(ctx: &mut Ctx<'_>, inner: &mut Inner, j: &Journey, st: JourneyStatus) 
                     .say(format!("travel: portal trip failed ({})", why.word()));
                 tracing::info!(bot = %ctx.persona.name, why = why.word(), ?why, "portals: journey failed");
             }
-            match why {
-                JourneyFail::OpenRefused(_)
-                | JourneyFail::OpenError(_)
-                | JourneyFail::NoGate
-                | JourneyFail::UseRefused(_)
-                | JourneyFail::NoTeleport
-                | JourneyFail::NoReply
-                    if !j.is_recall() =>
-                {
-                    inner.open_off_until_ms = now + OPEN_OFF_MS;
-                }
-                JourneyFail::RecallRefused(_) | JourneyFail::NoTeleport if j.is_recall() => {
-                    inner.recall_off_until_ms = now + RECALL_OFF_MS;
-                }
-                _ => {}
-            }
+            back_off(inner, why, j.is_recall(), now);
             if let JourneyFail::UseRefused(code) = why {
                 STATS.refusal(code);
             }
@@ -1253,6 +1267,29 @@ mod tests {
             line.contains("records 1/1 ok") && line.contains("610:2"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_buff_that_blocks_the_portals_pauses_them_for_every_destination() {
+        let mut inner = Inner::default();
+        back_off(&mut inner, JourneyFail::Blocked(2385), false, 1_000);
+        assert_eq!(inner.open_off_until_ms, 1_000 + BLOCKED_OFF_MS);
+        assert_eq!(inner.recall_off_until_ms, 1_000 + BLOCKED_OFF_MS);
+        // a longer pause that is running already stays
+        let mut inner = Inner::default();
+        back_off(&mut inner, JourneyFail::NoGate, false, 5_000);
+        back_off(&mut inner, JourneyFail::RecallRefused(8), true, 5_000);
+        back_off(&mut inner, JourneyFail::Blocked(2385), false, 6_000);
+        assert_eq!(inner.open_off_until_ms, 5_000 + OPEN_OFF_MS);
+        assert_eq!(inner.recall_off_until_ms, 5_000 + RECALL_OFF_MS);
+        // the other failures keep their pauses, and the ones that need none set none
+        let mut inner = Inner::default();
+        back_off(&mut inner, JourneyFail::Interrupted, false, 1_000);
+        back_off(&mut inner, JourneyFail::Timeout, true, 1_000);
+        assert_eq!((inner.open_off_until_ms, inner.recall_off_until_ms), (0, 0));
+        back_off(&mut inner, JourneyFail::OpenRefused(15), false, 1_000);
+        assert_eq!(inner.open_off_until_ms, 1_000 + OPEN_OFF_MS);
+        assert_eq!(inner.recall_off_until_ms, 0);
     }
 
     #[test]

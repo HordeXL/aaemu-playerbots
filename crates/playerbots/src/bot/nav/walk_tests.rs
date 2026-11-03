@@ -1000,3 +1000,27 @@ fn a_goal_that_stops_the_walk_in_range_counts_it_as_arrived() {
     let s = rig.metrics.snapshot(true);
     assert_eq!((s.trips, s.trips_arrived, s.trips_cancelled), (2, 1, 1));
 }
+
+#[test]
+fn a_chase_is_no_trip_in_the_statistics_but_cuts_a_goals_walk_off() {
+    let mut rig = Rig::new(detour_mesh(), [50.0, 40.0, FLOOR_Z], Opts::default());
+    // the chase of a monster that keeps moving: a new goal every tick, and then the stop
+    for i in 0..6 {
+        let now = rig.now;
+        rig.motion
+            .chase_to(150.0 + i as f32 * 3.0, 40.0, 2.0, Pace::Run, now);
+        assert_eq!(rig.tick(250), MotionStatus::Moving);
+    }
+    rig.motion.stop();
+    let s = rig.metrics.snapshot(true);
+    assert_eq!((s.trips, s.trips_arrived, s.trips_cancelled), (0, 0, 0));
+    // the walk of a goal that a fight cuts off is a cancelled trip, the chase after it is none
+    rig.go(190.0, 40.0, 0.0);
+    rig.tick(250);
+    let now = rig.now;
+    rig.motion.chase_to(60.0, 40.0, 2.0, Pace::Run, now);
+    let s = rig.metrics.snapshot(true);
+    assert_eq!((s.trips, s.trips_arrived, s.trips_cancelled), (1, 0, 1));
+    // (and the chase is walked like any trip)
+    assert_eq!(rig.tick(250), MotionStatus::Moving);
+}

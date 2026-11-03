@@ -1084,7 +1084,7 @@ impl Combat {
                 .is_none_or(|g| dist2d([g.0, g.1, 0.0], [upos[0], upos[1], 0.0]) > 2.0);
             if moved_target || !ctx.motion.is_moving() {
                 ctx.motion
-                    .go_to(upos[0], upos[1], arrival_radius(preferred), Pace::Run, now);
+                    .chase_to(upos[0], upos[1], arrival_radius(preferred), Pace::Run, now);
                 ctx.combat.last_goto = Some((upos[0], upos[1]));
             }
             return CombatStatus::Approaching;
@@ -1171,7 +1171,7 @@ impl Combat {
             if !super::goals::walkable(ctx.world, x, y) {
                 continue;
             }
-            ctx.motion.go_to(x, y, 1.0, Pace::Run, now);
+            ctx.motion.chase_to(x, y, 1.0, Pace::Run, now);
             let c = &mut *ctx.combat;
             c.last_goto = None;
             c.kite_until_ms = now + OBSTACLE_HOLD_MS + 1_000;
@@ -1294,7 +1294,7 @@ impl Combat {
             return false;
         }
         let now = ctx.now_ms;
-        ctx.motion.go_to(x, y, 1.0, Pace::Run, now);
+        ctx.motion.chase_to(x, y, 1.0, Pace::Run, now);
         let c = &mut *ctx.combat;
         c.last_goto = None;
         c.kite_until_ms = now + KITE_MS;
@@ -1402,7 +1402,7 @@ impl Combat {
             LootAction::WalkTo => {
                 if !ctx.motion.is_moving() {
                     ctx.motion
-                        .go_to(view.1[0], view.1[1], LOOT_WALK_RADIUS, Pace::Run, now);
+                        .chase_to(view.1[0], view.1[1], LOOT_WALK_RADIUS, Pace::Run, now);
                 }
             }
             LootAction::Open => {

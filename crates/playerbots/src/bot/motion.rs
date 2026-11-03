@@ -402,6 +402,26 @@ impl Motion {
 
     /// Starts a trip through `points` (the last one is the destination).
     pub fn go_via(&mut self, points: &[(f32, f32)], radius: f32, pace: Pace, now_ms: u64) {
+        self.go_via_counted(points, radius, pace, now_ms, true);
+    }
+
+    /// Like [`Motion::go_to`] for the combat controller's movements (the chase of a monster, a
+    /// step to the side, a retreat, the walk to loot): the trip is planned and walked the same,
+    /// but it is not a trip in the navigation statistics, because a chase restarts whenever the
+    /// monster moves and ends whenever the bot is in range, which is not a walk that fails to
+    /// arrive.
+    pub fn chase_to(&mut self, x: f32, y: f32, radius: f32, pace: Pace, now_ms: u64) {
+        self.go_via_counted(&[(x, y)], radius, pace, now_ms, false);
+    }
+
+    fn go_via_counted(
+        &mut self,
+        points: &[(f32, f32)],
+        radius: f32,
+        pace: Pace,
+        now_ms: u64,
+        counted: bool,
+    ) {
         self.path.clear();
         self.path.extend(
             points
@@ -424,7 +444,7 @@ impl Motion {
         let single = (self.path.len() == 1).then(|| self.path[0]);
         if let Some(n) = self.nav.as_deref_mut() {
             match single {
-                Some((x, y)) => n.begin(pos, [x, y], self.radius, now_ms),
+                Some((x, y)) => n.begin(pos, [x, y], self.radius, now_ms, counted),
                 None => n.end(TripEnd::Cancelled),
             }
         }
@@ -461,6 +481,20 @@ impl Motion {
         self.pending_tp = Some(PendingTeleport {
             deadline_ms: now_ms + TELEPORT_WAIT_MS,
         });
+    }
+
+    /// Puts the bot at height `z` (it keeps its place on the map and its trip): the server hears
+    /// of it with the next update, which is sent at once. For the dungeon goal in an instance,
+    /// where the bot has no ground under it, see `goals::dungeon`.
+    pub fn set_height(&mut self, z: f32) {
+        if !z.is_finite() {
+            return;
+        }
+        self.pos[2] = z;
+        self.force_send = true;
+        if !self.is_moving() {
+            self.stop_due = true;
+        }
     }
 
     /// Stops walking; a stopped update follows on the next tick.
@@ -940,6 +974,31 @@ mod tests {
         rig.tick(&t, 250, 250);
         rig.tick(&t, 250, 250);
         assert_eq!(rig.out.len(), n);
+    }
+
+    #[test]
+    fn a_new_height_reaches_the_server_and_the_trip_goes_on() {
+        // (inside an instance there is no ground)
+        let none = |_: f32, _: f32| None::<f32>;
+        let mut rig = Rig::new([10.0, 10.0, 167.0]);
+        // standing: a stopped update follows at once
+        rig.motion.set_height(110.0);
+        assert_eq!(rig.motion.pos()[2], 110.0);
+        rig.tick(&none, 250, 250);
+        assert_eq!(rig.out.len(), 1);
+        assert_eq!(flags(&rig.out[0]), 0x04);
+        // walking: the trip goes on, at the new height
+        rig.motion.go_to(60.0, 10.0, 0.0, Pace::Run, rig.now);
+        rig.tick(&none, 250, 250);
+        rig.motion.set_height(120.0);
+        assert_eq!(rig.motion.status(), MotionStatus::Moving);
+        rig.tick(&none, 250, 250);
+        assert_eq!(rig.motion.status(), MotionStatus::Moving);
+        assert_eq!(rig.motion.pos()[2], 120.0);
+        assert_eq!(flags(rig.out.last().unwrap()), 0x02);
+        // a height that is no number is ignored
+        rig.motion.set_height(f32::NAN);
+        assert_eq!(rig.motion.pos()[2], 120.0);
     }
 
     #[test]

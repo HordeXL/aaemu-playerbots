@@ -177,6 +177,8 @@ impl Sim {
                     .is_some_and(|i| i.from_char == leader.char_id),
             },
             at_door: m.at_door,
+            door_dist: if m.at_door { 0.0 } else { 100.0 },
+            muster_far: 0.0,
             trip: if m.walking_until.is_some() {
                 Trip::Moving
             } else {

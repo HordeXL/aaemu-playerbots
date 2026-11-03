@@ -40,13 +40,22 @@ pub const TEAM_MS: u64 = 75_000;
 pub const INVITE_GAP_MS: u64 = 4_500;
 /// Invitations per member.
 pub const INVITE_TRIES: u8 = 3;
-/// The whole trip to the entrance.
+/// The whole trip to the entrance, at least (see [`travel_budget_ms`]).
 pub const TRAVEL_MS: u64 = 10 * 60_000;
+/// The pace (m/s) a trip to the entrance is budgeted at: the run speed minus detours around cliffs
+/// and water, the fights on the way and the rests after them. (The first live run walked 2.9 km
+/// in more than ten minutes.)
+pub const TRAVEL_BUDGET_MPS: f32 = 3.0;
+/// Extra time on top of the walk, for the last bots of the party to catch up.
+pub const TRAVEL_SLACK_MS: u64 = 2 * 60_000;
+/// The longest budget of a trip to the entrance.
+pub const TRAVEL_MAX_MS: u64 = 45 * 60_000;
+
 /// Failed trips (stuck, timeout) before the run is given up.
 pub const MOTION_RETRIES: u8 = 5;
 /// Everybody within this many metres of the entrance counts as arrived.
 pub const MUSTER_M: f32 = 20.0;
-/// Waiting for the others at the entrance.
+/// Waiting for the others at the entrance (plus the walk of the farthest, see [`muster_patience_ms`]).
 pub const MUSTER_MS: u64 = 90_000;
 /// Delay between two members entering.
 pub const STAGGER_MS: u64 = 1_800;
@@ -80,6 +89,30 @@ pub const LEADER_OUT_WAIT_MS: u64 = 20_000;
 pub const EXIT_DOOR_WAIT_MS: u64 = 20_000;
 /// Re-sends of a team packet.
 pub const TEAM_RESEND_MS: u64 = 5_000;
+
+/// How long a bot at the entrance waits for the others: [`MUSTER_MS`], and the walk of the
+/// farthest of them (`far_m` metres from the entrance when the trip began). A party spreads over
+/// hundreds of metres, and a bot that was moved to the door by a GM `/move` stands there long
+/// before the others have walked.
+pub fn muster_patience_ms(far_m: f32) -> u64 {
+    let walk = if far_m.is_finite() && far_m > 0.0 {
+        (far_m / TRAVEL_BUDGET_MPS * 1000.0) as u64
+    } else {
+        0
+    };
+    (MUSTER_MS + walk).min(TRAVEL_MAX_MS)
+}
+
+/// How long the trip to the entrance may take when the bot started `dist` metres (straight line)
+/// from it: the party planner sends parties farther than the 10 minutes of a short walk cover.
+pub fn travel_budget_ms(dist: f32) -> u64 {
+    let walk = if dist.is_finite() && dist > 0.0 {
+        (dist / TRAVEL_BUDGET_MPS * 1000.0) as u64 + TRAVEL_SLACK_MS
+    } else {
+        0
+    };
+    walk.clamp(TRAVEL_MS, TRAVEL_MAX_MS)
+}
 
 /// The phase a run is in. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +222,8 @@ pub struct Facts {
     pub team: TeamFacts,
     /// The bot stands at the entrance.
     pub at_door: bool,
+    /// Horizontal distance to the entrance (0 = not known).
+    pub door_dist: f32,
     /// The movement controller.
     pub trip: Trip,
     /// The entrance doodad is in view.
@@ -197,6 +232,8 @@ pub struct Facts {
     pub muster_ready: bool,
     /// Members (the bot included) near the entrance.
     pub muster_near: u8,
+    /// Distance of the farthest online member from the entrance (0 = not known).
+    pub muster_far: f32,
     /// A refusal of the entry the server sent since [`Machine::error_watermark`].
     pub error: Option<EntryError>,
     /// The server refused the entrance cast itself (range, cooldown, state) since
@@ -311,6 +348,10 @@ pub struct Machine {
     /// Invitations sent per order index.
     invites: [u8; MAX_PARTY],
     trips_failed: u8,
+    /// The farthest the bot was from the entrance since the trip began (sets the time allowed).
+    travel_dist: f32,
+    /// The farthest a member was from the entrance since the muster began.
+    muster_far: f32,
     posted: bool,
     raised_ms: u64,
     left_stale: bool,
@@ -341,6 +382,8 @@ impl Machine {
             tries: 0,
             invites: [0; MAX_PARTY],
             trips_failed: 0,
+            travel_dist: 0.0,
+            muster_far: 0.0,
             posted: false,
             raised_ms: 0,
             left_stale: false,
@@ -394,6 +437,8 @@ impl Machine {
         self.since_ms = now_ms;
         self.last_ms = 0;
         self.tries = 0;
+        self.travel_dist = 0.0;
+        self.muster_far = 0.0;
     }
 
     /// The team the bot belonged to is gone (it was kicked or dismissed).
@@ -504,7 +549,8 @@ impl Machine {
         if self.lost(f) {
             return Intent::Fail(Fail::TeamBroke);
         }
-        if now.saturating_sub(self.since_ms) > TRAVEL_MS {
+        self.travel_dist = self.travel_dist.max(f.door_dist);
+        if now.saturating_sub(self.since_ms) > travel_budget_ms(self.travel_dist) {
             return Intent::Fail(Fail::Timeout);
         }
         if f.at_door {
@@ -534,10 +580,11 @@ impl Machine {
             return Intent::GoToDoor;
         }
         let waited = now.saturating_sub(self.since_ms);
+        self.muster_far = self.muster_far.max(f.muster_far);
         if self.ready_ms == 0 {
             // (once the party was complete the others walking in one by one do not undo it)
             if !f.muster_ready {
-                if waited <= MUSTER_MS {
+                if waited <= muster_patience_ms(self.muster_far) {
                     return Intent::Stand;
                 }
                 // the others did not come in time: go with those who did, if any
@@ -990,6 +1037,64 @@ mod tests {
         };
         assert_eq!(m.step(&full), Intent::GoToDoor);
         m
+    }
+
+    #[test]
+    fn the_muster_waits_for_the_walk_of_the_farthest_member() {
+        assert_eq!(muster_patience_ms(0.0), MUSTER_MS);
+        assert_eq!(muster_patience_ms(f32::NAN), MUSTER_MS);
+        assert_eq!(muster_patience_ms(3_000.0), MUSTER_MS + 1_000_000);
+        assert_eq!(muster_patience_ms(1.0e9), TRAVEL_MAX_MS);
+        // at the entrance first: the other walks 975 m (324 s), the old wait of 90 s was over
+        let mut m = at_travel();
+        let team = in_team(3, 0);
+        let at = |now, near, far| Facts {
+            team,
+            at_door: true,
+            muster_ready: false,
+            muster_near: near,
+            muster_far: far,
+            ..facts(now)
+        };
+        assert_eq!(m.step(&at(200, 1, 975.0)), Intent::Stand);
+        assert_eq!(m.phase(), Phase::Muster);
+        assert_eq!(m.step(&at(300, 1, 975.0)), Intent::Stand);
+        assert_eq!(m.step(&at(200 + MUSTER_MS + 1, 1, 400.0)), Intent::Stand);
+        assert_eq!(m.step(&at(200 + 330_000, 1, 10.0)), Intent::Stand);
+        // the others did come: the party goes in
+        assert_ne!(m.step(&at(200 + 340_000, 2, 0.0)), Intent::Fail(Fail::Team));
+        // and one that never comes is given up after the walk it needed
+        let mut m = at_travel();
+        assert_eq!(m.step(&at(200, 1, 975.0)), Intent::Stand);
+        assert_eq!(m.step(&at(300, 1, 975.0)), Intent::Stand);
+        assert_eq!(
+            m.step(&at(200 + muster_patience_ms(975.0) + 1, 1, 975.0)),
+            Intent::Fail(Fail::Team)
+        );
+    }
+
+    #[test]
+    fn a_far_entrance_gets_a_longer_budget() {
+        assert_eq!(travel_budget_ms(0.0), TRAVEL_MS);
+        assert_eq!(travel_budget_ms(1_000.0), TRAVEL_MS);
+        assert_eq!(travel_budget_ms(f32::NAN), TRAVEL_MS);
+        assert_eq!(travel_budget_ms(1.0e9), TRAVEL_MAX_MS);
+        // 2.9 km at 3 m/s and two minutes of slack: the 10 minutes of the first live run were short
+        let ms = travel_budget_ms(2_900.0);
+        assert!((1_000_000..1_200_000).contains(&ms), "{ms}");
+        let mut m = at_travel();
+        let team = in_team(3, 0);
+        let f = |now, door_dist| Facts {
+            team,
+            trip: Trip::Moving,
+            door_dist,
+            ..facts(now)
+        };
+        assert_eq!(m.step(&f(200, 2_900.0)), Intent::Wait);
+        // still walking after the old limit
+        assert_eq!(m.step(&f(100 + TRAVEL_MS + 60_000, 900.0)), Intent::Wait);
+        // the budget is the one of the start distance, not of the distance now
+        assert_eq!(m.step(&f(100 + ms + 1, 300.0)), Intent::Fail(Fail::Timeout));
     }
 
     #[test]
