@@ -1121,6 +1121,7 @@ fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
     d.has_loot
         || d.quest_glow != 0
         || world.is_dungeon_door(d.template)
+        || world.is_mirage_door(d.template)
         || world
             .doodad(d.template)
             .is_some_and(|t| t.flags != DoodadFlags::NONE)

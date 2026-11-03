@@ -237,6 +237,14 @@ impl World {
         self.travel().mirage.as_ref()
     }
 
+    /// Whether a doodad template is the island's portal (main world) or its exit door. Bots keep
+    /// these in view although they offer nothing else to use.
+    pub fn is_mirage_door(&self, template: u32) -> bool {
+        self.mirage().is_some_and(|m| {
+            m.portal.doodad == template || m.exit.is_some_and(|(t, _, _)| t == template)
+        })
+    }
+
     /// The zone group (`zones.group_id`) at (x, y): whose trade, shout and group-finding chat the
     /// character there reads. `None` where the baked zone grid has no zone.
     pub fn zone_group_at(&self, x: f32, y: f32) -> Option<u32> {

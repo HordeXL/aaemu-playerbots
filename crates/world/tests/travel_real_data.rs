@@ -628,6 +628,8 @@ fn mirage_isle_portals_arrival_and_exit() {
         "{:?}",
         m.meeting_point
     );
+    // bots keep both doors in view (neither offers anything a bot could use otherwise)
+    assert!(w.is_mirage_door(4894) && w.is_mirage_door(4895) && !w.is_mirage_door(532));
     // the island is no dungeon: the dungeon goal must never pick it
     assert!(w.dungeons().iter().all(|d| d.zone_group != 49));
     assert!(w.dungeon_by_entrance_doodad(4894).is_none());
