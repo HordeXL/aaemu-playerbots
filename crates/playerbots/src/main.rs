@@ -263,6 +263,12 @@ async fn run(
 
     let cancel = CancellationToken::new();
     let (coord_handle, coordinator) = coordinator::channel(hub.clone() as Arc<dyn Dispatch>);
+    // (without sites the coordinator never answers a wish for a dungeon)
+    let coordinator = if cfg.behavior.dungeons {
+        coordinator.with_sites(playerbots::bot::party::sites(&world))
+    } else {
+        coordinator
+    };
     let coord_task = tokio::spawn(coordinator.run(cancel.clone()));
 
     let shared = Arc::new(Shared {

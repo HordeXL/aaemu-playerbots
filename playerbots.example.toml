@@ -81,6 +81,9 @@ trade_with_players = false
 portals = true
 # Bots may form parties and enter instance dungeons (goal "dungeon").
 dungeons = true
+# A bot below the level range of a dungeon may raise its level to the minimum with the GM /level
+# command (needs gm_bootstrap; logged). Off: only bots whose level fits run a dungeon.
+dungeon_level_up = false
 # Bots may summon boats and sail (goal "sail").
 sailing = true
 # Bots walk routes on the navigation mesh (nav_<world>.bin in the baked data): around walls and

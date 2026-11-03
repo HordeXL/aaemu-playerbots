@@ -106,6 +106,8 @@ pub struct Dungeons {
     worlds: InstanceWorlds,
     /// `(entrance doodad, index into dungeons)` sorted.
     by_entrance: Vec<(u32, u16)>,
+    /// Exit doodad templates of all instance worlds, sorted.
+    exit_doodads: Vec<u32>,
 }
 
 impl Dungeons {
@@ -244,10 +246,18 @@ impl Dungeons {
             .collect();
         by_entrance.sort_unstable();
         by_entrance.dedup();
+        let mut exit_doodads: Vec<u32> = worlds
+            .all()
+            .iter()
+            .flat_map(|w| w.exits().iter().map(|e| e.template))
+            .collect();
+        exit_doodads.sort_unstable();
+        exit_doodads.dedup();
         Ok(Dungeons {
             dungeons,
             worlds,
             by_entrance,
+            exit_doodads,
         })
     }
 
@@ -270,6 +280,15 @@ impl Dungeons {
             .iter()
             .take_while(move |e| e.0 == template)
             .map(|e| &self.dungeons[usize::from(e.1)])
+    }
+
+    /// Whether `template` is a dungeon door: the entrance doodad of a dungeon in the main world
+    /// or an exit doodad of an instance world (the doodads the dungeon skills are cast on).
+    pub fn is_door(&self, template: u32) -> bool {
+        self.by_entrance
+            .binary_search_by_key(&template, |e| e.0)
+            .is_ok()
+            || self.exit_doodads.binary_search(&template).is_ok()
     }
 
     /// The dungeon of a zone group.
@@ -318,6 +337,7 @@ impl Dungeons {
                 })
                 .sum::<usize>()
             + self.by_entrance.capacity() * 8
+            + self.exit_doodads.capacity() * 4
             + self.worlds.bytes()
     }
 }
@@ -477,6 +497,8 @@ mod tests {
 
         assert!(d.dungeon_by_entrance_doodad(4088).is_none());
         assert!(d.dungeon_by_entrance_doodad(1).is_none());
+        // doors: the entrances of the main world
+        assert!(d.is_door(5075) && d.is_door(5085) && !d.is_door(4088) && !d.is_door(1));
         assert_eq!(d.by_zone_key(278).map(|d| d.zone_id), Some(192));
         assert!(d.bytes() > 0);
         let _ = std::fs::remove_dir_all(&dir);

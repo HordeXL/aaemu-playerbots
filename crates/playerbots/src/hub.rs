@@ -330,6 +330,8 @@ pub struct Hub {
     pub contest: Contest,
     /// Navigation: the planner pool and the counters, see [`crate::bot::nav`].
     pub nav: NavService,
+    /// What the leaders of dungeon parties tell their members (owned by the dungeons feature).
+    pub board: crate::bot::party::PartyBoard,
     /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
     issue_svc: Arc<Issues>,
     /// Server log lines handed to bots in the current second (second, lines).
@@ -361,6 +363,7 @@ impl Hub {
             chat: ChatHub::default(),
             contest: Contest::new(),
             nav: NavService::default(),
+            board: Default::default(),
             issue_svc: Arc::new(Issues::disabled()),
             log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),

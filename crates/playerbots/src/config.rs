@@ -199,6 +199,10 @@ pub struct BehaviorCfg {
     /// Bots may form parties and enter instance dungeons (the dungeons feature, goal `dungeon`).
     /// Off: no bot picks the goal or joins a party for it.
     pub dungeons: bool,
+    /// A bot below the level range of a dungeon may raise its level to the range's minimum with
+    /// the GM `/level` command (only with `bots.gm_bootstrap`; the raise is logged). Off: only
+    /// bots whose level fits a dungeon run it.
+    pub dungeon_level_up: bool,
     /// Bots may summon boats and sail (the sailing feature, goal `sail`). Off: no bot picks the
     /// goal or boards a boat.
     pub sailing: bool,
@@ -222,6 +226,7 @@ impl Default for BehaviorCfg {
             trade_with_players: false,
             portals: true,
             dungeons: true,
+            dungeon_level_up: false,
             sailing: true,
             navmesh: true,
         }
@@ -750,6 +755,21 @@ trade_with_players = true
                 .behavior
                 .trade_with_players
         );
+    }
+
+    #[test]
+    fn the_dungeon_level_raise_is_off_by_default_and_documented() {
+        assert!(!Config::default().behavior.dungeon_level_up);
+        assert!(
+            !Config::parse(Config::example())
+                .unwrap()
+                .behavior
+                .dungeon_level_up
+        );
+        assert!(Config::example().contains("dungeon_level_up = false"));
+        let cfg = Config::parse("[behavior]\ndungeon_level_up = true\n").unwrap();
+        assert!(cfg.behavior.dungeons && cfg.behavior.dungeon_level_up);
+        assert!(Config::parse("[behavior]\ndungeon_level_up = 1\n").is_err());
     }
 
     #[test]

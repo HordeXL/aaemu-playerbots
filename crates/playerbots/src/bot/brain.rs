@@ -233,6 +233,12 @@ impl Brain {
         })
     }
 
+    /// Whether a dungeon run is under way (it survives the bot's death inside the dungeon, so
+    /// the resurrection must not queue a rest).
+    pub fn in_dungeon_run(&self) -> bool {
+        matches!(self.goal, Some(Goal::Dungeon(_)))
+    }
+
     /// The running goal.
     pub fn goal(&self) -> Option<&Goal> {
         self.goal.as_ref()
@@ -298,8 +304,15 @@ impl Brain {
         let interval = ctx.cfg.llm.director_interval_secs;
         self.chat(&mut *ctx.rng, interval).social.tick(ctx);
         if ctx.state.me.dead {
-            // Dead bots drop their goal; the bot task asks for the resurrection.
-            self.end_goal(ctx, None);
+            // Dead bots drop their goal (a dungeon run goes on inside the dungeon); the bot task
+            // asks for the resurrection.
+            let keep = match self.goal.as_mut() {
+                Some(Goal::Dungeon(g)) => g.on_dead(ctx),
+                _ => false,
+            };
+            if !keep {
+                self.end_goal(ctx, None);
+            }
             return;
         }
         if !ctx.state.me.spawned {
@@ -323,6 +336,7 @@ impl Brain {
         ) {
             self.start_goal(ctx, GoalKind::Trade, None);
         }
+        super::goals::dungeon::unsolicited(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
@@ -357,7 +371,7 @@ impl Brain {
             && self
                 .goal
                 .as_ref()
-                .is_some_and(|g| g.kind() != GoalKind::Rest)
+                .is_some_and(|g| !matches!(g.kind(), GoalKind::Rest | GoalKind::Dungeon))
     }
 
     fn start_goal(&mut self, ctx: &mut Ctx<'_>, kind: GoalKind, order: Option<PairOrder>) {
@@ -817,20 +831,21 @@ mod tests {
 
     #[test]
     fn the_travel_goals_are_never_drawn_by_weight() {
-        // the stubs' weights are 0, so the table alone never picks them ...
+        // the sailing stub's weight is 0, so the table alone never picks it; the dungeon goal's
+        // weight is its temperament formula (the goal scores itself on top, see `own_scores`) ...
         let w = base();
-        assert_eq!(w[GoalKind::Dungeon.index()], 0.0);
+        assert!(w[GoalKind::Dungeon.index()] > 0.0);
         assert_eq!(w[GoalKind::Sail.index()], 0.0);
         // ... the other goals' numbers are what they were
         assert_eq!(w[GoalKind::Quest.index()], 1.0 * (0.4 + 1.2 * 0.5));
         assert_eq!(w[GoalKind::Wander.index()], 0.5 * (0.6 + 0.8 * 0.5));
         let s = scores(&w, &input(100));
-        assert_eq!(s[GoalKind::Dungeon.index()], 0.0);
+        assert_eq!(s[GoalKind::Dungeon.index()], w[GoalKind::Dungeon.index()]);
         assert_eq!(s[GoalKind::Sail.index()], 0.0);
         let mut rng = fastrand::Rng::with_seed(5);
         for _ in 0..5000 {
             let g = choose(&s, &mut rng).unwrap();
-            assert!(g != GoalKind::Dungeon && g != GoalKind::Sail, "{g:?}");
+            assert!(g != GoalKind::Sail, "{g:?}");
         }
     }
 

@@ -21,6 +21,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Player trade** | The coordinator pairs two bots; they meet, open the trade window, put up goods and/or money, lock and confirm. A trade request from a real player is accepted when the bot is idle. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and later "goes home" to rest there. |
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
+| **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see below). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see below). |
@@ -96,6 +97,9 @@ Safety of the GM lines:
   gates); `false` keeps them off portals.
 * `[behavior] dungeons = true` (default): bots may form parties and enter instance dungeons (goal
   `dungeon`); `false` keeps them out of both.
+* `[behavior] dungeon_level_up = false` (default): with `bots.gm_bootstrap`, `true` lets a bot below a
+  dungeon's level range raise its level to the range's minimum with the GM `/level` command
+  (logged); `false` keeps dungeons to the bots whose level fits.
 * `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
   them on land.
 * `[behavior] navmesh = true` (default): bots walk routes on the navigation mesh baked from the

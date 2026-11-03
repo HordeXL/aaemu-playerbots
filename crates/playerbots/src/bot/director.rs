@@ -349,9 +349,10 @@ mod tests {
         let with = eligible_goals(&s, true);
         assert!(with.contains(&GoalKind::TradeRun) && with.contains(&GoalKind::Housing));
         // (the dungeon and sail goals score themselves from the whole context, see
-        // `brain::own_scores`: this table leaves them at 0)
-        assert_eq!(with.len(), GoalKind::COUNT - 2);
-        assert!(!with.contains(&GoalKind::Dungeon) && !with.contains(&GoalKind::Sail));
+        // `brain::own_scores`: this raw table leaves the sail goal at 0 and has the dungeon's
+        // temperament weight, which `own_scores` replaces)
+        assert_eq!(with.len(), GoalKind::COUNT - 1);
+        assert!(!with.contains(&GoalKind::Sail));
     }
 
     #[test]
