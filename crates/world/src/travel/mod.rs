@@ -18,6 +18,7 @@
 pub mod boat;
 pub mod dungeon;
 pub mod instance;
+pub mod mirage;
 pub mod portal;
 
 mod funcs;
@@ -33,6 +34,7 @@ pub use dungeon::{Dungeon, Dungeons, Entrance, DEFAULT_ENTER_COUNT, ENTRY_WINDOW
 pub use instance::{
     InstanceDoodad, InstanceExit, InstanceNpc, InstanceSpawn, InstanceWorld, InstanceWorlds,
 };
+pub use mirage::Mirage;
 pub use portal::{
     MemoryTome, PortalKit, PortalReagent, Portals, RecallPoint, RespawnPoint, WorldGate,
 };
@@ -104,6 +106,8 @@ pub struct Travel {
     pub dungeons: Dungeons,
     /// Boat scrolls and slave templates.
     pub boats: Boats,
+    /// Mirage Isle, the market island (`None` when the data has no such portal).
+    pub mirage: Option<Mirage>,
 }
 
 impl Travel {
@@ -114,10 +118,12 @@ impl Travel {
         let worlds = InstanceWorlds::load(inp, &funcs)?;
         let dungeons = Dungeons::load(inp, &funcs, worlds)?;
         let boats = Boats::load(inp)?;
+        let mirage = Mirage::load(inp, &funcs, dungeons.worlds());
         let travel = Travel {
             portals,
             dungeons,
             boats,
+            mirage,
         };
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -135,15 +141,22 @@ impl Travel {
 
     /// Approximate heap bytes held.
     pub fn bytes(&self) -> usize {
-        self.portals.bytes() + self.dungeons.bytes() + self.boats.bytes()
+        self.portals.bytes()
+            + self.dungeons.bytes()
+            + self.boats.bytes()
+            + self.mirage.as_ref().map_or(0, Mirage::bytes)
     }
 
     /// Heap bytes per part, for the memory report.
-    pub fn memory_breakdown(&self) -> [(&'static str, usize); 3] {
+    pub fn memory_breakdown(&self) -> [(&'static str, usize); 4] {
         [
             ("travel: portals", self.portals.bytes()),
             ("travel: dungeons + instance worlds", self.dungeons.bytes()),
             ("travel: boats", self.boats.bytes()),
+            (
+                "travel: Mirage Isle",
+                self.mirage.as_ref().map_or(0, Mirage::bytes),
+            ),
         ]
     }
 }
@@ -207,6 +220,14 @@ impl World {
     /// An instance world by its directory name (`instance_cuttingwind_deadmine`).
     pub fn instance_world(&self, name: &str) -> Option<&InstanceWorld> {
         self.travel().dungeons.world(name)
+    }
+
+    // Mirage Isle
+
+    /// Mirage Isle, the market island: its portal doodad in the towns, the arrival point and the
+    /// exit doodad (`None` when the server data has no such portal).
+    pub fn mirage(&self) -> Option<&Mirage> {
+        self.travel().mirage.as_ref()
     }
 
     // Boats
