@@ -493,6 +493,62 @@ fn a_seller_bot_answers_a_wanted_ad_it_can_serve_at_a_price_over_its_floor() {
 }
 
 #[test]
+fn a_bot_with_its_own_advertisement_still_answers_the_ad_that_matches() {
+    let mut r = Rig::new("Ann");
+    r.surplus = vec![
+        Surplus {
+            template: ORE,
+            count: 20,
+        },
+        Surplus {
+            template: HAY,
+            count: 5,
+        },
+    ];
+    let mut a = AdState::default();
+    r.step(&mut a, 1_000);
+    assert!(a.listing().is_some(), "it advertised");
+    let own = a.listing().map(|l| l.template).unwrap_or(0);
+    // somebody wants the other item: the bot answers although its own advertisement stands
+    let other = if own == ORE { HAY } else { ORE };
+    let name = item_name(other);
+    let mut answered = 0;
+    for seed in 0..40 {
+        let mut r2 = Rig::new("Ann");
+        r2.surplus = r.surplus.clone();
+        r2.rng = fastrand::Rng::with_seed(seed);
+        r2.audience = 0;
+        let mut b = AdState::default();
+        r2.step(&mut b, 1_000);
+        b.listing = Some(Listing {
+            side: Side::Sell,
+            template: own,
+            qty: 5,
+            quote: Quote {
+                ask: 30,
+                floor: 20,
+                ceiling: 40,
+            },
+            posted_ms: 1_000,
+        });
+        b.on_chat(
+            2,
+            "Bob",
+            &format!("WTB {name} x3, paying 99s ea. PST"),
+            2_000,
+        );
+        r2.step(&mut b, 2_100);
+        if said(&mut b, 2_100)
+            .iter()
+            .any(|d| matches!(d.speech, Speech::Offer { template, .. } if template == other))
+        {
+            answered += 1;
+        }
+    }
+    assert!(answered > 5, "it answers now and then: {answered} of 40");
+}
+
+#[test]
 fn nothing_is_said_faster_than_a_person_types() {
     let mut r = Rig::new("Ann");
     let mut a = AdState::default();

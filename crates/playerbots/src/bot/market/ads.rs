@@ -235,12 +235,18 @@ pub struct AdState {
     check_ms: u64,
     /// Bot clock of the next report of the bot's place to the board ([`AdState::report_due`]).
     report_ms: u64,
+    /// Bot clock of the next status line ([`AdState::status_due`]).
+    status_ms: u64,
     /// Bot clock of the last whisper the bot sent (0 = none).
     whisper_ms: u64,
     /// Bot clock of the last chat refusal that was reported.
     chat_err_ms: u64,
     /// Advertisements posted.
     pub posted: u32,
+    /// Lines about buying and selling heard.
+    pub heard: u32,
+    /// Negotiations opened (an answer to an advertisement, in either direction).
+    pub talks_opened: u32,
     /// Deals agreed.
     pub agreed: u32,
 }
@@ -266,6 +272,7 @@ impl AdState {
         if self.inbox.len() >= INBOX_MAX {
             self.inbox.remove(0);
         }
+        self.heard = self.heard.saturating_add(1);
         self.inbox.push(Heard {
             kind,
             sender: sender.into(),
@@ -375,6 +382,16 @@ impl AdState {
     /// Bot clock of the last refusal that was reported.
     pub fn chat_error_seen_ms(&self) -> u64 {
         self.chat_err_ms
+    }
+
+    /// Whether the duty should write its status line now (every `gap_ms`).
+    pub fn status_due(&mut self, now_ms: u64, gap_ms: u64) -> bool {
+        if now_ms >= self.status_ms {
+            self.status_ms = now_ms + gap_ms;
+            true
+        } else {
+            false
+        }
     }
 
     /// Lets the next step post an advertisement without waiting for the interval.
@@ -546,7 +563,9 @@ impl AdState {
 
     /// The advertisement of somebody else.
     fn hear_ad(&mut self, h: &Heard, medium: Medium, may: bool, env: &mut Env<'_>) {
-        if !may || self.talks.len() >= MAX_TALKS || self.deal.is_some() || self.listing_busy() {
+        // (the bot's own advertisement does not keep it from answering somebody else's: a bot
+        // that sells ore may well want hay)
+        if !may || self.talks.len() >= MAX_TALKS || self.deal.is_some() {
             return;
         }
         let Some(template) = env.names.find(&h.text) else {
@@ -614,10 +633,6 @@ impl AdState {
         }
     }
 
-    fn listing_busy(&self) -> bool {
-        self.listing.is_some()
-    }
-
     fn talk_line(&mut self, i: usize, h: &Heard, medium: Medium, may: bool, env: &mut Env<'_>) {
         if self.talks[i].role == Role::Seller && !may {
             self.talks[i].close(Closed::Declined);
@@ -651,6 +666,7 @@ impl AdState {
         }
         let peer = t.peer.clone();
         self.talks.push(t);
+        self.talks_opened = self.talks_opened.saturating_add(1);
         if let Some(s) = reply {
             self.say(env, medium, &peer, s);
         }

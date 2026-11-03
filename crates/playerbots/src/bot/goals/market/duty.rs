@@ -25,6 +25,8 @@ use crate::bot::market::ledger::Ledger;
 use crate::bot::state::{Item, StateError, UnitKind};
 use crate::hub::unix_ms;
 
+/// The status line of the duty comes this often.
+const STATUS_MS: u64 = 3 * 60_000;
 /// A look at the surroundings at least this often.
 const CHECK_MS: u64 = 4_000;
 /// The bot tells the board where it is this often.
@@ -35,6 +37,8 @@ const LINES_PER_MIN: u32 = 14;
 const RETRY_MS: u64 = 6_000;
 /// Items the bot offers at once (the rest waits for the next advertisement).
 const MAX_SURPLUS: usize = 6;
+/// Kinds of goods a bot wants at once (all of the shared trade goods).
+const WANTS: usize = trade::GOODS.len();
 /// Units a bot wants of a good it needs.
 const NEED_QTY: u32 = 10;
 /// A bot with fewer than this many coppers does not shop.
@@ -72,30 +76,36 @@ pub fn surplus_of(
     out
 }
 
-/// What a bot would buy: one of the shared trade goods it holds hardly any of, a different one
-/// every hour. A stand-in for the materials of the bot's own work, which no goal reports yet.
+/// What a bot would buy: the shared trade goods it holds hardly any of (the order, and so the one
+/// it advertises first, changes every hour). A stand-in for the materials of the bot's own work,
+/// which no goal reports yet.
 pub fn wanted_goods(
     bag: &rustc_hash::FxHashMap<u16, Item>,
     money: i64,
     bot: u32,
     unix_ms: u64,
-) -> Option<Need> {
+) -> SmallVec<[Need; WANTS]> {
+    let mut out: SmallVec<[Need; WANTS]> = SmallVec::new();
     if money < SHOP_MONEY {
-        return None;
+        return out;
     }
     let goods = trade::GOODS;
-    let hour = unix_ms / 3_600_000;
-    let pick = (u64::from(bot) + hour) as usize % goods.len();
-    let template = goods[pick];
-    let have: i64 = bag
-        .values()
-        .filter(|i| i.template == template)
-        .map(|i| i64::from(i.count))
-        .sum();
-    (have < ENOUGH).then_some(Need {
-        template,
-        qty: NEED_QTY,
-    })
+    let start = (u64::from(bot) + unix_ms / 3_600_000) as usize;
+    for k in 0..WANTS {
+        let template = goods[(start + k) % goods.len()];
+        let have: i64 = bag
+            .values()
+            .filter(|i| i.template == template)
+            .map(|i| i64::from(i.count))
+            .sum();
+        if have < ENOUGH {
+            out.push(Need {
+                template,
+                qty: NEED_QTY,
+            });
+        }
+    }
+    out
 }
 
 /// A character name the server takes as a whisper target.
@@ -186,9 +196,7 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
 
     // what the bot has and wants
     let surplus = surplus_of(&inner.ledger, world, &st.bag);
-    let needs: SmallVec<[Need; 1]> = wanted_goods(&st.bag, money, bot_id, unix)
-        .into_iter()
-        .collect();
+    let needs = wanted_goods(&st.bag, money, bot_id, unix);
     let audience = board.audience(name, group, unix) + usize::from(real_near);
     let prices = VendorPrices(world);
     let index = names::global(world);
@@ -268,6 +276,19 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     };
     inner.ads.step(&mut env);
     let pending = inner.ads.deal().is_some();
+    if inner.ads.status_due(now, STATUS_MS) {
+        let line = format!(
+            "market: {} goods to sell, {} wanted, {} bots read the trade chat (group {group}); heard {}, {} ads posted, {} talks, {} deals agreed",
+            surplus.len(),
+            needs.len(),
+            audience,
+            inner.ads.heard,
+            inner.ads.posted,
+            inner.ads.talks_opened,
+            inner.ads.agreed,
+        );
+        ctx.log.say(line);
+    }
 
     say_due(ctx, now, unix);
     watch_chat_errors(ctx, now);
@@ -397,12 +418,24 @@ mod tests {
 
     #[test]
     fn a_poor_bot_or_one_with_enough_wants_nothing() {
-        assert!(wanted_goods(&bag(&[]), 100, 1, 0).is_none());
-        let rich = wanted_goods(&bag(&[]), 10_000, 1, 0).expect("a need");
-        assert!(trade::GOODS.contains(&rich.template));
-        assert_eq!(rich.qty, NEED_QTY);
-        let full = bag(&[(0, rich.template, 50)]);
-        assert!(wanted_goods(&full, 10_000, 1, 0).is_none());
+        assert!(wanted_goods(&bag(&[]), 100, 1, 0).is_empty());
+        let rich = wanted_goods(&bag(&[]), 10_000, 1, 0);
+        assert_eq!(rich.len(), WANTS);
+        for n in &rich {
+            assert!(trade::GOODS.contains(&n.template));
+            assert_eq!(n.qty, NEED_QTY);
+        }
+        let held: Vec<(u16, u32, i32)> = rich
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i as u16, n.template, 50))
+            .collect();
+        assert!(wanted_goods(&bag(&held), 10_000, 1, 0).is_empty());
+        // (one of them held: the other two are still wanted)
+        assert_eq!(
+            wanted_goods(&bag(&held[..1]), 10_000, 1, 0).len(),
+            WANTS - 1
+        );
     }
 
     #[test]
@@ -410,8 +443,9 @@ mod tests {
         let b = bag(&[]);
         let w = |bot, hour: u64| {
             wanted_goods(&b, 10_000, bot, hour * 3_600_000)
-                .unwrap()
-                .template
+                .iter()
+                .map(|n| n.template)
+                .collect::<Vec<_>>()
         };
         assert_ne!(w(1, 0), w(1, 1));
         assert_ne!(w(1, 0), w(2, 0));
