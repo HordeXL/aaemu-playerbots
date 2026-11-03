@@ -748,6 +748,10 @@ pub enum ActivityEvent {
         /// `(item template id, rate)` pairs.
         rates: Box<[(u32, u32)]>,
     },
+    // ---- auction house -------------------------------------------------------------------
+    /// An answer of the auction house (`SCAuctionPosted`, `SCAuctionSearched`, `SCAuctionBid`,
+    /// `SCAuctionCanceled`, `SCAuctionLowestPrice`); see [`crate::auction`].
+    Auction(Box<crate::auction::AuctionEvent>),
 }
 
 type Reader = fn(&mut PacketStream) -> Result<ActivityEvent, MarshalError>;
@@ -1078,7 +1082,10 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         sc::SCSpecialtyCurrentPacket => specialty_current,
-        _ => return Ok(None),
+        // the auction house answers live in `crate::auction`
+        _ => {
+            return Ok(crate::auction::parse(level, opcode, body)?.map(|a| E::Auction(Box::new(a))))
+        }
     };
     read(&mut PacketStream::from_bytes(body)).map(Some)
 }
@@ -1149,7 +1156,7 @@ const ITEM_TAIL_LEN: usize = 33;
 
 /// `Item.Write` (G/models/item.rs:1061-1082): `u32 template`, and, unless the template is 0,
 /// `u64 id, u8 grade, u8 flags, i32 count, u8 detail type`, the detail body and the tail.
-fn read_item(s: &mut PacketStream) -> Result<ItemBrief, MarshalError> {
+pub(crate) fn read_item(s: &mut PacketStream) -> Result<ItemBrief, MarshalError> {
     let template_id = s.read_u32()?;
     if template_id == 0 {
         return Ok(ItemBrief::default());

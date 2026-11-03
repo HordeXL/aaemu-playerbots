@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 
+use crate::auctioneers::Auctioneers;
 use crate::baked::{Baked, QuestSphere};
 use crate::chars::Chars;
 use crate::doodad::{DoodadData, DoodadTemplate};
@@ -103,6 +104,8 @@ pub struct World {
     doodads: DoodadData,
     npc_spawns: SpawnIndex,
     doodad_spawns: SpawnIndex,
+    /// Where the auction house NPCs stand.
+    pub(crate) auctioneers: Auctioneers,
     npc_spawn_stats: SpawnStats,
     doodad_spawn_stats: SpawnStats,
     quests: Quests,
@@ -170,6 +173,7 @@ impl World {
         )
         .context("load doodad spawns")?;
         let npc_spawns = SpawnIndex::build(npc_raw);
+        let auctioneers = Auctioneers::build(&npcs, &npc_spawns);
         let doodad_spawns = SpawnIndex::build(doodad_raw);
 
         let quests =
@@ -218,6 +222,7 @@ impl World {
             doodads,
             npc_spawns,
             doodad_spawns,
+            auctioneers,
             npc_spawn_stats,
             doodad_spawn_stats,
             quests,
@@ -297,6 +302,7 @@ impl World {
             ("skills", self.skills.bytes()),
             ("item names", self.items.bytes()),
             ("item trade facts", self.item_facts.bytes()),
+            ("auctioneers", self.auctioneers.bytes()),
             ("item use skills", self.item_uses.bytes()),
             ("quest start gates", self.start_gates.bytes()),
             ("crafts + specialty", self.economy.bytes()),

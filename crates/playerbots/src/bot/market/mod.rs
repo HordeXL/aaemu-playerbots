@@ -18,6 +18,7 @@ pub mod ads;
 pub mod auction;
 pub mod ledger;
 
+use aa_proto::sc::ServerEvent;
 use aa_world::World;
 use rustc_hash::FxHashMap;
 
@@ -118,6 +119,15 @@ impl MarketState {
         if let Some(inner) = self.get_mut() {
             inner.ledger.clamp_all(bag);
         }
+    }
+
+    /// A server event passed `BotState::apply`: the auction memory follows the answers of the
+    /// auction house and the mail it sends. A bot without market memory makes it for those only.
+    pub fn on_server_event(&mut self, ev: &ServerEvent, now_ms: u64) {
+        if self.0.is_none() && !AuctionMemory::concerns(ev) {
+            return;
+        }
+        self.inner_mut().auction.observe(ev, now_ms);
     }
 
     /// A chat line the bot heard: `kind` is the server's chat type (1 shout, 2 trade, 3 group

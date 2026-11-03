@@ -64,6 +64,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Duel** | A coordinator pairs two idle bots; they meet at a flag, challenge, accept, fight with their PvP rotation and rest afterwards. |
 | **Player trade** | The coordinator pairs two bots; they meet, open the trade window, put up goods and/or money, lock and confirm. A trade request from a real player is accepted when the bot is idle. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and later "goes home" to rest there. |
+| **Auction** | Walks to the nearest auctioneer, lists surplus goods, buys a bargain and goes home (see [Auction house](#auction-house)). Needs `[market] enabled` and `auction`. |
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
@@ -169,6 +170,47 @@ most 64 item kinds per bot and is forgotten when the connection is lost. Of what
 items that are sellable and not bound (`ItemFacts::tradable`) are offered, and a reserve of 10 is
 kept of items the bot may use itself (anything that casts a skill when used, anything a quest asks
 to gather).
+
+### Auction house
+
+With `[market] enabled` and `auction` a bot visits an auctioneer at most about every 45 minutes,
+when it has goods worth the trip (or gold to spend) and the auctioneer is within 3.5 km on the
+walkable mesh. The nearest reachable auctioneer comes from the world data's NPC spawns. A visit is
+a state machine that lasts a few minutes:
+
+1. **Walk** to the auctioneer and wait until it is in view (an auctioneer that is not at its spawn
+   is filed as an issue). An auctioneer the bot cannot reach, or died on the way to, is left alone
+   for half an hour.
+2. **Survey** the first pages of the house and the character's own lots.
+3. **Price and post.** For each honest surplus stack (see [Selling](#selling-market)) the bot looks
+   at the five cheapest buyouts of the item, takes their median per item as the going rate and asks
+   95 to 99 % of it; with no market it asks between the vendor price and the item's base price. The
+   fee (1 % of the buyout for 6 hours up to 4 % for the 48 hours the bot chooses, paid in cash) is
+   not refunded and the seller gets 90 % of the price by mail, so a stack is listed only when that
+   net beats the vendor refund by 8 %. Up to four whole stacks are listed per visit (the bot cannot
+   split stacks), a bot that cannot pay the expected fees does not go, and the start price is 90 %
+   of the buyout.
+4. **Cancel and relist.** Now and then (35 %) a lot older than 90 minutes that has been undercut
+   by more than 20 % is looked at again and cancelled; the item comes back by mail and is priced
+   again.
+5. **Browse and buy.** Only when `bots.gm_bootstrap` is off: with gold above 2,000 copper the bot
+   looks at the cheapest lots (the first pages) and buys out up to two of them: a lot that costs at
+   most 75 % of what a vendor would pay for it, or a consumable the bot can use itself (it casts a
+   skill and the item's level fits) that costs no more than a shop asks. It spends at most a
+   quarter of its money (50,000 copper at most) per visit.
+6. **Linger** a few seconds, then leave.
+
+The results arrive as mail (types 13 cancelled lot, 14 sale, 15 expired lot or outbid refund, 16
+won lot). A background duty lists the mailbox every five minutes and after a post, reads each new
+auction mail and takes its money or item; mails stay in the box after taking, so the bot remembers
+the ones it settled. Memory is bounded per bot (24 price notes, 16 own lots, 8 skips, 4 pending wins).
+
+Reported as issues: a post that took the item and fee without `SCAuctionPosted`, a confirmed lot
+missing from the own lots, a search that gets no answer next to the auctioneer, a buyout that took
+the money without `SCAuctionBid` or never delivered the item, an own lot that vanished with no
+result mail, an auction mail that is empty or cannot be read, and any error code that the rules do
+not explain (241 cannot pay and 388 too far are handled). The log line at the end of a visit
+totals the bot's visits, lots posted, fees, sales, purchases and timeouts.
 
 ## Chat and the LLM
 

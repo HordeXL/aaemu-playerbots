@@ -134,7 +134,7 @@ impl Goal {
             GoalKind::Housing => Goal::Housing(Housing::default()),
             GoalKind::Dungeon => Goal::Dungeon(Dungeon::new(party)),
             GoalKind::Sail => Goal::Sail(Sail::default()),
-            GoalKind::Auction => Goal::Auction(Auction),
+            GoalKind::Auction => Goal::Auction(Auction::default()),
             GoalKind::Market => Goal::Market(Market),
         }
     }
