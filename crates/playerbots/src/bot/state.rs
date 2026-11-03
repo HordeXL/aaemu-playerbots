@@ -469,7 +469,11 @@ impl BotState {
     /// Forgets everything about the world (a new connection starts from scratch) and frees the
     /// memory of the collections.
     pub fn reset(&mut self) {
+        // (the sailing cooldown outlives a connection: a bot that keeps losing its link does not
+        // get a trip every time it is back)
+        let trips = self.vehicle.trip_log();
         *self = BotState::default();
+        self.vehicle.restore_trip_log(trips);
     }
 
     // ---- queries ------------------------------------------------------------------------

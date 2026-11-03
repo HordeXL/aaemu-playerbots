@@ -79,6 +79,8 @@ pub struct SlaveTemplate {
     pub max_hp: u32,
     /// `ship_models.velocity` of the model (0 without a ship model).
     pub velocity: f32,
+    /// `ship_models.turn_accel` of the model (0 without a ship model or the column).
+    pub turn_accel: f32,
     /// Final `MoveSpeedMul` of the template (1.0 = no modifier).
     pub move_speed_mul: f32,
     /// `slaves.spawn_valid_area_range`: how far from the caster the boat may be placed, metres.
@@ -94,6 +96,29 @@ impl SlaveTemplate {
     /// without wind).
     pub fn top_speed(&self) -> f32 {
         self.velocity * self.move_speed_mul / 2.0
+    }
+
+    /// How the hull turns, from the server's ship physics (`systems/ai/physics/ship.rs`, per unit
+    /// of helm at full speed): the angular acceleration at full helm in rad/s^2
+    /// (`pi * turn_accel / 360 * 1.45`, the 1.45 being `STEERING_RESPONSIVENESS_MUL`) and the turn
+    /// rate the helm settles at in rad/s (`steer_max_deg_fixed(kind)`, 4.35 degrees per second for
+    /// a boat). Both fall to half at standstill (the turn factor rises from 0.5 to 1 over the
+    /// first 2.5 m/s). `None` without a ship model.
+    pub fn turn(&self) -> Option<(f32, f32)> {
+        if self.turn_accel <= 0.0 {
+            return None;
+        }
+        let accel = std::f32::consts::PI * self.turn_accel / 360.0 * 1.45;
+        let cap_deg: f32 = match self.kind {
+            slave_kind::BOAT => 4.35,
+            slave_kind::SMALL_SAILING_SHIP => 2.6,
+            slave_kind::BIG_SAILING_SHIP => 2.35,
+            slave_kind::FISHBOAT => 3.35,
+            slave_kind::SPEEDBOAT => 5.85,
+            slave_kind::MERCHANT_SHIP => 2.85,
+            _ => 3.1,
+        };
+        Some((accel, cap_deg.to_radians()))
     }
 
     /// Whether the model has a driver seat (attach point 1).
@@ -212,7 +237,7 @@ impl Boats {
         let boat_slaves: FxHashSet<u32> = rows.iter().map(|r| r.id).collect();
         let models: FxHashSet<u32> = rows.iter().map(|r| r.model).collect();
 
-        let velocity = ship_velocities(conn, &models)?;
+        let ship = ship_stats(conn, &models)?;
         let seats = model_seats(conn, &models)?;
         let mods = SlaveModifiers::load(conn, &boat_slaves)?;
         check_hp_formulas(conn);
@@ -232,7 +257,8 @@ impl Boats {
                     kind: row.kind,
                     level: row.level,
                     max_hp: hp.max(0) as u32,
-                    velocity: velocity.get(&row.model).copied().unwrap_or(0.0),
+                    velocity: ship.get(&row.model).map_or(0.0, |s| s.0),
+                    turn_accel: ship.get(&row.model).map_or(0.0, |s| s.1),
                     move_speed_mul: mods.move_speed_mul(m),
                     summon_range: row.range,
                     mountable: row.mountable,
@@ -345,12 +371,12 @@ struct SlaveRow {
     range: u16,
 }
 
-/// `model id -> ship_models.velocity` for the models of the boats (`models.sub_type =
-/// 'ShipModel'`, `sub_id` = the ship model).
-fn ship_velocities(
+/// `model id -> (ship_models.velocity, ship_models.turn_accel)` for the models of the boats
+/// (`models.sub_type = 'ShipModel'`, `sub_id` = the ship model).
+fn ship_stats(
     conn: &rusqlite::Connection,
     models: &FxHashSet<u32>,
-) -> Result<FxHashMap<u32, f32>> {
+) -> Result<FxHashMap<u32, (f32, f32)>> {
     let mut ship_of: FxHashMap<u32, u32> = FxHashMap::default();
     each_row(
         conn,
@@ -362,14 +388,18 @@ fn ship_velocities(
         },
     )
     .context("read ship models of boats")?;
-    let mut velocity_of_ship: FxHashMap<u32, f32> = FxHashMap::default();
-    each_row(conn, "SELECT id, velocity FROM ship_models", |r| {
-        velocity_of_ship.insert(r.u32(0), r.f32(1));
-    })
+    let mut stats_of_ship: FxHashMap<u32, (f32, f32)> = FxHashMap::default();
+    each_row(
+        conn,
+        "SELECT id, velocity, turn_accel FROM ship_models",
+        |r| {
+            stats_of_ship.insert(r.u32(0), (r.f32(1), r.f32(2)));
+        },
+    )
     .context("read ship_models")?;
     Ok(ship_of
         .into_iter()
-        .filter_map(|(model, ship)| Some((model, *velocity_of_ship.get(&ship)?)))
+        .filter_map(|(model, ship)| Some((model, *stats_of_ship.get(&ship)?)))
         .collect())
 }
 
@@ -521,7 +551,7 @@ mod tests {
              CREATE TABLE slaves (id INT, name TEXT, model_id INT, mountable TEXT, level INT,
                slave_kind_id INT, spawn_valid_area_range INT);
              CREATE TABLE models (id INT, sub_id INT, sub_type TEXT);
-             CREATE TABLE ship_models (id INT, velocity REAL);
+             CREATE TABLE ship_models (id INT, velocity REAL, turn_accel REAL);
              CREATE TABLE model_bindings (id INT, owner_id INT, owner_type TEXT, attach_point_id INT);
              CREATE TABLE unit_modifiers (id INT, owner_id INT, owner_type TEXT, unit_attribute_id INT,
                unit_modifier_type_id INT, value INT);
@@ -539,7 +569,7 @@ mod tests {
              INSERT INTO slaves VALUES (15, 'rowboat', 129, 't', 50, 4, 50), (52, 'clipper', 128, 't', 50, 3, 50),
                (100, 'tank', 5, 't', 50, 5, 50);
              INSERT INTO models VALUES (129, 4, 'ShipModel'), (128, 3, 'ShipModel'), (5, 9, 'VehicleModel');
-             INSERT INTO ship_models VALUES (4, 6.4), (3, 13.0);
+             INSERT INTO ship_models VALUES (4, 6.4, 9.9), (3, 13.0, 1.5);
              INSERT INTO model_bindings VALUES (1, 129, 'Model', 1), (2, 129, 'Model', 2), (3, 129, 'Model', 35),
                (4, 128, 'Model', 1), (5, 128, 'Model', 9), (6, 129, 'Object', 3);
              INSERT INTO unit_modifiers VALUES (1, 15, 'Slave', 10, 0, 1000), (2, 15, 'Slave', 6, 0, 1420),
@@ -614,6 +644,11 @@ mod tests {
         assert_eq!(row.seat_points().collect::<Vec<_>>(), vec![1, 2]);
         // +1000 flat -> MoveSpeedMul 2.0, the Item modifier is not the slave's
         assert_eq!(row.velocity, 6.4);
+        assert_eq!(row.turn_accel, 9.9);
+        // the rowboat turns slowly: 0.125 rad/s^2 at full helm, settling at 4.35 degrees a second
+        let (accel, cap) = row.turn().unwrap();
+        assert!((accel - 0.1254).abs() < 0.001, "{accel}");
+        assert!((cap.to_degrees() - 4.35).abs() < 1e-3);
         assert_eq!(row.move_speed_mul, 2.0);
         assert!((row.top_speed() - 6.4).abs() < 1e-5);
         // level 50: sta 108, 50 * 70 + 108 * 12 = 4796, + 1420
