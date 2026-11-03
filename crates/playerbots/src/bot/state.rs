@@ -596,6 +596,7 @@ impl BotState {
     pub fn apply(&mut self, ev: &ServerEvent) {
         self.econ.observe(ev, self.now_ms, self.me.obj);
         self.watch.observe(ev, self.me.obj, self.now_ms);
+        self.market.on_server_event(ev, self.now_ms);
         match ev {
             ServerEvent::World(w) => self.apply_world(w),
             ServerEvent::Activity(a) => self.apply_activity(a),
