@@ -403,6 +403,9 @@ impl Auction {
         let now = ctx.now_ms;
         let at_the_house = run.reached_the_house();
         let mem = &mut ctx.state.market.inner_mut().auction;
+        if ctx.state.me.dead {
+            run.died(mem, now);
+        }
         // a visit that reached the auctioneer counts; one that did not (interrupted, blocked)
         // is tried again in a few minutes
         mem.last_visit_end_ms = if at_the_house {

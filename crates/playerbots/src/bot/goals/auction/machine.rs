@@ -8,7 +8,7 @@ use super::report;
 use super::{Env, MAX_LISTINGS};
 use crate::bot::goals::{FailReason, GoalStatus};
 use crate::bot::market::auction::price::{self, Ask, Facts, Skip, Why};
-use crate::bot::market::auction::{OwnLot, Page};
+use crate::bot::market::auction::{AuctionMemory, OwnLot, Page};
 use crate::bot::motion::MotionStatus;
 use crate::bot::state::{dist2d, BotState, UnitKind};
 
@@ -392,6 +392,16 @@ impl Run {
         let now = env.now_ms();
         let key = spot_key(self.spot.pos[0], self.spot.pos[1]);
         env.mem().skip(key, now + BAD_SPOT_MS, now);
+    }
+
+    /// The goal was dropped because the bot died: when that happened on the way to the
+    /// auctioneer, the way is not safe and the auctioneer is left alone for a while (a bot that
+    /// walks into the same death every few minutes helps nobody).
+    pub fn died(&self, mem: &mut AuctionMemory, now: u64) {
+        if self.phase == Phase::Walk {
+            let key = spot_key(self.spot.pos[0], self.spot.pos[1]);
+            mem.skip(key, now + BAD_SPOT_MS, now);
+        }
     }
 
     /// One walking tick towards `dest`, stopping `radius` metres short.

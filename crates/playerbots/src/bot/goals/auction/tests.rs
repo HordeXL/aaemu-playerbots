@@ -602,6 +602,32 @@ fn run_visit(f: &mut Fake, max_steps: u32) -> (Run, GoalStatus) {
 // ---- visits -------------------------------------------------------------------------------------
 
 #[test]
+fn an_auctioneer_the_bot_died_on_the_way_to_is_left_alone() {
+    let mut f = Fake::new().with_ore();
+    let mut run = Run::new(f.now);
+    // walk until the bot is on its way (the fake walks one step per tick)
+    for _ in 0..4 {
+        f.now += 250;
+        f.walk_a_step();
+        assert_eq!(run.step(&mut f), GoalStatus::Running);
+    }
+    assert!(run.walking(), "the auctioneer is far enough to walk to");
+    let spot = f.spot.unwrap();
+    let key = machine::spot_key(spot.pos[0], spot.pos[1]);
+    assert!(!f.mem.skipped(key, f.now));
+    run.died(&mut f.mem, f.now);
+    assert!(f.mem.skipped(key, f.now + 1));
+    assert!(f.mem.skipped(key, f.now + 29 * 60_000));
+    assert!(!f.mem.skipped(key, f.now + 31 * 60_000));
+    // a bot that died anywhere else leaves the spot alone
+    let mut f = Fake::new().with_ore();
+    let (run, status) = run_visit(&mut f, 2_000);
+    assert_eq!(status, GoalStatus::Done);
+    run.died(&mut f.mem, f.now);
+    assert!(!f.mem.skipped(key, f.now));
+}
+
+#[test]
 fn a_visit_walks_surveys_prices_posts_verifies_and_lingers() {
     let mut f = Fake::new().with_ore();
     for buyout in [600, 640, 700] {
