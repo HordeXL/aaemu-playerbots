@@ -112,6 +112,8 @@ pub struct Talk {
     pub meet: Option<Meet>,
     /// Bot clock of the first line.
     pub started_ms: u64,
+    /// Times the seller told the place after the agreement (it answers a question twice at most).
+    pub place_told: u8,
     /// Bot clock of the last line either side said.
     pub last_ms: u64,
 }
@@ -150,6 +152,7 @@ impl Talk {
             countered: false,
             meet: None,
             started_ms: now_ms,
+            place_told: 0,
             last_ms: now_ms,
         }
     }
@@ -177,6 +180,7 @@ impl Talk {
             countered: false,
             meet: None,
             started_ms: now_ms,
+            place_told: 0,
             last_ms: now_ms,
         }
     }
@@ -279,7 +283,10 @@ impl Talk {
                 self.close(Closed::Cancelled);
                 return None;
             }
-            if l.where_q || l.meet || l.ask {
+            // (only a question gets the place, and only twice: "ill be at the mailbox" is a
+            // statement, and two bots must never answer each other's statements for ever)
+            if (l.where_q || l.ask || l.question) && self.place_told < 2 {
+                self.place_told += 1;
                 return self.meet.map(|meet| Speech::Place { meet });
             }
             return None;
@@ -607,9 +614,17 @@ mod tests {
             say(&mut t, "where?", 3000),
             Some(Speech::Place { meet: Meet::Mirage })
         );
-        // omw / thanks need no answer
+        // omw / thanks need no answer, nor does a statement about the place
         assert_eq!(say(&mut t, "ok omw", 4000), None);
         assert_eq!(say(&mut t, "thx", 5000), None);
+        assert_eq!(
+            say(&mut t, "ill be at the mailbox on Mirage Isle", 5500),
+            None
+        );
+        assert_eq!(say(&mut t, "Mirage Isle, by the mailbox", 5600), None);
+        // a question is answered twice at most (the first "where?" was the first answer)
+        assert!(say(&mut t, "where do we meet?", 6000).is_some());
+        assert_eq!(say(&mut t, "which town?", 7000), None);
         assert!(t.is_agreed());
     }
 

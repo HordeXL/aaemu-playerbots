@@ -526,6 +526,12 @@ impl AdState {
         if !h.line.is_market() || h.line.refuse {
             return;
         }
+        // a line about another item is not an answer to this advertisement
+        if let Some(t) = env.names.find(&h.text) {
+            if !(env.item_name)(t).eq_ignore_ascii_case(&(env.item_name)(l.template)) {
+                return;
+            }
+        }
         if self.talks.len() >= MAX_TALKS {
             return;
         }

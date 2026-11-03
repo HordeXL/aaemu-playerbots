@@ -480,18 +480,23 @@ impl Run {
             Act::StartTrade => self.start_trade(ctx),
             Act::Report(problem) => {
                 let (skill, template) = match problem {
-                    Problem::NoLoad { .. } => (
+                    Problem::NeverLoaded { .. } | Problem::PortalMissing => (
                         mirage.map_or(0, |x| x.portal.skill),
                         mirage.map_or(0, |x| x.portal.doodad),
                     ),
-                    Problem::NoExit { .. } => (
+                    Problem::NeverLeft { .. } => (
                         mirage.and_then(|x| x.exit).map_or(0, |e| e.2),
                         mirage.and_then(|x| x.exit).map_or(0, |e| e.0),
                     ),
                 };
+                let seen = if problem == Problem::PortalMissing {
+                    near_doodads(ctx)
+                } else {
+                    String::new()
+                };
                 ctx.log
-                    .say(format!("market: Mirage {problem:?} (skill {skill})"));
-                ctx.report_issue(report::mirage(problem, skill, template));
+                    .say(format!("market: Mirage {problem:?} (skill {skill}) {seen}"));
+                ctx.report_issue(report::mirage(problem, skill, template, &seen));
             }
         }
     }
@@ -585,6 +590,31 @@ impl Run {
             ctx.report_issue(report::transfer(t, a.seller));
         }
     }
+}
+
+/// The doodads within 30 m of the bot, as "count x template" for a report.
+fn near_doodads(ctx: &Ctx<'_>) -> String {
+    let me = ctx.state.me.pos;
+    let mut by_template: Vec<(u32, u32)> = Vec::new();
+    for d in ctx.state.doodads.values() {
+        if flat(me, d.pos) > 30.0 {
+            continue;
+        }
+        match by_template.iter_mut().find(|e| e.0 == d.template) {
+            Some(e) => e.1 += 1,
+            None => by_template.push((d.template, 1)),
+        }
+    }
+    by_template.sort_unstable();
+    if by_template.is_empty() {
+        return "none within 30 m".into();
+    }
+    by_template
+        .iter()
+        .take(12)
+        .map(|(t, n)| format!("{n} x {t}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether the ad state still holds the deal.

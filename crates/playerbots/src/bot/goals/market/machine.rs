@@ -25,6 +25,8 @@ pub const CAST_GAP_MS: u64 = 8_000;
 /// From the accepted cast to the load of the island (or to leaving it) the server may take this
 /// long; after it the bot reports the silence.
 pub const LOAD_MS: u64 = 30_000;
+/// At the portal's spawn point the doodad must come into view within this long.
+pub const PORTAL_VIEW_MS: u64 = 20_000;
 /// Casts of the portal or exit skill before the bot gives up.
 pub const MAX_CASTS: u8 = 3;
 /// At the place, waiting for the other side.
@@ -122,15 +124,17 @@ impl Facts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
     /// The portal cast was accepted, nothing loaded within [`LOAD_MS`].
-    NoLoad {
+    NeverLoaded {
         /// Casts made.
         casts: u8,
     },
     /// The exit cast was accepted, the bot is still on the island after [`LOAD_MS`].
-    NoExit {
+    NeverLeft {
         /// Casts made.
         casts: u8,
     },
+    /// The bot stands at a spawn point of the portal doodad and the doodad is not in view.
+    PortalMissing,
 }
 
 /// What the glue does.
@@ -188,6 +192,8 @@ pub struct Machine {
     last_cast_ms: u64,
     announced: bool,
     told: bool,
+    /// Bot clock at which the bot first stood at the portal's spawn point without seeing it.
+    blind_ms: u64,
     outcome: Option<Closed>,
 }
 
@@ -204,6 +210,7 @@ impl Machine {
             last_cast_ms: 0,
             announced: false,
             told: false,
+            blind_ms: 0,
             outcome: None,
         }
     }
@@ -273,6 +280,15 @@ impl Machine {
                     } else if f.portal_ready && f.there {
                         acts.push(Act::Stop);
                         self.go(Phase::Enter, now);
+                    } else if f.there && !f.portal_ready {
+                        // (at the spawn point and no doodad: wait a little, then say so)
+                        if self.blind_ms == 0 {
+                            self.blind_ms = now.max(1);
+                            acts.push(Act::Stop);
+                        } else if now.saturating_sub(self.blind_ms) > PORTAL_VIEW_MS {
+                            acts.push(Act::Report(Problem::PortalMissing));
+                            self.finish(Closed::Cancelled, f);
+                        }
                     } else if f.stuck || waited > GO_MS {
                         self.finish(Closed::TimedOut, f);
                     } else {
@@ -330,7 +346,7 @@ impl Machine {
         if self.casts > 0 && now.saturating_sub(self.first_cast_ms) >= LOAD_MS {
             if !f.refused && !self.told {
                 self.told = true;
-                acts.push(Act::Report(Problem::NoLoad { casts: self.casts }));
+                acts.push(Act::Report(Problem::NeverLoaded { casts: self.casts }));
             }
             self.finish(Closed::Cancelled, f);
             return;
@@ -398,7 +414,7 @@ impl Machine {
         if self.casts > 0 && now.saturating_sub(self.first_cast_ms) >= LOAD_MS && !self.told {
             self.told = true;
             if !f.refused {
-                acts.push(Act::Report(Problem::NoExit { casts: self.casts }));
+                acts.push(Act::Report(Problem::NeverLeft { casts: self.casts }));
             }
         }
         if waited > LEAVE_MS {
@@ -644,8 +660,47 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Act::Report(_)))
             .collect();
-        assert_eq!(reports, [&Act::Report(Problem::NoLoad { casts: 3 })]);
+        assert_eq!(reports, [&Act::Report(Problem::NeverLoaded { casts: 3 })]);
         assert_eq!(last, Some(Status::Over(Closed::Cancelled)));
+    }
+
+    #[test]
+    fn a_portal_that_is_not_there_is_reported_once_and_ends_the_meeting() {
+        let mut m = Machine::new(Role::Seller, Meet::Mirage, 0);
+        let blind = Facts {
+            there: true,
+            portal_ready: false,
+            ..facts(0)
+        };
+        let mut acts = Vec::new();
+        let mut last = None;
+        for s in 1..40u64 {
+            let st = m.step(&Facts {
+                now_ms: s * 1000,
+                ..blind
+            });
+            acts.extend(st.acts);
+            last = Some(st.status);
+        }
+        let reports = acts
+            .iter()
+            .filter(|a| **a == Act::Report(Problem::PortalMissing))
+            .count();
+        assert_eq!(reports, 1, "{acts:?}");
+        assert_eq!(last, Some(Status::Over(Closed::Cancelled)));
+        // the doodad shows up in time: no report
+        let mut m = Machine::new(Role::Seller, Meet::Mirage, 0);
+        m.step(&Facts {
+            now_ms: 1000,
+            ..blind
+        });
+        let st = m.step(&Facts {
+            now_ms: 5000,
+            portal_ready: true,
+            ..blind
+        });
+        assert!(!st.acts.contains(&Act::Report(Problem::PortalMissing)));
+        assert_eq!(m.phase(), Phase::Enter);
     }
 
     #[test]
@@ -790,7 +845,7 @@ mod tests {
         }
         let reports = acts
             .iter()
-            .filter(|a| matches!(a, Act::Report(Problem::NoExit { .. })))
+            .filter(|a| matches!(a, Act::Report(Problem::NeverLeft { .. })))
             .count();
         assert_eq!(reports, 1, "{acts:?}");
         assert!(acts.iter().filter(|a| **a == Act::CastExit).count() >= 3);

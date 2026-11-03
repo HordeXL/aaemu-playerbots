@@ -7,6 +7,8 @@ use crate::issues::{IssueKind, IssueReport, Severity, Suspect};
 
 /// The server area of the doodad functions that move a character (the island's portals, exits).
 const AREA_DOODAD_FUNCS: &str = "rust/crates/aaemu-game/src/systems/npcs/doodad/funcs/";
+/// The server area of the spawn data (a doodad the data places that never shows).
+const AREA_SPAWNS: &str = "rust/crates/aaemu-game/app/Data/Worlds/main_world/doodad_spawns.json";
 /// The server area of player trades.
 const AREA_TRADE: &str = "rust/crates/aaemu-game/src/systems/economy/trade.rs";
 /// The server area of chat.
@@ -50,21 +52,39 @@ impl Transfer {
     }
 }
 
-/// The report for a problem of the island's portal or exit.
-pub fn mirage(problem: Problem, skill: u32, doodad: u32) -> IssueReport {
+/// The report for a problem of the island's portal or exit. `seen` names the doodad templates in
+/// view when the portal was missing.
+pub fn mirage(problem: Problem, skill: u32, doodad: u32, seen: &str) -> IssueReport {
+    if problem == Problem::PortalMissing {
+        return IssueReport::new(
+            IssueKind::DoodadMissing,
+            "mirage portal-doodad-missing",
+            "Mirage Isle: the portal doodad is not in view at its spawn point",
+        )
+        .expected(format!(
+            "doodad {doodad} (skill {skill}) in view within 20 s of standing 5 m from a spawn point of the data"
+        ))
+        .actual(format!("doodad templates in view: {seen}"))
+        .suspect(Suspect::Data)
+        .severity(Severity::Medium)
+        .area(AREA_SPAWNS)
+        .fact("skill", skill)
+        .fact("doodad", doodad);
+    }
     let (key, title, expected, actual) = match problem {
-        Problem::NoLoad { casts } => (
+        Problem::NeverLoaded { casts } => (
             "mirage enter-no-load",
             "Mirage Isle: the portal cast was accepted but the island never loaded",
             "SCProcessingInstance or SCLoadInstance within 30 s of the accepted cast",
             format!("nothing for 30 s after {casts} cast(s) of skill {skill} on portal doodad {doodad}"),
         ),
-        Problem::NoExit { casts } => (
+        Problem::NeverLeft { casts } => (
             "mirage exit-stuck",
             "Mirage Isle: the exit cast was accepted but the character stayed on the island",
             "a load of the main world within 30 s of the accepted cast",
             format!("still on the island 30 s after {casts} cast(s) of skill {skill} on exit doodad {doodad}"),
         ),
+        Problem::PortalMissing => unreachable!("handled above"),
     };
     IssueReport::new(IssueKind::NoResponse, key, title)
         .expected(expected)
@@ -133,11 +153,17 @@ mod tests {
 
     #[test]
     fn the_island_reports_have_stable_keys_and_point_at_the_server() {
-        let a = mirage(Problem::NoLoad { casts: 3 }, 17829, 4894);
-        let b = mirage(Problem::NoLoad { casts: 1 }, 17829, 4894);
+        let a = mirage(Problem::NeverLoaded { casts: 3 }, 17829, 4894, "");
+        let b = mirage(Problem::NeverLoaded { casts: 1 }, 17829, 4894, "");
         assert_eq!(a.key, b.key, "the number of casts is no part of the key");
-        assert_ne!(a.key, mirage(Problem::NoExit { casts: 1 }, 17838, 4895).key);
+        assert_ne!(
+            a.key,
+            mirage(Problem::NeverLeft { casts: 1 }, 17838, 4895, "").key
+        );
         assert_eq!(a.suspect, Suspect::Server);
+        let c = mirage(Problem::PortalMissing, 17829, 4894, "4 x 1373");
+        assert_eq!(c.suspect, Suspect::Data);
+        assert!(c.actual.contains("1373"));
     }
 
     #[test]
