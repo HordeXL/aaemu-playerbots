@@ -36,6 +36,9 @@ pub const MAX_WINS: usize = 4;
 pub const PRICE_TTL_MS: u64 = 45 * 60_000;
 /// How long a win mail may take to arrive after a buyout.
 pub const WIN_MAIL_WAIT_MS: u64 = 90_000;
+/// How long before a buyout is handled a win mail may have been seen and still belong to it (the
+/// server sends the mail with the answer, and the goal reads the answer on its next tick).
+pub const EARLY_WIN_MS: u64 = 10_000;
 /// How long the result mail of a lot that vanished may take (the server settles on its 5 second
 /// timer and retries; the bot lists the mailbox in the meantime).
 pub const SALE_MAIL_WAIT_MS: u64 = 75_000;
@@ -169,6 +172,8 @@ pub struct AuctionMemory {
     deficit_since_ms: u64,
     /// Buyouts whose win mail has not come.
     wins: Vec<WinWait>,
+    /// Bot clock (ms) of the win mails seen while no buyout was waiting (see [`EARLY_WIN_MS`]).
+    early_wins: Vec<u64>,
     /// Bot clock (ms) at which the last visit ended, 0 = no visit yet.
     pub last_visit_end_ms: u64,
     /// Bot clock (ms) of the last lot the bot posted, 0 = none.
@@ -197,9 +202,15 @@ impl AuctionMemory {
                 let before = self.mail.win_mails;
                 self.mail.observe(other, now_ms);
                 for _ in before..self.mail.win_mails {
-                    // a win mail arrived: the oldest wait is over
+                    // a win mail arrived: the oldest wait is over; with none waiting the mail
+                    // came ahead of the answer of the buyout it belongs to
                     if !self.wins.is_empty() {
                         self.wins.remove(0);
+                    } else {
+                        if self.early_wins.len() >= MAX_WINS {
+                            self.early_wins.remove(0);
+                        }
+                        self.early_wins.push(now_ms);
                     }
                 }
             }
@@ -428,6 +439,13 @@ impl AuctionMemory {
 
     /// A buyout of `template` was accepted: its win mail is due within [`WIN_MAIL_WAIT_MS`].
     pub fn expect_win(&mut self, lot_id: u64, template: u32, now_ms: u64) {
+        self.early_wins
+            .retain(|&t| now_ms.saturating_sub(t) <= EARLY_WIN_MS);
+        if !self.early_wins.is_empty() {
+            // its mail was seen before the answer was handled: nothing left to wait for
+            self.early_wins.remove(0);
+            return;
+        }
         if self.wins.len() >= MAX_WINS {
             self.wins.remove(0);
         }
@@ -697,22 +715,10 @@ mod tests {
         assert_eq!((m.lots_gone, m.stats.cancelled), (1, 1));
     }
 
-    #[test]
-    fn a_buyout_expects_its_win_mail() {
-        let mut m = AuctionMemory::default();
-        assert!(!m.awaiting_mail());
-        m.expect_win(7, 3411, 1_000);
-        assert!(m.awaiting_mail());
-        assert_eq!(m.waiting_wins(), 1);
-        assert!(m.take_late_win(1_000 + WIN_MAIL_WAIT_MS - 1).is_none());
-        let late = m.take_late_win(1_000 + WIN_MAIL_WAIT_MS).unwrap();
-        assert_eq!((late.lot_id, late.template), (7, 3411));
-        assert_eq!(m.waiting_wins(), 0);
-        // a win mail ends the wait
-        m.expect_win(8, 3411, 0);
-        let win = ServerEvent::Activity(ActivityEvent::MailReceived {
+    fn win_mail(mail_id: i64) -> ServerEvent {
+        ServerEvent::Activity(ActivityEvent::MailReceived {
             mail: Box::new(MailHeader {
-                mail_id: 1,
+                mail_id,
                 mail_type: 16,
                 status: 0,
                 title: "".into(),
@@ -726,7 +732,40 @@ mod tests {
             unread: [0, 1, 0, 0],
             is_cancel: false,
             body: None,
-        });
+        })
+    }
+
+    #[test]
+    fn a_win_mail_seen_before_the_answer_is_handled_ends_no_wait() {
+        let mut m = AuctionMemory::default();
+        // the mail came with the answer of the buyout, before the goal read the answer
+        m.observe(&win_mail(1), 1_000);
+        m.expect_win(7, 3411, 1_800);
+        assert_eq!(m.waiting_wins(), 0, "nothing is late afterwards");
+        assert!(m.take_late_win(1_000_000).is_none());
+        // a mail seen long before (a mailbox listing at login) is not taken for the next buyout's
+        m.observe(&win_mail(2), 2_000);
+        m.expect_win(8, 3411, 2_000 + EARLY_WIN_MS + 1);
+        assert_eq!(m.waiting_wins(), 1);
+        // the usual order still works
+        m.observe(&win_mail(3), 30_000);
+        assert_eq!(m.waiting_wins(), 0);
+    }
+
+    #[test]
+    fn a_buyout_expects_its_win_mail() {
+        let mut m = AuctionMemory::default();
+        assert!(!m.awaiting_mail());
+        m.expect_win(7, 3411, 1_000);
+        assert!(m.awaiting_mail());
+        assert_eq!(m.waiting_wins(), 1);
+        assert!(m.take_late_win(1_000 + WIN_MAIL_WAIT_MS - 1).is_none());
+        let late = m.take_late_win(1_000 + WIN_MAIL_WAIT_MS).unwrap();
+        assert_eq!((late.lot_id, late.template), (7, 3411));
+        assert_eq!(m.waiting_wins(), 0);
+        // a win mail ends the wait
+        m.expect_win(8, 3411, 0);
+        let win = win_mail(1);
         assert!(AuctionMemory::concerns(&win));
         m.observe(&win, 10);
         assert_eq!(m.waiting_wins(), 0);
