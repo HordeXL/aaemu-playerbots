@@ -158,14 +158,18 @@ impl Run {
         }
     }
 
-    /// Whether the goal drives the combat controller: inside, and on the way out.
+    /// Whether the goal drives the combat controller: inside, and on the way out. The load
+    /// counts: a bot that arrives among monsters must still see its arrival.
     pub fn owns_combat(&self) -> bool {
-        matches!(self.machine.phase(), Phase::Clear | Phase::Leave)
+        matches!(
+            self.machine.phase(),
+            Phase::Load | Phase::Clear | Phase::Leave
+        )
     }
 
     /// Whether the run goes on after a death of the bot.
     pub fn survives_death(&self) -> bool {
-        matches!(self.machine.phase(), Phase::Clear | Phase::Leave)
+        self.machine.phase().survives_death()
     }
 
     /// The bot died.

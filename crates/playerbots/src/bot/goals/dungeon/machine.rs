@@ -122,6 +122,12 @@ impl Phase {
             Phase::Out => "leaving the team",
         }
     }
+
+    /// Whether a run goes on after the bot dies in this phase: inside the dungeon, which includes
+    /// the load (the monsters at the entrance are quick). Before that the bot has not entered.
+    pub fn survives_death(self) -> bool {
+        matches!(self, Phase::Load | Phase::Clear | Phase::Leave)
+    }
 }
 
 /// What the movement controller is doing.
@@ -739,6 +745,24 @@ impl Machine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_phases_inside_the_dungeon_survive_a_death() {
+        for p in [Phase::Load, Phase::Clear, Phase::Leave] {
+            assert!(p.survives_death(), "{p:?}");
+        }
+        for p in [
+            Phase::Gather,
+            Phase::Prep,
+            Phase::Team,
+            Phase::Travel,
+            Phase::Muster,
+            Phase::Enter,
+            Phase::Out,
+        ] {
+            assert!(!p.survives_death(), "{p:?}");
+        }
+    }
+
     use super::*;
 
     fn facts(now_ms: u64) -> Facts {
