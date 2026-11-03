@@ -1,12 +1,23 @@
 /target/
 # machine-local cargo settings (target-dir on another drive, jobs)
 /.cargo/config.toml
-# baked world data (heights, map, polygons) - produced by `playerbots bake`
+# baked world data (heights, map, polygons) - produced by `playerbots bake`; this is also the
+# default home of the roster, the issue book and the evidence folders
 /data/
 # local configuration, roster and secrets
 /playerbots.toml
 /roster.json
+/roster.json.*
 # the generated bot password (next to the roster)
 *.secrets.json
+*.secrets.json.*
 *.local.toml
 .env
+# run folders: issue book, evidence folders, issue queue, server and bot logs
+/issues/
+/evidence/
+/portal_zone_origins.txt
+*.log
+# tool leftovers
+*.tmp
+*.bak

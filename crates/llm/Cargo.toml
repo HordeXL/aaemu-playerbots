@@ -4,6 +4,14 @@ description = "Optional OpenAI-compatible LLM client (e.g. DeepSeek) with rate l
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 reqwest.workspace = true

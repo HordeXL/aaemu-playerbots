@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn load_missing_dir_is_empty() {
-        let b = Baked::load(Path::new("D:/definitely/not/here"), "main_world");
+        let b = Baked::load(Path::new("definitely/not/here"), "main_world");
         assert!(b.terrain.is_none());
         assert!(b.map.is_none());
         assert!(b.housing_areas.is_empty());
@@ -331,7 +331,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Reads the real baked data dir; run with `AA_BAKED=D:\aaemu-playerbots-data`.
+    /// Reads the real baked data dir; run with `AA_BAKED=<data dir>`.
     #[test]
     #[ignore = "needs a baked data dir: set AA_BAKED"]
     fn loads_real_baked_data() {

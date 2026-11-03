@@ -34,15 +34,13 @@ use crate::heights::{bake_heights, validate_step, HeightGrid, HeightsReport};
 use crate::pak::Pak;
 use crate::worldxml::{parse_world_xml, WorldDef};
 
-/// Scratch directory for tests: C: is nearly full on the dev machine, so prefer the baked data
-/// volume when present, else the OS temp dir.
+/// Scratch directory for tests: below `$AA_TEST_TMP` when set (a roomier volume), else the OS
+/// temp dir.
 #[cfg(test)]
 pub(crate) fn test_dir(name: &str) -> PathBuf {
-    let d_root = Path::new("D:/aaemu-playerbots-data");
-    let base = if d_root.is_dir() {
-        d_root.join("tmp-test")
-    } else {
-        std::env::temp_dir().join("aa-bake-test")
+    let base = match std::env::var_os("AA_TEST_TMP") {
+        Some(root) => PathBuf::from(root).join("tmp-test"),
+        None => std::env::temp_dir().join("aa-bake-test"),
     };
     let dir = base.join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

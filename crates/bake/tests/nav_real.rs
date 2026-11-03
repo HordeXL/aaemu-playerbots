@@ -1,7 +1,7 @@
 //! Bakes the navigation meshes from the real client pak.
 //!
 //! ```text
-//! AA_PAK=D:\AA1.2\game_pak [AA_NAV_OUT=<scratch dir>] cargo test --release -p aa-bake --test nav_real \
+//! AA_PAK=<client>/game_pak [AA_NAV_OUT=<scratch dir>] cargo test --release -p aa-bake --test nav_real \
 //!     -- --ignored --nocapture
 //! ```
 //!

@@ -4,6 +4,14 @@ description = "Headless ArcheAge 1.2 player bots for the AAEmu Rust server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [lib]
 name = "playerbots"

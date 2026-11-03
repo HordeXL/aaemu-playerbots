@@ -13,8 +13,14 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/AAEmu/aaemu-playerbots"
-rust-version = "1.85"
+repository = "https://github.com/NickMesser/aaemu-playerbots"
+homepage = "https://github.com/NickMesser/aaemu-playerbots"
+authors = ["Nick Messer"]
+readme = "README.md"
+keywords = ["archeage", "aaemu", "bots", "game-server", "emulator"]
+categories = ["games", "network-programming"]
+rust-version = "1.88"
+publish = false
 
 [workspace.dependencies]
 # internal

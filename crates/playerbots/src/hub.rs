@@ -265,7 +265,9 @@ impl Rss {
         let mut r = Rss {
             sys: sysinfo::System::new(),
             pid: sysinfo::get_current_pid().ok(),
-            refreshed: Instant::now() - RSS_REFRESH,
+            refreshed: Instant::now()
+                .checked_sub(RSS_REFRESH)
+                .unwrap_or_else(Instant::now),
             bytes: 0,
             baseline: 0,
         };

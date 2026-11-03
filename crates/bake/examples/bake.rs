@@ -1,8 +1,8 @@
 //! Runs the bake from the command line.
 //!
 //! ```text
-//! cargo run -p aa-bake --release --example bake -- --pak D:\AA1.2\game_pak --out D:\aaemu-playerbots-data \
-//!     --world main_world --step 4 --compact <server>\app\Data\compact.sqlite3 [--only heights,zones,housing,spheres,map,nav,nav_instances]
+//! cargo run -p aa-bake --release --example bake -- --pak <client>/game_pak --out <data dir> \
+//!     --world main_world --step 4 --compact <AAEmu>/rust/crates/aaemu-game/app/Data/compact.sqlite3 [--only heights,zones,housing,spheres,map,nav,nav_instances]
 //! ```
 
 use std::path::PathBuf;
