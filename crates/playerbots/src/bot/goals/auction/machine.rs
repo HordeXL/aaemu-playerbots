@@ -378,6 +378,9 @@ impl Run {
         }
         env.stop();
         env.face(pos[0], pos[1]);
+        if !self.arrived {
+            env.mem().stats.visits += 1;
+        }
         self.arrived = true;
         let to = self.resume;
         let text = headline(to);

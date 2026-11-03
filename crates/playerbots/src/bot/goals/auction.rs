@@ -406,7 +406,6 @@ impl Auction {
         // a visit that reached the auctioneer counts; one that did not (interrupted, blocked)
         // is tried again in a few minutes
         mem.last_visit_end_ms = if at_the_house {
-            mem.stats.visits += 1;
             now.max(1)
         } else {
             (now + RETRY_AFTER_FAIL_MS)

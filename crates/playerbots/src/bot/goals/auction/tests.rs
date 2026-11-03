@@ -663,6 +663,7 @@ fn a_visit_walks_surveys_prices_posts_verifies_and_lingers() {
     // the memory
     let m = &f.mem;
     assert_eq!(m.stats.posted, 1);
+    assert_eq!(m.stats.visits, 1, "a visit is counted when the bot arrives");
     assert_eq!(m.stats.fees, i64::from(wire::listing_fee(buyout, 3)));
     assert_eq!(m.own().len(), 1);
     assert!(m.own()[0].posted_here);
@@ -1140,6 +1141,7 @@ fn many_visits_do_not_grow_the_memory() {
         assert_eq!(status, GoalStatus::Done, "round {round}");
     }
     assert_eq!(f.mem.stats.posted, 30);
+    assert_eq!(f.mem.stats.visits, 30);
     assert!(f.mem.prices().len() <= crate::bot::market::auction::MAX_PRICES);
     assert!(f.mem.own().len() <= crate::bot::market::auction::MAX_OWN);
     // the packets of 30 visits are all answered (no queue is left behind)
