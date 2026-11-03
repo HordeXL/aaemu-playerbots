@@ -1138,6 +1138,17 @@ fn the_two_kilometre_hand_off_to_the_silent_forest_is_walked() {
         done.extend(local_quests(&world, spot.0, spot.1, 1700.0, &chain));
         done.sort_unstable();
         done.dedup();
+        println!(
+            "{name}: chapter 5 ends at ({:.0}, {:.0}, z {:.1}) in {}; {} quests done",
+            spot.0,
+            spot.1,
+            world.ground_z(spot.0, spot.1).unwrap_or(0.0),
+            zone_of(&world, [spot.0, spot.1, 0.0]),
+            done.len()
+        );
+        if std::env::var_os("AA_PRINT_DONE").is_some() {
+            println!("DONE {name} {done:?}");
+        }
         let mut rig = Rig::new(world.clone(), race, 800 + u64::from(race));
         rig.resume_at(spot.0, spot.1, 26, &done);
         rig.force(GoalKind::Quest);

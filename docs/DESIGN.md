@@ -152,8 +152,10 @@ the first scan) holds the trip, the empty-scan count, failed destinations and th
 trips. A trip has its own time limit (distance at 3 m/s plus 3 min, between 5 and 45 min) that the
 run's end does not cut short, and survives a rest or a duel in between. A destination that timed
 out, was blocked or killed the bot twice rests for 10 min, then 20, then 40, together with
-everything within 400 m of it. A search that finds no destination waits 2 min before the next. A
-scan that comes back empty within 90 s of arriving marks the place as barren.
+everything within 400 m of it. A quest in the journal that is only resting after a failure and may
+be tried again within 2 min keeps the bot where it is (no trip is planned: a short back-off must not
+send a bot across the map). A search that finds no destination waits 2 min before the next. A scan
+that comes back empty within 90 s of arriving marks the place as barren.
 
 **Visible.** The goal detail reads "heading to Lilyut Hills for quest 1234 Name (2.1 km to go)" /
 "... for quests suited to level 17" / "... to hunt monsters"; the log (`info`) has one line at the
