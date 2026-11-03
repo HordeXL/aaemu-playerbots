@@ -32,6 +32,7 @@ whatever it is doing. Most features have a switch in `[behavior]`, `[social]`, `
 | **Trade runs** | Crafts a trade pack at a specialty workbench, carries it to the NPC that buys it, sells it and collects the payment mail. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and goes home to rest there. |
 | **Rest, wander, chat** | Recovers hit points and mana, strolls around, answers whispers and nearby players (canned lines or, optionally, an LLM in character). |
+| **Life-like movement** | In front of a real player a bot jumps now and then (on a straight run, at a step, to cheer a level), turns on the spot, pauses at corners, runs at its own pace, greets passers-by, answers an emote and sits down to rest. Each bot has its own temperament (some never jump); nothing happens without an audience or while the bot fights, trades or sails. Switch: `[behavior] lifelike`, `jump_rate`, `emotes`. |
 
 Bots survive death (they ask for the resurrection), disconnects (reconnect with back-off) and name
 rejections (a new name is picked); the roster remembers accounts and characters across restarts. The

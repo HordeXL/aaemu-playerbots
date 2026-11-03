@@ -124,7 +124,13 @@ Safety of the GM lines:
   them on land.
 * `[behavior] lifelike = true` (default): bots move like people (jumps, emotes, idle mannerisms);
   `false` keeps them walking and standing still. `jump_rate = 1.0` scales how often they jump (0 =
-  never) and `emotes = true` lets them use emotes.
+  never) and `emotes = true` lets them use emotes. It only shows when a real player (a character that
+  is not one of this process's bots) is within 150 m, and never while a bot fights, trades, sails or is
+  in an instance. The server logs every emote at WARN (`express_text - ExpressEmotion`); a
+  process-wide allowance keeps that to a few lines a minute however many bots run. To see what the
+  bots do: `RUST_LOG=info,pb_life=debug` logs every jump and emote, and `pb_move=trace` logs the
+  movement packets other characters send, as the server relays them. Details in
+  [DESIGN.md](DESIGN.md#life-like-movement-botmannerrs).
 * `[market] sell_to_players = false` (default): bots sell only to other bots and the auction house;
   `true` lets them also sell to real players, and is ignored while `gm_bootstrap` is on (same rule
   as `trade_with_players`).
