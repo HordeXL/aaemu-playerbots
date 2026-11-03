@@ -1082,9 +1082,11 @@ impl Life {
         self.jump.is_some_and(|j| now_ms >= j.due_at())
     }
 
-    /// The next time the jump needs the bot loop (bot clock, ms).
-    pub fn wake_at(&self) -> Option<u64> {
-        let rejump = (self.rejump_ms != 0).then_some(self.rejump_ms);
+    /// The next time the jump needs the bot loop (bot clock, ms). A second jump that is already
+    /// due waits for the next ordinary tick (it must not keep the loop spinning when the
+    /// controller cannot take it, e.g. in a pause).
+    pub fn wake_at(&self, now_ms: u64) -> Option<u64> {
+        let rejump = (self.rejump_ms > now_ms).then_some(self.rejump_ms);
         let jump = self.jump.map(|j| j.due_at());
         match (jump, rejump) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1208,6 +1210,7 @@ pub fn tick_with(
     for act in acts {
         match act {
             Act::Emote { emotion, target } if obj != 0 => {
+                tracing::debug!(target: "pb_life", emotion, target, "emote");
                 out.push(cs::express_emotion(obj, target, emotion));
             }
             Act::Emote { .. } => {}
@@ -1282,6 +1285,7 @@ pub fn rest_tick(ctx: &mut Ctx<'_>) {
     let emotes_on = l.emotes_on;
     if emotes_on && obj != 0 {
         if let Some(Act::Emote { emotion, target }) = l.emotes.sit(now, gate, global_take) {
+            tracing::debug!(target: "pb_life", emotion, target, "emote");
             ctx.out.push(cs::express_emotion(obj, target, emotion));
         }
     }

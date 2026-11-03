@@ -330,7 +330,7 @@ impl Motion {
     pub fn wake_in(&self, now_ms: u64) -> Option<u64> {
         self.life
             .as_ref()?
-            .wake_at()
+            .wake_at(now_ms)
             .map(|t| t.saturating_sub(now_ms))
     }
 
@@ -537,6 +537,7 @@ impl Motion {
             l.fidget.reset();
             l.dawdle.reset();
             l.pause_until_ms = 0;
+            l.rejump_ms = 0;
             l.cosmetic = counted;
         }
         self.path.clear();
@@ -595,6 +596,7 @@ impl Motion {
     /// The `/move` asked for by [`Motion::travel_to`] was sent: wait for the server to move the
     /// bot instead of walking.
     pub fn begin_teleport(&mut self, now_ms: u64) {
+        self.life_end_jump();
         self.pending_tp = Some(PendingTeleport {
             deadline_ms: now_ms + TELEPORT_WAIT_MS,
         });
@@ -764,6 +766,7 @@ impl Motion {
                 l.rejump_ms = 0;
                 if moving && l.gate.show() && l.jump.is_none() {
                     l.jump = Some(manner::Jump::start(now, manner::JumpKind::Full));
+                    tracing::debug!(target: "pb_life", kind = ?manner::JumpKind::Full, "second jump");
                 }
             }
             return;
@@ -802,6 +805,7 @@ impl Motion {
         let mult = l.traits.jump_mult;
         if let Some(kind) = l.sched.decide(now, &look, mult, env.rng) {
             l.jump = Some(manner::Jump::start(now, kind));
+            tracing::debug!(target: "pb_life", ?kind, "jump");
         }
     }
 

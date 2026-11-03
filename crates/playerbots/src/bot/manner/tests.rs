@@ -305,17 +305,25 @@ fn a_late_tick_skips_to_the_newest_packet_due() {
 fn the_jump_asks_the_bot_loop_for_its_next_packet() {
     let mut rng = fastrand::Rng::with_seed(1);
     let mut life = Life::new(playful(), 1.0, true, 0, &mut rng);
-    assert_eq!(life.wake_at(), None);
+    assert_eq!(life.wake_at(0), None);
     life.jump = Some(Jump::start(1_000, JumpKind::Full));
-    assert_eq!(life.wake_at(), Some(1_000));
+    assert_eq!(life.wake_at(1_000), Some(1_000));
     assert!(life.jump_due(1_000));
     life.jump.as_mut().unwrap().step(1_000);
-    assert_eq!(life.wake_at(), Some(1_323));
+    assert_eq!(life.wake_at(1_000), Some(1_323));
     assert!(!life.jump_due(1_100));
     life.rejump_ms = 1_200;
-    assert_eq!(life.wake_at(), Some(1_200), "the earlier of the two");
+    assert_eq!(life.wake_at(1_100), Some(1_200), "the earlier of the two");
+    // a second jump that is due waits for the ordinary tick instead of spinning the loop
+    life.jump = None;
+    assert_eq!(life.wake_at(1_300), None);
+    life.rejump_ms = 1_400;
+    assert_eq!(life.wake_at(1_300), Some(1_400));
     life.end_jump();
-    assert_eq!((life.jump, life.rejump_ms, life.wake_at()), (None, 0, None));
+    assert_eq!(
+        (life.jump, life.rejump_ms, life.wake_at(1_000)),
+        (None, 0, None)
+    );
 }
 
 // ---- when a bot jumps ---------------------------------------------------------------------------
@@ -1717,4 +1725,38 @@ fn a_swimming_bot_sends_the_swim_stance_and_a_walking_one_the_relaxed_stance() {
     rig.motion.go_to(40.0, 10.0, 0.0, Pace::Run, rig.now);
     while rig.step(&flat) == MotionStatus::Moving {}
     assert!(moves(&rig.out).iter().all(|p| p.stance == 1));
+}
+
+#[test]
+fn the_life_of_a_bot_is_one_small_box() {
+    // (a thousand bots must not cost a megabyte; the bot itself only holds the pointer)
+    let size = std::mem::size_of::<Life>();
+    assert!(size <= 512, "{size} bytes");
+    assert_eq!(
+        std::mem::size_of::<Option<Box<Life>>>(),
+        std::mem::size_of::<usize>()
+    );
+}
+
+#[test]
+fn a_stale_second_jump_or_a_teleport_wait_does_not_spin_the_bot_loop() {
+    // a second jump left over from the last trip is dropped by the next one (a chase never jumps)
+    let mut rig = Rig::new(playful(), 1.0);
+    rig.life().rejump_ms = rig.now + 100;
+    rig.motion.chase_to(10.0, 500.0, 0.0, Pace::Run, rig.now);
+    assert_eq!(rig.life().rejump_ms, 0);
+    for _ in 0..40 {
+        rig.step(&flat);
+        assert_eq!(rig.motion.wake_in(rig.now), None);
+    }
+    // a bot in the air that has to wait for a teleport lands in its mind
+    let mut rig = Rig::new(playful(), 1.0);
+    rig.life().sched.cheer();
+    while moves(&rig.out).len() < 2 {
+        rig.step(&flat);
+    }
+    assert!(rig.life().jump.is_some());
+    rig.motion.begin_teleport(rig.now);
+    assert!(rig.life().jump.is_none());
+    assert_eq!(rig.motion.wake_in(rig.now), None);
 }
