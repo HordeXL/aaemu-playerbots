@@ -124,7 +124,7 @@ impl Goal {
             GoalKind::TradeRun => Goal::TradeRun(TradeRun::default()),
             GoalKind::Housing => Goal::Housing(Housing::default()),
             GoalKind::Dungeon => Goal::Dungeon(Dungeon::new(party)),
-            GoalKind::Sail => Goal::Sail(Sail),
+            GoalKind::Sail => Goal::Sail(Sail::default()),
         }
     }
 

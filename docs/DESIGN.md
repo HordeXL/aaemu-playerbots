@@ -176,9 +176,85 @@ files. Until a feature fills its hook it does nothing and the bots behave as bef
 
 `[behavior] portals`, `dungeons` and `sailing` (default on) are read from `ctx.cfg.behavior` by the
 features. `GoalKind::Dungeon` and `GoalKind::Sail` are scored only by their own `score` functions
-(0 while they are stubs, so no bot picks them); forcing one from the web UI makes it fail with
+(0 while a feature is a stub, so no bot picks it); forcing a stub from the web UI makes it fail with
 `NotImplemented`, which switches it off for that bot. A ship's `SCOneUnitMovement` is decoded twice
 (`Decoded::Ship`): the ordinary position event and `WorldEvent::ShipMoved` (heading, speed, helm).
+
+## Sailing (goal `sail`)
+
+A bot gets a boat summon scroll, summons a boat, sails it along a planned route and comes ashore.
+Only the sea is planned: lakes and rivers are out of scope (the sea mask knows nothing of them).
+
+```text
+Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every failure, then Failed)
+```
+
+- **Gear**: a scroll in the bag is used; otherwise, with `gm_bootstrap`, `/item add self 17906 1`
+  (the cheapest boat scroll of the data with a driver seat and a top speed of 4 m/s or more; the
+  rowboat). A boat left over from an earlier trip is despawned first. Without GM and without a
+  scroll the goal fails (`NoTarget`) and the brain's 60 s failure cooldown applies.
+- **Plan** (`goals/sail/trip.rs`): the nearest beach with open water in front of it is the launch
+  (`find_shore`: land 3 m behind the stand point, water 12 to 28 m off the beach); the landing is a
+  beach near a random open-water point 1 to 3 km away whose sea route is at most 2.2 times the
+  straight line; otherwise a sightseeing loop out to a point at sea and back to the launch. Hostile
+  monsters that live on the water (`danger_zones`: the spawns of NPC templates the bot's faction is
+  hostile to, e.g. 8563 / 13012 near (15344, 16346)) close a 140 m disc each to the planner.
+- **Sea map** (`aa-world::water`, `World::water()`): 16 m cells from the 4 m height grid, built on
+  first use by up to four threads (about 1.4 s in a debug build, a tenth in release) and shared by
+  all bots: a cell is sea when every height sample it touches is a real terrain sample under 98 m.
+  35 x 2431 cells of bits, **664 KiB**. The planner is an A* over open cells (a cell is open when
+  its square neighbourhood of `clear` cells is all sea) with hashed scratch, a node bound,
+  a shore penalty and line-of-sight smoothing; the route keeps two cells (32 m) off the beach, one
+  as a fallback.
+- **Shore / Summon**: the bot walks to the stand point, faces the water, waits 0.8 s and casts the
+  scroll's skill on itself (`start_skill_item`). Refusals of the place (`SkillResult` 0x23, error
+  messages 100 / 583) pick another beach, at most two more times; an unexpected refusal is a
+  `SkillRefused` finding; a boat that does not appear within the cast time plus 10 s is an issue.
+- **Board**: the bot swims to the hull (the server measures the bind reach to the hull's mass box,
+  under 4 m of surface gap) and sends `CSBindSlave` from 2.8 m, closer after a "too far" answer.
+- **Sail** (`bot/vehicle/{helm,follow}.rs`): pure-pursuit on the waypoints (lookahead 70 m, waypoint
+  reach 40 m, arrival 18 m) and a hull-aware rate-tracking heading controller. The server turns
+  slowly (a rowboat 4.35 degrees per second, angular acceleration 0.125 rad/s^2 at full helm; both
+  from `ship_models.turn_accel` and the kind's turn cap, `SlaveTemplate::turn`), so the controller
+  asks for the yaw rate that stops on the target heading (`sqrt(2 a err)`), converts the rate error
+  to a steering value and slows down for sharp turns. A steering probe at the start (80 steering
+  with 100 throttle for 2.5 s) measures which way the wheel turns (the documented direction is a
+  positive steering that lowers the yaw), and a divergence watch flips the sign once more if the
+  heading runs away. A `ShipRequest` is sent when the throttle changes, the steering moves by 6 or
+  more, or as a 1 s heartbeat (the server keeps a request until the next one).
+- **Stuck**: less than 3 m of progress in 8 s with the engine on, or the server's `stuck` flag, backs
+  the boat off astern for 4 s and plans the route again from where it is; the fourth episode aborts.
+- **Land**: brake (astern while above 2.5 m/s), set the throttle to 0, `CSDiscardSlave`, then
+  `CSDespawnSlave`, then walk (swim) to the landing stand point. Each request is repeated once
+  after a timeout; a missing answer is an issue and the trip goes on.
+- **Never leave a boat behind**: every way the goal ends (done, failed, interrupted by a rest, a
+  forced goal, death) passes through `Sail::stop`, which stops the helm, leaves the seat and
+  despawns the boat. A cast that is still in flight when the goal is interrupted can still put a
+  boat on the water; the next sail goal despawns it first and the server removes it at logout.
+- **Scoring** (`goals::sail::score`): 0 unless `[behavior] sailing`, outside instances, hit points
+  60 percent or more, online 3 minutes or more, 30 minutes since the last trip of this bot, a scroll
+  obtainable (bag or GM) and a coast within 450 m (terrain probes under 98 m); the weight is
+  `0.2 * (0.3 + 0.7 * (1 - homebody) + 0.7 * merchant)`, so explorer- and merchant-like bots go
+  more often than homebodies. `base_weight` stays 0 (the goal owns its weight).
+- **Fast ticks**: `VehicleState::fast_tick` keeps the 250 ms bot tick while the goal has a boat or a
+  seat (the idle tick is 1.5 s). On the boat the goal owns the combat decisions
+  (`owns_combat`): a fight does not pause the helm; the combat controller only defends.
+- **Detectors** (`ctx.report_issue`, one per key and bot): `sail:no_slave:<skill>` (cast accepted,
+  no boat), `sail:bind_no_attach` (`SCSlaveBound` names the bot, no `SCUnitAttached`),
+  `sail:bind_no_response`, `sail:no_ship_movement`, `sail:no_thrust` (engine on 5 s, deep water,
+  not aground, speed 0), `sail:dead_wheel` (helm hard over at speed for 10 s, no turn),
+  `sail:despawn_ignored`, `sail:discard_ignored`, `sail:error_code:<id>` (an unexpected
+  `SCErrorMsg` after a boat action).
+- **Memory**: `VehicleState` is one pointer (the `Sailor` is allocated by the first sail goal or
+  summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea map
+  is 664 KiB once. `size_of::<Bot>()` went from 3152 to 3160 bytes (limit 3200), `Goal` is 152
+  bytes (limit 160).
+- **Tests**: the water mask, the planner (detour, no route, discs), the shore finder, the heading
+  controller (also with an inverted wheel and other hulls), the route follower, and the whole
+  machine against a scripted server (`goals/sail/tests.rs`: a rowboat with the server's turn
+  physics, GM scroll, refused places, no boat, no seat, ignored bind / discard / despawn, a dead
+  engine, a boat aground, an interruption at every point of the trip, a late boat of an interrupted
+  cast). Real-data check: `AA_BAKED=... cargo test -p aa-world --test water_real -- --ignored`.
 
 ## Data directory
 
