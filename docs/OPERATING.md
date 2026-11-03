@@ -194,8 +194,10 @@ The chat market is a duty every bot runs next to its goal, plus the goal `market
 * **Economy safety.** Only the clean ledger is sold, never GM-made goods, trade, mail or auction
   returns. Real players are served only with `sell_to_players = true`, never while
   `bots.gm_bootstrap` is on. Everything is off with `enabled = false` or `chat_ads = false`.
-* **Issue detectors** (see Server issue reports): a portal cast the server accepted that never
-  loaded the island within 30 s, an exit cast that leaves the bot on the island, a trade both
+* **Issue detectors** (see Server issue reports): a portal doodad that is not in view 20 s after
+  the bot reached its spawn point (the data places it, the server does not show it), a portal
+  cast the server accepted that never loaded the island within 30 s, an exit cast that leaves the
+  bot on the island, a trade both
   sides confirmed that moved nothing, and refused whispers (error 437 or 265, reported only as
   information, the bot being the suspect).
 
