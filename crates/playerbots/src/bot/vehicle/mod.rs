@@ -392,6 +392,24 @@ impl VehicleState {
             .is_some_and(|s| s.active && (s.boat.is_some() || s.seat.is_some()))
     }
 
+    /// When the last sailing trip ended and how many trips there were: what a new connection
+    /// keeps (see [`VehicleState::restore_trip_log`]).
+    pub fn trip_log(&self) -> (u64, u16) {
+        self.sailor
+            .as_ref()
+            .map_or((0, 0), |s| (s.last_trip_end_ms, s.trips))
+    }
+
+    /// Puts [`VehicleState::trip_log`] back into a fresh state (allocates only when a trip was
+    /// made).
+    pub fn restore_trip_log(&mut self, (last_end_ms, trips): (u64, u16)) {
+        if last_end_ms != 0 || trips != 0 {
+            let s = self.sailor_mut();
+            s.last_trip_end_ms = last_end_ms;
+            s.trips = trips;
+        }
+    }
+
     /// Heap bytes held (for the memory report).
     pub fn heap_bytes(&self) -> usize {
         self.sailor
@@ -441,6 +459,31 @@ mod tests {
             std::mem::size_of::<VehicleState>(),
             std::mem::size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn the_trip_log_survives_a_new_connection() {
+        let mut v = VehicleState::default();
+        v.restore_trip_log(v.trip_log());
+        assert!(v.sailor().is_none(), "nothing to keep, nothing allocated");
+        let s = v.sailor_mut();
+        s.last_trip_end_ms = 5000;
+        s.trips = 2;
+        s.boat = Some(Boat {
+            obj: 1,
+            tl: 1,
+            template: 1,
+            hp: 1,
+            max_hp: 1,
+            pos: [0.0; 3],
+            driver_char: 0,
+            despawning: false,
+        });
+        let log = v.trip_log();
+        let mut fresh = VehicleState::default();
+        fresh.restore_trip_log(log);
+        assert_eq!(fresh.trip_log(), (5000, 2));
+        assert!(fresh.boat().is_none() && fresh.seat().is_none());
     }
 
     #[test]
