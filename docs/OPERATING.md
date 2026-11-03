@@ -173,7 +173,8 @@ walkable mesh. The nearest reachable auctioneer comes from the world data's NPC 
 a state machine that lasts a few minutes:
 
 1. **Walk** to the auctioneer and wait until it is in view (an auctioneer that is not at its spawn
-   is filed as an issue).
+   is filed as an issue). An auctioneer the bot cannot reach, or died on the way to, is left alone
+   for half an hour.
 2. **Survey** the first pages of the house and the character's own lots.
 3. **Price and post.** For each honest surplus stack (see [Selling](#selling-market)) the bot looks
    at the five cheapest buyouts of the item, takes their median per item as the going rate and asks
@@ -187,8 +188,10 @@ a state machine that lasts a few minutes:
    by more than 20 % is looked at again and cancelled; the item comes back by mail and is priced
    again.
 5. **Browse and buy.** Only when `bots.gm_bootstrap` is off: with gold above 2,000 copper the bot
-   buys out up to two lots priced under 75 % of the going rate, spending at most a quarter of its
-   money (50,000 copper at most) per visit.
+   looks at the cheapest lots (the first pages) and buys out up to two of them: a lot that costs at
+   most 75 % of what a vendor would pay for it, or a consumable the bot can use itself (it casts a
+   skill and the item's level fits) that costs no more than a shop asks. It spends at most a
+   quarter of its money (50,000 copper at most) per visit.
 6. **Linger** a few seconds, then leave.
 
 The results arrive as mail (types 13 cancelled lot, 14 sale, 15 expired lot or outbid refund, 16
