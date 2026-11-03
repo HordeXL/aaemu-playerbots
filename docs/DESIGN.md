@@ -218,7 +218,9 @@ Server rules the live run showed (all of them are data, not bugs): a bot with a 
 `SCErrorMsg` 610 on `CSUsePortal` and result 50 on the open skill (a buff of the pack), so a laden bot
 plans no gate and opens or follows none (`JourneyFail::Laden`); the record skill 11215 is not on the
 `skill_reqs` whitelist of the peace-zone buffs (2149 around a Nui statue, 2221, 4828), so it is refused
-with result 50 there and the bot waits for the buff to go; with `bots.long_travel_teleport_m` set a GM
+with result 50 there. `Portals::blocking_buffs(skill)` reads such buffs (and stun, landing, ...) from
+`skill_reqs` for the record, open and recall skills; the bot waits for one to go (`JourneyFail::Blocked`
+after 15 s) instead of casting into a refusal; with `bots.long_travel_teleport_m` set a GM
 `/move` is faster than any gate, so far trips are left to it.
 
 `TravelState` is one pointer (the data is a lazily created `Box<Inner>`); `size_of::<Bot>()` grew by 8

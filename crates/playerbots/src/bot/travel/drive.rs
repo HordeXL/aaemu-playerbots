@@ -551,10 +551,10 @@ fn plan_route(ctx: &Ctx<'_>, inner: &Inner, dest: [f32; 2]) -> Route {
     let me_zone = world.zone_key_at(me[0], me[1]).unwrap_or(0);
     let can_open = now >= inner.open_off_until_ms
         && (ctx.state.find_item(TELEPORT_BOOK_ITEM).is_some() || ctx.gm_allowed());
-    let mut near: SmallVec<[(f32, book::Target); 8]> = inner
-        .book
-        .targets(recall_at)
-        .map(|t| (dist(t.at, dest), t))
+    let known: SmallVec<[book::Target; 16]> = inner.book.targets(recall_at).collect();
+    let mut near: SmallVec<[(f32, book::Target); 8]> = known
+        .iter()
+        .map(|t| (dist(t.at, dest), *t))
         .filter(|(d, _)| *d <= NEAR_ENTRY_M)
         .collect();
     near.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -588,14 +588,25 @@ fn plan_route(ctx: &Ctx<'_>, inner: &Inner, dest: [f32; 2]) -> Route {
     .then(|| portals.recall(bound))
     .flatten()
     .map(|r| [r.pos.x, r.pos.y]);
-    plan::choose(&PlanIn {
+    let route = plan::choose(&PlanIn {
         me,
         dest,
         cands: &cands,
         recall_at: recall,
         can_open,
         can_topup: ctx.gm_allowed(),
-    })
+    });
+    tracing::debug!(
+        bot = %ctx.persona.name,
+        entries = inner.book.private.len(),
+        districts = inner.book.districts.len(),
+        resolved = known.len(),
+        near = cands.len(),
+        can_open,
+        route = ?route,
+        "portals: route"
+    );
+    route
 }
 
 /// A free spot 1.8 m from the bot, on land and at about its height, to open the gate on.
