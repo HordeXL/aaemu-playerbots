@@ -95,6 +95,21 @@ struct Sim {
     item_pending: Vec<(u64, u32)>,
     /// Item casts credited, by item template.
     item_credited: HashMap<u32, u32>,
+    /// How the experience of the character grows.
+    xp: Xp,
+    /// Monsters the bot killed.
+    kills: u32,
+}
+
+/// The experience model of the fake server.
+#[derive(Default, Clone, Copy)]
+enum Xp {
+    /// Two quests a level up to level 10 (the first quests of a start area).
+    #[default]
+    Slow,
+    /// A quest turned in brings the bot to the level of the quest (or a level per three quests
+    /// done), and every twelve kills give a level, up to `cap`.
+    FollowsQuests { cap: u8 },
 }
 
 impl Rig {
@@ -198,7 +213,48 @@ impl Rig {
         self.motion.tick(&mut env);
         self.state.me.pos = self.motion.pos();
         self.credit_due_items();
+        self.credit_spheres();
         self.serve();
+    }
+
+    /// Credits the sphere objectives the bot stands in.
+    fn credit_spheres(&mut self) {
+        let me = self.state.me.pos;
+        let mut hits: Vec<(u32, usize)> = Vec::new();
+        for (&q, row) in &self.sim.active {
+            let Some(quest) = self.world.quest(q) else {
+                continue;
+            };
+            let mut idx = 0usize;
+            for step in quest.progress.iter() {
+                for o in step.objectives.iter() {
+                    if let ObjKind::Sphere { .. } = o.kind {
+                        if idx < 5 && row.objectives[idx] < 1 {
+                            if let Some(s) = self.world.quest_sphere(q, o.component) {
+                                let d = ((s.x - me[0]).powi(2) + (s.y - me[1]).powi(2)).sqrt();
+                                if d <= s.radius {
+                                    hits.push((q, idx));
+                                }
+                            }
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        for (q, idx) in hits {
+            let Some(row) = self.sim.active.get_mut(&q) else {
+                continue;
+            };
+            row.objectives[idx] = 1;
+            let row = *row;
+            self.feed_activity(ActivityEvent::QuestUpdated {
+                quest: Box::new(row),
+                component: 0,
+                p: [0; 4],
+            });
+            self.update_status(q);
+        }
     }
 
     /// Credits the item casts whose delay has passed.
@@ -419,6 +475,14 @@ impl Rig {
             quest: Box::new(row),
             component: 0,
         });
+        // the server counts an item the quest hands over towards a gather objective
+        for &(item, count) in quest.supplies.iter() {
+            self.credit(
+                |k| matches!(k, ObjKind::Gather { item: i, .. } if *i == item),
+                count as i32,
+                None,
+            );
+        }
         self.update_status(q);
     }
 
@@ -552,9 +616,21 @@ impl Rig {
             return;
         }
         self.finish(q);
-        // a little experience: two levels for the first quests
-        let lvl = 1 + (self.sim.completed.len() as u8 / 2);
-        self.state.me.level = lvl.min(10);
+        match self.sim.xp {
+            Xp::Slow => {
+                // a little experience: two levels for the first quests
+                let lvl = 1 + (self.sim.completed.len() as u8 / 2);
+                self.state.me.level = lvl.min(10);
+            }
+            Xp::FollowsQuests { cap } => {
+                // the level of the quest, or a level per three quests done, whichever is more
+                let by_count = 1 + (self.sim.completed.len() / 3).min(255) as u8;
+                let level = quest.level.max(by_count).min(cap);
+                if level > self.state.me.level {
+                    self.state.me.level = level;
+                }
+            }
+        }
     }
 
     fn on_skill(&mut self, o: &Out) {
@@ -636,6 +712,12 @@ impl Rig {
             return;
         }
         let t = unit.id;
+        self.sim.kills += 1;
+        if let Xp::FollowsQuests { cap } = self.sim.xp {
+            if self.sim.kills.is_multiple_of(12) && self.state.me.level < cap {
+                self.state.me.level += 1;
+            }
+        }
         self.feed_world(WorldEvent::UnitDeath {
             obj: mob,
             killer: ME,
@@ -821,4 +903,347 @@ fn a_quest_item_is_cast_once_when_the_server_is_slow_to_credit_it() {
     for (item, casts) in &rig.sim.item_casts {
         assert_eq!(*casts, 1, "item {item} was cast {casts} times for one use");
     }
+}
+
+// ---- progression: bots that have nothing near go where the quests are -------------------------
+
+use playerbots::bot::goals::quest::atlas;
+use playerbots::bot::goals::quest::progress::{Outcome, Why};
+
+/// A trip as the test saw it.
+#[derive(Debug, Clone)]
+struct TripNote {
+    start_min: u64,
+    from: (f32, f32),
+    to: (f32, f32),
+    dist: f32,
+    why: Why,
+    /// `None` while it is under way.
+    outcome: Option<Outcome>,
+    end_min: u64,
+}
+
+/// What a bot did over a run: the zones it came to and the trips it made.
+#[derive(Default)]
+struct Journey {
+    /// (minute, zone name) at the first visit of each zone.
+    zones: Vec<(u64, String)>,
+    trips: Vec<TripNote>,
+    /// (minute, quest) of every accepted quest, in order.
+    accepted: Vec<(u64, u32)>,
+}
+
+fn zone_of(world: &World, pos: [f32; 3]) -> String {
+    world
+        .zone_key_at(pos[0], pos[1])
+        .and_then(|k| world.zone_name(k))
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Runs the rig for `minutes` and notes the zones and the trips.
+fn run_journey(rig: &mut Rig, minutes: u64) -> Journey {
+    let mut j = Journey::default();
+    let mut seen_started = 0usize;
+    for tick in 0..(minutes * 60 * 4) {
+        rig.tick(250);
+        let min = tick / 240;
+        let zone = zone_of(&rig.world, rig.state.me.pos);
+        if !j.zones.iter().any(|z| z.1 == zone) {
+            j.zones.push((min, zone));
+        }
+        while seen_started < rig.sim.started.len() {
+            j.accepted.push((min, rig.sim.started[seen_started]));
+            seen_started += 1;
+        }
+        let progress = rig
+            .state
+            .quest_mem
+            .as_ref()
+            .and_then(|m| m.progress.as_ref());
+        let now_trip = progress.and_then(|p| p.trip);
+        let open = j.trips.last().is_some_and(|t| t.outcome.is_none());
+        match (now_trip, open) {
+            (Some(t), false) => j.trips.push(TripNote {
+                start_min: min,
+                from: t.from,
+                to: (t.target.x, t.target.y),
+                dist: t.target.dist,
+                why: t.target.why,
+                outcome: None,
+                end_min: min,
+            }),
+            (None, true) => {
+                let last = progress.and_then(|p| p.history.last().copied());
+                let note = j.trips.last_mut().unwrap();
+                note.outcome = last.map(|r| r.outcome);
+                note.end_min = min;
+            }
+            _ => {}
+        }
+    }
+    j
+}
+
+fn print_journey(label: &str, rig: &Rig, j: &Journey) {
+    let zones: Vec<String> = j.zones.iter().map(|(m, z)| format!("{z}@{m}")).collect();
+    println!(
+        "{label}: {} quests done, {} accepted, level {}, {} kills, refused {}",
+        rig.sim.completed.len(),
+        rig.sim.started.len(),
+        rig.state.me.level,
+        rig.sim.kills,
+        rig.sim.refused.len()
+    );
+    println!("  zones: {}", zones.join(", "));
+    for t in &j.trips {
+        println!(
+            "  trip min {}..{}: ({:.0}, {:.0}) -> ({:.0}, {:.0}) {:.0} m {:?} {:?}",
+            t.start_min, t.end_min, t.from.0, t.from.1, t.to.0, t.to.1, t.dist, t.why, t.outcome
+        );
+    }
+}
+
+/// The story line of `race` as the bots see it.
+fn chain_of(world: &World, race: u8) -> Vec<u32> {
+    atlas(world)
+        .chain(race)
+        .map(|c| c.quests.to_vec())
+        .unwrap_or_default()
+}
+
+/// The quests of the chain up to `chapter`, and where the last of them is handed in.
+fn chain_end(world: &World, race: u8, chapter: u16) -> (Vec<u32>, (f32, f32)) {
+    let done: Vec<u32> = chain_of(world, race)
+        .into_iter()
+        .filter(|&q| world.quest(q).is_some_and(|q| q.chapter_idx <= chapter))
+        .collect();
+    let last = done
+        .iter()
+        .filter_map(|&q| world.quest(q))
+        .max_by_key(|q| (q.chapter_idx, q.quest_idx))
+        .expect("a chain");
+    let spot = match last.report {
+        QuestReport::Npc(t) => world.npc_spawns(t).first().copied(),
+        QuestReport::Doodad(t) => world.doodad_spawns(t).first().copied(),
+        _ => None,
+    }
+    .or_else(|| {
+        last.starts.iter().find_map(|s| match s {
+            QuestStart::Npc(t) => world.npc_spawns(*t).first().copied(),
+            _ => None,
+        })
+    })
+    .expect("a spot");
+    (done, (spot.x, spot.y))
+}
+
+impl Rig {
+    /// Puts the bot at (x, y) and level `level`, with `quests` done.
+    fn resume_at(&mut self, x: f32, y: f32, level: u8, quests: &[u32]) {
+        let z = self.world.ground_z(x, y).unwrap_or(0.0);
+        self.motion.enter_world(ME, [x, y, z], 0.0, self.now_ms);
+        self.state.me.pos = [x, y, z];
+        self.state.me.level = level;
+        for &q in quests {
+            self.sim.completed.push(q);
+            self.feed_activity(ActivityEvent::QuestCompleted {
+                quest_id: q,
+                component: 0,
+                block_mask: 0,
+            });
+        }
+        self.sim.xp = Xp::FollowsQuests { cap: 40 };
+    }
+
+    fn chain_started(&self, race: u8) -> Vec<u32> {
+        let chain = chain_of(&self.world, race);
+        self.sim
+            .started
+            .iter()
+            .copied()
+            .filter(|q| chain.contains(q))
+            .collect()
+    }
+}
+
+/// Each race leaves the zone it starts in and starts its second chapter in the next one.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data); AA_BAKED for the zones"]
+fn every_race_leaves_its_start_zone_and_starts_chapter_two() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    for (race, name, minutes) in [
+        (1u8, "Nuian", 240u64),
+        (4, "Elf", 240),
+        (5, "Harani", 240),
+        (6, "Firran", 240),
+    ] {
+        let mut rig = Rig::new(world.clone(), race, 700 + u64::from(race));
+        rig.sim.xp = Xp::FollowsQuests { cap: 30 };
+        rig.force(GoalKind::Quest);
+        let start_zone = zone_of(&world, rig.state.me.pos);
+        let j = run_journey(&mut rig, minutes);
+        print_journey(name, &rig, &j);
+        let chain = chain_of(&world, race);
+        assert!(
+            chain.len() >= 50,
+            "{name}: the chain has {} quests",
+            chain.len()
+        );
+        let started = rig.chain_started(race);
+        let in_chapter = |q: &u32, c: u16| world.quest(*q).is_some_and(|q| q.chapter_idx == c);
+        assert!(
+            j.zones.iter().any(|z| z.1 != start_zone),
+            "{name} never left {start_zone}: {:?}",
+            j.zones
+        );
+        assert!(
+            started.iter().any(|q| in_chapter(q, 2)),
+            "{name} never started chapter 2 (started {started:?})"
+        );
+    }
+}
+
+/// Every quest the givers within `radius` of (x, y) offer, except the ones in `keep`.
+fn local_quests(world: &World, x: f32, y: f32, radius: f32, keep: &[u32]) -> Vec<u32> {
+    let mut found = Vec::new();
+    let center = Vec3::new(x, y, 0.0);
+    world.npc_spawns_within(center, radius, |t, _| {
+        found.extend(world.quests_from_npc(t))
+    });
+    world.doodad_spawns_within(center, radius, |t, _| {
+        found.extend(world.quests_from_doodad(t));
+    });
+    found.sort_unstable();
+    found.dedup();
+    found.retain(|q| !keep.contains(q));
+    found
+}
+
+/// Harani and Firran bots at the end of Villanelle with every other quest around done: the next
+/// story quest is 2 km away, beyond what the quest picker searches. They go there.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn the_two_kilometre_hand_off_to_the_silent_forest_is_walked() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    for (race, name, first_of_chapter_6) in [(5u8, "Harani", 3558u32), (6, "Firran", 3480)] {
+        let (mut done, spot) = chain_end(&world, race, 5);
+        let chain = chain_of(&world, race);
+        done.extend(local_quests(&world, spot.0, spot.1, 1700.0, &chain));
+        done.sort_unstable();
+        done.dedup();
+        let mut rig = Rig::new(world.clone(), race, 800 + u64::from(race));
+        rig.resume_at(spot.0, spot.1, 26, &done);
+        rig.force(GoalKind::Quest);
+        let j = run_journey(&mut rig, 60);
+        print_journey(name, &rig, &j);
+        let giver = world.quest(first_of_chapter_6).unwrap();
+        println!("  chapter 6 starts with {} {}", giver.id, giver.name);
+        assert!(
+            j.accepted.iter().any(|a| a.1 == first_of_chapter_6),
+            "{name} never accepted {first_of_chapter_6}: {:?}",
+            j.accepted
+        );
+        let trip = j
+            .trips
+            .iter()
+            .find(|t| t.why == Why::Story(first_of_chapter_6))
+            .unwrap_or_else(|| panic!("{name}: no story trip: {:?}", j.trips));
+        assert!(trip.dist > 1500.0, "{name}: a trip of {} m", trip.dist);
+        assert!(trip.outcome.is_some_and(Outcome::good), "{trip:?}");
+    }
+}
+
+/// A Harani bot far above the quests of Villanelle does not do them: they are trivial, and the
+/// story waits in the Silent Forest.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_high_level_bot_skips_the_trivial_quests_around_it() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let (done, spot) = chain_end(&world, 5, 5);
+    let mut rig = Rig::new(world.clone(), 5, 802);
+    rig.resume_at(spot.0, spot.1, 36, &done);
+    rig.force(GoalKind::Quest);
+    let j = run_journey(&mut rig, 45);
+    print_journey("Harani 36", &rig, &j);
+    let trip = j.trips.first().expect("a trip");
+    assert_eq!(trip.why, Why::Story(3558), "{:?}", j.trips);
+    // nothing it accepted before the story quest was trivial for a bot of level 36
+    for (_, q) in j.accepted.iter().take_while(|a| a.1 != 3558) {
+        let quest = world.quest(*q).unwrap();
+        println!("  accepted {} {} L{}", q, quest.name, quest.level);
+        assert!(quest.level >= 31, "trivial quest {q} L{}", quest.level);
+    }
+    assert!(
+        j.accepted.iter().any(|a| a.1 == 3558),
+        "the story quest was never accepted: {:?}",
+        j.accepted
+    );
+}
+
+/// A Nuian bot of level 20 at the start with the first three chapters done does not busy itself
+/// with the trivial quests of the start area: it walks to the fourth chapter in White Arden.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn trivial_side_quests_do_not_keep_a_bot_from_its_story() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let (done, _) = chain_end(&world, 1, 3);
+    let start = world.race_start(1).unwrap();
+    let mut rig = Rig::new(world.clone(), 1, 900);
+    rig.resume_at(start.x, start.y, 20, &done);
+    rig.force(GoalKind::Quest);
+    let j = run_journey(&mut rig, 90);
+    print_journey("Nuian 20", &rig, &j);
+    let trip = j.trips.first().expect("a trip");
+    assert_eq!(trip.why, Why::Story(2498), "{:?}", j.trips);
+    assert!(trip.dist > 3000.0);
+    assert!(
+        rig.chain_started(1).contains(&2498),
+        "{:?}",
+        rig.chain_started(1)
+    );
+}
+
+/// When the next story quest is out of the bot's reach (its level is too low) the bot goes to the
+/// zone with the most quests for its level instead.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn a_bot_below_its_next_story_quest_goes_to_the_best_zone() {
+    let Some(world) = world() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let (mut done, _) = chain_end(&world, 1, 2);
+    let start = world.race_start(1).unwrap();
+    // the quests of the start area are done
+    let chain = chain_of(&world, 1);
+    done.extend(local_quests(&world, start.x, start.y, 1700.0, &chain));
+    done.sort_unstable();
+    done.dedup();
+    let mut rig = Rig::new(world.clone(), 1, 901);
+    // level 12: chapter 3 starts at level 15, so no story quest qualifies
+    rig.resume_at(start.x, start.y, 12, &done);
+    rig.force(GoalKind::Quest);
+    let j = run_journey(&mut rig, 90);
+    print_journey("Nuian 12", &rig, &j);
+    let trip = j
+        .trips
+        .iter()
+        .find(|t| matches!(t.why, Why::Zone(_)))
+        .unwrap_or_else(|| panic!("no zone trip: {:?}", j.trips));
+    assert!(trip.dist > 1500.0);
+    assert!(trip.outcome.is_some_and(Outcome::good), "{trip:?}");
+    assert!(rig.sim.completed.len() > done.len(), "nothing done there");
 }

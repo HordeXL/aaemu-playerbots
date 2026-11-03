@@ -18,6 +18,8 @@ use std::fmt;
 
 use smallvec::SmallVec;
 
+use super::progress::Progress;
+
 /// A quest that failed is not tried again for this long.
 pub const BACKOFF_MS: u64 = 30_000;
 /// Failures in a row after which a side quest is quarantined.
@@ -129,6 +131,9 @@ pub struct Memory {
     pub failed: u32,
     /// Bot-clock time before which the goal does not scan for a new quest again.
     pub next_scan_ms: u64,
+    /// Trips to places with quests when nothing is near, see [`super::progress`]. Allocated by the
+    /// first empty scan.
+    pub progress: Option<Box<Progress>>,
 }
 
 impl Memory {

@@ -19,6 +19,7 @@ use crate::housing::{AreaIndex, Housing, HousingDesign};
 use crate::items::{ItemFacts, ItemTable};
 use crate::npc::{self, NpcTemplate};
 use crate::quest::{Quest, QuestStats, Quests};
+use crate::quest_atlas::QuestAtlas;
 use crate::reqs::StartGates;
 use crate::skill::{SkillInfo, Skills};
 use crate::spatial::SpawnIndex;
@@ -123,6 +124,8 @@ pub struct World {
     travel: Travel,
     /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
     water: OnceLock<Option<WaterMap>>,
+    /// Where the quests are, built at the first [`World::quest_atlas`].
+    quest_atlas: OnceLock<QuestAtlas>,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -233,6 +236,7 @@ impl World {
             spheres,
             travel,
             water: OnceLock::new(),
+            quest_atlas: OnceLock::new(),
         };
         let q = world.quests.stats();
         tracing::info!(
@@ -314,6 +318,10 @@ impl World {
                 .get()
                 .and_then(Option::as_ref)
                 .map_or(0, WaterMap::bytes),
+        ));
+        v.push((
+            "quest atlas",
+            self.quest_atlas.get().map_or(0, QuestAtlas::bytes),
         ));
         v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
@@ -486,6 +494,26 @@ impl World {
     /// "mother faction" quest requirements compare with.
     pub fn mother_faction(&self, faction: u32) -> u32 {
         self.factions.mother_of(faction)
+    }
+
+    /// Where the quests are (see [`crate::quest_atlas`]), built the first time it is asked for.
+    /// `supported(quest)` says whether a bot can do the quest at all; the world does not know what
+    /// bots can do, so the first caller's answer is the table every caller gets (the bots ask with
+    /// the same predicate).
+    pub fn quest_atlas(&self, supported: &dyn Fn(&Quest) -> bool) -> &QuestAtlas {
+        self.quest_atlas.get_or_init(|| {
+            let started = Instant::now();
+            let atlas = QuestAtlas::build(self, supported);
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                points = atlas.len(),
+                zones = atlas.zones().len(),
+                chains = atlas.chains().len(),
+                kib = atlas.bytes() / 1024,
+                "quest atlas built"
+            );
+            atlas
+        })
     }
 
     /// The baked sign sphere of a quest component (start / objective position).
