@@ -27,6 +27,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod director;
 pub mod goals;
+pub mod market;
 pub mod motion;
 pub mod nav;
 pub mod party;

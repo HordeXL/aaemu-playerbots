@@ -311,7 +311,7 @@ pub enum Command {
 
 impl Command {
     /// Values accepted by [`Command::Goal`].
-    pub const GOALS: [&'static str; 11] = [
+    pub const GOALS: [&'static str; 13] = [
         "quest",
         "grind",
         "duel",
@@ -320,6 +320,8 @@ impl Command {
         "housing",
         "dungeon",
         "sail",
+        "auction",
+        "market",
         "rest",
         "wander",
         "auto",
@@ -617,6 +619,8 @@ mod tests {
         assert!(g("wander").validate(Some(1)).is_ok());
         assert!(g("dungeon").validate(Some(1)).is_ok());
         assert!(g("sail").validate(Some(1)).is_ok());
+        assert!(g("auction").validate(Some(1)).is_ok());
+        assert!(g("market").validate(Some(1)).is_ok());
 
         assert!(Command::Spawn { count: 10 }.validate(None).is_ok());
         assert!(Command::Spawn { count: 0 }.validate(None).is_err());

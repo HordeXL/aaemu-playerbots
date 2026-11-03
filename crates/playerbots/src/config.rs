@@ -30,6 +30,8 @@ pub struct Config {
     pub bots: BotsCfg,
     /// Goal weights.
     pub behavior: BehaviorCfg,
+    /// Selling: the auction house, trade-chat advertisements, buyers.
+    pub market: MarketCfg,
     /// Operator web UI (`bind`, `token`).
     pub web: pb_web::WebConfig,
     /// Optional LLM add-on.
@@ -209,6 +211,13 @@ pub struct BehaviorCfg {
     /// Bots walk routes on the navigation mesh (`nav_<world>.bin` in the baked data) instead of
     /// straight lines. Off: every trip is the straight line, as before the mesh existed.
     pub navmesh: bool,
+    /// Bots move like people: jumps, emotes and idle mannerisms (the life-like movement feature).
+    /// Off: they only walk and stand still.
+    pub lifelike: bool,
+    /// How often bots jump while walking, as a multiplier of the default rate; 0 = never.
+    pub jump_rate: f32,
+    /// Bots use emotes (a wave, a bow, a sit) in life-like moments. Off: no emotes.
+    pub emotes: bool,
 }
 
 impl Default for BehaviorCfg {
@@ -229,6 +238,60 @@ impl Default for BehaviorCfg {
             dungeon_level_up: false,
             sailing: true,
             navmesh: true,
+            lifelike: true,
+            jump_rate: 1.0,
+            emotes: true,
+        }
+    }
+}
+
+/// Where a bot meets the buyer of something it advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeetAt {
+    /// The bot picks: Mirage Isle when it can get there, else the town it is in.
+    #[default]
+    Auto,
+    /// Mirage Isle (the market island).
+    Mirage,
+    /// The town the bot is in.
+    Town,
+}
+
+/// `[market]`: selling what the bots gather. Auction listings, trade-chat advertisements and
+/// sales to real players, all of them only with goods the bots came by honestly (never GM-made
+/// ones, see `bot::market::ledger`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MarketCfg {
+    /// Master switch of the market features (goals `auction` and `market`). Off: bots neither list
+    /// nor advertise nor sell.
+    pub enabled: bool,
+    /// Bots list surplus goods at the auction house (goal `auction`).
+    pub auction: bool,
+    /// Bots advertise surplus goods in trade chat (goal `market`).
+    pub chat_ads: bool,
+    /// Bots sell advertised goods to real players (characters that are not ours) in a trade. Off
+    /// by default; ignored while `bots.gm_bootstrap` is on, see [`Config::may_sell_to_players`].
+    pub sell_to_players: bool,
+    /// Where a bot meets a buyer, see [`MeetAt`].
+    pub meet_at: MeetAt,
+    /// All bots together post at most this many trade-chat advertisements per hour (0 = none).
+    pub max_ads_per_hour: u32,
+    /// One bot posts an advertisement at most this often, in seconds (at least 60).
+    pub ad_interval_secs: u64,
+}
+
+impl Default for MarketCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auction: true,
+            chat_ads: true,
+            sell_to_players: false,
+            meet_at: MeetAt::Auto,
+            max_ads_per_hour: 12,
+            ad_interval_secs: 900,
         }
     }
 }
@@ -430,6 +493,14 @@ impl Config {
         }
     }
 
+    /// Whether bots may sell goods to real players (characters that are not one of ours):
+    /// `market.sell_to_players` with `market.enabled`, and never while `bots.gm_bootstrap` is on,
+    /// because what a GM-bootstrapped bot holds may be minted goods and gold that no player should
+    /// be able to collect (the same rule as `behavior.trade_with_players`).
+    pub fn may_sell_to_players(&self) -> bool {
+        self.market.enabled && self.market.sell_to_players && !self.bots.gm_bootstrap
+    }
+
     /// Checks the values that would otherwise fail late and obscurely.
     pub fn validate(&self) -> anyhow::Result<()> {
         let s = &self.server;
@@ -497,6 +568,14 @@ impl Config {
         ensure!(
             w.persona_spread.is_finite() && (0.0..=1.0).contains(&w.persona_spread),
             "behavior.persona_spread must be in 0..=1"
+        );
+        ensure!(
+            w.jump_rate.is_finite() && w.jump_rate >= 0.0,
+            "behavior.jump_rate must be a number >= 0"
+        );
+        ensure!(
+            self.market.ad_interval_secs >= 60,
+            "market.ad_interval_secs must be at least 60"
         );
         let c = &self.social;
         ensure!(
@@ -830,6 +909,185 @@ sailing = 1
 ",
             "[behavior]
 sail = true
+",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_market_keys_have_quiet_defaults() {
+        let m = Config::default().market;
+        assert!(m.enabled && m.auction && m.chat_ads);
+        assert!(!m.sell_to_players, "selling to players is opt-in");
+        assert_eq!(m.meet_at, MeetAt::Auto);
+        assert_eq!((m.max_ads_per_hour, m.ad_interval_secs), (12, 900));
+        // the example file documents every key with its default
+        let ex = Config::parse(Config::example()).unwrap().market;
+        assert!(ex.enabled && ex.auction && ex.chat_ads && !ex.sell_to_players);
+        assert_eq!(ex.meet_at, MeetAt::Auto);
+        assert_eq!((ex.max_ads_per_hour, ex.ad_interval_secs), (12, 900));
+        let section = Config::example()
+            .split(
+                "
+[market]
+",
+            )
+            .nth(1)
+            .and_then(|s| {
+                s.split(
+                    "
+[",
+                )
+                .next()
+            })
+            .expect("a [market] section");
+        for key in [
+            "enabled = true",
+            "auction = true",
+            "chat_ads = true",
+            "sell_to_players = false",
+            "meet_at = \"auto\"",
+            "max_ads_per_hour = 12",
+            "ad_interval_secs = 900",
+        ] {
+            assert!(
+                section.contains(&format!(
+                    "
+{key}
+"
+                )),
+                "{key}"
+            );
+        }
+        // each key can be set on its own
+        let cfg = Config::parse(
+            "[market]
+enabled = false
+auction = false
+chat_ads = false
+sell_to_players = true
+meet_at = \"mirage\"
+max_ads_per_hour = 0
+ad_interval_secs = 60
+",
+        )
+        .unwrap();
+        let m = cfg.market;
+        assert!(!m.enabled && !m.auction && !m.chat_ads && m.sell_to_players);
+        assert_eq!(m.meet_at, MeetAt::Mirage);
+        assert_eq!((m.max_ads_per_hour, m.ad_interval_secs), (0, 60));
+        for (text, want) in [("auto", MeetAt::Auto), ("town", MeetAt::Town)] {
+            let cfg = Config::parse(&format!(
+                "[market]
+meet_at = \"{text}\"
+"
+            ))
+            .unwrap();
+            assert_eq!(cfg.market.meet_at, want);
+        }
+        // a typo, a bad place and bad numbers are refused
+        for bad in [
+            "[market]
+auctions = true
+",
+            "[market]
+meet_at = \"moon\"
+",
+            "[market]
+meet_at = true
+",
+            "[market]
+enabled = 1
+",
+            "[market]
+max_ads_per_hour = -1
+",
+            "[market]
+ad_interval_secs = 59
+",
+            "[market]
+ad_interval_secs = 0
+",
+            "[market]
+sell_to_players = \"yes\"
+",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn players_only_buy_from_bots_that_hold_nothing_minted() {
+        let mut cfg = Config::default();
+        assert!(!cfg.may_sell_to_players(), "off by default");
+        cfg.market.sell_to_players = true;
+        assert!(cfg.may_sell_to_players());
+        // the market master switch wins
+        cfg.market.enabled = false;
+        assert!(!cfg.may_sell_to_players());
+        cfg.market.enabled = true;
+        // what a GM-bootstrapped bot holds may be minted: nothing of it is sold to a player
+        cfg.bots.gm_bootstrap = true;
+        assert!(!cfg.may_sell_to_players());
+        // (and the old switch does not open the market)
+        cfg.market.sell_to_players = false;
+        cfg.behavior.trade_with_players = true;
+        cfg.bots.gm_bootstrap = false;
+        assert!(!cfg.may_sell_to_players());
+    }
+
+    #[test]
+    fn the_lifelike_keys_are_on_and_validated() {
+        let b = Config::default().behavior;
+        assert!(b.lifelike && b.emotes);
+        assert_eq!(b.jump_rate, 1.0);
+        let ex = Config::parse(Config::example()).unwrap().behavior;
+        assert!(ex.lifelike && ex.emotes);
+        assert_eq!(ex.jump_rate, 1.0);
+        for key in ["lifelike = true", "jump_rate = 1.0", "emotes = true"] {
+            assert!(
+                Config::example().contains(&format!(
+                    "
+{key}
+"
+                )),
+                "{key}"
+            );
+        }
+        let cfg = Config::parse(
+            "[behavior]
+lifelike = false
+jump_rate = 0
+emotes = false
+",
+        )
+        .unwrap();
+        assert!(!cfg.behavior.lifelike && !cfg.behavior.emotes);
+        assert_eq!(cfg.behavior.jump_rate, 0.0);
+        assert_eq!(
+            Config::parse(
+                "[behavior]
+jump_rate = 2.5
+"
+            )
+            .unwrap()
+            .behavior
+            .jump_rate,
+            2.5
+        );
+        for bad in [
+            "[behavior]
+jump_rate = -0.5
+",
+            "[behavior]
+jump_rate = \"often\"
+",
+            "[behavior]
+lifelike = 1
+",
+            "[behavior]
+emote = true
 ",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");

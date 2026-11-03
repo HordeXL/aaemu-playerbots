@@ -90,6 +90,32 @@ sailing = true
 # Bots walk routes on the navigation mesh (nav_<world>.bin in the baked data): around walls and
 # water, along roads, with rounded corners. false = straight lines, as before the mesh existed.
 navmesh = true
+# Life-like movement: bots jump now and then, use emotes and shift about while they stand.
+lifelike = true
+# How often they jump, as a multiplier of the usual rate (0 = never).
+jump_rate = 1.0
+# Emotes (a wave, a bow, a sit) in life-like moments.
+emotes = true
+
+[market]
+# Selling what the bots gather: auction listings, trade-chat advertisements and sales to players.
+# Only goods the bots came by honestly are sold (looted, gathered, crafted, quest rewards, bought
+# from a vendor), never GM-made ones. false = no bot lists, advertises or sells anything.
+enabled = true
+# Bots list surplus goods at the auction house (goal "auction").
+auction = true
+# Bots advertise surplus goods in trade chat (goal "market").
+chat_ads = true
+# Bots sell advertised goods to real players in a trade. Off by default, and ignored while
+# bots.gm_bootstrap is on: what a GM-bootstrapped bot holds may be minted.
+sell_to_players = false
+# Where a bot meets a buyer: "auto" (Mirage Isle if it can get there, else the town it is in),
+# "mirage" or "town".
+meet_at = "auto"
+# All bots together post at most this many advertisements per hour (0 = none) ...
+max_ads_per_hour = 12
+# ... and one bot posts one at most this often, in seconds (at least 60).
+ad_interval_secs = 900
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

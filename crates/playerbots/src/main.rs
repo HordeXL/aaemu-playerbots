@@ -231,6 +231,11 @@ async fn run(
             "behavior.trade_with_players is ignored while bots.gm_bootstrap is on: what the bots hold may be GM-made, so real players cannot trade with them"
         );
     }
+    if cfg.market.enabled && cfg.market.sell_to_players && cfg.bots.gm_bootstrap {
+        tracing::warn!(
+            "market.sell_to_players is ignored while bots.gm_bootstrap is on: what the bots hold may be GM-made, so real players cannot buy from them"
+        );
+    }
     announce_password(&resolved, &roster_path);
     let roster = Arc::new(SharedRoster::new(roster, roster_path));
     let wanted = cfg.bots.count as usize;

@@ -2,8 +2,9 @@
 //!
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
-//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`] and [`Sail`] (the last
-//! two are stubs the dungeons and sailing features fill in). A goal that reports
+//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`]
+//! and [`Market`] (the last two are stubs the auction and market features fill in). A goal that
+//! reports
 //! [`FailReason::NotImplemented`] is switched off for good by the brain.
 //!
 //! # Writing a goal
@@ -19,10 +20,12 @@
 //!   [`GoalStatus::Failed`] when it cannot proceed; the brain applies a cooldown to a failed goal.
 //! * Do not keep borrows of `ctx` between ticks and do not allocate per tick.
 
+pub mod auction;
 pub mod duel;
 pub mod dungeon;
 pub mod grind;
 pub mod housing;
+pub mod market;
 pub mod quest;
 pub mod rest;
 pub mod sail;
@@ -33,10 +36,12 @@ pub mod wander;
 
 use pb_web::Activity;
 
+pub use auction::Auction;
 pub use duel::Duel;
 pub use dungeon::Dungeon;
 pub use grind::Grind;
 pub use housing::Housing;
+pub use market::Market;
 pub use quest::Quest;
 pub use rest::Rest;
 pub use sail::Sail;
@@ -99,6 +104,10 @@ pub enum Goal {
     Dungeon(Dungeon),
     /// Summon a boat and sail.
     Sail(Sail),
+    /// List goods at the auction house.
+    Auction(Auction),
+    /// Advertise and sell goods.
+    Market(Market),
 }
 
 impl Goal {
@@ -125,6 +134,8 @@ impl Goal {
             GoalKind::Housing => Goal::Housing(Housing::default()),
             GoalKind::Dungeon => Goal::Dungeon(Dungeon::new(party)),
             GoalKind::Sail => Goal::Sail(Sail::default()),
+            GoalKind::Auction => Goal::Auction(Auction),
+            GoalKind::Market => Goal::Market(Market),
         }
     }
 
@@ -141,6 +152,8 @@ impl Goal {
             Goal::Housing(_) => GoalKind::Housing,
             Goal::Dungeon(_) => GoalKind::Dungeon,
             Goal::Sail(_) => GoalKind::Sail,
+            Goal::Auction(_) => GoalKind::Auction,
+            Goal::Market(_) => GoalKind::Market,
         }
     }
 
@@ -151,6 +164,8 @@ impl Goal {
             Goal::Grind(_) | Goal::Quest(_) | Goal::Duel(_) => true,
             Goal::Dungeon(g) => g.owns_combat(),
             Goal::Sail(g) => g.owns_combat(),
+            Goal::Auction(g) => g.owns_combat(),
+            Goal::Market(g) => g.owns_combat(),
             _ => false,
         }
     }
@@ -168,6 +183,8 @@ impl Goal {
             Goal::Housing(g) => g.start(ctx),
             Goal::Dungeon(g) => g.start(ctx),
             Goal::Sail(g) => g.start(ctx),
+            Goal::Auction(g) => g.start(ctx),
+            Goal::Market(g) => g.start(ctx),
         }
     }
 
@@ -187,6 +204,8 @@ impl Goal {
             Goal::Housing(g) => return g.tick(ctx),
             Goal::Dungeon(g) => return g.tick(ctx),
             Goal::Sail(g) => return g.tick(ctx),
+            Goal::Auction(g) => return g.tick(ctx),
+            Goal::Market(g) => return g.tick(ctx),
         };
         if !resume {
             return GoalStatus::Done;
@@ -212,6 +231,8 @@ impl Goal {
             Goal::Housing(g) => g.stop(ctx),
             Goal::Dungeon(g) => g.stop(ctx),
             Goal::Sail(g) => g.stop(ctx),
+            Goal::Auction(g) => g.stop(ctx),
+            Goal::Market(g) => g.stop(ctx),
         }
     }
 
@@ -240,6 +261,8 @@ impl Goal {
             Goal::Housing(_) => Activity::Housing,
             Goal::Dungeon(g) => g.activity(moving, fighting),
             Goal::Sail(g) => g.activity(moving, fighting),
+            Goal::Auction(g) => g.activity(moving, fighting),
+            Goal::Market(g) => g.activity(moving, fighting),
         }
     }
 
@@ -256,6 +279,8 @@ impl Goal {
             Goal::TradeRun(g) => g.describe(out),
             Goal::Dungeon(g) => g.describe(out),
             Goal::Sail(g) => g.describe(out),
+            Goal::Auction(g) => g.describe(out),
+            Goal::Market(g) => g.describe(out),
         }
     }
 }

@@ -414,6 +414,9 @@ pub struct BotState {
     /// The team the bot is in and its dungeon memory (owned by the dungeons feature); made on
     /// the first team event or dungeon goal.
     pub party: Option<Box<super::party::PartyMem>>,
+    /// What the bot may sell and what the market features remember (the provenance ledger, see
+    /// [`super::market`]); allocated when the bot first gains something it may sell.
+    pub market: super::market::MarketState,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -791,6 +794,7 @@ impl BotState {
                             },
                         );
                     }
+                    self.market.on_bag_reloaded(&self.bag);
                 }
             }
             WorldEvent::ItemTask(task) => self.apply_item_task(task),
@@ -1025,6 +1029,7 @@ impl BotState {
     }
 
     fn apply_item_task(&mut self, task: &ItemTaskInfo) {
+        let touched = super::market::ledger::Touched::before(task, &self.bag);
         for change in &task.changes {
             self.apply_item_change(change);
         }
@@ -1032,6 +1037,7 @@ impl BotState {
             self.bag
                 .retain(|_, item| !task.force_removed.contains(&item.id));
         }
+        self.market.on_item_task(task.reason, &touched, &self.bag);
     }
 
     fn apply_item_change(&mut self, change: &ItemChange) {
@@ -2510,6 +2516,90 @@ mod tests {
         let mut s2 = in_world();
         s2.apply(&ServerEvent::Activity(task(vec![ItemChange::Money(5)])));
         assert!(!s.watch.has_findings() && !s2.watch.has_findings());
+    }
+
+    #[test]
+    fn item_tasks_feed_the_provenance_ledger() {
+        use crate::bot::market::ledger::reason;
+        let task = |reason: u8, changes: Vec<ItemChange>| {
+            world(WorldEvent::ItemTask(Box::new(ItemTaskInfo {
+                reason,
+                changes: changes.into_iter().collect(),
+                force_removed: Default::default(),
+            })))
+        };
+        let added = |slot: u8, id: u64, count: i32| ItemChange::Added {
+            action: 5,
+            slot_type: SLOT_BAG,
+            slot,
+            template: 3411,
+            id,
+            grade: 0,
+            count,
+        };
+        let mut s = in_world();
+        assert!(s.market.get().is_none(), "no memory before a gain");
+        // looted ore is the bot's own, GM-made ore (a second stack) is not
+        s.apply(&task(reason::LOOT, vec![added(0, 50, 12)]));
+        s.apply(&task(reason::GM, vec![added(1, 51, 100)]));
+        assert_eq!(s.item_count(3411), 112);
+        assert_eq!(s.market.clean_count(3411), 12);
+        // gathering more merges into the first stack
+        s.apply(&task(
+            reason::SKILL_EFFECT_GAIN_ITEM,
+            vec![ItemChange::CountUpdate {
+                slot_type: SLOT_BAG,
+                slot: 0,
+                id: 50,
+                delta: 3,
+                template: 3411,
+            }],
+        ));
+        assert_eq!(s.market.clean_count(3411), 15);
+        // whatever leaves the bag leaves the ledger, however it leaves
+        s.apply(&task(
+            reason::STORE_SELL,
+            vec![ItemChange::CountUpdate {
+                slot_type: SLOT_BAG,
+                slot: 1,
+                id: 51,
+                delta: -90,
+                template: 3411,
+            }],
+        ));
+        assert_eq!(s.item_count(3411), 25);
+        assert_eq!(s.market.clean_count(3411), 0, "the honest part goes first");
+        // a stack that is removed whole
+        s.apply(&task(reason::QUEST_COMPLETE, vec![added(2, 52, 4)]));
+        assert_eq!(s.market.clean_count(3411), 4);
+        s.apply(&task(
+            reason::MAIL,
+            vec![ItemChange::Removed {
+                slot_type: SLOT_BAG,
+                slot: 2,
+                id: 52,
+                template: 3411,
+            }],
+        ));
+        assert_eq!(s.market.clean_count(3411), 0);
+        // a bag that the server resends is the truth
+        s.apply(&task(reason::LOOT, vec![added(3, 53, 6)]));
+        assert_eq!(s.market.clean_count(3411), 6);
+        s.apply(&world(WorldEvent::Inventory {
+            slot_type: SLOT_BAG,
+            chunk: 0,
+            items: Box::new([InvItem {
+                slot: 3,
+                id: 53,
+                template: 3411,
+                grade: 0,
+                count: 2,
+            }]),
+        }));
+        assert_eq!(s.market.clean_count(3411), 2);
+        // and a new connection forgets all of it
+        s.reset();
+        assert!(s.market.get().is_none());
     }
 
     #[test]

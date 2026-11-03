@@ -27,11 +27,15 @@ pub enum GoalKind {
     Dungeon,
     /// Summon a boat and sail (owned by the sailing feature).
     Sail,
+    /// List goods at the auction house (owned by the auction feature).
+    Auction,
+    /// Advertise goods in trade chat and sell them (owned by the market feature).
+    Market,
 }
 
 impl GoalKind {
     /// Every goal.
-    pub const ALL: [GoalKind; 10] = [
+    pub const ALL: [GoalKind; 12] = [
         GoalKind::Wander,
         GoalKind::Rest,
         GoalKind::Grind,
@@ -42,6 +46,8 @@ impl GoalKind {
         GoalKind::Housing,
         GoalKind::Dungeon,
         GoalKind::Sail,
+        GoalKind::Auction,
+        GoalKind::Market,
     ];
 
     /// Number of goals.
@@ -65,6 +71,8 @@ impl GoalKind {
             GoalKind::Housing => "housing",
             GoalKind::Dungeon => "dungeon",
             GoalKind::Sail => "sail",
+            GoalKind::Auction => "auction",
+            GoalKind::Market => "market",
         }
     }
 
@@ -195,6 +203,17 @@ mod tests {
             }
         }
         assert_eq!(GoalChoice::parse("fly"), None);
+    }
+
+    #[test]
+    fn auction_and_market_are_goals_the_web_ui_can_force() {
+        for (name, kind) in [("auction", GoalKind::Auction), ("market", GoalKind::Market)] {
+            assert_eq!(GoalKind::parse(name), Some(kind));
+            assert_eq!(kind.name(), name);
+            assert_eq!(GoalChoice::parse(name), Some(GoalChoice::Forced(kind)));
+            assert!(pb_web::Command::GOALS.contains(&name));
+        }
+        assert_eq!(GoalKind::ALL.len(), GoalKind::COUNT);
     }
 
     #[test]

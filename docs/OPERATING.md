@@ -24,7 +24,8 @@ reads it (default `playerbots.toml`).
 | `[server]` | The login server's public address (`login`), the world to enter (`world_id`), the bot account prefix and the shared password. |
 | `[data]` | Paths of the server's `compact.sqlite3` and `app/Data` directory, the baked data directory (`baked`) and the world name. |
 | `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings, reconnect back-off. |
-| `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, and the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`. |
+| `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
+| `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -121,6 +122,12 @@ Safety of the GM lines:
   (logged); `false` keeps dungeons to the bots whose level fits.
 * `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
   them on land.
+* `[behavior] lifelike = true` (default): bots move like people (jumps, emotes, idle mannerisms);
+  `false` keeps them walking and standing still. `jump_rate = 1.0` scales how often they jump (0 =
+  never) and `emotes = true` lets them use emotes.
+* `[market] sell_to_players = false` (default): bots sell only to other bots and the auction house;
+  `true` lets them also sell to real players, and is ignored while `gm_bootstrap` is on (same rule
+  as `trade_with_players`).
 * `[behavior] navmesh = true` (default): bots walk routes on the navigation mesh baked from the
   client (`nav_main_world.bin`, one more per instance world) instead of straight lines: around
   walls, cliffs and water, along roads, with rounded corners and a slower pace over the last metres.
@@ -129,6 +136,33 @@ Safety of the GM lines:
   straight lines. Without the baked mesh the option does nothing. Counters (searches inline and
   pooled, latency, fallbacks, stuck events, trips) are in `/api/stats` under `nav` and in the log
   once a minute.
+
+## Selling (`[market]`)
+
+The market features let bots sell what they gather: the goal `auction` lists goods at the auction
+house and the goal `market` advertises them in trade chat and meets buyers. Both are scored by their
+own features and are off until those exist; `[market]` is their configuration:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch: `false` and no bot lists, advertises or sells anything. |
+| `auction` | `true` | Bots list surplus goods at the auction house. |
+| `chat_ads` | `true` | Bots advertise surplus goods in trade chat. |
+| `sell_to_players` | `false` | Bots sell to real players in a trade; never while `bots.gm_bootstrap` is on. |
+| `meet_at` | `"auto"` | Where a buyer is met: `"auto"` (Mirage Isle when the bot can get there, else the town), `"mirage"` or `"town"`. |
+| `max_ads_per_hour` | `12` | All bots together post at most this many advertisements per hour (0 = none). |
+| `ad_interval_secs` | `900` | One bot posts one at most this often (at least 60). |
+
+**What a bot may sell.** Never "what is in the bag" but what it came by honestly. Every item change
+the server sends names its reason (`ItemTaskType`); the bot's provenance ledger
+(`bot/market/ledger.rs`) counts a gain only for loot (9, 10, 35), a picked-up craft product (29),
+quest rewards and supplies (37, 38), gathering skill effects (42, 43) and vendor purchases (54).
+GM-made goods (11), trades, mail and auction returns never count. Whatever leaves the bag, for any
+reason, is taken off the ledger first, so the ledger errs on the side of selling less; it holds at
+most 64 item kinds per bot and is forgotten when the connection is lost. Of what is left, only
+items that are sellable and not bound (`ItemFacts::tradable`) are offered, and a reserve of 10 is
+kept of items the bot may use itself (anything that casts a skill when used, anything a quest asks
+to gather).
 
 ## Chat and the LLM
 
@@ -199,7 +233,7 @@ playerbots run --config playerbots.toml
 The map shows every bot by activity, with houses, duel flags and trade outlets; the list can be
 searched; selecting a bot shows its state, quests, extra details, the last chat lines it heard or
 said and its event log. Commands per bot: pause/resume, force a goal (quest, grind, duel, trade,
-trade run, housing, dungeon, sail, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
+trade run, housing, dungeon, sail, auction, market, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
 line to a character. Global: spawn/despawn bots, pause or resume all. With `[web] token` set, POST
 requests need the header `x-playerbots-token`. While the UI is bound to a loopback address, every
 route (reads included) refuses a request whose `Host` is not a loopback name (a DNS-rebinding page

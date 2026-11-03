@@ -7,8 +7,9 @@
 //! [`FailReason::NotImplemented`] are switched off for good, goals that fail otherwise rest for a
 //! while ([`FAIL_COOLDOWN_MS`]).
 //!
-//! The dungeon and sail goals are the exception: the features that own them score them from the
-//! whole tick context (`own_scores`), 0 until they exist, with none of the factors above.
+//! The dungeon, sail, auction and market goals are the exception: the features that own them score
+//! them from the whole tick context (`own_scores`), with none of the factors above (the auction
+//! and market goals score 0 until their features exist).
 //!
 //! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
 //! pack recipe, housing without GM help or a design item) are left out of the draw up front
@@ -85,16 +86,19 @@ pub fn base_weights(b: &BehaviorCfg, t: &Temperament) -> [f32; GoalKind::COUNT] 
     w[GoalKind::Housing.index()] = b.housing * (0.4 + 1.2 * t.homebody);
     w[GoalKind::Rest.index()] = b.rest * (0.5 + t.homebody);
     w[GoalKind::Wander.index()] = b.wander * (0.6 + 0.8 * t.homebody);
-    // (the travel goals own their weights, see `own_scores`)
+    // (the travel and market goals own their weights, see `own_scores`)
     w[GoalKind::Dungeon.index()] = super::goals::dungeon::base_weight(b, t);
     w[GoalKind::Sail.index()] = super::goals::sail::base_weight(b, t);
+    w[GoalKind::Auction.index()] = super::goals::auction::base_weight(b, t);
+    w[GoalKind::Market.index()] = super::goals::market::base_weight(b, t);
     w
 }
 
-/// Goals that score themselves from the whole tick context: the dungeons and sailing features
-/// own their eligibility (a party, a boat scroll, the `behavior.dungeons` and `behavior.sailing`
-/// switches), so the brain applies none of its factors to them. A goal that is blocked (switched
-/// off, cooling down, gated) is not asked; a score that is not a positive number is 0.
+/// Goals that score themselves from the whole tick context: the dungeons, sailing, auction and
+/// market features own their eligibility (a party, a boat scroll, goods to sell, the
+/// `behavior.dungeons`, `behavior.sailing` and `[market]` switches), so the brain applies none of
+/// its factors to them. A goal that is blocked (switched off, cooling down, gated) is not asked;
+/// a score that is not a positive number is 0.
 fn own_scores(
     ctx: &Ctx<'_>,
     base: &[f32; GoalKind::COUNT],
@@ -103,10 +107,18 @@ fn own_scores(
 ) {
     let dungeon = GoalKind::Dungeon.index();
     let sail = GoalKind::Sail.index();
+    let auction = GoalKind::Auction.index();
+    let market = GoalKind::Market.index();
     s[dungeon] = own_score(blocked, dungeon, || {
         super::goals::dungeon::score(ctx, base[dungeon])
     });
     s[sail] = own_score(blocked, sail, || super::goals::sail::score(ctx, base[sail]));
+    s[auction] = own_score(blocked, auction, || {
+        super::goals::auction::score(ctx, base[auction])
+    });
+    s[market] = own_score(blocked, market, || {
+        super::goals::market::score(ctx, base[market])
+    });
 }
 
 /// `raw()` unless goal `index` is in `blocked` or the value is not a positive number.
@@ -171,6 +183,24 @@ pub fn choose(scores: &[f32; GoalKind::COUNT], rng: &mut fastrand::Rng) -> Optio
     last_nonzero
 }
 
+/// Until when each goal rests after a failure, on the bot clock. Whole seconds in a `u32` (136
+/// years): half the size of milliseconds in a `u64`, which the per-bot budget needs now that
+/// there are twelve goals (`size_of::<Bot>() < 3200` is asserted).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Cooldowns([u32; GoalKind::COUNT]);
+
+impl Cooldowns {
+    /// `kind` rests until `until_ms` (rounded up to the next second).
+    fn set(&mut self, kind: GoalKind, until_ms: u64) {
+        self.0[kind.index()] = u32::try_from(until_ms.div_ceil(1000)).unwrap_or(u32::MAX);
+    }
+
+    /// Whether `kind` is still resting at the bot clock `now_ms`.
+    fn active(&self, kind: GoalKind, now_ms: u64) -> bool {
+        now_ms < u64::from(self.0[kind.index()]) * 1000
+    }
+}
+
 /// The chat duty and the director of one bot. Created at the first tick, so a bot that has not
 /// started yet costs a pointer.
 #[derive(Debug)]
@@ -188,8 +218,8 @@ pub struct Brain {
     last: Option<GoalKind>,
     /// Goals that reported `NotImplemented`.
     disabled: u16,
-    /// Bot clock until which a failed goal is not picked.
-    cooldown_until: [u64; GoalKind::COUNT],
+    /// Until when a failed goal is not picked.
+    cooldown_until: Cooldowns,
     next_think_ms: u64,
     /// A goal to start at the next tick (operator command, pairing, recovery after death).
     queued: Option<(GoalKind, Option<PairOrder>)>,
@@ -213,7 +243,7 @@ impl Brain {
             choice: GoalChoice::Auto,
             last: None,
             disabled: 0,
-            cooldown_until: [0; GoalKind::COUNT],
+            cooldown_until: Cooldowns::default(),
             next_think_ms: 0,
             queued: None,
             party: None,
@@ -426,7 +456,7 @@ impl Brain {
             other => {
                 ctx.log
                     .debug(format!("goal {} failed: {other:?}", kind.name()));
-                self.cooldown_until[kind.index()] = ctx.now_ms + FAIL_COOLDOWN_MS;
+                self.cooldown_until.set(kind, ctx.now_ms + FAIL_COOLDOWN_MS);
                 if self.choice == GoalChoice::Forced(kind) {
                     self.forced_fails += 1;
                     if self.forced_fails >= MAX_FORCED_FAILS {
@@ -442,7 +472,7 @@ impl Brain {
     fn pick(&mut self, ctx: &mut Ctx<'_>) {
         let now = ctx.now_ms;
         if let GoalChoice::Forced(kind) = self.choice {
-            if !self.is_disabled(kind) && now >= self.cooldown_until[kind.index()] {
+            if !self.is_disabled(kind) && !self.cooldown_until.active(kind, now) {
                 self.start_goal(ctx, kind, None);
                 return;
             }
@@ -470,7 +500,7 @@ impl Brain {
     fn scores_now(&self, ctx: &Ctx<'_>) -> [f32; GoalKind::COUNT] {
         let mut blocked = self.disabled | self.gated_goals(ctx);
         for g in GoalKind::ALL {
-            if ctx.now_ms < self.cooldown_until[g.index()] {
+            if self.cooldown_until.active(g, ctx.now_ms) {
                 blocked |= 1 << g.index();
             }
         }
@@ -847,6 +877,46 @@ mod tests {
             let g = choose(&s, &mut rng).unwrap();
             assert!(g != GoalKind::Sail, "{g:?}");
         }
+    }
+
+    #[test]
+    fn the_market_goals_are_never_drawn_by_weight_until_their_features_exist() {
+        let w = base();
+        let s = scores(&w, &input(100));
+        for g in [GoalKind::Auction, GoalKind::Market] {
+            assert_eq!(w[g.index()], 0.0, "{g:?}");
+            assert_eq!(s[g.index()], 0.0, "{g:?}");
+        }
+        let mut rng = fastrand::Rng::with_seed(9);
+        for _ in 0..5000 {
+            let g = choose(&s, &mut rng).unwrap();
+            assert!(g != GoalKind::Auction && g != GoalKind::Market, "{g:?}");
+        }
+        // forcing one from the web UI queues it, and its stub switches it off for the bot
+        let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
+        brain.command(&BotCmd::Goal(GoalChoice::Forced(GoalKind::Market)));
+        assert!(matches!(brain.queued, Some((GoalKind::Market, None))));
+    }
+
+    #[test]
+    fn a_failed_goal_rests_for_a_minute_to_the_second() {
+        let mut c = Cooldowns::default();
+        for g in GoalKind::ALL {
+            assert!(!c.active(g, 0), "{g:?}");
+        }
+        c.set(GoalKind::Quest, 1_000 + FAIL_COOLDOWN_MS);
+        assert!(c.active(GoalKind::Quest, 0));
+        assert!(c.active(GoalKind::Quest, 60_999));
+        assert!(!c.active(GoalKind::Quest, 61_000));
+        // rounded up, never short
+        c.set(GoalKind::Duel, 1_500);
+        assert!(c.active(GoalKind::Duel, 1_999));
+        assert!(!c.active(GoalKind::Duel, 2_000));
+        // the goals do not share a slot
+        assert!(!c.active(GoalKind::Rest, 1_000));
+        // far in the future saturates instead of wrapping
+        c.set(GoalKind::Grind, u64::MAX);
+        assert!(c.active(GoalKind::Grind, 1 << 40));
     }
 
     #[test]

@@ -1027,6 +1027,8 @@ mod tests {
         for (name, kind) in [
             ("dungeon", crate::bot::cmd::GoalKind::Dungeon),
             ("sail", crate::bot::cmd::GoalKind::Sail),
+            ("auction", crate::bot::cmd::GoalKind::Auction),
+            ("market", crate::bot::cmd::GoalKind::Market),
         ] {
             assert_eq!(
                 to_bot_cmd(Command::Goal { goal: name.into() }),

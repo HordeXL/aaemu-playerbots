@@ -63,6 +63,8 @@ pub fn option_text(kind: GoalKind) -> &'static str {
         GoalKind::Housing => "housing: build or tend a house",
         GoalKind::Dungeon => "dungeon: join a party and clear an instance dungeon",
         GoalKind::Sail => "sail: summon a boat and sail across the water",
+        GoalKind::Auction => "auction: list spare goods at the auction house",
+        GoalKind::Market => "market: advertise spare goods and sell them to buyers",
         GoalKind::Rest => "rest: sit down and recover",
         GoalKind::Wander => "wander: stroll around and see the sights",
     }
@@ -351,8 +353,10 @@ mod tests {
         // (the dungeon and sail goals score themselves from the whole context, see
         // `brain::own_scores`: this raw table leaves the sail goal at 0 and has the dungeon's
         // temperament weight, which `own_scores` replaces)
-        assert_eq!(with.len(), GoalKind::COUNT - 1);
+        // (the auction and market goals do too, and are 0 until their features exist)
+        assert_eq!(with.len(), GoalKind::COUNT - 3);
         assert!(!with.contains(&GoalKind::Sail));
+        assert!(!with.contains(&GoalKind::Auction) && !with.contains(&GoalKind::Market));
     }
 
     #[test]

@@ -690,12 +690,19 @@ fn line_key(who: &str, text: &str) -> u64 {
 }
 
 /// Files the inbox: chat lines go to `heard` (and the detail panel), system lines to the ring
-/// that goals read, the rest is dropped. Empties the inbox.
+/// that goals read, the rest is dropped; shouts, trade and group-finding lines and whispers are
+/// also handed to the market ([`crate::bot::market::forward_chat`]). Empties the inbox.
 fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
     if ctx.state.inbox.is_empty() {
         return;
     }
     let lines = std::mem::take(&mut ctx.state.inbox);
+    // (the market features hear the shout, trade and group-finding channels and the whispers
+    // besides us; what they do with them is no business of the routing below)
+    let market = &mut ctx.state.market;
+    crate::bot::market::forward_chat(&lines, |kind, sender, text, at_ms| {
+        market.on_chat(kind, sender, text, at_ms)
+    });
     let t = unix_ms();
     ctx.log
         .with_slot(|g| route_lines(lines, &mut g.social, t, heard));

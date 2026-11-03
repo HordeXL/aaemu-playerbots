@@ -180,6 +180,28 @@ features. `GoalKind::Dungeon` and `GoalKind::Sail` are scored only by their own 
 `NotImplemented`, which switches it off for that bot. A ship's `SCOneUnitMovement` is decoded twice
 (`Decoded::Ship`): the ordinary position event and `WorldEvent::ShipMoved` (heading, speed, helm).
 
+## Market hooks (quests, auction, life-like movement, trade-chat sales)
+
+Four more features plug in the same way. Shared and done: the goals, the configuration, the item
+facts, the provenance ledger and the chat forwarding.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `Auction` goal, `goals::auction::{base_weight, score}`, `AuctionMemory` (`BotState::market`, `Inner::auction`) | `bot/goals/auction.rs`, `bot/market/auction.rs` | auction house |
+| `Market` goal, `goals::market::{base_weight, score}`, `AdState` (`Inner::ads`) fed by `AdState::on_chat` | `bot/goals/market.rs`, `bot/market/ads.rs`, `bot/goals/trade*` | trade-chat sales |
+| `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` | `aa-world` `items.rs` | shared (done) |
+| `Ledger` (`MarketState::clean_count`, `sellable_surplus`): the quantity of each item the bot may sell, fed by `BotState::apply` from the item task reasons | `bot/market/ledger.rs`, `bot/state.rs` | shared (done) |
+| `MarketState::on_chat(kind, sender, text, now_ms)`: shouts, trade chat, group-finding chat and whispers, forwarded by the social duty before it files the inbox (`market::forward_chat`; which kinds: `ads::hears`) | `bot/market/`, `bot/goals/social.rs` | shared (done), kinds are the market feature's |
+| `[behavior] lifelike`, `jump_rate`, `emotes` | `config.rs` | life-like movement |
+| `[market]` | `config.rs`, `Config::may_sell_to_players` | shared (done) |
+
+`MarketState` is one pointer per bot (`Option<Box<Inner>>`, allocated by the first gain the ledger
+counts), because the per-bot budget is tight (`size_of::<Bot>() < 3200`). The brain scores
+`GoalKind::Auction` and `GoalKind::Market` only through their own `score` functions (0 while they
+are stubs, so no bot picks them); forcing one from the web UI makes it fail with `NotImplemented`,
+which switches it off for that bot. The brain's failure cooldowns are whole seconds in a `u32`
+for the same reason.
+
 ## Navigation motion (`bot/nav/`)
 
 Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight lines;
