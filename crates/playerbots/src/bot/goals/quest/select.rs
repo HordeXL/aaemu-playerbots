@@ -38,7 +38,7 @@ pub fn givers(quest: &Quest) -> impl Iterator<Item = Giver> + '_ {
 
 /// `quest_contexts.category_id` of the seasonal event quests (Hallowtide and the like): their
 /// objects only exist while the event runs, so the bot takes them last.
-pub const EVENT_CATEGORY: u32 = 55;
+pub const EVENT_CATEGORY: u32 = aa_world::CATEGORY_EVENT;
 
 /// A quest a giver near the bot offers.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,6 +55,9 @@ pub struct Candidate {
     pub event: bool,
     /// Part of a story line.
     pub story: bool,
+    /// Far below the bot's level ([`super::progress::trivial`]): done after everything else, and
+    /// not at all when a better place is known.
+    pub trivial: bool,
     /// Story chapter.
     pub chapter: u16,
     /// Position in the chapter.
@@ -117,7 +120,8 @@ impl Judge<'_> {
 }
 
 /// Whether `a` should be accepted before `b`: regular quests before event quests, story quests
-/// first (lowest chapter, then position), then the nearest giver, then the lowest quest id.
+/// first (lowest chapter, then position), then quests worth the bot's time before trivial ones,
+/// then the nearest giver, then the lowest quest id.
 pub fn order(a: &Candidate, b: &Candidate) -> Ordering {
     a.event
         .cmp(&b.event)
@@ -129,6 +133,7 @@ pub fn order(a: &Candidate, b: &Candidate) -> Ordering {
                 Ordering::Equal
             }
         })
+        .then_with(|| a.trivial.cmp(&b.trivial))
         .then_with(|| a.dist.total_cmp(&b.dist))
         .then_with(|| a.quest.cmp(&b.quest))
 }
@@ -146,6 +151,7 @@ mod tests {
             dist,
             event: false,
             story,
+            trivial: false,
             chapter,
             idx,
         }
@@ -179,6 +185,32 @@ mod tests {
             v.iter().map(|c| c.quest).collect::<Vec<_>>(),
             vec![2531, 251, 8000004]
         );
+    }
+
+    #[test]
+    fn trivial_quests_come_after_the_ones_worth_the_time() {
+        let trivial_near = Candidate {
+            trivial: true,
+            ..cand(5, false, 0, 0, 10.0)
+        };
+        let useful_far = cand(6, false, 0, 0, 1200.0);
+        let story_far = cand(2531, true, 1, 1, 1400.0);
+        let mut v = [trivial_near, useful_far, story_far];
+        v.sort_by(order);
+        assert_eq!(
+            v.iter().map(|c| c.quest).collect::<Vec<_>>(),
+            vec![2531, 6, 5]
+        );
+        // among trivial quests the nearest still goes first
+        let a = Candidate {
+            trivial: true,
+            ..cand(5, false, 0, 0, 10.0)
+        };
+        let b = Candidate {
+            trivial: true,
+            ..cand(6, false, 0, 0, 20.0)
+        };
+        assert_eq!(order(&a, &b), Ordering::Less);
     }
 
     #[test]

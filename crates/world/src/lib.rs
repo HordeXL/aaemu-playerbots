@@ -21,6 +21,7 @@ pub mod items;
 pub mod jsonc;
 pub mod npc;
 pub mod quest;
+pub mod quest_atlas;
 pub mod reqs;
 pub mod skill;
 pub mod spatial;
@@ -44,6 +45,7 @@ pub use npc::{NpcRoles, NpcTemplate};
 pub use quest::{
     ObjKind, Objective, Quest, QuestReport, QuestStart, QuestStats, QuestStep, CATEGORY_TUTORIAL,
 };
+pub use quest_atlas::{AtlasPoint, AtlasZone, Chain, QuestAtlas, CATEGORY_EVENT};
 pub use reqs::{Gate, StartGates, Who};
 pub use skill::{mana_level_scale, SkillInfo};
 pub use spawns::SpawnStats;

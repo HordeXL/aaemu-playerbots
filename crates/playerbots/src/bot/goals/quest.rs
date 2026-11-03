@@ -15,6 +15,11 @@
 //!   the quest is quarantined and dropped from the journal.
 //! * **Turn in.** Walk to the report NPC or doodad and send `CSCompleteQuestContext`; quests that
 //!   complete by themselves are waited for.
+//! * **Progression.** A bot that has found nothing within 1500 m for several scans in a row does
+//!   not stay where it is: it plans a trip ([`progress`]) to the giver of the next quest of its
+//!   race's story line, else to the zone with the most quests for its level, else to monsters of
+//!   its level, and walks there until quests come within reach. Trivial side quests (far below the
+//!   bot's level) give way to such a trip.
 //! * **Failures** are typed ([`Failure`]) and remembered in [`Memory`]: a failed quest backs off
 //!   for 30 s, three failures quarantine a side quest for 5 minutes (a story quest rests
 //!   instead), an objective without progress for 4 minutes is skipped or fails its quest.
@@ -24,13 +29,16 @@
 
 mod memory;
 mod objective;
+pub mod progress;
 mod select;
 
 use std::fmt::Write;
 
 use aa_proto::cs;
 use aa_proto::sc_activity::quest_status;
-use aa_world::{ObjKind, Quest as QuestData, QuestReport, SkillNeed, Vec3, World};
+use aa_world::{
+    AtlasPoint, ObjKind, Quest as QuestData, QuestAtlas, QuestReport, SkillNeed, Vec3, World,
+};
 use smallvec::SmallVec;
 
 use crate::bot::avoid::UNREACHABLE_MS;
@@ -43,6 +51,7 @@ use crate::bot::watch::{Finding, Role};
 use crate::contest::{doodad_key, spot_key, unit_key};
 
 use objective::{Env, Plan, Slot};
+use progress::{Dest, Outcome, Progress, Trip, Why};
 use select::{Candidate, Giver, Judge};
 
 pub use memory::{Failure, Memory, Verdict};
@@ -127,6 +136,10 @@ const ROUND_GAP_MS: u64 = 20_000;
 const MAX_LEGS: u8 = 6;
 /// A leg must have brought the bot at least this much closer to count as progress.
 const LEG_MIN_GAIN_M: f32 = 30.0;
+/// Gap between two scans for a quest, and between two looks for quests on a trip.
+const SCAN_GAP_MS: u64 = 5_000;
+/// A trip that got this much closer to its destination has the whole of its legs again.
+const TRIP_CHECKPOINT_M: f32 = 250.0;
 
 /// What the goal is working on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +152,8 @@ enum Mode {
     Work,
     /// Walk to the report target and hand the quest in.
     TurnIn,
+    /// Walk to a place with quests: nothing is near ([`progress`]).
+    Travel,
 }
 
 /// Where the current piece of work is.
@@ -258,6 +273,10 @@ struct Inner {
     cast_skill: u32,
     /// Spawn points of the target in work where the bot stood and found nothing.
     stood: u8,
+    /// Bot clock of the next look for quests on a trip.
+    trip_scan_ms: u64,
+    /// Distance to the destination at the last checkpoint of the trip.
+    cp_dist: f32,
     detail: String,
     detail_key: u64,
 }
@@ -295,6 +314,8 @@ impl Default for Inner {
             credit: None,
             cast_skill: 0,
             stood: 0,
+            trip_scan_ms: 0,
+            cp_dist: f32::MAX,
             detail: String::new(),
             detail_key: 0,
         }
@@ -317,6 +338,190 @@ fn usable(state: &BotState, quest: u32, now_ms: u64) -> bool {
         .is_none_or(|m| m.usable(quest, now_ms))
 }
 
+/// The progression memory of the bot.
+fn prog(state: &mut BotState) -> &mut Progress {
+    mem(state).progress.get_or_insert_with(Default::default)
+}
+
+/// The trip under way, if any (does not allocate the memory).
+fn current_trip(state: &BotState) -> Option<Trip> {
+    state
+        .quest_mem
+        .as_ref()
+        .and_then(|m| m.progress.as_ref())
+        .and_then(|p| p.trip)
+}
+
+/// The table of where the quests are, built by the first bot that asks. The quests in it are the
+/// ones a bot can do at all (every objective and the turn-in have a plan); whether a bot may do
+/// one now is judged per bot by [`Eligibility`].
+pub fn atlas(world: &World) -> &QuestAtlas {
+    world.quest_atlas(&|q| objective::supported(&Env { world }, q, u8::MAX).is_ok())
+}
+
+/// What the bot's data says about a quest, in one place for the picker (`find_candidate`) and for
+/// the choice of a place to go to ([`plan_target`]).
+struct Eligibility<'a> {
+    world: &'a World,
+    facts: Env<'a>,
+    level: u8,
+    faction: u32,
+    who: aa_world::Who<'a>,
+    judge: Judge<'a>,
+}
+
+impl Eligibility<'_> {
+    /// Whether the bot may start `quest` at `giver` now: level, done, in the journal, resting,
+    /// prerequisites, the race and quest gates of the start, a giver that is not hostile and every
+    /// objective within the bot's ability.
+    fn check(&self, quest: &QuestData, giver: Giver) -> bool {
+        self.explain(quest, giver).is_ok()
+    }
+
+    /// Like [`Eligibility::check`], with the reason for a no.
+    fn explain(&self, quest: &QuestData, giver: Giver) -> Result<(), &'static str> {
+        match self.judge.check(quest) {
+            Ok(()) => {}
+            Err(select::Skip::Level) => return Err("level too low"),
+            Err(select::Skip::Done) => return Err("done"),
+            Err(select::Skip::Active) => return Err("in the journal"),
+            Err(select::Skip::Prerequisite) => return Err("prerequisite not done"),
+            Err(select::Skip::Resting) => return Err("resting after a failure"),
+            Err(select::Skip::NoGiver) => return Err("no giver"),
+        }
+        if !self.world.start_gates().open(quest.id, &self.who) {
+            return Err("start requirements not met");
+        }
+        if let Giver::Npc(t) = giver {
+            let hostile = self.world.npc(t).is_some_and(|n| {
+                self.world.relation(self.faction, n.faction_id) == aa_world::Relation::Hostile
+            });
+            if hostile {
+                return Err("giver is hostile");
+            }
+        }
+        if objective::supported(&self.facts, quest, self.level).is_err() {
+            return Err("objectives not supported");
+        }
+        Ok(())
+    }
+}
+
+/// Runs `f` with the [`Eligibility`] of the bot at bot-clock `now_ms`.
+fn with_eligibility<R>(
+    world: &World,
+    state: &BotState,
+    now_ms: u64,
+    f: impl FnOnce(&Eligibility<'_>) -> R,
+) -> R {
+    let (level, faction) = (state.me.level, state.me.faction);
+    let done = |q: u32| state.quests.is_done(q);
+    let owns = |item: u32| state.find_item(item).is_some();
+    let active = |q: u32| state.quests.row(q).is_some();
+    let usable_now = |q: u32| usable(state, q, now_ms);
+    f(&Eligibility {
+        world,
+        facts: Env { world },
+        level,
+        faction,
+        who: aa_world::Who {
+            level,
+            race: state.me.race,
+            gender: state.me.gender,
+            mother_faction: world.mother_faction(faction),
+            done: &done,
+            owns: &owns,
+        },
+        judge: Judge {
+            level,
+            done: &done,
+            active: &active,
+            usable: &usable_now,
+        },
+    })
+}
+
+/// Where to go when no quest is near: the giver of the next story quest, else the best zone, else
+/// monsters of the bot's level. See [`progress`].
+fn plan_target(ctx: &Ctx<'_>) -> Option<Dest> {
+    let world = ctx.world;
+    let state = &*ctx.state;
+    let now = ctx.now_ms;
+    let (level, faction, race) = (state.me.level, state.me.faction, state.me.race);
+    let me = (state.me.pos[0], state.me.pos[1]);
+    let atlas = atlas(world);
+    let memory = state.quest_mem.as_ref().and_then(|m| m.progress.as_deref());
+    let blocked = |x: f32, y: f32| memory.is_some_and(|p| p.blocked(x, y, now));
+    let risky = |from: (f32, f32), to: (f32, f32)| {
+        progress::deadly(world, faction, level, from, to) || progress::cut_off(world, from, to)
+    };
+    let settled = memory.is_some_and(|p| p.settled(now));
+    with_eligibility(world, state, now, |elig| {
+        let eligible = |pt: &AtlasPoint| {
+            pt.level <= level.saturating_add(select::LEVEL_SLACK)
+                && world.quest(pt.quest).is_some_and(|q| {
+                    let giver = if pt.doodad {
+                        Giver::Doodad(pt.giver)
+                    } else {
+                        Giver::Npc(pt.giver)
+                    };
+                    elig.check(q, giver)
+                })
+        };
+        let weight = |pt: &AtlasPoint| {
+            if eligible(pt) {
+                progress::level_weight(level, pt.level)
+            } else {
+                0.0
+            }
+        };
+        if let Some(chain) = atlas.chain(race) {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                // the first quest of the story line that is not done, and what is wrong with it
+                if let Some(q) = chain.quests.iter().find(|q| !state.quests.is_done(**q)) {
+                    let verdict = world.quest(*q).map(|quest| {
+                        let giver = quest
+                            .starts
+                            .iter()
+                            .find_map(|s| match s {
+                                aa_world::QuestStart::Npc(t) => Some(Giver::Npc(*t)),
+                                aa_world::QuestStart::Doodad(t) => Some(Giver::Doodad(*t)),
+                                _ => None,
+                            })
+                            .unwrap_or(Giver::Npc(0));
+                        elig.explain(quest, giver)
+                    });
+                    ctx.log
+                        .debug(format!("progress: next story quest {q}: {verdict:?}"));
+                }
+            }
+            if let Some(t) =
+                progress::story_target(atlas, &chain.quests, me, &eligible, &blocked, &risky)
+            {
+                return Some(t);
+            }
+        }
+        if let Some(t) = progress::zone_target(atlas, me, &weight, &blocked, &risky) {
+            return Some(t);
+        }
+        if settled {
+            return None;
+        }
+        progress::grind_target(atlas, me, level, &blocked, &risky, &|hub| {
+            progress::grind_spot(world, faction, level, hub)
+        })
+    })
+}
+
+/// "Zone name (x, y)" for the logs.
+fn place(world: &World, x: f32, y: f32) -> String {
+    let zone = world
+        .zone_key_at(x, y)
+        .and_then(|k| world.zone_name(k))
+        .unwrap_or("?");
+    format!("{zone} ({x:.0}, {y:.0})")
+}
+
 impl Inner {
     fn start(&mut self, ctx: &mut Ctx<'_>) {
         *self = Inner::default();
@@ -332,6 +537,15 @@ impl Inner {
         }
         self.fighting = None;
         ctx.hub.contest.release_bot(ctx.persona.id);
+        // A death on the way to a far place counts against the trip: a road that kills twice is
+        // not walked a third time.
+        if ctx.state.me.dead && self.mode == Mode::Travel {
+            let now = ctx.now_ms;
+            if prog(ctx.state).died(now) {
+                ctx.log
+                    .say("progress: died twice on the way; giving the trip up");
+            }
+        }
     }
 
     fn tick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
@@ -370,7 +584,9 @@ impl Inner {
             // The controller defends the bot or loots; the walk is re-issued afterwards.
             return GoalStatus::Running;
         }
-        if now >= self.end_ms || ctx.state.me.hp_pct() < LOW_HP_PCT {
+        // (a trip is not cut short by the end of the run: it has a time limit of its own)
+        let travelling = self.mode == Mode::Travel;
+        if (now >= self.end_ms && !travelling) || ctx.state.me.hp_pct() < LOW_HP_PCT {
             return GoalStatus::Done;
         }
         let status = match self.mode {
@@ -378,6 +594,7 @@ impl Inner {
             Mode::Accept => self.accept(ctx),
             Mode::Work => self.work(ctx),
             Mode::TurnIn => self.turn_in(ctx),
+            Mode::Travel => self.travel(ctx),
         };
         self.refresh_detail(ctx);
         status
@@ -388,25 +605,239 @@ impl Inner {
     fn pick(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
         if let Some((quest, mode)) = self.best_active(ctx) {
+            // (work in the journal is not an empty scan)
+            prog(ctx.state).fruitful();
             self.begin(ctx, quest, mode, None);
+            return GoalStatus::Running;
+        }
+        // A trip that was under way when the last run ended goes on.
+        if self.resume_trip(ctx) {
             return GoalStatus::Running;
         }
         if now < mem(ctx.state).next_scan_ms {
             return GoalStatus::Running;
         }
-        for radius in [select::NEAR_RADIUS, select::FAR_RADIUS] {
-            if let Some(c) = self.find_candidate(ctx, radius) {
-                ctx.log.debug(format!(
-                    "quest {}: giver {:?} at {:.0} m",
-                    c.quest, c.giver, c.dist
-                ));
-                self.begin(ctx, c.quest, Mode::Accept, Some(c.giver));
+        match self.scan(ctx) {
+            Some(c) if !c.trivial => {
+                prog(ctx.state).fruitful();
+                self.accept_candidate(ctx, c);
+                GoalStatus::Running
+            }
+            Some(c) => {
+                // Only quests far below the bot's level are near: a place with better ones is
+                // worth the walk, else they are better than nothing.
+                prog(ctx.state).fruitful();
+                if self.retry_soon(ctx) {
+                    // a quest in the journal comes back soon: neither a trip nor a trivial quest,
+                    // the brain fills the time
+                    mem(ctx.state).next_scan_ms = now + SCAN_GAP_MS;
+                    return GoalStatus::Failed(FailReason::NoTarget);
+                }
+                if !self.start_trip(ctx) {
+                    self.accept_candidate(ctx, c);
+                }
+                GoalStatus::Running
+            }
+            None => self.nothing_near(ctx),
+        }
+    }
+
+    /// The best acceptable quest within reach: within 300 m, else within 1500 m (a trivial one
+    /// near the bot gives way to a worthwhile one farther away).
+    fn scan(&self, ctx: &mut Ctx<'_>) -> Option<Candidate> {
+        let near = self.find_candidate(ctx, select::NEAR_RADIUS);
+        if near.as_ref().is_some_and(|c| !c.trivial) {
+            return near;
+        }
+        self.find_candidate(ctx, select::FAR_RADIUS).or(near)
+    }
+
+    fn accept_candidate(&mut self, ctx: &mut Ctx<'_>, c: Candidate) {
+        ctx.log.debug(format!(
+            "quest {}: giver {:?} at {:.0} m",
+            c.quest, c.giver, c.dist
+        ));
+        self.begin(ctx, c.quest, Mode::Accept, Some(c.giver));
+    }
+
+    /// A scan found nothing. After [`progress::EMPTY_SCANS`] of them in a row the bot goes where
+    /// quests are; until then it looks again in a few seconds, and when there is nowhere to go the
+    /// goal fails (the brain tries grinding and wandering).
+    fn nothing_near(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
+        let now = ctx.now_ms;
+        let (empty, barren) = {
+            let p = prog(ctx.state);
+            let barren = p.barren(now);
+            p.empty_scans = p.empty_scans.saturating_add(1);
+            (p.empty_scans, barren)
+        };
+        if barren {
+            ctx.log.say(
+                "progress: no quest for this bot where the trip went; leaving that place alone for a while",
+            );
+        }
+        mem(ctx.state).next_scan_ms = now + SCAN_GAP_MS;
+        if empty < progress::EMPTY_SCANS {
+            return GoalStatus::Running;
+        }
+        if !self.retry_soon(ctx) && self.start_trip(ctx) {
+            return GoalStatus::Running;
+        }
+        GoalStatus::Failed(FailReason::NoTarget)
+    }
+
+    /// Whether a quest in the journal is only resting after a failure and may be tried again
+    /// within [`progress::RETRY_WAIT_MS`]: the bot stays near it instead of going on a trip.
+    fn retry_soon(&self, ctx: &Ctx<'_>) -> bool {
+        let now = ctx.now_ms;
+        let Some(m) = ctx.state.quest_mem.as_ref() else {
+            return false;
+        };
+        ctx.state
+            .quests
+            .active
+            .iter()
+            .filter(|row| row.status != quest_status::FAILED)
+            .any(|row| {
+                m.retry_in(row.template, now)
+                    .is_some_and(|t| t <= progress::RETRY_WAIT_MS)
+            })
+    }
+
+    // ---- trips --------------------------------------------------------------------------
+
+    /// Plans a trip and starts it. `false` when there is nowhere better to go (that is remembered
+    /// for a while, so the planning does not run on every scan).
+    fn start_trip(&mut self, ctx: &mut Ctx<'_>) -> bool {
+        let now = ctx.now_ms;
+        if prog(ctx.state).searched_in_vain(now) {
+            return false;
+        }
+        let Some(target) = plan_target(ctx) else {
+            prog(ctx.state).found_nothing(now);
+            ctx.log
+                .debug("progress: nowhere better to go; trying again later");
+            return false;
+        };
+        let me = (ctx.state.me.pos[0], ctx.state.me.pos[1]);
+        let trip = prog(ctx.state).begin(target, me, now);
+        let world = ctx.world;
+        let what = match target.why {
+            Why::Story(q) => format!("for story quest {q} {}", quest_name(world, q)),
+            Why::Zone(_) => format!("for quests suited to level {}", ctx.state.me.level),
+            Why::Grind(_) => format!("to hunt monsters of level {}", ctx.state.me.level),
+        };
+        ctx.log.say(format!(
+            "progress: heading to {} {what}: {:.0} m from {}, {} s allowed",
+            place(world, target.x, target.y),
+            target.dist,
+            place(world, me.0, me.1),
+            (trip.deadline_ms - now) / 1000
+        ));
+        self.enter_travel(ctx);
+        true
+    }
+
+    /// Switches to walking the trip under way.
+    fn enter_travel(&mut self, ctx: &mut Ctx<'_>) {
+        let now = ctx.now_ms;
+        self.mode = Mode::Travel;
+        self.giver = None;
+        self.obj = u8::MAX;
+        self.quest = 0;
+        self.reset_task(now);
+        self.trip_scan_ms = now + SCAN_GAP_MS;
+        self.cp_dist = f32::MAX;
+    }
+
+    /// Takes up the trip the last run left unfinished, or ends it when its time is up.
+    fn resume_trip(&mut self, ctx: &mut Ctx<'_>) -> bool {
+        let Some(trip) = current_trip(ctx.state) else {
+            return false;
+        };
+        if ctx.now_ms >= trip.deadline_ms {
+            self.finish_trip(ctx, Outcome::TimedOut);
+            return false;
+        }
+        self.enter_travel(ctx);
+        true
+    }
+
+    /// Records the end of the trip under way and logs it.
+    fn finish_trip(&mut self, ctx: &mut Ctx<'_>, outcome: Outcome) {
+        let now = ctx.now_ms;
+        let me = (ctx.state.me.pos[0], ctx.state.me.pos[1]);
+        let Some(trip) = prog(ctx.state).end(outcome, now) else {
+            return;
+        };
+        let t = trip.target;
+        let left = ((t.x - me.0).powi(2) + (t.y - me.1).powi(2)).sqrt();
+        ctx.log.say(format!(
+            "progress: trip to {} {} after {} s ({:.0} m of {:.0} m to go)",
+            place(ctx.world, t.x, t.y),
+            outcome.text(),
+            now.saturating_sub(trip.started_ms) / 1000,
+            left,
+            t.dist
+        ));
+    }
+
+    /// Ends the trip for good and fails the goal with the matching reason.
+    fn end_trip(&mut self, ctx: &mut Ctx<'_>, outcome: Outcome) -> GoalStatus {
+        ctx.motion.stop();
+        self.finish_trip(ctx, outcome);
+        self.back_to_pick(ctx);
+        GoalStatus::Failed(match outcome {
+            Outcome::TimedOut => FailReason::Timeout,
+            _ => FailReason::Stuck,
+        })
+    }
+
+    /// One tick of a trip: quests that come within reach end it, otherwise the bot walks on.
+    fn travel(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
+        let now = ctx.now_ms;
+        let Some(trip) = current_trip(ctx.state) else {
+            self.back_to_pick(ctx);
+            return GoalStatus::Running;
+        };
+        if now >= trip.deadline_ms {
+            return self.end_trip(ctx, Outcome::TimedOut);
+        }
+        if now >= self.trip_scan_ms {
+            self.trip_scan_ms = now + SCAN_GAP_MS;
+            if let Some(c) = self.scan(ctx).filter(|c| !c.trivial) {
+                // The way led within reach of something the picker takes: its job is done.
+                ctx.motion.stop();
+                self.finish_trip(ctx, Outcome::InRange);
+                prog(ctx.state).fruitful();
+                self.accept_candidate(ctx, c);
                 return GoalStatus::Running;
             }
         }
-        mem(ctx.state).next_scan_ms = now + 5_000;
-        GoalStatus::Failed(FailReason::NoTarget)
+        let (x, y) = (trip.target.x, trip.target.y);
+        let left = dist2d(ctx.state.me.pos, [x, y, 0.0]);
+        if left + TRIP_CHECKPOINT_M < self.cp_dist {
+            // Good progress renews the legs the walk may be cut into.
+            self.cp_dist = left;
+            self.legs = 0;
+        }
+        match self.walk(ctx, x, y, progress::ARRIVE_M) {
+            Walk::Moving => GoalStatus::Running,
+            Walk::Arrived => {
+                self.finish_trip(ctx, Outcome::Arrived);
+                self.back_to_pick(ctx);
+                mem(ctx.state).next_scan_ms = 0;
+                if matches!(trip.target.why, Why::Grind(_)) {
+                    // monsters are what this place is for: the brain's grinding takes over
+                    return GoalStatus::Failed(FailReason::NoTarget);
+                }
+                GoalStatus::Running
+            }
+            Walk::Failed => self.end_trip(ctx, Outcome::Blocked),
+        }
     }
+
+    // ---- choosing ------------------------------------------------------------------------
 
     /// The quest in the journal to work on next, and what to do with it.
     fn best_active(&mut self, ctx: &mut Ctx<'_>) -> Option<(u32, Mode)> {
@@ -476,80 +907,52 @@ impl Inner {
 
     /// The best acceptable quest the givers within `radius` offer.
     fn find_candidate(&self, ctx: &mut Ctx<'_>, radius: f32) -> Option<Candidate> {
-        let now = ctx.now_ms;
         let world = ctx.world;
-        let facts = Env { world };
         let state = &*ctx.state;
-        let (level, faction) = (state.me.level, state.me.faction);
+        let level = state.me.level;
         let me = state.me.pos;
-        let done = |q: u32| state.quests.is_done(q);
-        let who = aa_world::Who {
-            level,
-            race: state.me.race,
-            gender: state.me.gender,
-            mother_faction: world.mother_faction(faction),
-            done: &done,
-            owns: &|item| state.find_item(item).is_some(),
-        };
-        let active = |q: u32| state.quests.row(q).is_some();
-        let usable_now = |q: u32| usable(state, q, now);
-        let judge = Judge {
-            level,
-            done: &done,
-            active: &active,
-            usable: &usable_now,
-        };
-        let mut best: Option<Candidate> = None;
         let center = Vec3::new(me[0], me[1], me[2]);
-        let mut consider = |quest_id: u32, giver: Giver, p: Vec3| {
-            let Some(quest) = world.quest(quest_id) else {
-                return;
-            };
-            let dist = ((p.x - me[0]).powi(2) + (p.y - me[1]).powi(2)).sqrt();
-            // Cheap checks first; the data checks run only for a quest that would win.
-            let cand = Candidate {
-                quest: quest_id,
-                giver,
-                at: (p.x, p.y),
-                dist,
-                event: quest.category == select::EVENT_CATEGORY,
-                story: quest.story,
-                chapter: quest.chapter_idx,
-                idx: quest.quest_idx,
-            };
-            if best
-                .as_ref()
-                .is_some_and(|b| select::order(&cand, b) != std::cmp::Ordering::Less)
-            {
-                return;
-            }
-            if judge.check(quest).is_err() || !world.start_gates().open(quest_id, &who) {
-                return;
-            }
-            if let Giver::Npc(t) = giver {
-                let hostile = world.npc(t).is_some_and(|n| {
-                    world.relation(faction, n.faction_id) == aa_world::Relation::Hostile
-                });
-                if hostile {
+        with_eligibility(world, state, ctx.now_ms, |elig| {
+            let mut best: Option<Candidate> = None;
+            let mut consider = |quest_id: u32, giver: Giver, p: Vec3| {
+                let Some(quest) = world.quest(quest_id) else {
+                    return;
+                };
+                let dist = ((p.x - me[0]).powi(2) + (p.y - me[1]).powi(2)).sqrt();
+                // Cheap checks first; the data checks run only for a quest that would win.
+                let cand = Candidate {
+                    quest: quest_id,
+                    giver,
+                    at: (p.x, p.y),
+                    dist,
+                    event: quest.category == select::EVENT_CATEGORY,
+                    story: quest.story,
+                    trivial: progress::trivial(level, quest.level, quest.story),
+                    chapter: quest.chapter_idx,
+                    idx: quest.quest_idx,
+                };
+                if best
+                    .as_ref()
+                    .is_some_and(|b| select::order(&cand, b) != std::cmp::Ordering::Less)
+                {
                     return;
                 }
-            }
-            if objective::supported(&facts, quest, level).is_err() {
-                return;
-            }
-            best = Some(cand);
-        };
-        world.npc_spawns_within(center, radius, |t, p| {
-            for &q in world.quests_from_npc(t) {
-                consider(q, Giver::Npc(t), p);
-            }
-        });
-        world.doodad_spawns_within(center, radius, |t, p| {
-            for &q in world.quests_from_doodad(t) {
-                consider(q, Giver::Doodad(t), p);
-            }
-        });
-        best
+                if elig.check(quest, giver) {
+                    best = Some(cand);
+                }
+            };
+            world.npc_spawns_within(center, radius, |t, p| {
+                for &q in world.quests_from_npc(t) {
+                    consider(q, Giver::Npc(t), p);
+                }
+            });
+            world.doodad_spawns_within(center, radius, |t, p| {
+                for &q in world.quests_from_doodad(t) {
+                    consider(q, Giver::Doodad(t), p);
+                }
+            });
+            best
+        })
     }
 
     /// Starts working on `quest`.
@@ -1634,18 +2037,55 @@ impl Inner {
             .quests
             .row(self.quest)
             .map_or(-1, |r| r.objectives.iter().sum::<i32>());
-        let key = (self.mode as u64)
+        let mut key = (self.mode as u64)
             | (self.stage as u64) << 4
             | u64::from(self.obj) << 8
             | u64::from(self.quest) << 16
             | ((have.max(-1) + 1) as u64) << 48;
+        let trip = (self.mode == Mode::Travel)
+            .then(|| current_trip(ctx.state))
+            .flatten();
+        if let Some(t) = &trip {
+            // (the distance to go changes the line every 100 m)
+            let left = dist2d(ctx.state.me.pos, [t.target.x, t.target.y, 0.0]);
+            key = (self.mode as u64)
+                | ((left / 100.0) as u64) << 8
+                | u64::from(t.started_ms as u32) << 24;
+        }
         if key == self.detail_key && !self.detail.is_empty() {
             return;
         }
         self.detail_key = key;
         self.detail.clear();
         let world = ctx.world;
-        if self.mode == Mode::Pick || self.quest == 0 {
+        if let Some(t) = trip {
+            let left = dist2d(ctx.state.me.pos, [t.target.x, t.target.y, 0.0]);
+            let zone = world
+                .zone_key_at(t.target.x, t.target.y)
+                .and_then(|k| world.zone_name(k))
+                .unwrap_or("a far place");
+            let _ = match t.target.why {
+                Why::Story(q) => write!(
+                    self.detail,
+                    "heading to {zone} for quest {q} {} ({:.1} km to go)",
+                    quest_name(world, q),
+                    left / 1000.0
+                ),
+                Why::Zone(_) => write!(
+                    self.detail,
+                    "heading to {zone} for quests suited to level {} ({:.1} km to go)",
+                    ctx.state.me.level,
+                    left / 1000.0
+                ),
+                Why::Grind(_) => write!(
+                    self.detail,
+                    "heading to {zone} to hunt monsters ({:.1} km to go)",
+                    left / 1000.0
+                ),
+            };
+            return;
+        }
+        if self.mode == Mode::Pick || self.mode == Mode::Travel || self.quest == 0 {
             self.detail.push_str("looking for a quest");
             return;
         }
@@ -1655,7 +2095,7 @@ impl Inner {
             return;
         };
         match self.mode {
-            Mode::Pick => {}
+            Mode::Pick | Mode::Travel => {}
             Mode::Accept => match self.giver {
                 Some(Giver::Npc(t)) => {
                     let _ = write!(self.detail, "getting it from {}", npc_name(world, t));
