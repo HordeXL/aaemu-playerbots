@@ -30,6 +30,9 @@ pub const DOOR_STOP: f32 = 2.0;
 const VIEW_M: f32 = 70.0;
 /// Monsters this far above or below the bot are on another floor.
 const FLOOR_REACH_M: f32 = 12.0;
+/// A leg whose end is higher or lower than the bot by more than this starts at the height of its
+/// end (inside an instance the bot has no ground under it, see [`match_floor`]).
+const FLOOR_FIX_M: f32 = 4.0;
 /// The leader's target is good for the members this long.
 const BOARD_FRESH: Duration = Duration::from_secs(8);
 /// No hostile unit in view this long after arriving, with spawns listed, is a finding.
@@ -777,6 +780,7 @@ impl Run {
             .destination()
             .is_none_or(|(x, y)| flat([x, y, 0.0], [door.pos[0], door.pos[1], 0.0]) > 3.0);
         if !ctx.motion.is_moving() || moved {
+            match_floor(ctx, door.pos[2]);
             ctx.motion
                 .go_to(door.pos[0], door.pos[1], DOOR_STOP, Pace::Run, now);
         }
@@ -885,6 +889,19 @@ impl Run {
                     .destination()
                     .is_none_or(|(dx, dy)| flat([dx, dy, 0.0], [x, y, 0.0]) > 4.0);
                 if !ctx.motion.is_moving() || moved {
+                    // the floor the leg ends on: the stop's for the leader, the leader's own for
+                    // the others
+                    let floor = if leader {
+                        self.route
+                            .iter()
+                            .find(|s| flat([s.x, s.y, 0.0], [x, y, 0.0]) < 1.0)
+                            .map(|s| s.z)
+                    } else {
+                        leader_pos.map(|p| p[2])
+                    };
+                    if let Some(z) = floor {
+                        match_floor(ctx, z);
+                    }
                     ctx.motion.go_to(x, y, radius, Pace::Run, now);
                 }
                 ctx.combat.note_travelling(now);
@@ -993,6 +1010,16 @@ impl Run {
                 ctx.state.doodads.len()
             ));
             self.sample_npcs(ctx);
+            // Monsters on other floors are the bot's doing (it has no ground under it), no
+            // finding about the server.
+            let off_floor = self.hostile_off_floor(ctx);
+            if off_floor > 0 {
+                self.told |= T_NO_MONSTERS;
+                ctx.log.say(format!(
+                    "dungeon: {off_floor} hostile monsters in view stand on other floors"
+                ));
+                return;
+            }
             self.tell(
                 ctx,
                 T_NO_MONSTERS,
@@ -1004,6 +1031,18 @@ impl Run {
                 },
             );
         }
+    }
+
+    /// How many monsters in view the bot would fight if they stood on its floor.
+    fn hostile_off_floor(&self, ctx: &Ctx<'_>) -> usize {
+        let me = ctx.state.me.pos;
+        let faction = ctx.state.me.faction;
+        ctx.state
+            .units
+            .values()
+            .filter(|u| u.kind == UnitKind::Npc && u.dist2d(me) <= VIEW_M)
+            .filter(|u| combat::attackable(ctx.world, faction, u).is_some())
+            .count()
     }
 
     /// Writes the nearest few NPC units in view to the bot log: what they are to this bot
@@ -1246,6 +1285,17 @@ fn drop_stale_load(ctx: &mut Ctx<'_>) {
         ctx.state.place.loaded();
         ctx.log
             .say("dungeon: dropped a load the server never finished");
+    }
+}
+
+/// Inside an instance the bot has no ground under it: it keeps the height it arrived at, so the
+/// mobs of another floor stay out of reach. A leg to another floor therefore starts at the height
+/// of its end (the server takes the position the client reports).
+fn match_floor(ctx: &mut Ctx<'_>, z: f32) {
+    let me = ctx.state.me.pos;
+    if (z - me[2]).abs() > FLOOR_FIX_M {
+        ctx.motion.teleported([me[0], me[1], z]);
+        ctx.state.me.pos[2] = z;
     }
 }
 
