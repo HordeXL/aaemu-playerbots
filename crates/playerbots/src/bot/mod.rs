@@ -27,6 +27,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod director;
 pub mod goals;
+pub mod manner;
 pub mod market;
 pub mod motion;
 pub mod nav;
@@ -87,6 +88,9 @@ const LEAVE_WAIT: Duration = Duration::from_secs(2);
 const RESURRECT_RETRY_MS: u64 = 5_000;
 /// A real player within this many metres makes the bot send movement at the full tick rate.
 const WATCH_RADIUS: f32 = 150.0;
+/// The shortest sleep (ms) the movement controller may ask the bot loop for (the packets of a
+/// jump).
+const MIN_WAKE_MS: u64 = 15;
 /// The bot's detail panel is refreshed this often.
 const EXTRA_EVERY_SECS: u32 = 5;
 /// The most points of the route the web UI gets for a bot.
@@ -217,6 +221,16 @@ impl Bot {
             slot.clone(),
             entry.id,
         ));
+        let mut rng = fastrand::Rng::new();
+        if cfg.behavior.lifelike {
+            motion.attach_life(manner::Life::new(
+                entry.id,
+                cfg.behavior.jump_rate,
+                cfg.behavior.emotes,
+                0,
+                &mut rng,
+            ));
+        }
         Bot {
             log: Logger::new(slot.clone()),
             slot,
@@ -226,7 +240,7 @@ impl Bot {
             motion,
             combat: Combat::new(),
             brain,
-            rng: fastrand::Rng::new(),
+            rng,
             out: Vec::with_capacity(8),
             cmd_rx,
             clock: Instant::now(),
@@ -602,7 +616,7 @@ impl Bot {
         }
     }
 
-    fn tick_period(&self) -> Duration {
+    fn tick_period(&mut self) -> Duration {
         let b = &self.shared.cfg.bots;
         let active = self.motion.busy()
             || self.combat.busy()
@@ -611,7 +625,14 @@ impl Bot {
             || self.state.travel.busy()
             || self.state.vehicle.fast_tick()
             || !self.state.me.spawned;
-        Duration::from_millis(if active { b.tick_ms } else { b.idle_tick_ms })
+        let ms = if active { b.tick_ms } else { b.idle_tick_ms };
+        // life-like: a walk in front of a player has an uneven pace, and a jump in progress
+        // wakes the bot for its next packet
+        let mut ms = (ms as f32 * self.motion.period_scale(&mut self.rng)) as u64;
+        if let Some(wake) = self.motion.wake_in(self.now_ms()) {
+            ms = ms.min(wake.max(MIN_WAKE_MS));
+        }
+        Duration::from_millis(ms)
     }
 
     fn on_packet(&mut self, p: &Packet) {
@@ -621,6 +642,20 @@ impl Bot {
         w.packet(now, Dir::S2C, p.level, p.opcode);
         w.conn.on_rx(now);
         w.on_raw(p.level, p.opcode, &p.body, self.state.me.obj, now);
+        if tracing::enabled!(target: "pb_move", tracing::Level::TRACE) {
+            manner::trace_packet(p.level, p.opcode, &p.body);
+        }
+        if aa_proto::sc_emote::is_expressed(p.level, p.opcode) {
+            if let Ok(e) = aa_proto::sc_emote::read_expressed(&p.body) {
+                manner::on_expressed(
+                    &mut self.motion,
+                    &self.state,
+                    &self.shared.hub,
+                    &e,
+                    &mut self.rng,
+                );
+            }
+        }
         if p.level == LEVEL_PROXY && p.opcode == pp::PongPacket {
             self.on_pong(p, now);
         }
@@ -818,6 +853,21 @@ impl Bot {
             self.out.push(cs::resurrect(false));
             self.next_rez_ms = now_ms + RESURRECT_RETRY_MS;
         }
+        let moment = manner::Moment {
+            audience: self.real_near,
+            busy: self.life_busy(),
+            online_ms: self
+                .online_since
+                .map_or(0, |t| t.elapsed().as_millis() as u64),
+        };
+        manner::tick(
+            &mut self.motion,
+            &self.state,
+            &self.shared.hub,
+            moment,
+            &mut self.out,
+            &mut self.rng,
+        );
         let queued = self.out.len();
         self.motion.sync_place(&self.state.place);
         if !self.paused || self.state.me.dead {
@@ -858,6 +908,23 @@ impl Bot {
         self.clear_target_after_player_fight();
         self.drain_findings();
         None
+    }
+
+    /// Whether the bot must not show off now: it fights, loots, trades, travels by portal, sails,
+    /// is in an instance, is loading, paused or dead.
+    fn life_busy(&self) -> bool {
+        let st = &self.state;
+        self.paused
+            || st.me.dead
+            || !st.me.spawned
+            || self.combat.busy()
+            || !st.threats.is_empty()
+            || st.trade.active()
+            || st.travel.busy()
+            || st.vehicle.seat().is_some()
+            || st.vehicle.boat().is_some()
+            || st.place.in_instance()
+            || st.place.loading()
     }
 
     /// Answers what the state noticed: teleports, instance loads, death, resurrection, kicks.

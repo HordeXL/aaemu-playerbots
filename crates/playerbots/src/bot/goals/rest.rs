@@ -7,6 +7,7 @@
 //! ([`Rest::resumes_run`], used by [`super::Goal::tick`]); the new run walks the pack to the buyer.
 
 use crate::bot::ctx::Ctx;
+use crate::bot::manner;
 
 use super::trade_run::carried_pack_of;
 use super::{jitter_ms, GoalStatus};
@@ -32,6 +33,7 @@ impl Rest {
     /// Called once when the brain picks the goal.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
         ctx.motion.stop();
+        manner::rest_begin(ctx);
         self.min_end_ms = ctx.now_ms + MIN_MS;
         self.end_ms = ctx.now_ms + jitter_ms(ctx.rng, MAX_MS.0, MAX_MS.1);
         self.after_run = ctx.state.econ.take_interrupted_run(ctx.now_ms);
@@ -51,10 +53,14 @@ impl Rest {
         if now >= self.end_ms || (now >= self.min_end_ms && recovered) {
             GoalStatus::Done
         } else {
+            // (a bot that rests in front of a player looks around and sits down)
+            manner::rest_tick(ctx);
             GoalStatus::Running
         }
     }
 
     /// Called when the goal ends.
-    pub fn stop(&mut self, _ctx: &mut Ctx<'_>) {}
+    pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
+        manner::rest_end(ctx);
+    }
 }

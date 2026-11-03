@@ -336,6 +336,16 @@ impl Route {
         }
     }
 
+    /// Metres left on the straight piece the bot walks, before the next corner (or the end of
+    /// the route); 0 in the rounding of a corner. A bot that wants a straight run to jump on
+    /// asks for it.
+    pub fn straight_left(&self) -> f32 {
+        match self.at {
+            At::Seg { s, u } => (self.range(s).1 - u).max(0.0),
+            At::Corner { .. } | At::End => 0.0,
+        }
+    }
+
     /// The current piece touches a waypoint (indoors, stairs, a bridge).
     pub fn indoor_here(&self) -> bool {
         match self.at {

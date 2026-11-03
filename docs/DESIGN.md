@@ -192,7 +192,7 @@ facts, the provenance ledger and the chat forwarding.
 | `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` | `aa-world` `items.rs` | shared (done) |
 | `Ledger` (`MarketState::clean_count`, `sellable_surplus`): the quantity of each item the bot may sell, fed by `BotState::apply` from the item task reasons | `bot/market/ledger.rs`, `bot/state.rs` | shared (done) |
 | `MarketState::on_chat(kind, sender, text, now_ms)`: shouts, trade chat, group-finding chat and whispers, forwarded by the social duty before it files the inbox (`market::forward_chat`; which kinds: `ads::hears`) | `bot/market/`, `bot/goals/social.rs` | shared (done), kinds are the market feature's |
-| `[behavior] lifelike`, `jump_rate`, `emotes` | `config.rs` | life-like movement |
+| `[behavior] lifelike`, `jump_rate`, `emotes` | `config.rs` | life-like movement (done, see below) |
 | `[market]` | `config.rs`, `Config::may_sell_to_players` | shared (done) |
 
 `MarketState` is one pointer per bot (`Option<Box<Inner>>`, allocated by the first gain the ledger
@@ -241,6 +241,68 @@ Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight li
   once a minute.
 - **Web.** `Bot::publish` writes the rest of the route (at most 32 points, Ramer-Douglas-Peucker
   decimated) into the hub slot; the map draws it for the selected bot.
+
+## Life-like movement (`bot/manner.rs`)
+
+A bot that only walks and stands still looks like a bot. With `[behavior] lifelike` (default on) the
+movement controller adds what a person does, **for the eyes of a real player only**: nothing happens
+unless a character that is not one of our bots is within the watch radius (the same signal that
+raises the movement update rate), and nothing while the bot fights, loots, casts, trades, sails, is in
+an instance, dead or loading (`Bot::life_busy`). `jump_rate` scales the jumps (0 = none), `emotes`
+switches the emotes.
+
+- **Where it plugs in.** `Life` (traits, jump state, schedule, mannerisms, emote state; one
+  `Box` per bot, `Option<Box<Life>>` in `Motion`, so the bot gained 8 bytes) is owned by `Motion`.
+  `Motion`'s public API did not change; its tick calls the parts and `Bot::on_tick` calls
+  `manner::tick` for the emotes and to tell the controller the moment (`Gate`: audience, busy, town).
+  The parts are plain values without clock or socket (`Traits`, `Arc`/`Jump`, `JumpSched`, `Fidget`,
+  `Dawdle`, `Emotes`, `Budget`), so the rates and limits are unit-tested over simulated hours.
+- **Wire fixes** (`aa_proto::cs::move_unit`): velocity shorts are `m/s * 32767/60` (the client's
+  scale; they were `m/s * 1000`, which a remote client reads as 1.8 times the speed), a
+  walk has actor flag `0x01` and half the stick (`delta` 63), a stop has actor `0x04` and no
+  velocity, a swimming bot sends stance 2.
+- **Jumps.** The client's physics: 1.3 m, gravity 25 m/s^2, so 8.06 m/s up, apex after 0.32 s, 0.65 s
+  in the air (a hop over a step: 0.55 m). Packets go at take-off (header `0x04`, `0x06` with a stick
+  held, actor `0x10`, `vel.z` up), at the apex and on the way down (header `0x00`/`0x02`, actor
+  `0x00`, height in `pos.z`), at touchdown (header `0x04`, actor `0x14`, no vertical speed) and 90 ms
+  later as an ordinary ground update. The bot's real position stays on the ground; the height is only
+  in the packets. A running bot keeps its horizontal speed. A jump wakes the bot loop for its next
+  packet (`Motion::wake_in`, at least 15 ms apart); the regular updates wait while it lasts.
+  Triggers: a straight stretch of 6 m or more while running (one per 30 to 60 s times the bot's
+  multiplier, 10 s cooldown, one in ten is two in a row), a step of 0.3 to 1.2 m ahead (a hop, 15 s
+  cooldown), after the stuck detector's side-step, in place after 90 to 180 s of standing, and to
+  cheer a level or a finished quest. A bot's playfulness comes from its id: 12 % never jump, the rest
+  jump 0.35 to 1.65 times as often as the rate. A pin, a stop, a teleport or a new height ends a jump
+  (a bot never jumps with a range-checked packet queued, in combat, swimming, sitting, or while a
+  teleport waits).
+- **Mannerisms.** After a trip a standing bot turns in place one to three times (30 to 120 degrees,
+  2 to 6 s apart) and sometimes shuffles 0.5 to 1.5 m at walk pace; at some corners of a long route it
+  stops for 0.3 to 1 s; in a town (the peace aura or a crowd of eight) a quarter of the short trips
+  are walked; every bot runs within 3 % of the configured speed; in front of a player the tick period
+  varies by 20 % either way (the mean, so the packet rate, does not change).
+- **Emotes** (`CSExpressEmotion`, `SCEmotionExpressed`). Greeting (a player within 6 m, 60 % of the
+  time, once per player per 10 min), an answer to an emote of a real player (90 % when played at the
+  bot, 30 % nearby, at most one per player per 30 s), ambient emotes in towns (at most one per 45 s
+  per bot), a celebration with a jump for a level or a quest, and the sit emote (id 48) 8 to 25 s into
+  a rest; the stand-up is a stopped update. Each bot waits 8 s between emotes, and a process-wide
+  allowance (5 ambient and 15 social a minute) keeps the server log quiet, because the server logs
+  every emote at WARN.
+- **Ground truth.** What the real 1.2 client sends was captured with a bot that logs the relayed
+  packets (`RUST_LOG=pb_move=trace`): a standing client sends header `0x00`, actor `0x04` about every
+  3 s; walking, about seven updates a second with header `0x02`, actor `0x04` and a vertical speed
+  on slopes; a stop is two updates 47 ms apart (`0x04`, the second without velocity; bots send one);
+  a fall is header `0x00`, actor `0x00` and ends in `0x04`, actor `0x14`. The **take-off flags of a
+  jump and the emote packets are not confirmed by a capture** (the client driver could not press the
+  jump key or run an emote); they follow the server's `MoveTypeFlags` (`Moving | Stopping` is a
+  jump), the touchdown and the client code. `RUST_LOG=pb_life=debug` logs every jump and emote a bot
+  makes.
+- **Live check** (20 bots for 16 minutes near the Nuian start with real characters in range, against
+  the same bots with `lifelike = false`). Jumps: 258 started, 48 per bot-hour (31 on the run, 17
+  hops), 18 of the 20 bots jumped. Emotes: 36, about 2.3 a minute, one server WARN line each (19
+  celebrations, 11 ambient, 3 greetings, 3 sits). Outgoing packets per bot stayed within the
+  run-to-run noise (1.6 to 1.9 a second with it on, 1.7 off, in the same place); the server log had no
+  speed-audit or landing lines. The relayed packets (`pb_move`) showed every jump as the sequence
+  above, the take-off and the touchdown always in pairs.
 
 ## Portal travel (`bot/travel/`)
 
