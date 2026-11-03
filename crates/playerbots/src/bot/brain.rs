@@ -359,6 +359,13 @@ impl Brain {
         if let Some((kind, order)) = self.queued.take() {
             self.start_goal(ctx, kind, order);
         }
+        // Market duty: negotiates in the trade chat whatever the bot does; a sale agreed there
+        // starts the market goal (the meeting and the trade).
+        if super::goals::market::duty(ctx, self.goal.as_ref().map(Goal::kind))
+            && !self.is_disabled(GoalKind::Market)
+        {
+            self.start_goal(ctx, GoalKind::Market, None);
+        }
         // Trade requests no goal asked for are answered here; the house marker follows `houses`.
         if super::goals::trade::unsolicited(
             ctx,

@@ -706,6 +706,11 @@ fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
     let t = unix_ms();
     ctx.log
         .with_slot(|g| route_lines(lines, &mut g.social, t, heard));
+    // a whisper that belongs to a negotiation of the market is the market's to answer
+    if ctx.cfg.market.enabled && ctx.cfg.market.chat_ads {
+        let market = &ctx.state.market;
+        heard.retain(|l| !(l.kind == -3 && market.claims_whisper(&l.name)));
+    }
 }
 
 /// The routing itself: chat lines to `heard` and the panel, system lines to the ring, the rest

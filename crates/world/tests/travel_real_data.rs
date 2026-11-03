@@ -587,3 +587,59 @@ fn travel_memory_report() {
     assert_eq!(total, t.bytes());
     assert!(total < 512 * 1024, "travel data must stay small: {total}");
 }
+
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn mirage_isle_portals_arrival_and_exit() {
+    let Some(w) = load() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let m = w.mirage().expect("the Mirage Isle portal is in the data");
+    println!(
+        "mirage: zone {} key {} world {} portals {} arrival {:?} exit {:?} meeting {:?}",
+        m.zone_id,
+        m.zone_key,
+        m.world,
+        m.portal.spawns.len(),
+        m.arrival,
+        m.exit,
+        m.meeting_point
+    );
+    assert_eq!((m.zone_id, m.zone_key), (183, 260));
+    assert_eq!((m.portal.doodad, m.portal.skill), (4894, 17829));
+    assert_eq!(&*m.world, "arche_mall_world");
+    // one portal beside each auctioneer of the towns
+    assert!(m.portal.spawns.len() > 50, "{}", m.portal.spawns.len());
+    // Austera: the portal is within a few metres of the auctioneer
+    let near = m
+        .nearest_portal(Vec3::new(16700.6, 9036.6, 0.0))
+        .expect("a portal near Austera");
+    assert!(
+        ((near.x - 16700.6).powi(2) + (near.y - 9036.6).powi(2)).sqrt() < 40.0,
+        "{near:?}"
+    );
+    assert!(near_xy(m.arrival, 3680.5, 4572.2, 10.0), "{:?}", m.arrival);
+    let (exit, pos, skill) = m.exit.expect("an exit doodad");
+    assert_eq!((exit, skill), (4895, 17838));
+    assert!(near_xy(pos, 3683.9, 4545.5, 5.0), "{pos:?}");
+    assert!(
+        near_xy(m.meeting_point, 3675.0, 4560.1, 5.0),
+        "{:?}",
+        m.meeting_point
+    );
+    // bots keep both doors in view (neither offers anything a bot could use otherwise)
+    assert!(w.is_mirage_door(4894) && w.is_mirage_door(4895) && !w.is_mirage_door(532));
+    // the island is no dungeon: the dungeon goal must never pick it
+    assert!(w.dungeons().iter().all(|d| d.zone_group != 49));
+    assert!(w.dungeon_by_entrance_doodad(4894).is_none());
+    // the islands's world is known by its zone key
+    assert_eq!(
+        w.instance_world_by_zone_key(260).map(|i| &*i.name),
+        Some("arche_mall_world")
+    );
+}
+
+fn near_xy(p: Vec3, x: f32, y: f32, tol: f32) -> bool {
+    (p.x - x).abs() <= tol && (p.y - y).abs() <= tol
+}

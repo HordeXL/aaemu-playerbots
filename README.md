@@ -29,6 +29,7 @@ whatever it is doing. Most features have a switch in `[behavior]`, `[social]`, `
 | **Grinding** | Kills level-appropriate monsters near the bot and loots them. |
 | **Duels** | A coordinator pairs two idle bots; they meet at a flag, fight with their PvP rotation and rest afterwards. |
 | **Player trade** | Two bots meet, open the trade window, put up goods and money, lock and confirm. Trades with real players are off unless `trade_with_players` is set (and never while `gm_bootstrap` is on). |
+| **Trade-chat market** | Bots with honestly gathered surplus advertise in trade chat, answer buyers (price, one counter, the place), meet them in town or on Mirage Isle and trade only a window that holds exactly what was agreed (`[market]`, see `docs/OPERATING.md`). |
 | **Trade runs** | Crafts a trade pack at a specialty workbench, carries it to the NPC that buys it, sells it and collects the payment mail. |
 | **Auction house** | Walks to the nearest auctioneer now and then, lists whole stacks of honestly gathered goods at a price under the going rate, buys a bargain when the bot has gold of its own, and collects the sale, refund and won-lot mails. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and goes home to rest there. |

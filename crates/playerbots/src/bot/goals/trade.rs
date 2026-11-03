@@ -18,7 +18,19 @@
 //! * A request nobody asked for (a real player, or a bot that was steered by the operator) is
 //!   answered by the brain through [`unsolicited`]: accepted when the bot is idle and its trade
 //!   weight is above 0, declined otherwise.
+//!
+//! # Safety
+//!
+//! The server lets both sides put up anything and clears the locks whenever an offer changes, so
+//! the window part never locks on "the partner put something up". It holds a [`Deal`] (what the
+//! bot gives, what it demands) and checks the window against it ([`deal::verify`]) before every
+//! lock and every confirmation, again after every unlock, and cancels when the window is not the
+//! deal or when the partner changed the offer after the bot locked. A random trade between our own
+//! bots has a generous deal (any offer that is not empty), a trade with a player that nobody agreed
+//! to in chat must be worth a share of what the bot gives, and a sale agreed in chat
+//! (`goals::market`) demands exactly the agreed goods and at least the agreed copper.
 
+mod deal;
 mod log;
 
 use std::fmt::Write as _;
@@ -34,6 +46,7 @@ use crate::bot::state::{dist2d, BotState, Item, StateError, Unit, UnitKind, SLOT
 
 use super::{FailReason, GoalStatus};
 
+pub use deal::{verify, Deal, Identity, Refusal, Terms, Verdict};
 pub use log::{Offer, Outcome, Put, TradeLog, Window};
 
 /// Unbound, cheap, stackable materials a bot may mint and trade (`bind_id` 1 in compact.sqlite3,
@@ -64,6 +77,17 @@ const AWAIT_REQUEST_MS: u64 = 90_000;
 const ACCEPT_WAIT_MS: u64 = 15_000;
 /// A trade window lives at most this long.
 const TRADE_MAX_MS: u64 = 60_000;
+/// A window of a sale agreed in chat lives this long (a player is slower than a bot).
+const DEAL_MAX_MS: u64 = 100_000;
+/// A partner of a sale agreed in chat has this long to put up everything that was agreed.
+const DEAL_OFFER_WAIT_MS: u64 = 40_000;
+/// A partner whose offer is not the deal has this long to put it right before the bot leaves.
+const REFUSE_GRACE_MS: u64 = 6_000;
+/// The bot locks again after the server undid its lock at most this many times.
+const MAX_RELOCKS: u8 = 3;
+/// A trade nobody agreed to in chat with a character that is not ours must bring in this many
+/// percent of the value (vendor refund prices) of what the bot gives.
+const FAIR_PERCENT: i64 = 60;
 /// The offers must be quiet this long before the bot locks.
 const QUIET_MS: u64 = 700;
 /// The bot waits this long for the partner's offer before it walks away from the trade.
@@ -191,6 +215,8 @@ pub enum Note {
     },
     /// The bot walked away.
     GaveUp(&'static str),
+    /// The bot cancelled because the window was not the deal.
+    Refused(Refusal),
     /// Item `template` is bound.
     Bound(u32),
 }
@@ -238,6 +264,12 @@ pub struct Io<'a> {
     pub bound_err: bool,
     /// Items other than [`GOODS`] may be offered (the bot cannot mint goods).
     pub allow_other: bool,
+    /// Whether the unit of the window is the character the bot agreed to trade with.
+    pub identity: Identity,
+    /// The partner is one of our bots (or was paired by the coordinator, which only pairs bots).
+    pub partner_is_bot: bool,
+    /// Copper one unit of an item template is worth (the vendor refund); 0 when unknown.
+    pub worth: &'a dyn Fn(u32) -> i64,
     /// Packets to send.
     pub out: &'a mut Vec<Out>,
     /// Randomness.
@@ -272,10 +304,18 @@ pub struct Trade {
     mint_tries: u8,
     /// Bot clock of the put-ups.
     offered_ms: u64,
-    /// Bot clock of the last mint request (Prepare) or the last re-aim at the partner (Meet).
+    /// Bot clock of the last mint request (Prepare), the last re-aim at the partner (Meet) or the
+    /// moment the partner's offer stopped being the deal (Window; 0 = it is, or not yet known).
     aux_ms: u64,
     /// Earliest bot clock for the next lock or OK.
     resend_ms: u64,
+    /// What the bot gives and demands; made when the window opens unless the goal was started
+    /// with one (a sale agreed in chat).
+    deal: Option<Box<Deal>>,
+    /// The server confirmed a lock of ours in this window.
+    locked_once: bool,
+    /// Locks sent after the first one.
+    relocks: u8,
 }
 
 impl Trade {
@@ -306,7 +346,31 @@ impl Trade {
             offered_ms: 0,
             aux_ms: 0,
             resend_ms: 0,
+            deal: None,
+            locked_once: false,
+            relocks: 0,
         }
+    }
+
+    /// A goal for a sale agreed in chat: the partner is at hand (`order` names the character), the
+    /// bot asks (`role` initiator) or waits for the request (responder), and trades `deal`.
+    pub fn for_deal(order: PairOrder, deal: Deal) -> Trade {
+        let role = order.role;
+        let mut t = Trade::new(Some(order));
+        t.role = role;
+        t.plan = deal.give;
+        t.deal = Some(Box::new(deal));
+        t.phase = if role == PairRole::Initiator {
+            Phase::Invite
+        } else {
+            Phase::Await
+        };
+        t
+    }
+
+    /// The deal this goal trades, once it has one.
+    pub fn deal(&self) -> Option<&Deal> {
+        self.deal.as_deref()
     }
 
     /// The coordinator's pairing, if any.
@@ -327,6 +391,11 @@ impl Trade {
             set_partner(ctx, Some(bot));
         }
         let asked = ctx.state.trade.incoming.is_some();
+        if let (Some(o), Some(_)) = (&self.order, &self.deal) {
+            ctx.log
+                .say(format!("trade: agreed sale with {}", o.partner_name));
+            return;
+        }
         ctx.log.say(match (&self.order, self.role) {
             (Some(o), PairRole::Initiator) => format!("trade: going to ask {}", o.partner_name),
             (Some(o), PairRole::Responder) => format!("trade: going to meet {}", o.partner_name),
@@ -460,8 +529,9 @@ impl Trade {
         };
         match st.units.get(&obj) {
             Some(u) => is_partner(u, o),
-            // not in view yet: a bot-to-bot trade, trust the object id the server sent
-            None => self.peer == obj || self.peer == 0,
+            // not in view yet: a bot-to-bot trade, trust the object id the server sent (a sale
+            // agreed in chat never trusts a unit it cannot see)
+            None => self.peer == obj || (self.peer == 0 && self.deal.is_none()),
         }
     }
 
@@ -641,6 +711,13 @@ impl Trade {
             matches!(e, StateError::Msg(ERR_SOUL_BOUND)) && now.saturating_sub(*t) < 5_000
         });
         let allow_other = !ctx.gm_allowed();
+        let (identity, partner_is_bot) = self.who_is_in_the_window(ctx);
+        let world = ctx.world;
+        let worth = |template: u32| {
+            world
+                .item_facts(template)
+                .map_or(0, |f| i64::from(f.refund))
+        };
         let st = &mut *ctx.state;
         let mut io = Io {
             now_ms: now,
@@ -651,6 +728,9 @@ impl Trade {
             incoming_ok,
             bound_err,
             allow_other,
+            identity,
+            partner_is_bot,
+            worth: &worth,
             out: &mut *ctx.out,
             rng: &mut *ctx.rng,
         };
@@ -662,6 +742,32 @@ impl Trade {
             self.log_note(ctx, note);
         }
         step.status
+    }
+
+    /// Who stands in the open window: whether it is the character this goal agreed to trade with
+    /// (by the unit the server named in `SCTradeStarted`), and whether that is one of our bots.
+    /// Without a pairing or an agreement the partner is not known to be anybody in particular.
+    fn who_is_in_the_window(&self, ctx: &Ctx<'_>) -> (Identity, bool) {
+        let Some(w) = ctx.state.trade.window.as_deref() else {
+            return (Identity::Unknown, false);
+        };
+        let unit = ctx
+            .state
+            .units
+            .get(&w.peer_obj)
+            .filter(|u| u.kind == UnitKind::Character);
+        let identity = match (&self.order, unit) {
+            (Some(o), Some(u)) if is_partner(u, o) => Identity::Match,
+            (Some(_), Some(_)) => Identity::Mismatch,
+            _ => Identity::Unknown,
+        };
+        // (the coordinator only pairs our own bots; a sale agreed in chat is with whoever
+        // answered, so there the unit decides)
+        let bot = match (&self.deal, &self.order) {
+            (None, Some(_)) => true,
+            _ => unit.is_some_and(|u| ctx.hub.is_bot_char(u.id)),
+        };
+        (identity, bot)
     }
 
     fn log_note(&mut self, ctx: &mut Ctx<'_>, note: Note) {
@@ -686,6 +792,10 @@ impl Trade {
                 ));
             }
             Note::GaveUp(why) => ctx.log.say(format!("trade with {who}: {why}")),
+            Note::Refused(why) => ctx.log.say(format!(
+                "trade with {who} refused: {} (scam guard)",
+                why.why()
+            )),
             Note::Bound(template) => {
                 learn_bound(template);
                 ctx.log.say(format!(
@@ -800,16 +910,37 @@ impl Trade {
         self.money_sent = false;
         self.resend_ms = 0;
         self.lock_sent = false;
-        match choose_offer(io.bag, io.money, io.allow_other, io.rng) {
-            Some(plan) => self.plan = plan,
-            None => {
-                self.plan = Plan::default();
+        self.locked_once = false;
+        self.relocks = 0;
+        self.aux_ms = 0;
+        if let Some(deal) = self.deal.as_deref() {
+            // a sale agreed in chat: the goods and the copper must still be there
+            self.plan = deal.give;
+            if !can_give(io.bag, io.money, &deal.give) {
                 io.out.push(cs::cancel_trade(0));
                 return Step::failed(
-                    FailReason::Other("nothing to offer"),
-                    Some(Note::GaveUp("nothing to offer")),
+                    FailReason::Other("the goods are gone"),
+                    Some(Note::GaveUp("the agreed goods are not in the bag any more")),
                 );
             }
+        } else {
+            match choose_offer(io.bag, io.money, io.allow_other, io.rng) {
+                Some(plan) => self.plan = plan,
+                None => {
+                    self.plan = Plan::default();
+                    io.out.push(cs::cancel_trade(0));
+                    return Step::failed(
+                        FailReason::Other("nothing to offer"),
+                        Some(Note::GaveUp("nothing to offer")),
+                    );
+                }
+            }
+            let deal = if io.partner_is_bot {
+                Deal::generous(self.plan)
+            } else {
+                Deal::fair(self.plan, FAIR_PERCENT, io.worth)
+            };
+            self.deal = Some(Box::new(deal));
         }
         self.offered_ms = now;
         Step {
@@ -821,6 +952,12 @@ impl Trade {
     fn cancel(&mut self, io: &mut Io<'_>, why: &'static str, reason: FailReason) -> Step {
         io.out.push(cs::cancel_trade(0));
         Step::failed(reason, Some(Note::GaveUp(why)))
+    }
+
+    /// Ends the trade because the window is not the deal.
+    fn refuse(&mut self, io: &mut Io<'_>, why: Refusal) -> Step {
+        io.out.push(cs::cancel_trade(0));
+        Step::failed(FailReason::Other("trade refused"), Some(Note::Refused(why)))
     }
 
     fn window(&mut self, io: &mut Io<'_>) -> Step {
@@ -835,14 +972,22 @@ impl Trade {
             }
             return Step::running();
         };
-        if now.saturating_sub(w.opened_ms) > TRADE_MAX_MS {
+        let strict = self.deal.as_deref().is_some_and(|d| d.strict);
+        let max_ms = if strict { DEAL_MAX_MS } else { TRADE_MAX_MS };
+        if now.saturating_sub(w.opened_ms) > max_ms {
             return self.cancel(io, "took too long", FailReason::Timeout);
         }
         let (my_lock, other_lock, my_ok) = (w.my_lock, w.other_lock, w.my_ok);
         let changed = w.changed_ms;
-        let other_ready = !w.other.is_empty();
-        let item_ready = self.plan.amount <= 0 || !w.mine.items.is_empty();
-        let money_ready = self.plan.money <= 0 || w.mine.money == self.plan.money;
+        let (own, verdict) = match self.deal.as_deref() {
+            Some(d) => (deal::own_offer(d, w), verify(d, w, io.identity, io.worth)),
+            None => (deal::Own::Pending, Verdict::Wait),
+        };
+        // the wrong person, or an offer of ours that is not the deal, ends it before anything is
+        // put up
+        if let Verdict::Refuse(r @ (Refusal::WrongPartner | Refusal::MineChanged)) = verdict {
+            return self.refuse(io, r);
+        }
 
         if !self.item_sent && self.plan.amount > 0 {
             io.out.push(cs::putup_trade_item(
@@ -858,34 +1003,95 @@ impl Trade {
             self.money_sent = true;
             self.offered_ms = now;
         }
-        let mine_ready = item_ready && money_ready;
-        if !mine_ready {
+        if own != deal::Own::Standing {
             if now.saturating_sub(self.offered_ms) > OFFER_WAIT_MS {
                 return self.cancel(io, "the put-up was not accepted", FailReason::Timeout);
             }
             return Step::running();
         }
-        let quiet = now.saturating_sub(changed) >= QUIET_MS;
-        if my_lock && self.lock_sent {
-            // the lock came through: the OK may follow at once
-            self.lock_sent = false;
-            self.resend_ms = 0;
-        }
-        if !my_lock && quiet && now >= self.resend_ms {
-            if other_ready {
-                io.out.push(cs::trade_lock(true));
-                self.lock_sent = true;
-                self.resend_ms = now + RESEND_MS;
-            } else if now.saturating_sub(self.offered_ms) >= OFFER_WAIT_MS {
-                return self.cancel(io, "the partner offered nothing", FailReason::NoTarget);
+        if my_lock {
+            // the lock came through (the OK may follow at once)
+            self.locked_once = true;
+            if self.lock_sent {
+                self.lock_sent = false;
+                self.resend_ms = 0;
             }
         }
-        if my_lock && other_lock && !my_ok && now >= self.resend_ms {
-            io.out.push(cs::trade_ok());
-            self.resend_ms = now + RESEND_MS;
+        let quiet = now.saturating_sub(changed) >= QUIET_MS;
+        match verdict {
+            Verdict::Refuse(why) => {
+                // after our lock a partner that changes the offer to something else ends it at
+                // once; before it gets a moment to put it right
+                if self.locked_once || self.lock_sent {
+                    return self.refuse(io, why);
+                }
+                if self.aux_ms == 0 {
+                    self.aux_ms = now.max(1);
+                } else if now.saturating_sub(self.aux_ms) > REFUSE_GRACE_MS {
+                    return self.refuse(io, why);
+                }
+                Step::running()
+            }
+            Verdict::Wait => {
+                self.aux_ms = 0;
+                if self.locked_once && !my_lock && !self.lock_sent {
+                    // the server undid our lock: the partner changed the offer, and it is not
+                    // the deal any more
+                    return self.cancel(
+                        io,
+                        "the partner changed the offer after the lock",
+                        FailReason::Other("offer changed after the lock"),
+                    );
+                }
+                let patience = if strict {
+                    DEAL_OFFER_WAIT_MS
+                } else {
+                    OFFER_WAIT_MS
+                };
+                if now.saturating_sub(self.offered_ms.max(changed)) >= patience {
+                    let why = if strict {
+                        "the partner did not put up what was agreed"
+                    } else {
+                        "the partner offered nothing"
+                    };
+                    return self.cancel(io, why, FailReason::NoTarget);
+                }
+                Step::running()
+            }
+            Verdict::Ok => {
+                self.aux_ms = 0;
+                if !my_lock && quiet && now >= self.resend_ms {
+                    if !self.lock_sent && self.locked_once {
+                        if self.relocks >= MAX_RELOCKS {
+                            return self.cancel(
+                                io,
+                                "the partner keeps changing the offer",
+                                FailReason::Other("offer kept changing"),
+                            );
+                        }
+                        self.relocks += 1;
+                    }
+                    io.out.push(cs::trade_lock(true));
+                    self.lock_sent = true;
+                    self.resend_ms = now + RESEND_MS;
+                }
+                if my_lock && other_lock && !my_ok && quiet && now >= self.resend_ms {
+                    io.out.push(cs::trade_ok());
+                    self.resend_ms = now + RESEND_MS;
+                }
+                Step::running()
+            }
         }
-        Step::running()
     }
+}
+
+/// Whether the bag and the purse still hold what `give` names.
+fn can_give(bag: &FxHashMap<u16, Item>, money: i64, give: &Plan) -> bool {
+    let item = give.amount <= 0
+        || bag
+            .get(&u16::from(give.slot))
+            .is_some_and(|i| i.template == give.template && i.count >= give.amount);
+    item && i64::from(give.money.max(0)) <= money
 }
 
 /// Whether the unit is the character `order` names.
@@ -1002,7 +1208,8 @@ pub fn unsolicited(
     weight: f32,
     disabled: bool,
 ) -> bool {
-    if running == Some(GoalKind::Trade) {
+    // (the market goal trades through its own trade goal and declines strangers itself)
+    if matches!(running, Some(GoalKind::Trade | GoalKind::Market)) {
         return false;
     }
     if ctx.state.trade.window.is_some() {
@@ -1070,6 +1277,8 @@ mod tests {
         incoming_ok: bool,
         bound_err: bool,
         allow_other: bool,
+        identity: Identity,
+        partner_is_bot: bool,
     }
 
     impl Rig {
@@ -1084,6 +1293,8 @@ mod tests {
                 incoming_ok: true,
                 bound_err: false,
                 allow_other: true,
+                identity: Identity::Match,
+                partner_is_bot: true,
             }
         }
 
@@ -1097,6 +1308,9 @@ mod tests {
                 incoming_ok: self.incoming_ok,
                 bound_err: self.bound_err,
                 allow_other: self.allow_other,
+                identity: self.identity,
+                partner_is_bot: self.partner_is_bot,
+                worth: &|template| if template == 3411 { 20 } else { 5 },
                 out: &mut self.out,
                 rng: &mut self.rng,
             };
@@ -1700,6 +1914,377 @@ mod tests {
         st.me.money = 1000;
         st.apply(&ev);
         assert_eq!(st.me.money, 750);
+    }
+
+    // ---- safe trades: a sale agreed in chat ----------------------------------------------
+
+    /// 10 copper ore from bag slot 4 for 3000 copper, the bot waits for the buyer.
+    fn sale(role: PairRole) -> Trade {
+        let give = Plan {
+            slot: 4,
+            template: 3411,
+            amount: 10,
+            money: 0,
+        };
+        Trade::for_deal(order(role), Deal::agreed(give, &[], 3000))
+    }
+
+    /// The window opens and the bot's put-up is confirmed; returns the clock after it.
+    fn sale_window(r: &mut Rig, t: &mut Trade) -> u64 {
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        let s = r.step(t, 1100);
+        assert_eq!(s.note, Some(Note::Opened));
+        r.step(t, 1200);
+        assert_eq!(r.sent(), [op(|| cs::putup_trade_item(SLOT_BAG, 4, 10))]);
+        r.ev(
+            ActivityEvent::TradeItemPutup {
+                slot_type: 2,
+                slot: 4,
+                amount: 10,
+            },
+            1300,
+        );
+        1300
+    }
+
+    fn locks(sent: &[Out]) -> usize {
+        sent.iter().filter(|o| **o == cs::trade_lock(true)).count()
+    }
+
+    fn other_item(template: u32, count: i32) -> ActivityEvent {
+        ActivityEvent::OtherTradeItemPutup {
+            item: ItemBrief {
+                template_id: template,
+                count,
+                ..ItemBrief::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_sale_is_locked_and_confirmed_only_for_the_agreed_money() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        assert_eq!(t.phase, Phase::Await);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 3000 }, 2000);
+        r.step(&mut t, 2400);
+        assert!(r.sent().is_empty(), "locked before the offers were quiet");
+        r.step(&mut t, 2800);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
+        r.ev(
+            ActivityEvent::TradeLockUpdate {
+                mine: true,
+                other: true,
+            },
+            2900,
+        );
+        r.step(&mut t, 3000);
+        assert_eq!(r.sent(), [op(cs::trade_ok)]);
+        r.ev(
+            ActivityEvent::TradeMade {
+                action: 0,
+                tasks: 2,
+                items: Default::default(),
+            },
+            3200,
+        );
+        assert_eq!(r.step(&mut t, 3300).status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn one_copper_for_ten_ore_is_never_locked() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 1 }, 2000);
+        let mut sent = Vec::new();
+        for now in (2500..40_000).step_by(500) {
+            let s = r.step(&mut t, now);
+            sent.extend(r.sent());
+            assert_eq!(s.status, GoalStatus::Running, "at {now}");
+        }
+        assert_eq!(locks(&sent), 0, "{sent:?}");
+        // the partner never topped it up: the bot walks away
+        let s = r.step(&mut t, 2000 + DEAL_OFFER_WAIT_MS + 1000);
+        assert_eq!(s.status, GoalStatus::Failed(FailReason::NoTarget));
+        assert_eq!(r.sent(), [op(|| cs::cancel_trade(0))]);
+        assert_eq!(
+            s.note,
+            Some(Note::GaveUp("the partner did not put up what was agreed"))
+        );
+    }
+
+    #[test]
+    fn a_partner_that_tops_the_money_up_in_time_gets_the_sale() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 1000 }, 2000);
+        r.step(&mut t, 5000);
+        assert!(r.sent().is_empty());
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 3000 }, 9000);
+        r.step(&mut t, 9300);
+        r.step(&mut t, 9900);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
+    }
+
+    #[test]
+    fn a_swapped_item_is_refused_and_never_locked() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        // junk instead of the money
+        r.ev(other_item(9999, 50), 2000);
+        let mut sent = Vec::new();
+        for now in (2500..12_000).step_by(500) {
+            let s = r.step(&mut t, now);
+            sent.extend(r.sent());
+            if !matches!(s.status, GoalStatus::Running) {
+                assert_eq!(s.note, Some(Note::Refused(Refusal::ExtraItem)));
+                assert!(sent.contains(&cs::cancel_trade(0)));
+                assert_eq!(locks(&sent), 0);
+                return;
+            }
+        }
+        panic!("the bot did not leave: {sent:?}");
+    }
+
+    #[test]
+    fn the_right_money_and_a_junk_item_gets_nothing_until_the_junk_is_gone() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 3000 }, 2000);
+        r.ev(other_item(9999, 1), 2100);
+        r.step(&mut t, 3000);
+        assert_eq!(locks(&r.sent()), 0);
+        // the partner takes the junk down in time: now it is the deal
+        r.ev(
+            ActivityEvent::OtherTradeItemTookdown {
+                item: ItemBrief {
+                    template_id: 9999,
+                    count: 1,
+                    ..ItemBrief::default()
+                },
+            },
+            4000,
+        );
+        r.step(&mut t, 4200);
+        r.step(&mut t, 4900);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
+    }
+
+    #[test]
+    fn an_offer_changed_after_the_lock_ends_the_trade_at_once() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 3000 }, 2000);
+        r.step(&mut t, 2800);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
+        r.ev(
+            ActivityEvent::TradeLockUpdate {
+                mine: true,
+                other: false,
+            },
+            2900,
+        );
+        r.step(&mut t, 3000);
+        r.sent();
+        // the buyer swaps the money for one copper: the server undoes the locks
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 1 }, 3100);
+        r.ev(
+            ActivityEvent::TradeLockUpdate {
+                mine: false,
+                other: false,
+            },
+            3101,
+        );
+        let s = r.step(&mut t, 3200);
+        assert!(matches!(s.status, GoalStatus::Failed(_)), "{s:?}");
+        assert_eq!(r.sent(), [op(|| cs::cancel_trade(0))]);
+        assert_eq!(
+            s.note,
+            Some(Note::GaveUp("the partner changed the offer after the lock"))
+        );
+    }
+
+    #[test]
+    fn a_better_offer_after_the_lock_is_locked_again_but_not_forever() {
+        let mut r = Rig::new();
+        let mut t = sale(PairRole::Responder);
+        sale_window(&mut r, &mut t);
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 3000 }, 2000);
+        r.step(&mut t, 2800);
+        r.sent();
+        let mut now = 2900;
+        let mut money = 3000;
+        for round in 0..=MAX_RELOCKS {
+            r.ev(
+                ActivityEvent::TradeLockUpdate {
+                    mine: true,
+                    other: false,
+                },
+                now,
+            );
+            r.step(&mut t, now + 100);
+            r.sent();
+            // the partner adds a little (still the deal): the server undoes the locks
+            money += 100;
+            now += 200;
+            r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: money }, now);
+            r.ev(
+                ActivityEvent::TradeLockUpdate {
+                    mine: false,
+                    other: false,
+                },
+                now + 1,
+            );
+            r.step(&mut t, now + 100);
+            assert!(r.sent().is_empty(), "round {round}: not quiet yet");
+            let s = r.step(&mut t, now + 900);
+            if round < MAX_RELOCKS {
+                assert_eq!(r.sent(), [op(|| cs::trade_lock(true))], "round {round}");
+                assert_eq!(s.status, GoalStatus::Running);
+                now += 1000;
+            } else {
+                assert!(matches!(s.status, GoalStatus::Failed(_)), "{s:?}");
+                assert_eq!(locks(&r.sent()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_of_somebody_else_is_cancelled_before_anything_is_put_up() {
+        let mut r = Rig::new();
+        r.identity = Identity::Mismatch;
+        let mut t = sale(PairRole::Responder);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 99 }, 1000);
+        r.step(&mut t, 1100);
+        let s = r.step(&mut t, 1200);
+        assert_eq!(s.note, Some(Note::Refused(Refusal::WrongPartner)));
+        assert_eq!(r.sent(), [op(|| cs::cancel_trade(0))], "no put-up first");
+        // and a unit the bot cannot see is not the agreed partner either
+        let mut r = Rig::new();
+        r.identity = Identity::Unknown;
+        let mut t = sale(PairRole::Responder);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 99 }, 1000);
+        r.step(&mut t, 1100);
+        let s = r.step(&mut t, 1200);
+        assert_eq!(s.note, Some(Note::Refused(Refusal::WrongPartner)));
+    }
+
+    #[test]
+    fn a_sale_checks_that_the_goods_are_still_there() {
+        let mut r = Rig::new();
+        r.bag = bag(&[(4, item(900, 3411, 4))]);
+        let mut t = sale(PairRole::Responder);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        let s = r.step(&mut t, 1100);
+        assert!(matches!(s.status, GoalStatus::Failed(_)));
+        assert_eq!(r.sent(), [op(|| cs::cancel_trade(0))]);
+    }
+
+    fn purchase() -> Trade {
+        let give = Plan {
+            slot: 0,
+            template: 0,
+            amount: 0,
+            money: 3000,
+        };
+        Trade::for_deal(
+            order(PairRole::Initiator),
+            Deal::agreed(give, &[(3411, 10)], 0),
+        )
+    }
+
+    #[test]
+    fn a_buyer_pays_only_for_the_agreed_goods() {
+        let mut r = Rig::new();
+        r.money = 10_000;
+        let mut t = purchase();
+        assert_eq!(t.phase, Phase::Invite);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        r.step(&mut t, 1100);
+        r.step(&mut t, 1200);
+        assert_eq!(r.sent(), [op(|| cs::putup_trade_money(3000))]);
+        r.ev(ActivityEvent::TradeMoneyPutup { amount: 3000 }, 1300);
+        // the seller puts up fewer units than agreed: wait
+        r.ev(other_item(3411, 4), 2000);
+        r.step(&mut t, 3500);
+        assert_eq!(locks(&r.sent()), 0);
+        // and the rest: it is the deal
+        r.ev(other_item(3411, 6), 4000);
+        r.step(&mut t, 4200);
+        r.step(&mut t, 4800);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
+    }
+
+    #[test]
+    fn a_buyer_does_not_pay_for_the_wrong_goods() {
+        let mut r = Rig::new();
+        r.money = 10_000;
+        let mut t = purchase();
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        r.step(&mut t, 1100);
+        r.step(&mut t, 1200);
+        r.sent();
+        r.ev(ActivityEvent::TradeMoneyPutup { amount: 3000 }, 1300);
+        r.ev(other_item(3712, 10), 2000);
+        let mut sent = Vec::new();
+        let mut outcome = None;
+        for now in (2500..12_000).step_by(500) {
+            let s = r.step(&mut t, now);
+            sent.extend(r.sent());
+            if !matches!(s.status, GoalStatus::Running) {
+                outcome = Some(s);
+                break;
+            }
+        }
+        let s = outcome.expect("the buyer leaves");
+        assert_eq!(s.note, Some(Note::Refused(Refusal::ExtraItem)));
+        assert_eq!(locks(&sent), 0);
+    }
+
+    #[test]
+    fn a_random_trade_with_a_player_must_bring_in_a_fair_share() {
+        // not a bot of ours: the partner has to put up about as much as the bot gives
+        let mut r = Rig::new();
+        r.partner_is_bot = false;
+        let mut t = at(Phase::Invite, PairRole::Initiator);
+        t.order = None;
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        r.step(&mut t, 1100);
+        r.step(&mut t, 1200);
+        r.sent();
+        let amount = t.plan.amount;
+        r.ev(
+            ActivityEvent::TradeItemPutup {
+                slot_type: 2,
+                slot: 4,
+                amount,
+            },
+            1300,
+        );
+        // one copper for up to five ore worth 20 each
+        r.ev(ActivityEvent::OtherTradeMoneyPutup { amount: 1 }, 1400);
+        let mut sent = Vec::new();
+        for now in (2500..7000).step_by(500) {
+            r.step(&mut t, now);
+            sent.extend(r.sent());
+        }
+        assert_eq!(locks(&sent), 0, "{sent:?}");
+        // a fair amount is accepted
+        r.ev(
+            ActivityEvent::OtherTradeMoneyPutup {
+                amount: 20 * amount,
+            },
+            7100,
+        );
+        r.step(&mut t, 7200);
+        r.step(&mut t, 8000);
+        assert_eq!(r.sent(), [op(|| cs::trade_lock(true))]);
     }
 
     #[test]

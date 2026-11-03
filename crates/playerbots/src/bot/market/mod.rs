@@ -137,7 +137,16 @@ impl MarketState {
     pub fn on_chat(&mut self, kind: i16, sender: &str, text: &str, now_ms: u64) {
         if let Some(inner) = self.get_mut() {
             inner.ads.on_chat(kind, sender, text, now_ms);
+        } else if ads::worth_hearing(kind, text) {
+            // (a line about buying or selling: now the bot has something to remember)
+            self.inner_mut().ads.on_chat(kind, sender, text, now_ms);
         }
+    }
+
+    /// Whether a whisper from `sender` belongs to a negotiation of the market, so that the social
+    /// duty must not answer it as well.
+    pub fn claims_whisper(&self, sender: &str) -> bool {
+        self.get().is_some_and(|i| i.ads.claims_whisper(sender))
     }
 }
 
@@ -240,8 +249,9 @@ mod tests {
         let mut m = MarketState::default();
         assert!(m.get().is_none());
         assert_eq!(m.clean_count(7), 0);
-        // chat, reloads and losses do not make the memory
-        m.on_chat(2, "Bob", "WTS ore", 5);
+        // chat about other things, reloads and losses do not make the memory
+        m.on_chat(2, "Bob", "anyone seen the dragon?", 5);
+        m.on_chat(0, "Bob", "WTS ore 30s", 5);
         m.on_bag_reloaded(&bag_of(&[(0, 7, 3)]));
         let bag = bag_of(&[]);
         let t = task(

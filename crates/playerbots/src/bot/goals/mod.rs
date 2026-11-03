@@ -3,9 +3,8 @@
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
 //! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`]
-//! and [`Market`] (the last two are stubs the auction and market features fill in). A goal that
-//! reports
-//! [`FailReason::NotImplemented`] is switched off for good by the brain.
+//! and [`Market`]. A goal that reports [`FailReason::NotImplemented`] is switched off for good by
+//! the brain.
 //!
 //! # Writing a goal
 //!
@@ -135,7 +134,7 @@ impl Goal {
             GoalKind::Dungeon => Goal::Dungeon(Dungeon::new(party)),
             GoalKind::Sail => Goal::Sail(Sail::default()),
             GoalKind::Auction => Goal::Auction(Auction::default()),
-            GoalKind::Market => Goal::Market(Market),
+            GoalKind::Market => Goal::Market(Market::default()),
         }
     }
 
