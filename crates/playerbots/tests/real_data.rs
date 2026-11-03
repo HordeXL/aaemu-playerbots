@@ -1358,3 +1358,119 @@ fn a_real_player_cannot_open_a_trade_with_a_bot_unless_the_operator_allows_it() 
     );
     assert!(!accepts(&rig, foe));
 }
+
+/// Bots walk real navmesh routes around the Nuian start: they arrive, every step is a plausible
+/// step, and while a route is followed the bot stays on or beside the mesh.
+#[test]
+#[ignore = "needs AA_COMPACT, AA_SERVER_DATA and AA_BAKED with nav_main_world.bin"]
+fn nav_motion_walks_real_routes_around_the_nuian_start() {
+    use aa_world::Vec3;
+    use playerbots::bot::motion::{MotionStatus, Pace};
+
+    let Some(world) = world() else { return };
+    let Some(mesh) = world.nav() else {
+        eprintln!("no nav_main_world.bin in AA_BAKED: skipped");
+        return;
+    };
+    let cfg = Config::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let hub = Hub::new(HubParams {
+        world: &world,
+        baked_dir: None,
+        supervisor: tx,
+        llm: None,
+    });
+    let slot = hub.register(pb_web::BotSnapshot {
+        id: 1,
+        name: "Tester".into(),
+        ..pb_web::BotSnapshot::default()
+    });
+    let _rx = slot.attach();
+    let start = world.race_start(1).expect("Nuian start");
+    let origin = [
+        start.x,
+        start.y,
+        world.ground_z(start.x, start.y).unwrap_or(start.z),
+    ];
+    let mut rng = fastrand::Rng::with_seed(11);
+    let mut out = Vec::new();
+    let (mut trips, mut routed, mut jumps, mut off_mesh) = (0u32, 0u32, 0u32, 0u32);
+    let (mut walked_sum, mut straight_sum) = (0.0f64, 0.0f64);
+    for _ in 0..60 {
+        // a goal 25 to 140 m away that has ground and is near the mesh
+        let (ang, r) = (rng.f32() * std::f32::consts::TAU, 25.0 + rng.f32() * 115.0);
+        let (x, y) = (origin[0] + ang.cos() * r, origin[1] + ang.sin() * r);
+        let Some(z) = world.ground_z(x, y).filter(|z| *z > 101.0) else {
+            continue;
+        };
+        if mesh.locate(Vec3::new(x, y, z), 6.0).is_none() {
+            continue;
+        }
+        let mut motion = Motion::new(MotionCfg::default());
+        motion.attach_nav(playerbots::bot::nav::link_for_bot(
+            &hub,
+            &world,
+            &cfg,
+            slot.clone(),
+            1,
+        ));
+        motion.enter_world(ME, origin, 0.0, 1);
+        let before = hub.nav.metrics().snapshot(true);
+        motion.go_to(x, y, 1.0, Pace::Run, 1);
+        let mut now = 1u64;
+        let mut prev = origin;
+        let (mut walked, mut samples, mut on) = (0.0f32, 0u32, 0u32);
+        let mut status = MotionStatus::Moving;
+        for _ in 0..800 {
+            now += 250;
+            let mut env = MotionEnv {
+                ground: &*world,
+                now_ms: now,
+                out: &mut out,
+                rng: &mut rng,
+                send_gap_ms: 250,
+                combat: false,
+            };
+            status = motion.tick(&mut env);
+            let p = motion.pos();
+            let step = dist2d(prev, p);
+            walked += step;
+            if step > 5.4 * 0.25 * 1.03 {
+                jumps += 1;
+            }
+            samples += 1;
+            if mesh.locate(Vec3::new(p[0], p[1], p[2]), 1.5).is_some() {
+                on += 1;
+            }
+            prev = p;
+            if status != MotionStatus::Moving {
+                break;
+            }
+        }
+        assert_eq!(status, MotionStatus::Arrived, "to ({x:.0}, {y:.0})");
+        let after = hub.nav.metrics().snapshot(true);
+        trips += 1;
+        if after.found > before.found && after.legacy_fallbacks == before.legacy_fallbacks {
+            routed += 1;
+            walked_sum += f64::from(walked);
+            straight_sum += f64::from(dist2d(origin, [x, y, 0.0]) - 1.0);
+            // a route is followed: the bot is on the mesh (or the hop to an off-mesh goal)
+            off_mesh += samples - on;
+            assert!(
+                on as f32 >= samples as f32 * 0.9,
+                "{on} of {samples} on the mesh"
+            );
+        }
+    }
+    let s = hub.nav.metrics().snapshot(true);
+    eprintln!(
+        "{trips} trips, {routed} on a route, detour {:.3}, {jumps} jumps, {off_mesh} samples off the mesh; {s:?}",
+        walked_sum / straight_sum.max(1.0)
+    );
+    assert!(trips >= 30, "only {trips} trips");
+    assert_eq!(jumps, 0);
+    assert!(
+        routed * 2 >= trips,
+        "{routed} of {trips} trips used the mesh"
+    );
+}
