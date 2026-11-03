@@ -1237,8 +1237,9 @@ impl Run {
         if env.now_ms() < self.linger_until {
             return GoalStatus::Running;
         }
+        let total = super::summary(env.mem());
         env.say(&format!(
-            "auction: visit done, {} posted, {} bought",
+            "auction: visit done, {} posted, {} bought (all visits: {total})",
             self.posted, self.bought
         ));
         GoalStatus::Done
