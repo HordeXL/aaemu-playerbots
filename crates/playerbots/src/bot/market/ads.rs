@@ -574,6 +574,16 @@ impl AdState {
         if !may || self.talks.len() >= MAX_TALKS || self.deal.is_some() {
             return;
         }
+        // two bots that sell and want each other's goods would answer both advertisements at the
+        // same moment and then wait for each other for good: the one that sorts first leaves the
+        // other's selling advertisement to it
+        if h.line.sell_ad
+            && (env.is_bot)(&h.sender)
+            && self.listing.is_some_and(|l| l.side == Side::Sell)
+            && env.me.to_lowercase() <= h.sender.to_lowercase()
+        {
+            return;
+        }
         let Some(template) = env.names.find(&h.text) else {
             return;
         };

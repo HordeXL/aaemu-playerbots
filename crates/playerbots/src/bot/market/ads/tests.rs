@@ -549,6 +549,48 @@ fn a_bot_with_its_own_advertisement_still_answers_the_ad_that_matches() {
 }
 
 #[test]
+fn of_two_sellers_that_want_each_others_goods_only_one_answers() {
+    // Ann and Zed both advertise hay and both want ore; Bob (not selling) advertises ore. Zed
+    // sorts after Ann, so Ann leaves the selling advertisement of Zed alone and Zed does not
+    // leave hers: they never answer each other at the same moment.
+    let listing = Listing {
+        side: Side::Sell,
+        template: HAY,
+        qty: 5,
+        quote: Quote {
+            ask: 30,
+            floor: 20,
+            ceiling: 40,
+        },
+        posted_ms: 1_000,
+    };
+    let answered = |me: &'static str, other: &'static str| {
+        let mut n = 0;
+        for seed in 0..40 {
+            let mut r = Rig::new(me);
+            r.rng = fastrand::Rng::with_seed(seed);
+            r.surplus.clear();
+            r.audience = 0;
+            r.bots = vec![other];
+            let mut a = AdState {
+                listing: Some(listing),
+                ..AdState::default()
+            };
+            a.on_chat(2, other, "WTS Copper Ore x20 - 30s ea, PST", 1_000);
+            r.step(&mut a, 1_100);
+            n += said(&mut a, 1_100).len();
+        }
+        n
+    };
+    assert_eq!(
+        answered("Ann", "Zed"),
+        0,
+        "the one that sorts first stays out"
+    );
+    assert!(answered("Zed", "Ann") > 5, "the other one answers");
+}
+
+#[test]
 fn nothing_is_said_faster_than_a_person_types() {
     let mut r = Rig::new("Ann");
     let mut a = AdState::default();
