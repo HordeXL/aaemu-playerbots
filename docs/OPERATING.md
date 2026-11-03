@@ -140,8 +140,8 @@ Safety of the GM lines:
 ## Selling (`[market]`)
 
 The market features let bots sell what they gather: the goal `auction` lists goods at the auction
-house and the goal `market` advertises them in trade chat and meets buyers. Both are scored by their
-own features and are off until those exist; `[market]` is their configuration:
+house, and the trade-chat market advertises them, answers buyers and meets them (the goal `market`
+does the meeting). `[market]` is their configuration:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -163,6 +163,44 @@ most 64 item kinds per bot and is forgotten when the connection is lost. Of what
 items that are sellable and not bound (`ItemFacts::tradable`) are offered, and a reserve of 10 is
 kept of items the bot may use itself (anything that casts a skill when used, anything a quest asks
 to gather).
+
+### Selling in trade chat
+
+The chat market is a duty every bot runs next to its goal, plus the goal `market` for the meeting.
+
+* **Ads.** A bot with clean surplus posts a `WTS` line in the trade channel; one that needs goods
+  posts a `WTB` line. Wording varies, prices come from the vendor values of the item (a little
+  over half way between what a vendor pays and asks), lines are plain text of at most 200
+  characters with no item links. A bot posts only when somebody could read it (other bots or a
+  player in the same zone group's trade chat), at most every `ad_interval_secs` (with jitter),
+  and all bots together at most `max_ads_per_hour` ads and 14 market lines per minute.
+* **Talk.** A small grammar reads "how much", "price", "i'll take", "x20", "30s", "1g", "deal",
+  "ok", "no", "too much", "meet", "where". The seller quotes, counters once and never goes under
+  its floor; the buyer haggles once and never pays over its ceiling. Replies go out the way the
+  other side spoke (whisper for whisper, the trade channel addressed by name for channel lines),
+  which also serves characters of the other faction, who cannot be whispered (error 437). Bots
+  buy from and sell to each other's ads. Nothing a bot says gives away that it is a bot.
+* **Meeting.** `meet_at = "auto"`: the same faction near the same town meets at that town's
+  auctioneer; another faction, far apart, or a buyer nobody can place meets on Mirage Isle. The
+  bot walks to the nearest portal doodad (template 4894, next to the auctioneers), casts it, waits
+  at the mailbox, trades, and leaves through the exit doodad (4895). It waits four minutes for
+  the buyer and drops a deal after twelve.
+* **Safe trades.** Every trade made from chat has a deal: who, what the bot gives, what it must
+  receive. The partner must be the agreed character; money must be at least the price and the
+  goods exactly the agreed ones; the bot's own offer must be unchanged. The server unlocks both
+  sides on any change, so the bot checks again after every unlock before it locks, and cancels on
+  a mismatch (one copper for the goods, a swapped item, an offer changed after the lock, the wrong
+  character) or on a timeout. Requests from anybody else during a meeting are declined.
+* **Economy safety.** Only the clean ledger is sold, never GM-made goods, trade, mail or auction
+  returns. Real players are served only with `sell_to_players = true`, never while
+  `bots.gm_bootstrap` is on. Everything is off with `enabled = false` or `chat_ads = false`.
+* **Issue detectors** (see Server issue reports): a portal cast the server accepted that never
+  loaded the island within 30 s, an exit cast that leaves the bot on the island, a trade both
+  sides confirmed that moved nothing, and refused whispers (error 437 or 265, reported only as
+  information, the bot being the suspect).
+
+Force the goal from the web UI to make a bot post an ad at once and listen for buyers for four
+minutes. The stand-in "need" of a WTB bot is one of the shared trade goods it holds hardly any of.
 
 ## Chat and the LLM
 
