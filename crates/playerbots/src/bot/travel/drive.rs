@@ -52,10 +52,7 @@ const NO_RECORD_MS: u64 = 30 * 60_000;
 const NO_RECORD_M: f32 = 150.0;
 /// `SkillResult` of a cast a buff forbids (`SKILL_REQ_FAIL`).
 const SKILL_REQ_FAIL: u8 = 50;
-/// Buffs of the peace zones (the aura around a Nui statue, a declared territory, the vicinity of
-/// an instance dungeon). `skill_reqs` lets only listed skills through while one is on, and the
-/// record skill (11215) is not listed, so the server answers it with `SKILL_REQ_FAIL`.
-const PEACE_BUFFS: [u32; 3] = [2149, 2221, 4828];
+
 /// The most Memory Ink a GM top-up adds.
 const INK_TOPUP: u32 = 3;
 /// Stones added on top of what the gate needs when a GM tops up.
@@ -314,6 +311,8 @@ fn run(j: &mut Journey, ctx: &mut Ctx<'_>, inner: &mut Inner) -> JourneyStatus {
         dead: ctx.state.me.dead,
         hostile: hostile(ctx),
         laden: laden(ctx),
+        open_blocked: blocked_by_buff(ctx, OPEN_SKILL),
+        recall_blocked: blocked_by_buff(ctx, RECALL_SKILL),
         gm: ctx.gm_allowed(),
         book: ctx
             .state
@@ -707,12 +706,26 @@ fn fault_report(f: Fault) -> IssueReport {
     }
 }
 
+/// The ids of the bot's buffs, comma separated, for issue facts.
+fn buff_list(ctx: &Ctx<'_>) -> String {
+    ctx.state
+        .buffs
+        .iter()
+        .map(|b| b.1.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn report_fault(ctx: &mut Ctx<'_>, f: Fault) {
     Counters::bump(&STATS.faults);
     tracing::info!(bot = %ctx.persona.name, fault = ?f, "portals: symptom");
     let mut report = fault_report(f);
     let p = ctx.state.me.pos;
     report = report.fact("pos", format!("{:.0}, {:.0}, {:.0}", p[0], p[1], p[2]));
+    if matches!(f, Fault::OpenRefused(_) | Fault::RecallRefused(_)) {
+        // the buffs say which `skill_reqs` requirement refused the skill
+        report = report.fact("buffs", buff_list(ctx));
+    }
     ctx.report_issue(report);
 }
 
@@ -731,7 +744,9 @@ pub fn far_trip(ctx: &mut Ctx<'_>, x: f32, y: f32) -> bool {
         return false;
     }
     let p = ctx.state.me.pos;
-    if dist([p[0], p[1]], [x, y]) <= FAR_TRIP_M {
+    let far = dist([p[0], p[1]], [x, y]);
+    // a GM `/move` (bots.long_travel_teleport_m) is faster than any gate
+    if far <= FAR_TRIP_M || ctx.would_teleport(far) {
         return false;
     }
     // a bot that never heard of a book or a recall point has nothing to open a gate to
@@ -739,6 +754,7 @@ pub fn far_trip(ctx: &mut Ctx<'_>, x: f32, y: f32) -> bool {
         return false;
     };
     let took = far_trip_with(ctx, &mut inner, x, y);
+    tracing::debug!(bot = %ctx.persona.name, x, y, far, took, "portals: far trip asked");
     ctx.state.travel.put(inner);
     took
 }
@@ -752,7 +768,9 @@ pub fn has_route(ctx: &mut Ctx<'_>, x: f32, y: f32) -> bool {
         return false;
     }
     let p = ctx.state.me.pos;
-    if dist([p[0], p[1]], [x, y]) <= FAR_TRIP_M {
+    let far = dist([p[0], p[1]], [x, y]);
+    // a GM `/move` (bots.long_travel_teleport_m) is faster than any gate
+    if far <= FAR_TRIP_M || ctx.would_teleport(far) {
         return false;
     }
     let Some(mut inner) = ctx.state.travel.take(false) else {
@@ -972,9 +990,14 @@ fn calm(ctx: &Ctx<'_>, goal: Option<GoalKind>) -> bool {
             .is_none_or(|g| g >= SWIM_THRESHOLD + 1.0)
 }
 
-/// Whether a peace-zone buff is on the bot: the record skill is refused there.
-fn in_peace_zone(ctx: &Ctx<'_>) -> bool {
-    ctx.state.buffs.iter().any(|b| PEACE_BUFFS.contains(&b.1))
+/// The buff on the bot that makes the server refuse `skill` (`skill_reqs`), if any: a stun, the
+/// landing after a fall, a trade pack, and for the record skill the peace-zone aura around a Nui
+/// statue (the skill is not on the lists of skills the aura lets through).
+fn blocked_by_buff(ctx: &Ctx<'_>, skill: u32) -> Option<u32> {
+    ctx.world
+        .travel()
+        .portals
+        .blocked_by(skill, ctx.state.buffs.iter().map(|b| b.1))
 }
 
 /// The recording duty. Returns whether it holds the goal this tick.
@@ -1005,15 +1028,7 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
                     _ => Suspect::Unknown,
                 })
                 .fact("skill_result", n.result)
-                .fact(
-                    "buffs",
-                    ctx.state
-                        .buffs
-                        .iter()
-                        .map(|b| b.1.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
+                .fact("buffs", buff_list(ctx));
                 if n.result == SKILL_REQ_FAIL {
                     // a buff of the place (a peace zone at a Nui statue) lets only listed skills
                     // through: leave the place alone for a while
@@ -1072,7 +1087,7 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
         Rec::Idle => {}
     }
     let pos = ctx.state.me.pos;
-    let calm = calm(ctx, goal) && !in_peace_zone(ctx);
+    let calm = calm(ctx, goal) && blocked_by_buff(ctx, RECORD_PORTAL_SKILL).is_none();
     let input = places::RecordIn {
         now_ms: now,
         next_record_ms: inner.next_record_ms,

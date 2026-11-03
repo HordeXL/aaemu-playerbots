@@ -67,6 +67,16 @@ fn portal_facts() {
     assert_eq!((k.bind.id, k.bind.cast_ms), (14602, 3_000));
     assert_eq!((k.entrance_npc, k.exit_npc), (3891, 6949));
     assert!(w.npc(3891).is_some() && w.npc(6949).is_some());
+
+    // buffs the server refuses the skills for (`skill_reqs`): the aura around a Nui statue (2149)
+    // lets the open and recall skills through but not the record skill
+    assert!(p.blocking_buffs(11215).contains(&2149));
+    assert!(!p.blocking_buffs(11216).contains(&2149));
+    assert!(!p.blocking_buffs(10594).contains(&2149));
+    assert!(
+        p.blocking_buffs(11216).len() > 100,
+        "stun, fear, landing, ... block the open skill too"
+    );
     assert_eq!(k.open_distance, 3.0);
     assert_eq!(w.item_name(4045), Some("Teleport Book"));
     assert_eq!(w.item_name(4053), Some("Memory Ink"));

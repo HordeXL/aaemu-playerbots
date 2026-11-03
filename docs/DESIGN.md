@@ -214,6 +214,13 @@ all off.
   (`decide`: one record per 10 minutes, calm, no entry within 600 m, ink, book of at most 20 entries,
   the most redundant entry goes first) and the entry names.
 
+Server rules the live run showed (all of them are data, not bugs): a bot with a trade pack gets
+`SCErrorMsg` 610 on `CSUsePortal` and result 50 on the open skill (a buff of the pack), so a laden bot
+plans no gate and opens or follows none (`JourneyFail::Laden`); the record skill 11215 is not on the
+`skill_reqs` whitelist of the peace-zone buffs (2149 around a Nui statue, 2221, 4828), so it is refused
+with result 50 there and the bot waits for the buff to go; with `bots.long_travel_teleport_m` set a GM
+`/move` is faster than any gate, so far trips are left to it.
+
 `TravelState` is one pointer (the data is a lazily created `Box<Inner>`); `size_of::<Bot>()` grew by 8
 bytes. The server events it needs are routed by `state::route` (the portal events and the answers to
 skills 11215, 11216, 10594 and 16841); `apply_unit_state` tells it about gate NPCs (with their owner).

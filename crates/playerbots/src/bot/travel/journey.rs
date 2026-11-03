@@ -77,6 +77,9 @@ pub enum JourneyFail {
     NoRoute,
     /// The bot carries a trade pack: the server refuses every gate then (`SCErrorMsg` 610).
     Laden,
+    /// A buff on the bot (this id) makes the server refuse the skill (`skill_reqs`) for longer than
+    /// the journey waits.
+    Blocked(u32),
     /// The bot has no Teleport Book and may not mint one.
     NoBook,
     /// The bot has no stones for the gate and may not mint them.
@@ -111,6 +114,7 @@ impl JourneyFail {
         match self {
             JourneyFail::NoRoute => "no route",
             JourneyFail::Laden => "carries a trade pack",
+            JourneyFail::Blocked(_) => "blocked by a buff",
             JourneyFail::NoBook => "no teleport book",
             JourneyFail::NoReagents => "no stones",
             JourneyFail::NoSpot => "no free spot",
@@ -207,6 +211,10 @@ pub struct Snap<'a> {
     /// The bot carries a trade pack: the server refuses `CSUsePortal` (610), so no gate is opened
     /// or entered.
     pub laden: bool,
+    /// A buff on the bot that makes the server refuse the open skill (stun, landing, ...).
+    pub open_blocked: Option<u32>,
+    /// A buff on the bot that makes the server refuse the recall skill.
+    pub recall_blocked: Option<u32>,
     /// GM commands may be used to top up the book, stones and ink.
     pub gm: bool,
     /// The Teleport Book's item id in the bag.
@@ -486,6 +494,9 @@ impl Journey {
                 self.cooldown(s, acts)
             }
             Some(Route::Recall) => {
+                if let Some(buff) = s.recall_blocked {
+                    return JourneyStatus::Failed(JourneyFail::Blocked(buff));
+                }
                 self.recall = true;
                 acts.push(Act::Stop);
                 acts.push(Act::Recall);
@@ -504,9 +515,12 @@ impl Journey {
     }
 
     fn cooldown(&mut self, s: &Snap<'_>, acts: &mut Acts) -> JourneyStatus {
-        if !s.open_ready {
+        if !s.open_ready || s.open_blocked.is_some() {
             if s.now_ms.saturating_sub(self.phase_ms) > COOLDOWN_WAIT_MS {
-                return JourneyStatus::Failed(JourneyFail::Timeout);
+                return JourneyStatus::Failed(match s.open_blocked {
+                    Some(buff) => JourneyFail::Blocked(buff),
+                    None => JourneyFail::Timeout,
+                });
             }
             return JourneyStatus::Running;
         }
@@ -716,6 +730,8 @@ mod tests {
             dead: false,
             hostile: false,
             laden: false,
+            open_blocked: None,
+            recall_blocked: None,
             gm: false,
             book: Some(77),
             stones: 3,
@@ -888,6 +904,42 @@ mod tests {
                 consumed: false
             })]
         );
+    }
+
+    #[test]
+    fn a_buff_that_blocks_the_skill_is_waited_out_or_fails_typed() {
+        // the open skill: a stun that ends in time delays the cast, one that stays fails typed
+        let mut j = Journey::new([3000.0, 0.0]);
+        let mut s = snap(1_000, &[]);
+        s.route = Some(gate_route(true));
+        s.open_blocked = Some(77);
+        let (st, acts) = step(&mut j, &s);
+        assert_eq!(st, JourneyStatus::Running);
+        assert!(acts.is_empty());
+        let mut later = snap(1_000 + COOLDOWN_WAIT_MS - 1, &[]);
+        later.open_blocked = Some(77);
+        assert_eq!(step(&mut j, &later).0, JourneyStatus::Running);
+        let mut free = snap(2_000, &[]);
+        free.open_blocked = None;
+        let (st, acts) = step(&mut j, &free);
+        assert_eq!(st, JourneyStatus::Running);
+        assert!(matches!(acts.as_slice(), [Act::Stop, Act::Open { .. }]));
+        let mut j = Journey::new([3000.0, 0.0]);
+        assert_eq!(step(&mut j, &s).0, JourneyStatus::Running);
+        let mut stuck = snap(1_000 + COOLDOWN_WAIT_MS + 1, &[]);
+        stuck.open_blocked = Some(77);
+        assert_eq!(
+            step(&mut j, &stuck).0,
+            JourneyStatus::Failed(JourneyFail::Blocked(77))
+        );
+        // the recall skill: no waiting
+        let mut j = Journey::new([3000.0, 0.0]);
+        let mut s = snap(1_000, &[]);
+        s.route = Some(Route::Recall);
+        s.recall_blocked = Some(5);
+        let (st, acts) = step(&mut j, &s);
+        assert_eq!(st, JourneyStatus::Failed(JourneyFail::Blocked(5)));
+        assert!(acts.is_empty());
     }
 
     #[test]
