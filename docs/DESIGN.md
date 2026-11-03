@@ -159,7 +159,7 @@ allocated on the first packet, names resolved from the opcode tables only when a
 Nothing runs per tick except a few comparisons; an episode is reported once.
 
 The web crate only knows `IssueSummary` / `IssueDetail` / `IssueAction` and three defaulted `BotHub`
-methods. Operator documentation: the README section "Server issue reports".
+methods. Operator documentation: [`ISSUES.md`](ISSUES.md).
 
 ## Travel hooks (navigation motion, portals, dungeons, sailing)
 

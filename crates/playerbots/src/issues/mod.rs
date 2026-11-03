@@ -55,8 +55,8 @@
 //! # What becomes a queue entry
 //!
 //! See [`book`] for the policy and the limits, [`queue`] for the entry format, [`evidence`] for the
-//! folders and [`logtail`] for the server log. The README section "Server issue reports" has the
-//! operator's view.
+//! folders and [`logtail`] for the server log. `docs/ISSUES.md` has the operator's
+//! view.
 
 pub mod book;
 pub mod evidence;

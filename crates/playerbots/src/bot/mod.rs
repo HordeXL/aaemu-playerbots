@@ -1129,8 +1129,8 @@ fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
 mod tests {
     use super::*;
 
-    /// Sizes of the per-bot structures, printed with `--nocapture` for the memory estimate in the
-    /// README; the asserts keep them from growing unnoticed.
+    /// Sizes of the per-bot structures, printed with `--nocapture` for the memory estimate in
+    /// `docs/OPERATING.md`; the asserts keep them from growing unnoticed.
     #[test]
     fn per_bot_structures_stay_small() {
         use std::mem::size_of;
