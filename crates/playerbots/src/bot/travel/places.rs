@@ -165,6 +165,14 @@ pub fn decide(i: &RecordIn, spot: impl FnOnce() -> Option<Spot>) -> Decision {
     Decision::Record
 }
 
+/// Whether a record was refused within `radius` metres of `at` and the memory of it (`(x, y,
+/// until)`) has not run out at `now_ms`.
+pub fn refused_near(refused: &[(f32, f32, u64)], now_ms: u64, at: [f32; 2], radius: f32) -> bool {
+    refused
+        .iter()
+        .any(|&(x, y, until)| until > now_ms && (x - at[0]).hypot(y - at[1]) <= radius)
+}
+
 /// The name for a new entry at `pos`: the nearest recall point's name (a town), else the zone's,
 /// made unique among `taken`, at most [`MAX_NAME_CHARS`] characters.
 pub fn name_for<'a>(
@@ -290,6 +298,15 @@ mod tests {
         assert_eq!(decide(&i, TOWN), Decision::MakeRoom);
         i.entries = MAX_ENTRIES - 1;
         assert_eq!(decide(&i, TOWN), Decision::Record);
+    }
+
+    #[test]
+    fn a_refused_place_is_left_alone_until_the_memory_runs_out() {
+        let refused = [(100.0, 100.0, 5_000)];
+        assert!(refused_near(&refused, 4_999, [180.0, 100.0], 150.0));
+        assert!(!refused_near(&refused, 4_999, [300.0, 100.0], 150.0));
+        assert!(!refused_near(&refused, 5_000, [100.0, 100.0], 150.0));
+        assert!(!refused_near(&[], 0, [0.0, 0.0], 150.0));
     }
 
     #[test]

@@ -46,6 +46,16 @@ const RECORD_WAIT_MS: u64 = 10_000;
 const DELETE_WAIT_MS: u64 = 4_000;
 /// Another record is not tried within this long of the last failure, ms.
 const RECORD_RETRY_MS: u64 = 5 * 60_000;
+/// A place where the server refused the record cast is left alone for this long, ms.
+const NO_RECORD_MS: u64 = 30 * 60_000;
+/// ... within this many metres.
+const NO_RECORD_M: f32 = 150.0;
+/// `SkillResult` of a cast a buff forbids (`SKILL_REQ_FAIL`).
+const SKILL_REQ_FAIL: u8 = 50;
+/// Buffs of the peace zones (the aura around a Nui statue, a declared territory, the vicinity of
+/// an instance dungeon). `skill_reqs` lets only listed skills through while one is on, and the
+/// record skill (11215) is not listed, so the server answers it with `SKILL_REQ_FAIL`.
+const PEACE_BUFFS: [u32; 3] = [2149, 2221, 4828];
 /// The most Memory Ink a GM top-up adds.
 const INK_TOPUP: u32 = 3;
 /// Stones added on top of what the gate needs when a GM tops up.
@@ -303,6 +313,7 @@ fn run(j: &mut Journey, ctx: &mut Ctx<'_>, inner: &mut Inner) -> JourneyStatus {
         me_char: ctx.state.me.char_id,
         dead: ctx.state.me.dead,
         hostile: hostile(ctx),
+        laden: laden(ctx),
         gm: ctx.gm_allowed(),
         book: ctx
             .state
@@ -337,7 +348,7 @@ fn settle(ctx: &mut Ctx<'_>, inner: &mut Inner, j: &Journey, st: JourneyStatus) 
             tracing::info!(bot = %ctx.persona.name, how, "portals: arrived");
         }
         JourneyStatus::Failed(why) => {
-            if why != JourneyFail::NoRoute {
+            if !matches!(why, JourneyFail::NoRoute | JourneyFail::Laden) {
                 Counters::bump(&STATS.failures);
                 ctx.log
                     .say(format!("travel: portal trip failed ({})", why.word()));
@@ -454,6 +465,15 @@ fn hostile(ctx: &Ctx<'_>) -> bool {
     ctx.combat.busy() || !ctx.state.threats.is_empty()
 }
 
+/// Whether the bot carries a trade pack (worn in the back slot). The server refuses every
+/// `CSUsePortal` of such a bot with `SCErrorMsg` 610, so it neither opens nor enters a gate.
+fn laden(ctx: &Ctx<'_>) -> bool {
+    ctx.state
+        .equipment
+        .iter()
+        .any(|e| !ctx.world.specialty_buyers(e.template).is_empty())
+}
+
 /// How many gate stones the bag holds (every kind the open skill takes).
 fn stones(ctx: &Ctx<'_>) -> i64 {
     ctx.state.item_count(BOUND_STONE_ITEM) + ctx.state.item_count(STONE_ITEM)
@@ -521,6 +541,9 @@ fn refresh(ctx: &Ctx<'_>, inner: &mut Inner) {
 
 /// The route for a trip to `dest`.
 fn plan_route(ctx: &Ctx<'_>, inner: &Inner, dest: [f32; 2]) -> Route {
+    if laden(ctx) {
+        return Route::Walk;
+    }
     let now = ctx.now_ms;
     let me = [ctx.state.me.pos[0], ctx.state.me.pos[1]];
     let world = ctx.world;
@@ -752,6 +775,10 @@ pub fn has_route(ctx: &mut Ctx<'_>, x: f32, y: f32) -> bool {
 }
 
 fn far_trip_with(ctx: &mut Ctx<'_>, inner: &mut Inner, x: f32, y: f32) -> bool {
+    // the server refuses a gate to a bot with a trade pack: walk (or /move) like before
+    if laden(ctx) && inner.auto.is_none() {
+        return false;
+    }
     let now = ctx.now_ms;
     inner.blocked.retain(|b| b.until_ms > now);
     let cell = cell_of(x, y);
@@ -769,7 +796,7 @@ fn far_trip_with(ctx: &mut Ctx<'_>, inner: &mut Inner, x: f32, y: f32) -> bool {
         JourneyStatus::Running => true,
         JourneyStatus::Arrived => false,
         JourneyStatus::Failed(why) => {
-            let ms = if why == JourneyFail::NoRoute {
+            let ms = if matches!(why, JourneyFail::NoRoute | JourneyFail::Laden) {
                 NO_ROUTE_MS
             } else {
                 BLOCK_MS
@@ -930,7 +957,9 @@ fn calm(ctx: &Ctx<'_>, goal: Option<GoalKind>) -> bool {
         )
     );
     let st = &ctx.state;
+    // a trade pack's buff forbids the record skill and the server refuses every gate
     free_goal
+        && !laden(ctx)
         && !hostile(ctx)
         && st.me.hp_pct() >= CALM_HP_PCT
         && !ctx.motion.busy()
@@ -941,6 +970,11 @@ fn calm(ctx: &Ctx<'_>, goal: Option<GoalKind>) -> bool {
             .world
             .ground_z(st.me.pos[0], st.me.pos[1])
             .is_none_or(|g| g >= SWIM_THRESHOLD + 1.0)
+}
+
+/// Whether a peace-zone buff is on the bot: the record skill is refused there.
+fn in_peace_zone(ctx: &Ctx<'_>) -> bool {
+    ctx.state.buffs.iter().any(|b| PEACE_BUFFS.contains(&b.1))
 }
 
 /// The recording duty. Returns whether it holds the goal this tick.
@@ -970,7 +1004,26 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
                     crate::bot::watch::classify::Refusal::Bot => Suspect::Bot,
                     _ => Suspect::Unknown,
                 })
-                .fact("skill_result", n.result);
+                .fact("skill_result", n.result)
+                .fact(
+                    "buffs",
+                    ctx.state
+                        .buffs
+                        .iter()
+                        .map(|b| b.1.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                if n.result == SKILL_REQ_FAIL {
+                    // a buff of the place (a peace zone at a Nui statue) lets only listed skills
+                    // through: leave the place alone for a while
+                    let p = ctx.state.me.pos;
+                    inner.no_record.retain(|r| r.2 > now);
+                    if inner.no_record.len() >= 4 {
+                        inner.no_record.remove(0);
+                    }
+                    inner.no_record.push((p[0], p[1], now + NO_RECORD_MS));
+                }
                 ctx.report_issue(report);
                 return false;
             }
@@ -1019,7 +1072,7 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
         Rec::Idle => {}
     }
     let pos = ctx.state.me.pos;
-    let calm = calm(ctx, goal);
+    let calm = calm(ctx, goal) && !in_peace_zone(ctx);
     let input = places::RecordIn {
         now_ms: now,
         next_record_ms: inner.next_record_ms,
@@ -1036,8 +1089,13 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
     }
     let homes: SmallVec<[[f32; 3]; 2]> = ctx.state.houses.iter().map(|h| h.pos).collect();
     let mut found = None;
+    let refused_here = places::refused_near(&inner.no_record, now, [pos[0], pos[1]], NO_RECORD_M);
     let decision = places::decide(&input, || {
-        found = places::worth(ctx.world, pos, &homes);
+        found = if refused_here {
+            None
+        } else {
+            places::worth(ctx.world, pos, &homes)
+        };
         found
     });
     let Some(spot) = found else {

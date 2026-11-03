@@ -75,6 +75,8 @@ pub enum JourneyFail {
     /// No portal route beats walking (nothing near the destination, the trip is short, or the bot
     /// is in an instance).
     NoRoute,
+    /// The bot carries a trade pack: the server refuses every gate then (`SCErrorMsg` 610).
+    Laden,
     /// The bot has no Teleport Book and may not mint one.
     NoBook,
     /// The bot has no stones for the gate and may not mint them.
@@ -108,6 +110,7 @@ impl JourneyFail {
     pub fn word(self) -> &'static str {
         match self {
             JourneyFail::NoRoute => "no route",
+            JourneyFail::Laden => "carries a trade pack",
             JourneyFail::NoBook => "no teleport book",
             JourneyFail::NoReagents => "no stones",
             JourneyFail::NoSpot => "no free spot",
@@ -201,6 +204,9 @@ pub struct Snap<'a> {
     pub dead: bool,
     /// A fight or a threat: casts break.
     pub hostile: bool,
+    /// The bot carries a trade pack: the server refuses `CSUsePortal` (610), so no gate is opened
+    /// or entered.
+    pub laden: bool,
     /// GM commands may be used to top up the book, stones and ink.
     pub gm: bool,
     /// The Teleport Book's item id in the bag.
@@ -399,6 +405,18 @@ impl Journey {
         let stepping_through = matches!(self.phase, Phase::Use { .. });
         if s.hostile && !stepping_through {
             return JourneyStatus::Failed(JourneyFail::Interrupted);
+        }
+        // a pack in the back slot makes every gate useless: do not start one, do not wait at one
+        let before_the_gate = matches!(
+            self.phase,
+            Phase::Plan
+                | Phase::Supplies { .. }
+                | Phase::Cooldown
+                | Phase::Gate { .. }
+                | Phase::Seek
+        );
+        if s.laden && before_the_gate {
+            return JourneyStatus::Failed(JourneyFail::Laden);
         }
         match self.phase {
             Phase::Plan => self.plan(s, acts),
@@ -667,6 +685,7 @@ mod tests {
     use crate::bot::travel::plan::Cand;
 
     const ME: u32 = 500;
+    const OTHER: u32 = 321;
     const GATE_OBJ: u32 = 0x9000;
 
     fn target() -> Target {
@@ -696,6 +715,7 @@ mod tests {
             me_char: ME,
             dead: false,
             hostile: false,
+            laden: false,
             gm: false,
             book: Some(77),
             stones: 3,
@@ -868,6 +888,41 @@ mod tests {
                 consumed: false
             })]
         );
+    }
+
+    #[test]
+    fn a_laden_bot_neither_opens_nor_follows_a_gate() {
+        // planning: the trade pack in the back slot ends the journey before anything is spent
+        let mut j = Journey::new([3000.0, 0.0]);
+        let mut s = snap(1_000, &[]);
+        s.route = Some(gate_route(true));
+        s.laden = true;
+        let (st, acts) = step(&mut j, &s);
+        assert_eq!(st, JourneyStatus::Failed(JourneyFail::Laden));
+        assert!(acts.is_empty());
+        // a follower waiting for a gate gives up the same way
+        let mut j = Journey::follow_gate(OTHER);
+        let (st, acts) = step(&mut j, &s);
+        assert_eq!(st, JourneyStatus::Failed(JourneyFail::Laden));
+        assert!(acts.is_empty());
+        // ... and so does one that walks to a gate that is already open
+        let mut j = Journey::follow_gate(OTHER);
+        let theirs = [gate(OTHER, 1_000)];
+        assert_eq!(
+            step(&mut j, &snap(1_000, &theirs)).0,
+            JourneyStatus::Running
+        );
+        let mut s = snap(1_500, &theirs);
+        s.laden = true;
+        assert_eq!(
+            step(&mut j, &s).0,
+            JourneyStatus::Failed(JourneyFail::Laden)
+        );
+        // a bot that is not laden is not affected
+        let mut j = Journey::new([3000.0, 0.0]);
+        let mut s = snap(1_000, &[]);
+        s.route = Some(gate_route(true));
+        assert_eq!(step(&mut j, &s).0, JourneyStatus::Running);
     }
 
     #[test]

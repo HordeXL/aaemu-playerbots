@@ -142,6 +142,9 @@ pub struct Inner {
     pub notified: SmallVec<[u32; 6]>,
     /// Do not look for a recall district to visit before this bot clock.
     pub next_visit_ms: u64,
+    /// Places where the server refused the record cast (a peace-zone buff lets only listed skills
+    /// through): `(x, y, until)`, the last few. No new record is tried near them until then.
+    pub no_record: SmallVec<[(f32, f32, u64); 4]>,
 }
 
 impl TravelState {
