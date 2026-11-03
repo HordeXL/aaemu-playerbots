@@ -132,7 +132,7 @@ impl Run {
             return false;
         };
         ctx.log.say(format!(
-            "market: meeting {} on {} for {} x {}",
+            "market: meeting {} ({}) for {} x {}",
             d.peer,
             meet_word(d.meet),
             d.qty,
