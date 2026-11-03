@@ -16,6 +16,7 @@ pub mod economy;
 pub mod faction;
 pub mod geom;
 pub mod housing;
+pub mod items;
 pub mod jsonc;
 pub mod npc;
 pub mod quest;
@@ -36,6 +37,7 @@ pub use economy::Craft;
 pub use faction::Relation;
 pub use geom::Vec3;
 pub use housing::HousingDesign;
+pub use items::{ItemFacts, ItemTable};
 pub use npc::{NpcRoles, NpcTemplate};
 pub use quest::{
     ObjKind, Objective, Quest, QuestReport, QuestStart, QuestStats, QuestStep, CATEGORY_TUTORIAL,

@@ -335,6 +335,11 @@ fn chat() {
     );
     assert_eq!(cs::chat_type::SHOUT, 1);
     assert_eq!(cs::chat_type::PARTY, 4);
+    // the server's ChatType numbers (systems/social/chat.rs)
+    assert_eq!(cs::chat_type::TRADE, 2);
+    assert_eq!(cs::chat_type::GROUP_FIND, 3);
+    assert_eq!(cs::chat_type::REGION, 6);
+    assert_eq!(cs::chat_type::ALLY, 14);
 }
 
 /// The message string of a built chat packet (the body is `i16, i16, i32, str target, str msg, ..`).
@@ -364,7 +369,11 @@ fn chat_never_carries_a_command() {
             cs::chat_type::SAY,
             cs::chat_type::WHISPER,
             cs::chat_type::SHOUT,
+            cs::chat_type::TRADE,
+            cs::chat_type::GROUP_FIND,
             cs::chat_type::PARTY,
+            cs::chat_type::REGION,
+            cs::chat_type::ALLY,
         ] {
             let out = cs::chat(kind, "Bob", text);
             let sent = chat_message(&out);

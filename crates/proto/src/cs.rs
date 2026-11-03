@@ -799,8 +799,16 @@ pub mod chat_type {
     pub const SAY: i16 = 0;
     /// Shout.
     pub const SHOUT: i16 = 1;
+    /// Trade chat (the channel of buying and selling).
+    pub const TRADE: i16 = 2;
+    /// Group-finding chat.
+    pub const GROUP_FIND: i16 = 3;
     /// Party chat.
     pub const PARTY: i16 = 4;
+    /// Region chat.
+    pub const REGION: i16 = 6;
+    /// Chat with the allied faction.
+    pub const ALLY: i16 = 14;
 }
 
 /// Longest chat line (in characters) the builders accept.

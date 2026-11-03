@@ -16,6 +16,7 @@ use crate::economy::{Craft, Economy};
 use crate::faction::{Factions, Relation};
 use crate::geom::{IdMap, StrTable, Vec3};
 use crate::housing::{AreaIndex, Housing, HousingDesign};
+use crate::items::{ItemFacts, ItemTable};
 use crate::npc::{self, NpcTemplate};
 use crate::quest::{Quest, QuestStats, Quests};
 use crate::reqs::StartGates;
@@ -110,6 +111,8 @@ pub struct World {
     housing: Housing,
     areas: AreaIndex,
     items: StrTable,
+    /// Trade facts (price, binding, stacking, auction categories) of every item template.
+    item_facts: ItemTable,
     item_uses: ItemUses,
     zones: Zones,
     /// Doodad templates (that spawn) yielding a gather item.
@@ -151,6 +154,7 @@ impl World {
         let doodads = crate::doodad::load(&conn, &texts).context("load doodads")?;
         let items = load_items(&conn, &texts).context("load items")?;
         let item_uses = ItemUses::load(&conn).context("load item use skills")?;
+        let item_facts = ItemTable::load(&conn).context("load item trade facts")?;
 
         // Spawn files.
         let world_dir: PathBuf = paths.server_data.join("Worlds").join(&paths.world);
@@ -222,6 +226,7 @@ impl World {
             housing,
             areas,
             items,
+            item_facts,
             item_uses,
             zones,
             gather_doodads,
@@ -244,6 +249,7 @@ impl World {
             crafts = world.economy.craft_count(),
             designs = world.housing.designs().len(),
             items = world.items.len(),
+            item_facts = world.item_facts.len(),
             item_use_skills = world.item_uses.len(),
             gated_quests = world.start_gates.len(),
             recall_points = world.travel.portals.recall_points().len(),
@@ -290,6 +296,7 @@ impl World {
             ("quests", self.quests.bytes()),
             ("skills", self.skills.bytes()),
             ("item names", self.items.bytes()),
+            ("item trade facts", self.item_facts.bytes()),
             ("item use skills", self.item_uses.bytes()),
             ("quest start gates", self.start_gates.bytes()),
             ("crafts + specialty", self.economy.bytes()),
@@ -567,6 +574,17 @@ impl World {
     /// An item's English name.
     pub fn item_name(&self, id: u32) -> Option<&str> {
         self.items.get(id)
+    }
+
+    /// The trade facts of item `template` (vendor prices, binding, stacking, auction categories);
+    /// `None` for an unknown template. See [`ItemFacts::tradable`].
+    pub fn item_facts(&self, template: u32) -> Option<&ItemFacts> {
+        self.item_facts.get(template)
+    }
+
+    /// The trade facts of every item template.
+    pub fn item_table(&self) -> &ItemTable {
+        &self.item_facts
     }
 
     // ---- Housing -------------------------------------------------------------------------
