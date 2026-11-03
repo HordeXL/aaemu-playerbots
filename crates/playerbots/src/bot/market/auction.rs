@@ -36,6 +36,9 @@ pub const MAX_WINS: usize = 4;
 pub const PRICE_TTL_MS: u64 = 45 * 60_000;
 /// How long a win mail may take to arrive after a buyout.
 pub const WIN_MAIL_WAIT_MS: u64 = 90_000;
+/// How long the result mail of a lot that vanished may take (the server settles on its 5 second
+/// timer and retries; the bot lists the mailbox in the meantime).
+pub const SALE_MAIL_WAIT_MS: u64 = 75_000;
 
 /// What the bot learned about the market price of an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +165,8 @@ pub struct AuctionMemory {
     pub stats: Stats,
     /// Own lots that vanished from the house since the connection started.
     pub lots_gone: u32,
+    /// Bot clock (ms) at which `lots_gone` first exceeded the seller mails seen, 0 = it does not.
+    deficit_since_ms: u64,
     /// Buyouts whose win mail has not come.
     wins: Vec<WinWait>,
     /// Bot clock (ms) at which the last visit ended, 0 = no visit yet.
@@ -337,9 +342,19 @@ impl AuctionMemory {
         self.own.push(lot);
     }
 
-    /// Forgets own lot `id` (cancelled).
+    /// Forgets own lot `id` without a trace (the house never listed it).
     pub fn forget_own(&mut self, id: u64) {
         self.own.retain(|l| l.id != id);
+    }
+
+    /// Own lot `id` was cancelled: it is forgotten, and the mail that returns its item is one the
+    /// detectors expect like the mail of a lot that sold.
+    pub fn own_cancelled(&mut self, id: u64) {
+        if self.own.iter().any(|l| l.id == id) {
+            self.own.retain(|l| l.id != id);
+            self.lots_gone += 1;
+            self.stats.cancelled += 1;
+        }
     }
 
     /// Starts a survey of the own lots: nothing is seen yet.
@@ -371,6 +386,10 @@ impl AuctionMemory {
         let gone: Vec<OwnLot> = self.own.iter().filter(|l| !l.seen).copied().collect();
         self.own.retain(|l| l.seen);
         self.lots_gone += gone.len() as u32;
+        if !gone.is_empty() {
+            // their mail may have come before the bot knew they were gone, or it comes now
+            self.mail.want_list();
+        }
         gone
     }
 
@@ -380,6 +399,31 @@ impl AuctionMemory {
     /// mails seen (never negative).
     pub fn missing_seller_mails(&self) -> u32 {
         self.lots_gone.saturating_sub(self.mail.seller_mails)
+    }
+
+    /// The number of seller result mails that are overdue: the lots gone outnumber the mails seen
+    /// for [`SALE_MAIL_WAIT_MS`], with the mailbox listed since and nothing being collected. Once:
+    /// the missing mails are written off.
+    pub fn sale_mail_overdue(&mut self, now_ms: u64) -> Option<u32> {
+        let missing = self.missing_seller_mails();
+        if missing == 0 {
+            self.deficit_since_ms = 0;
+            return None;
+        }
+        if self.deficit_since_ms == 0 {
+            self.deficit_since_ms = now_ms.max(1);
+            return None;
+        }
+        if now_ms < self.deficit_since_ms + SALE_MAIL_WAIT_MS || self.mail.collecting() > 0 {
+            return None;
+        }
+        if !self.mail.listed_since(self.deficit_since_ms) {
+            self.mail.want_list();
+            return None;
+        }
+        self.lots_gone = self.mail.seller_mails;
+        self.deficit_since_ms = 0;
+        Some(missing)
     }
 
     /// A buyout of `template` was accepted: its win mail is due within [`WIN_MAIL_WAIT_MS`].
@@ -582,6 +626,52 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_sale_mail_is_reported_once_after_the_wait_and_a_listing() {
+        let mut m = AuctionMemory::default();
+        m.note_own(OwnLot {
+            id: 1,
+            template: 7,
+            count: 1,
+            buyout: 10,
+            posted_ms: 0,
+            posted_here: true,
+            seen: true,
+        });
+        m.begin_survey();
+        assert_eq!(m.end_survey().len(), 1);
+        assert_eq!(m.missing_seller_mails(), 1);
+        // the first look starts the clock; the mailbox is to be listed
+        assert_eq!(m.sale_mail_overdue(1_000), None);
+        let mut out = Vec::new();
+        m.mail.tick(1_000, false, &mut out);
+        assert_eq!(out.len(), 1, "the mailbox was listed");
+        assert_eq!(m.sale_mail_overdue(1_000 + SALE_MAIL_WAIT_MS - 1), None);
+        assert_eq!(m.sale_mail_overdue(1_000 + SALE_MAIL_WAIT_MS), Some(1));
+        // written off: no second report
+        assert_eq!(m.sale_mail_overdue(500_000), None);
+        assert_eq!(m.missing_seller_mails(), 0);
+        // without a listing after the deficit began the report waits for one
+        let mut m = AuctionMemory {
+            lots_gone: 1,
+            ..AuctionMemory::default()
+        };
+        assert_eq!(m.sale_mail_overdue(10), None);
+        assert_eq!(m.sale_mail_overdue(10 + SALE_MAIL_WAIT_MS), None);
+        let mut out = Vec::new();
+        m.mail.tick(10 + SALE_MAIL_WAIT_MS, false, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(m.sale_mail_overdue(20 + SALE_MAIL_WAIT_MS), Some(1));
+        // the mail came in time: nothing to report
+        let mut m = AuctionMemory {
+            lots_gone: 1,
+            ..AuctionMemory::default()
+        };
+        assert_eq!(m.sale_mail_overdue(10), None);
+        m.mail.seller_mails = 1;
+        assert_eq!(m.sale_mail_overdue(10 + SALE_MAIL_WAIT_MS * 2), None);
+    }
+
+    #[test]
     fn own_lots_are_bounded() {
         let mut m = AuctionMemory::default();
         for id in 0..(MAX_OWN as u64 * 3) {
@@ -599,6 +689,12 @@ mod tests {
         assert_eq!(m.own()[0].id, MAX_OWN as u64 * 2);
         m.forget_own(m.own()[0].id);
         assert_eq!(m.own().len(), MAX_OWN - 1);
+        assert_eq!(m.lots_gone, 0);
+        // a cancel counts as a lot gone: its item comes back by mail
+        let id = m.own()[0].id;
+        m.own_cancelled(id);
+        m.own_cancelled(id);
+        assert_eq!((m.lots_gone, m.stats.cancelled), (1, 1));
     }
 
     #[test]

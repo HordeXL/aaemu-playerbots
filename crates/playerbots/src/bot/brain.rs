@@ -350,6 +350,8 @@ impl Brain {
         }
         // Payment mails of sold trade packs are collected whatever the bot is doing.
         super::goals::trade_run::collect_payments(ctx);
+        // The same for the mail the auction house sends.
+        super::goals::auction::duty(ctx);
         let combat = Combat::tick(ctx);
         let now = ctx.now_ms;
 
