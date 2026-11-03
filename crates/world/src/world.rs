@@ -2,6 +2,7 @@
 //! (`Arc<World>`).
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,7 @@ use crate::sql::{each_row, open_readonly, RowExt};
 use crate::text::{TextTable, Texts};
 use crate::travel::{Travel, TravelInputs};
 use crate::uses::{ItemUses, SkillNeed};
+use crate::water::{WaterMap, NAV_FLOOR_M};
 
 /// Where the world data lives.
 #[derive(Clone, Debug)]
@@ -116,6 +118,8 @@ pub struct World {
     spheres: FxHashMap<(u32, u32), u32>,
     /// Portals, instance dungeons and boats (the travel abilities' static data).
     travel: Travel,
+    /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
+    water: OnceLock<Option<WaterMap>>,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -223,6 +227,7 @@ impl World {
             gather_doodads,
             spheres,
             travel,
+            water: OnceLock::new(),
         };
         let q = world.quests.stats();
         tracing::info!(
@@ -296,6 +301,13 @@ impl World {
             ("indexes", gather + self.spheres.capacity() * 16),
         ];
         v.extend(self.travel.memory_breakdown());
+        v.push((
+            "water map",
+            self.water
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, WaterMap::bytes),
+        ));
         v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
@@ -308,6 +320,26 @@ impl World {
     /// Portals, instance dungeons and boats; see [`crate::travel`].
     pub fn travel(&self) -> &Travel {
         &self.travel
+    }
+
+    /// The sea map boats are planned on, built from the baked terrain the first time it is asked
+    /// for (a tenth of a second on four threads, 0.7 MB; see [`crate::water`]); `None` without
+    /// baked terrain.
+    pub fn water(&self) -> Option<&WaterMap> {
+        self.water
+            .get_or_init(|| {
+                let started = Instant::now();
+                let map = WaterMap::from_terrain(self.baked.terrain.as_ref()?, NAV_FLOOR_M);
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    cells = u64::from(map.cols()) * u64::from(map.rows()),
+                    sea_cells = map.sea_count(),
+                    kib = map.bytes() / 1024,
+                    "water map built"
+                );
+                Some(map)
+            })
+            .as_ref()
     }
 
     /// Terrain height at (x, y) from the baked grid; `None` without baked terrain or outside it.

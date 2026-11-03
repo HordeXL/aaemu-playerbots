@@ -27,6 +27,7 @@ mod sql;
 mod text;
 pub mod travel;
 pub mod uses;
+pub mod water;
 mod world;
 
 pub use chars::CharRow;
