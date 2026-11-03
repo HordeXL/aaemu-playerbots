@@ -19,14 +19,25 @@
 //! The limits grow with the waiting time, so a lone bot is eventually paired with anybody; a
 //! request that finds nobody within [`REQUEST_TTL`] is dropped. The sweep that expires requests
 //! also looks for pairs again, because waiting relaxes the limits.
+//!
+//! # Parties for dungeons
+//!
+//! A bot that wants a dungeon sends a [`Wish`] ([`CoordHandle::request_party`]); the coordinator
+//! keeps the wishes for [`WISH_TTL`] and, whenever one arrives or the sweep runs, asks
+//! [`party::plan`] for a party of bots that fit one dungeon (level, alliance, distance, the
+//! dungeons each bot can still enter) and sends every member a [`BotCmd::Party`] with the same
+//! [`PartyOrder`]. The sites come from [`Coordinator::with_sites`]; without them wishes are never
+//! answered. A formed party is remembered for [`FORMED_TTL`] (see [`Coordinator::formed`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::cmd::{BotCmd, PairKind, PairOrder, PairRole};
+use super::party::{self, PartyOrder, PartyPurpose, Site, Wish};
 use crate::hub::Hub;
 
 /// Where the coordinator's orders go: the hub in production, a recorder in tests.
@@ -65,6 +76,12 @@ impl Dispatch for Hub {
 
 /// How long a request waits for a partner before it is dropped.
 pub const REQUEST_TTL: Duration = Duration::from_secs(120);
+/// How long a wish for a dungeon waits for a party before it is dropped.
+pub const WISH_TTL: Duration = Duration::from_secs(150);
+/// How long a formed party stays in the coordinator's list.
+pub const FORMED_TTL: Duration = Duration::from_secs(45 * 60);
+/// Most remembered parties.
+const FORMED_MAX: usize = 32;
 /// Two bots that were paired are not paired with each other again for this long.
 pub const REPAIR_COOLDOWN: Duration = Duration::from_secs(90);
 /// Distance (metres) within which a fresh request may be paired.
@@ -96,11 +113,13 @@ pub enum CoordMsg {
         /// Where it stands (x, y).
         at: (f32, f32),
     },
-    /// The bot no longer wants a partner (it gave up or was paired by hand).
+    /// The bot no longer wants a partner or a dungeon (it gave up or was paired by hand).
     Cancel {
         /// The bot.
         bot: u32,
     },
+    /// A bot wants to run a dungeon with a party.
+    Party(Wish),
 }
 
 /// The cheap, cloneable end bots talk to the coordinator with.
@@ -115,6 +134,11 @@ impl CoordHandle {
         self.tx
             .try_send(CoordMsg::Request { kind, bot, at })
             .is_ok()
+    }
+
+    /// Asks for a party for an instance dungeon. False when the coordinator's inbox is full.
+    pub fn request_party(&self, wish: Wish) -> bool {
+        self.tx.try_send(CoordMsg::Party(wish)).is_ok()
     }
 
     /// Withdraws a request.
@@ -143,12 +167,35 @@ struct Recent {
     at: Instant,
 }
 
+/// A bot that wants a dungeon.
+struct Wishing {
+    wish: Wish,
+    since: Instant,
+}
+
+/// A party that was formed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Formed {
+    /// Coordinator-assigned id.
+    pub party_id: u32,
+    /// The dungeon (zone group).
+    pub zone_group: u32,
+    /// The members' bot ids, the leader first.
+    pub bots: SmallVec<[u32; party::MAX_PARTY]>,
+    /// When it was formed.
+    pub at: Instant,
+}
+
 /// The coordinator task state.
 pub struct Coordinator {
     rx: mpsc::Receiver<CoordMsg>,
     sink: Arc<dyn Dispatch>,
     waiting: Vec<Waiting>,
     recent: Vec<Recent>,
+    sites: Vec<Site>,
+    wishing: Vec<Wishing>,
+    formed: Vec<Formed>,
+    next_party: u32,
 }
 
 /// Creates the coordinator and the handle bots use.
@@ -161,11 +208,31 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
             sink,
             waiting: Vec::new(),
             recent: Vec::new(),
+            sites: Vec::new(),
+            wishing: Vec::new(),
+            formed: Vec::new(),
+            next_party: 1,
         },
     )
 }
 
 impl Coordinator {
+    /// Gives the coordinator the dungeons it may send parties to ([`party::sites`]).
+    pub fn with_sites(mut self, sites: Vec<Site>) -> Coordinator {
+        self.sites = sites;
+        self
+    }
+
+    /// The parties formed lately, oldest first.
+    pub fn formed(&self) -> &[Formed] {
+        &self.formed
+    }
+
+    /// Number of bots waiting for a party.
+    pub fn wishing(&self) -> usize {
+        self.wishing.len()
+    }
+
     /// Runs until `cancel` fires.
     pub async fn run(mut self, cancel: CancellationToken) {
         let mut sweep = tokio::time::interval(Duration::from_secs(SWEEP_SECS));
@@ -184,7 +251,15 @@ impl Coordinator {
     /// Handles one message; pairs bots when two fit together.
     pub fn handle(&mut self, msg: CoordMsg, now: Instant) {
         match msg {
-            CoordMsg::Cancel { bot } => self.waiting.retain(|w| w.bot != bot),
+            CoordMsg::Cancel { bot } => {
+                self.waiting.retain(|w| w.bot != bot);
+                self.wishing.retain(|w| w.wish.bot != bot);
+            }
+            CoordMsg::Party(wish) => {
+                self.wishing.retain(|w| w.wish.bot != wish.bot);
+                self.wishing.push(Wishing { wish, since: now });
+                self.form_parties(now);
+            }
             CoordMsg::Request { kind, bot, at } => {
                 self.waiting.retain(|w| w.bot != bot);
                 self.waiting.push(Waiting {
@@ -205,7 +280,64 @@ impl Coordinator {
             .retain(|w| now.saturating_duration_since(w.since) < REQUEST_TTL);
         self.recent
             .retain(|r| now.saturating_duration_since(r.at) < REPAIR_COOLDOWN);
+        self.wishing
+            .retain(|w| now.saturating_duration_since(w.since) < WISH_TTL);
+        self.formed
+            .retain(|f| now.saturating_duration_since(f.at) < FORMED_TTL);
         self.pair_up(now);
+        self.form_parties(now);
+    }
+
+    /// Forms parties out of the wishes until no more can be formed, and orders every member.
+    fn form_parties(&mut self, now: Instant) {
+        while self.wishing.len() >= party::MIN_PARTY && !self.sites.is_empty() {
+            let wishes: Vec<(Wish, u64)> = self
+                .wishing
+                .iter()
+                .map(|w| (w.wish, now.saturating_duration_since(w.since).as_secs()))
+                .collect();
+            let Some(f) = party::plan(&wishes, &self.sites) else {
+                return;
+            };
+            let bots: SmallVec<[u32; party::MAX_PARTY]> =
+                f.members.iter().map(|&i| wishes[i].0.bot).collect();
+            // (the members leave the wish list, highest index first)
+            let mut gone: SmallVec<[usize; party::MAX_PARTY]> = f.members.clone();
+            gone.sort_unstable_by(|a, b| b.cmp(a));
+            for i in gone {
+                self.wishing.remove(i);
+            }
+            let party_id = self.next_party;
+            self.next_party = self.next_party.wrapping_add(1).max(1);
+            tracing::info!(
+                party = party_id,
+                zone_group = f.site.zone_group,
+                bots = ?bots,
+                "dungeon party formed"
+            );
+            for &bot in &bots {
+                let order = PartyOrder {
+                    party_id,
+                    leader: bots[0],
+                    members: bots.clone(),
+                    purpose: PartyPurpose::Dungeon {
+                        zone_group: f.site.zone_group,
+                    },
+                };
+                if let Err(e) = self.sink.send(bot, BotCmd::Party(Box::new(order))) {
+                    tracing::debug!("party order to {bot}: {e}");
+                }
+            }
+            if self.formed.len() >= FORMED_MAX {
+                self.formed.remove(0);
+            }
+            self.formed.push(Formed {
+                party_id,
+                zone_group: f.site.zone_group,
+                bots,
+                at: now,
+            });
+        }
     }
 
     /// Number of bots waiting for a partner.

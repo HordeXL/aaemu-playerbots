@@ -411,6 +411,9 @@ pub struct BotState {
     pub travel: TravelState,
     /// What the bot knows about its boat; gets the slave events (owned by the sailing feature).
     pub vehicle: VehicleState,
+    /// The team the bot is in and its dungeon memory (owned by the dungeons feature); made on
+    /// the first team event or dungeon goal.
+    pub party: Option<Box<super::party::PartyMem>>,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -689,6 +692,10 @@ impl BotState {
                 }
             }
             WorldEvent::TargetChanged { obj, target } => {
+                if let Some(mem) = self.party.as_mut() {
+                    mem.team
+                        .on_target(*obj, *target, self.me.obj, &self.units, self.now_ms);
+                }
                 if *obj == self.me.obj {
                     return;
                 }
@@ -865,6 +872,10 @@ impl BotState {
         self.threats.clear();
         self.kills.clear();
         self.avoid = None;
+        if let Some(mem) = self.party.as_mut() {
+            mem.team.member_targets.clear();
+            mem.team.attackers.clear();
+        }
     }
 
     fn apply_unit_state(&mut self, info: &UnitInfo) {
@@ -1155,6 +1166,7 @@ impl BotState {
     fn apply_activity(&mut self, ev: &ActivityEvent) {
         self.trade.apply(ev, self.now_ms);
         self.house_log.apply(ev, self.now_ms, self.me.char_id);
+        super::party::observe(&mut self.party, ev, self.now_ms);
         match ev {
             ActivityEvent::Quests { list } => {
                 for row in list {

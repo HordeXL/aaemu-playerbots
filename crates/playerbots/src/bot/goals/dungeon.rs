@@ -15,6 +15,11 @@
 //!   instance is loading; the instance packets keep it current.
 //! * `World::dungeons()` / `World::instance_world_by_zone_key` for the static data.
 
+mod clear;
+mod entry;
+mod machine;
+mod route;
+
 use pb_web::Activity;
 
 use crate::bot::ctx::Ctx;

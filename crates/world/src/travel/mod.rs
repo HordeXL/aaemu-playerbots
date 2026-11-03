@@ -188,6 +188,17 @@ impl World {
         self.travel().dungeons.by_entrance_doodad(template)
     }
 
+    /// Whether a doodad template is a dungeon door: an entrance doodad in the main world or an
+    /// exit doodad of an instance world. Cheap (two binary searches).
+    pub fn is_dungeon_door(&self, template: u32) -> bool {
+        self.travel().dungeons.is_door(template)
+    }
+
+    /// The instance world a dungeon loads.
+    pub fn dungeon_world(&self, dungeon: &Dungeon) -> Option<&InstanceWorld> {
+        self.travel().dungeons.world_of(dungeon)
+    }
+
     /// The instance world that the `zone_key` of an `SCLoadInstance` belongs to.
     pub fn instance_world_by_zone_key(&self, zone_key: u16) -> Option<&InstanceWorld> {
         self.travel().dungeons.world_by_zone_key(zone_key)
