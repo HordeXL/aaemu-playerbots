@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use aa_proto::cs;
 use aa_world::travel::Dungeon;
-use aa_world::Vec3;
 use smallvec::SmallVec;
 
 use super::clear::{self, Action, Clearing, Mob, Sight};
@@ -41,6 +40,8 @@ const EMPTY_LISTED_MIN: usize = 20;
 const SOON_BACK_OFF_MS: u64 = 15 * 60_000;
 /// Gap between two answers to an invitation.
 const ACCEPT_GAP_MS: u64 = 3_000;
+/// A load the server never finished (it said "processing" and then nothing) is dropped after this.
+const STALE_LOAD_MS: u64 = 45_000;
 /// Reports of one run, one bit each.
 const T_NO_LOAD: u16 = 1;
 const T_WRONG_WORLD: u16 = 1 << 1;
@@ -76,6 +77,13 @@ fn flat(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// A distance that weighs the height heavily: inside an instance the bot keeps the height it
+/// arrived at (see `Place::ground`), so a doodad on another floor is out of reach however near it
+/// is on the map, and the exit to use is the one on the bot's own floor.
+fn floor_dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+    flat(a, b) + 3.0 * (a[2] - b[2]).abs()
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -109,6 +117,11 @@ pub struct Run {
     last_cast_skill: u32,
     cast_result: u8,
     finished: bool,
+    /// The exit skill of the last exit cast and the bot clock of that cast.
+    exit_cast: (u32, u64),
+    /// Refusals of the exit skill seen, and the bot clock of the last one.
+    exit_refused: (u8, u64),
+    exit_noted: bool,
 }
 
 impl Run {
@@ -139,6 +152,9 @@ impl Run {
             last_cast_skill: 0,
             cast_result: 0,
             finished: false,
+            exit_cast: (0, 0),
+            exit_refused: (0, 0),
+            exit_noted: false,
         }
     }
 
@@ -340,7 +356,10 @@ impl Run {
         // the end of the clear
         f.route_done = self.route_done;
         if !f.leader {
-            f.party_leaving = ctx.hub.board.stage(order.party_id) >= Stage::Leaving;
+            let stage = ctx.hub.board.stage(order.party_id);
+            f.party_leaving = stage >= Stage::Leaving;
+            // (a member that comes to the door after the leader went in is not kept waiting)
+            f.muster_ready |= stage >= Stage::Clearing;
             f.leader_gone = leader_mate.is_none_or(|m| !m.online);
         }
         // the way out
@@ -365,6 +384,48 @@ impl Run {
         match (place.world_name(), ctx.world.dungeon_world(d)) {
             (Some(got), Some(w)) => got == &*w.name,
             _ => true,
+        }
+    }
+
+    /// Follows the exit casts: a refusal of the exit skill is the bot's doing (out of range, on
+    /// another floor), a cast the server accepted and did nothing about is the server's, and
+    /// reported when the bot has to fall back on leaving the team.
+    fn watch_exit(&mut self, ctx: &mut Ctx<'_>) {
+        let (skill, cast_ms) = self.exit_cast;
+        if skill != 0 {
+            let seen = self.exit_refused.1.max(cast_ms.saturating_sub(1));
+            for &(t, e) in ctx.state.errors.iter() {
+                if t > seen {
+                    if let StateError::Skill { skill: s, result } = e {
+                        if s == skill && result != 0 {
+                            self.exit_refused = (self.exit_refused.0.saturating_add(1), t);
+                        }
+                    }
+                }
+            }
+        }
+        if !self.machine.exit_failed() || self.exit_noted {
+            return;
+        }
+        self.exit_noted = true;
+        let refused = self.exit_refused.0;
+        let Some(d) = self.dungeon_ref(ctx) else {
+            return;
+        };
+        let exit = self.exit_door(ctx, d).map(|x| x.0);
+        if refused == 0 {
+            self.tell(
+                ctx,
+                T_EXIT,
+                Problem::ExitStuck {
+                    doodad: exit.map_or(0, |x| x.template),
+                    skill: exit.map_or(skill, |x| x.skill),
+                },
+            );
+        } else {
+            ctx.log.say(format!(
+                "dungeon: the server refused the exit skill {refused} times (out of range or another floor); the bot leaves the team instead"
+            ));
         }
     }
 
@@ -406,7 +467,7 @@ impl Run {
         let mut best: Option<(Door, f32)> = None;
         for x in iw.exits() {
             if let Some((_, pos)) = find_doodad(ctx, x.template, [x.pos.x, x.pos.y, x.pos.z]) {
-                let dist = flat(me, pos);
+                let dist = floor_dist(me, pos);
                 if best.is_none_or(|b| dist < b.1) {
                     best = Some((
                         Door {
@@ -422,7 +483,10 @@ impl Run {
         if let Some((door, _)) = best {
             return Some((door, true));
         }
-        let x = iw.nearest_exit(Vec3::new(me[0], me[1], me[2]))?;
+        let x = iw.exits().iter().min_by(|a, b| {
+            floor_dist(me, [a.pos.x, a.pos.y, a.pos.z])
+                .total_cmp(&floor_dist(me, [b.pos.x, b.pos.y, b.pos.z]))
+        })?;
         Some((
             Door {
                 template: x.template,
@@ -448,6 +512,7 @@ impl Run {
             (c != 0).then_some(c)
         });
         reject_strays(ctx, leader_char);
+        drop_stale_load(ctx);
         let facts = self.facts(ctx, order);
         let before = self.machine.phase();
         let intent = self.machine.step(&facts);
@@ -456,16 +521,18 @@ impl Run {
             self.on_phase(ctx, order, before, after);
         }
         self.last_phase = after;
+        self.watch_exit(ctx);
         self.carry_out(ctx, order, &facts, intent)
     }
 
     fn on_phase(&mut self, ctx: &mut Ctx<'_>, order: Option<&PartyOrder>, from: Phase, to: Phase) {
         let name = self.name(ctx).to_owned();
-        ctx.log.say(format!(
-            "dungeon: {} ({name}): {}",
-            to.word(),
-            phase_note(from, to)
-        ));
+        let note = phase_note(from, to);
+        ctx.log.say(if note.is_empty() {
+            format!("dungeon: {} ({name})", to.word())
+        } else {
+            format!("dungeon: {} ({name}): {note}", to.word())
+        });
         let leader = order.is_some_and(|o| o.is_leader(ctx.persona.id));
         let party_id = order.map_or(0, |o| o.party_id);
         match to {
@@ -732,6 +799,7 @@ impl Run {
         };
         let me = ctx.state.me.obj;
         ctx.send(cs::start_skill_doodad(skill, me, obj));
+        self.exit_cast = (skill, ctx.now_ms.max(1));
         ctx.log.say(format!(
             "dungeon: casting the exit skill {skill} on doodad {obj}"
         ));
@@ -911,9 +979,67 @@ impl Run {
         if entered == 0 || ctx.now_ms.saturating_sub(entered) < EMPTY_AFTER_MS {
             return;
         }
-        if self.listed >= EMPTY_LISTED_MIN {
+        if self.listed >= EMPTY_LISTED_MIN && self.told & T_NO_MONSTERS == 0 {
             let listed = self.listed;
-            self.tell(ctx, T_NO_MONSTERS, Problem::NoMonsters { listed });
+            let count = |k: UnitKind| ctx.state.units.values().filter(|u| u.kind == k).count();
+            let (seen_npcs, seen_characters) = (count(UnitKind::Npc), count(UnitKind::Character));
+            let waited_s = ctx.now_ms.saturating_sub(entered) / 1000;
+            ctx.log.say(format!(
+                "dungeon: nothing hostile in view {waited_s} s after arriving ({seen_npcs} NPC units, {seen_characters} characters, {} doodads in view; the data lists {listed} hostile spawns)",
+                ctx.state.doodads.len()
+            ));
+            self.sample_npcs(ctx);
+            self.tell(
+                ctx,
+                T_NO_MONSTERS,
+                Problem::NoMonsters {
+                    listed,
+                    seen_npcs,
+                    seen_characters,
+                    waited_s,
+                },
+            );
+        }
+    }
+
+    /// Writes the nearest few NPC units in view to the bot log: what they are to this bot
+    /// (the reason a unit is no monster is in these numbers).
+    fn sample_npcs(&self, ctx: &mut Ctx<'_>) {
+        let me = ctx.state.me.pos;
+        let own = ctx.state.me.faction;
+        let mut near: SmallVec<[(f32, u32); 5]> = SmallVec::new();
+        let mut all: Vec<(f32, u32)> = ctx
+            .state
+            .units
+            .iter()
+            .filter(|(_, u)| u.kind == UnitKind::Npc)
+            .map(|(&o, u)| (u.dist2d(me), o))
+            .collect();
+        all.sort_by(|a, b| a.0.total_cmp(&b.0));
+        near.extend(all.into_iter().take(5));
+        for (d, o) in near {
+            let Some(u) = ctx.state.units.get(&o) else {
+                continue;
+            };
+            let template = ctx.world.npc(u.id);
+            let faction = if u.faction != 0 {
+                u.faction
+            } else {
+                template.map_or(0, |t| t.faction_id)
+            };
+            let line = format!(
+                "dungeon: sample npc {} lv{} faction {} (own {}): {:?}, {:.0} m away, dz {:.1}, flags {:#x}, template {}",
+                u.id,
+                u.level,
+                faction,
+                own,
+                ctx.world.relation(own, faction),
+                d,
+                u.pos[2] - me[2],
+                u.flags,
+                if template.is_some() { "known" } else { "unknown" }
+            );
+            ctx.log.say(line);
         }
     }
 
@@ -1100,6 +1226,23 @@ fn hostile_template(ctx: &Ctx<'_>, template: u32) -> bool {
     ctx.world.npc(template).is_some_and(|t| {
         ctx.world.relation(ctx.state.me.faction, t.faction_id) == aa_world::Relation::Hostile
     })
+}
+
+/// A load that never ended (the server sent `SCProcessingInstance` for an entry it then refused
+/// without a word) would keep the next entry from being cast: forget it.
+fn drop_stale_load(ctx: &mut Ctx<'_>) {
+    let place = &ctx.state.place;
+    if place.in_instance() {
+        return;
+    }
+    if place
+        .loading_since_ms()
+        .is_some_and(|t| ctx.now_ms.saturating_sub(t) > STALE_LOAD_MS)
+    {
+        ctx.state.place.loaded();
+        ctx.log
+            .say("dungeon: dropped a load the server never finished");
+    }
 }
 
 /// Turns down an invitation that is not the leader's.

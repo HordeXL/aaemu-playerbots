@@ -61,6 +61,12 @@ pub enum Problem<'a> {
     NoMonsters {
         /// Hostile spawns the data lists in the world.
         listed: usize,
+        /// NPC units of any kind the bot sees.
+        seen_npcs: usize,
+        /// Characters (the party) the bot sees.
+        seen_characters: usize,
+        /// Seconds since the bot arrived.
+        waited_s: u64,
     },
     /// The exit doodad was cast on and nothing happened.
     ExitStuck {
@@ -173,16 +179,25 @@ pub fn build(at: Where<'_>, problem: Problem<'_>) -> IssueReport {
         .actual("no such unit came into view within 10 s")
         .suspect(Suspect::Data)
         .fact("npc", template),
-        Problem::NoMonsters { listed } => base(
+        Problem::NoMonsters {
+            listed,
+            seen_npcs,
+            seen_characters,
+            waited_s,
+        } => base(
             IssueKind::NpcMissing,
             "no-monsters".into(),
             format!("{name}: no monster at all in view inside the dungeon"),
         )
         .expected(format!("some of the {listed} hostile spawns of the data"))
-        .actual("an empty spawn list: not one hostile unit was shown")
+        .actual(format!(
+            "after {waited_s} s inside: {seen_npcs} NPC units and {seen_characters} characters in view, not one hostile"
+        ))
         .suspect(Suspect::Server)
         .severity(Severity::High)
-        .fact("listed", listed),
+        .fact("listed", listed)
+        .fact("seen_npcs", seen_npcs)
+        .fact("seen_characters", seen_characters),
         Problem::ExitStuck { doodad, skill } => base(
             IssueKind::NoResponse,
             format!("exit doodad={doodad}"),
@@ -292,7 +307,12 @@ mod tests {
                 "dungeon=50 boss=12188",
             ),
             (
-                Problem::NoMonsters { listed: 300 },
+                Problem::NoMonsters {
+                    listed: 300,
+                    seen_npcs: 1,
+                    seen_characters: 2,
+                    waited_s: 30,
+                },
                 IssueKind::NpcMissing,
                 Suspect::Server,
                 "dungeon=50 no-monsters",

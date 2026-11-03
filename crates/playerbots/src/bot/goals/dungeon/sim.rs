@@ -44,6 +44,8 @@ struct Mate {
     machine: Machine,
     team: TeamLog,
     online: bool,
+    /// How long the walk to the door takes.
+    walk_ms: u64,
     /// Walking to the door; arrives at this time.
     walking_until: Option<u64>,
     at_door: bool,
@@ -100,6 +102,7 @@ impl Sim {
                 machine: Machine::new(true, 0),
                 team: TeamLog::default(),
                 online: true,
+                walk_ms: WALK_MS,
                 walking_until: None,
                 at_door: false,
                 in_instance: false,
@@ -180,7 +183,9 @@ impl Sim {
                 Trip::Idle
             },
             door_in_view: m.at_door,
-            muster_ready: self.mates.iter().filter(|o| o.online).all(near),
+            // (a member that comes after the leader went in is not kept waiting)
+            muster_ready: self.mates.iter().filter(|o| o.online).all(near)
+                || (m.rank != 0 && leader.in_instance),
             muster_near: self.mates.iter().filter(|o| near(o)).count() as u8,
             error: m.cast_error,
             cast_refused: false,
@@ -336,7 +341,7 @@ impl Sim {
             Intent::DismissTeam => self.dismiss(),
             Intent::GoToDoor => {
                 if self.mates[i].walking_until.is_none() && !self.mates[i].at_door {
-                    self.mates[i].walking_until = Some(now + WALK_MS);
+                    self.mates[i].walking_until = Some(now + self.mates[i].walk_ms);
                 }
             }
             Intent::CastEntry => {
@@ -537,4 +542,14 @@ fn the_members_leave_when_the_leader_drops_out() {
         assert!(!m.in_instance, "the members came out");
         assert_ne!(m.end, End::Running);
     }
+}
+
+#[test]
+fn a_member_that_comes_to_the_door_after_the_leader_went_in_follows_it() {
+    let mut s = Sim::new(3, Door::Works);
+    // the walk of bot 1 takes longer than the muster is willing to wait
+    s.mates[1].walk_ms = 160_000;
+    s.run(20 * 60_000);
+    assert_eq!(s.ends(), vec![End::Done; 3], "{:?}", s.ends());
+    assert_eq!(s.entered_order, vec![0, 2, 1], "the slow one goes in last");
 }
