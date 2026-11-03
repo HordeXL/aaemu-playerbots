@@ -171,7 +171,12 @@ impl Planner {
 
 impl Drop for Planner {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        // The flag is set under the queue lock: a thread that has checked it and is about to wait
+        // holds the lock until it waits, so it cannot miss the wake-up.
+        {
+            let _q = self.shared.queue.lock();
+            self.shared.stop.store(true, Ordering::Relaxed);
+        }
         self.shared.wake.notify_all();
         for t in self.threads.drain(..) {
             let _ = t.join();

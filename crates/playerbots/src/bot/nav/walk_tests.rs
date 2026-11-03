@@ -887,6 +887,23 @@ fn a_goal_beyond_one_search_is_walked_in_pieces() {
 }
 
 #[test]
+fn a_planner_pool_that_is_dropped_right_after_it_starts_stops() {
+    // the stop flag races with a worker that is about to wait: many short-lived pools show a
+    // wake-up that is lost
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..400 {
+            drop(Planner::start(2, 8, Arc::new(NavMetrics::default())));
+        }
+        let _ = done.send(());
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+        "a planner pool did not stop"
+    );
+}
+
+#[test]
 fn many_bots_share_a_small_pool_without_losing_an_answer() {
     let metrics = Arc::new(NavMetrics::default());
     let planner = Planner::start(2, 64, metrics.clone());
