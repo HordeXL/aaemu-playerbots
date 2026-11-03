@@ -20,6 +20,7 @@ pub mod dungeon;
 pub mod instance;
 pub mod mirage;
 pub mod portal;
+pub mod zonegroup;
 
 mod funcs;
 
@@ -38,6 +39,7 @@ pub use mirage::Mirage;
 pub use portal::{
     MemoryTome, PortalKit, PortalReagent, Portals, RecallPoint, RespawnPoint, WorldGate,
 };
+pub use zonegroup::ZoneGroups;
 
 use crate::doodad::DoodadData;
 use crate::geom::{IdMap, StrTable, Vec3};
@@ -108,6 +110,8 @@ pub struct Travel {
     pub boats: Boats,
     /// Mirage Isle, the market island (`None` when the data has no such portal).
     pub mirage: Option<Mirage>,
+    /// Zone key to zone group: who hears the trade chat.
+    pub zone_groups: ZoneGroups,
 }
 
 impl Travel {
@@ -124,6 +128,7 @@ impl Travel {
             dungeons,
             boats,
             mirage,
+            zone_groups: ZoneGroups::load(inp.conn),
         };
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -145,10 +150,11 @@ impl Travel {
             + self.dungeons.bytes()
             + self.boats.bytes()
             + self.mirage.as_ref().map_or(0, Mirage::bytes)
+            + self.zone_groups.bytes()
     }
 
     /// Heap bytes per part, for the memory report.
-    pub fn memory_breakdown(&self) -> [(&'static str, usize); 4] {
+    pub fn memory_breakdown(&self) -> [(&'static str, usize); 5] {
         [
             ("travel: portals", self.portals.bytes()),
             ("travel: dungeons + instance worlds", self.dungeons.bytes()),
@@ -157,6 +163,7 @@ impl Travel {
                 "travel: Mirage Isle",
                 self.mirage.as_ref().map_or(0, Mirage::bytes),
             ),
+            ("travel: zone groups", self.zone_groups.bytes()),
         ]
     }
 }
@@ -228,6 +235,12 @@ impl World {
     /// exit doodad (`None` when the server data has no such portal).
     pub fn mirage(&self) -> Option<&Mirage> {
         self.travel().mirage.as_ref()
+    }
+
+    /// The zone group (`zones.group_id`) at (x, y): whose trade, shout and group-finding chat the
+    /// character there reads. `None` where the baked zone grid has no zone.
+    pub fn zone_group_at(&self, x: f32, y: f32) -> Option<u32> {
+        self.travel().zone_groups.of_key(self.zone_key_at(x, y)?)
     }
 
     // Boats
