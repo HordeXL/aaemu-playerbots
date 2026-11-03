@@ -435,6 +435,15 @@ pub fn route(ev: &WorldEvent) -> Route {
         | WorldEvent::PortalSaved(_)
         | WorldEvent::PortalDeleted { .. }
         | WorldEvent::PortalUsed { .. } => Route::Travel,
+        // (the answers to the four portal skills: record, rename, open a gate, recall)
+        WorldEvent::SkillStarted {
+            skill:
+                aa_world::travel::portal::RECORD_PORTAL_SKILL
+                | aa_world::travel::portal::RENAME_PORTAL_SKILL
+                | aa_world::travel::portal::OPEN_PORTAL_SKILL
+                | aa_world::travel::portal::RECALL_SKILL,
+            ..
+        } => Route::Travel,
         WorldEvent::SlaveCreated { .. }
         | WorldEvent::MySlave(_)
         | WorldEvent::SlaveBound { .. }
@@ -585,7 +594,7 @@ impl BotState {
 
     fn apply_world(&mut self, ev: &WorldEvent) {
         match route(ev) {
-            Route::Travel => return self.travel.on_event(ev),
+            Route::Travel => return self.travel.on_event(ev, self.me.obj, self.now_ms),
             Route::Vehicle => return self.vehicle.on_event(ev, self.me.obj),
             Route::Place | Route::Other => {}
         }
@@ -920,6 +929,16 @@ impl BotState {
         }
         if info.owner_id != 0 {
             flags |= U_OWNED;
+        }
+        if kind == UnitKind::Npc && info.id == aa_world::travel::portal::PORTAL_ENTRANCE_NPC {
+            // an open portal's entrance: the portal travel remembers whose gate it is
+            self.travel.note_gate(
+                info.obj,
+                info.owner_id,
+                info.owner_id != 0 && info.owner_id == self.me.char_id,
+                [info.pos.0, info.pos.1, info.pos.2],
+                self.now_ms,
+            );
         }
         self.units.insert(
             info.obj,

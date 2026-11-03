@@ -282,6 +282,14 @@ impl Portals {
         self.recalls.iter().filter(move |r| r.sub_zone == sub_zone)
     }
 
+    /// Recall points within `radius` metres (horizontal) of `pos`.
+    pub fn recalls_within(&self, pos: Vec3, radius: f32) -> impl Iterator<Item = &RecallPoint> {
+        let r2 = radius * radius;
+        self.recalls
+            .iter()
+            .filter(move |r| r.pos.dist2d_sq(pos) <= r2)
+    }
+
     /// Respawn points.
     pub fn respawn_points(&self) -> &[RespawnPoint] {
         &self.respawns
@@ -371,6 +379,131 @@ impl Portals {
             + self.tomes.capacity() * std::mem::size_of::<MemoryTome>()
             + self.tome_returns.capacity() * 12
             + self.continents.capacity() * std::mem::size_of::<(u16, u8)>()
+    }
+}
+
+/// Metres per zone origin cell (the wire offsets of a book entry count from `origin * 1024`).
+pub const ZONE_CELL_M: f32 = 1024.0;
+
+/// The origin cell `(cx, cy)` that turns the wire offset `off` of a Teleport Book entry into the
+/// world position `world` (`world = off + cell * 1024`). `None` when the difference is not a whole
+/// number of cells within `tolerance` metres: then one of the two is not the same spot.
+pub fn origin_cell(world: (f32, f32), off: (f32, f32), tolerance: f32) -> Option<(i32, i32)> {
+    let axis = |w: f32, o: f32| {
+        let cells = ((w - o) / ZONE_CELL_M).round();
+        if !cells.is_finite() || (w - o - cells * ZONE_CELL_M).abs() > tolerance {
+            return None;
+        }
+        Some(cells as i32)
+    };
+    Some((axis(world.0, off.0)?, axis(world.1, off.1)?))
+}
+
+/// The zone origin cells learned so far (`zone key -> (cell x, cell y)`).
+///
+/// The server sends a Teleport Book entry as an offset from the origin cell of its zone
+/// (`world.xml` of the client, which the bots do not read), so a bot learns each zone's cell from
+/// a spot whose world position it knows: the place it stood when it recorded the entry, or a recall
+/// point (`recalls.json` has world positions). The table is tiny (one entry per zone) and is kept
+/// in a text form (`zone x y` per line) so a run can keep it for the next one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZoneOrigins {
+    cells: Vec<(u16, i32, i32)>,
+}
+
+impl ZoneOrigins {
+    /// Most zones kept (the main world has about a hundred).
+    pub const MAX: usize = 512;
+
+    /// A table that knows no zone (usable in a `static`).
+    pub const EMPTY: ZoneOrigins = ZoneOrigins { cells: Vec::new() };
+
+    /// The origin cell of `zone`.
+    pub fn get(&self, zone: u16) -> Option<(i32, i32)> {
+        self.cells
+            .binary_search_by_key(&zone, |c| c.0)
+            .ok()
+            .map(|i| (self.cells[i].1, self.cells[i].2))
+    }
+
+    /// Remembers the origin cell of `zone`; returns whether that changed anything.
+    pub fn learn(&mut self, zone: u16, cell: (i32, i32)) -> bool {
+        match self.cells.binary_search_by_key(&zone, |c| c.0) {
+            Ok(i) => {
+                let changed = (self.cells[i].1, self.cells[i].2) != cell;
+                self.cells[i] = (zone, cell.0, cell.1);
+                changed
+            }
+            Err(i) if self.cells.len() < Self::MAX => {
+                self.cells.insert(i, (zone, cell.0, cell.1));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Learns the cell of `zone` from an entry with the wire offset `off` that is known to be at
+    /// world position `world`; `None` when the two do not differ by whole cells within
+    /// `tolerance` metres (nothing is learned), else whether the table changed.
+    pub fn learn_from(
+        &mut self,
+        zone: u16,
+        world: (f32, f32),
+        off: (f32, f32),
+        tolerance: f32,
+    ) -> Option<bool> {
+        let cell = origin_cell(world, off, tolerance)?;
+        Some(self.learn(zone, cell))
+    }
+
+    /// World `(x, y)` of an entry of `zone` with the wire offset `off`. Zone 0 sends world
+    /// coordinates already; an unknown zone gives `None`.
+    pub fn world_xy(&self, zone: u16, off: (f32, f32)) -> Option<(f32, f32)> {
+        if zone == 0 {
+            return Some(off);
+        }
+        let (cx, cy) = self.get(zone)?;
+        Some((
+            off.0 + cx as f32 * ZONE_CELL_M,
+            off.1 + cy as f32 * ZONE_CELL_M,
+        ))
+    }
+
+    /// Number of zones known.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Whether no zone is known.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// One `zone x y` line per zone.
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        for (zone, x, y) in &self.cells {
+            s.push_str(&format!("{zone} {x} {y}\n"));
+        }
+        s
+    }
+
+    /// Reads the text form; lines that do not parse are skipped.
+    pub fn from_text(text: &str) -> ZoneOrigins {
+        let mut o = ZoneOrigins::default();
+        for line in text.lines() {
+            let mut it = line.split_whitespace().map(str::parse::<i64>);
+            if let (Some(Ok(z)), Some(Ok(x)), Some(Ok(y)), None) =
+                (it.next(), it.next(), it.next(), it.next())
+            {
+                if let (Ok(z), Ok(x), Ok(y)) =
+                    (u16::try_from(z), i32::try_from(x), i32::try_from(y))
+                {
+                    o.learn(z, (x, y));
+                }
+            }
+        }
+        o
     }
 }
 
@@ -815,5 +948,80 @@ mod tests {
         assert!(p.world_gates().is_empty());
         assert!(p.nearest_recall(Vec3::default()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recalls_within_a_radius() {
+        let conn = fixture();
+        let dir = data_dir();
+        let p = load(&conn, &dir);
+        let here = Vec3::new(15500.0, 15400.0, 0.0);
+        let ids: Vec<u32> = p.recalls_within(here, 200.0).map(|r| r.id).collect();
+        assert_eq!(ids, vec![243]);
+        assert_eq!(p.recalls_within(here, 10.0).count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_origin_cell_is_the_whole_cells_between_world_and_offset() {
+        // a spot at world (15578.04, 15382.12) with the wire offset (218.04, -1001.88)
+        let cell = origin_cell((15578.04, 15382.12), (218.04, -1001.88), 0.5);
+        assert_eq!(cell, Some((15, 16)));
+        // a spot that is not a whole number of cells away is no origin
+        assert_eq!(origin_cell((100.0, 100.0), (50.0, 50.0), 2.0), None);
+        // the tolerance covers a position that is a little off
+        assert_eq!(origin_cell((2048.8, 1024.0), (0.0, 0.0), 1.0), Some((2, 1)));
+        assert_eq!(origin_cell((2051.0, 1024.0), (0.0, 0.0), 1.0), None);
+        assert_eq!(origin_cell((f32::NAN, 0.0), (0.0, 0.0), 1.0), None);
+        // negative offsets are fine
+        assert_eq!(
+            origin_cell((10.0, 10.0), (-1014.0, -1014.0), 0.1),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn zone_origins_learn_resolve_and_round_trip() {
+        let mut o = ZoneOrigins::default();
+        assert!(o.is_empty());
+        assert_eq!(o.world_xy(179, (1.0, 2.0)), None, "unknown zone");
+        assert_eq!(
+            o.world_xy(0, (1.0, 2.0)),
+            Some((1.0, 2.0)),
+            "zone 0 is world"
+        );
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 100.0), 3.0),
+            None,
+            "the second axis is no whole cell"
+        );
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 22.0), 3.0),
+            Some(true)
+        );
+        assert_eq!(o.get(179), Some((15, 15)));
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 22.0), 3.0),
+            Some(false)
+        );
+        assert_eq!(
+            o.world_xy(179, (10.0, 20.0)),
+            Some((10.0 + 15360.0, 20.0 + 15360.0))
+        );
+        o.learn(5, (-1, 2));
+        o.learn(900, (3, 4));
+        let text = o.to_text();
+        assert_eq!(ZoneOrigins::from_text(&text), o);
+        // bad lines are skipped
+        let back = ZoneOrigins::from_text(
+            "7 1 2
+nope
+8 1
+9 1 2 3
+70000 1 1
+",
+        );
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.get(7), Some((1, 2)));
     }
 }

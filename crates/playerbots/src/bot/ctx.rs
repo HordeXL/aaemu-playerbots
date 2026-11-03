@@ -183,9 +183,15 @@ impl Ctx<'_> {
         self.cfg.bots.gm_bootstrap
     }
 
-    /// Starts a trip to (x, y), stopping `radius` metres short. Long trips use `/move` when the
-    /// config allows it.
+    /// Starts a trip to (x, y), stopping `radius` metres short. A trip of more than 1.2 km goes
+    /// through a portal when `behavior.portals` is on and the bot's book has an entry near the
+    /// destination (then the motion stays idle while the portal journey runs and the goal waits,
+    /// see [`crate::bot::travel`]); long trips otherwise use `/move` when the config allows it.
     pub fn travel(&mut self, x: f32, y: f32, radius: f32, pace: Pace) {
+        // a far trip may go by portal (a gate to a book entry near the destination, or a recall)
+        if super::travel::far_trip(self, x, y) {
+            return;
+        }
         let teleport = if self.cfg.bots.gm_bootstrap {
             self.cfg.bots.long_travel_teleport_m
         } else {

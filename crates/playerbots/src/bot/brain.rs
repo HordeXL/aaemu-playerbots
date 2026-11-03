@@ -329,11 +329,14 @@ impl Brain {
         } else if self.hurt_and_idle(ctx) {
             self.start_goal(ctx, GoalKind::Rest, None);
         }
+        // Portal duty: records book entries, steps a far trip by portal, hops through a gate. While
+        // it casts or waits at a gate the goal waits too.
+        let travelling = super::travel::duty(ctx, self.goal.as_ref().map(Goal::kind));
         let Some(goal) = self.goal.as_mut() else {
             return;
         };
-        if ctx.combat.busy() && !goal.owns_combat() {
-            // The controller is defending the bot; the goal waits.
+        if travelling || (ctx.combat.busy() && !goal.owns_combat()) {
+            // The controller is defending the bot, or a portal cast is under way; the goal waits.
             return;
         }
         match goal.tick(ctx, combat) {
@@ -379,6 +382,7 @@ impl Brain {
             _ => None,
         };
         goal.stop(ctx);
+        super::travel::on_goal_end(ctx);
         self.last = Some(kind);
         if let Some(ext) = self.ext.as_mut() {
             ext.director.note_goal(kind, why.is_none());
