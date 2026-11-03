@@ -1037,7 +1037,9 @@ impl Run {
             return self.buy(env, why, lot);
         }
         self.pages_left = BROWSE_PAGES;
-        self.page = i32::from(env.rng().bool());
+        // the server sorts by buyout, so page 0 holds the cheapest lots; a later page is asked for
+        // only after a full one (the server warns about a page past the end)
+        self.page = 0;
         self.best = None;
         self.enter(env, Phase::Browse, "Auction: looking at the lots on offer");
         GoalStatus::Running
