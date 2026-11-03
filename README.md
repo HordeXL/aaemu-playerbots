@@ -231,6 +231,9 @@ else is bounded: [docs/OPERATING.md](docs/OPERATING.md#memory-and-scale)).
   random goals near the Nuian start).
 * Dungeon navigation meshes are split into rooms, and no party has killed a dungeon boss yet (the
   parties are level 18 in starter gear).
+* Quest progression walks: a bot never rides a carriage or an airship, so a trip to a zone it
+  can only reach that way fails and the destination rests for a while. A trip ends as soon as
+  any quest comes within 1500 m, so a bot on its way can be drawn aside by a side quest.
 * Sailing is sea only (no lakes or rivers) and has no passengers yet.
 * Portal ink and stones, boat scrolls and the dungeon level-up need the GM bootstrap unless the bot
   already carries them.

@@ -107,6 +107,65 @@ command-like text into nothing; `cs::gm_command` is the only builder that keeps 
 Bots also decline trade requests from real players unless `behavior.trade_with_players` is on (and
 never when they can mint goods).
 
+## Quest progression (`goals/quest/progress.rs`, `aa-world::quest_atlas`)
+
+The quest picker looks for a giver within 300 m, then within 1500 m. A bot that has done everything
+in that circle used to stay there (grinding and wandering filled in), so the Harani and Firran
+hand-off from Villanelle to the Silent Forest, 2 km apart, never happened. Now a bot whose scan
+finds nothing three times in a row (5 s apart) plans a **trip**, and the picker itself ranks quests
+a little differently.
+
+**The atlas.** `World::quest_atlas` is built once, by the first bot that asks (about 80 KiB, listed in the memory breakdown): per quest, at most three giver spawns (position,
+zone, level, story flag), sorted by zone, plus each race's **story chain**: the open story category
+with the most quests (Nuian 3, Elf 8, Harani 62, Firran 61), in chapter order. It holds only quests
+whose objectives all have a plan (`objective::supported`). It is race-independent; whether a bot
+may take a quest is judged per bot (`Eligibility`: level with the usual +1 slack, done, in the
+journal, quarantined, prerequisites, the race/gender/quest gates of the start, a giver that is not
+hostile).
+
+**Choosing a destination** (`plan_target`, pure functions in `progress.rs`, in this order):
+
+1. **Story.** The giver of the first quest of the bot's chain that it qualifies for and that lies
+   beyond 1500 m. Chain order, then level; unsupported and quarantined quests are skipped.
+2. **Zone.** The zone whose eligible quests, weighted by how well they fit the bot's level, add up
+   to the most (at least 1.5), then the densest cluster of its givers (400 m), discounted by
+   distance.
+3. **Grind.** A spot with monsters of the bot's level near the zone whose quests it will be able to
+   take within a few levels. Reaching it fails the goal with `NoTarget`, so the brain's grinding
+   takes over; no further grinding trip is planned for ten minutes.
+
+A candidate is dropped when it is blocked (a failed destination, below) or risky: monsters
+10 or more levels above the bot at the destination, 14 or more along the route (bosses excluded
+there, they stand off the road), or a destination on a part of the navigation mesh the bot cannot
+reach. The picker ranks by story, chapter, then "worth the time", then distance: a quest more than
+6 levels below the bot (a side quest, never a story quest) comes after every other one, and a
+bot with only those near goes to a better place instead of farming them.
+
+**Walking.** The goal has a fifth mode, `Travel`, that uses the existing `walk()` legs (the
+navigation mesh in pieces of up to 1500 m, at most ten, the straight line where there is no mesh;
+`Ctx::travel` and the portal journey for trips over 1200 m; `/move` only with
+`long_travel_teleport_m`). Every five seconds it rescans; as soon as a non-trivial quest is within
+1500 m the trip ends as `InRange` and the picker takes it.
+
+**State and back-offs.** `Memory.progress: Option<Box<Progress>>` (one pointer per bot, allocated by
+the first scan) holds the trip, the empty-scan count, failed destinations and the last few
+trips. A trip has its own time limit (distance at 3 m/s plus 3 min, between 5 and 45 min) that the
+run's end does not cut short, and survives a rest or a duel in between. A destination that timed
+out, was blocked or killed the bot twice rests for 10 min, then 20, then 40, together with
+everything within 400 m of it. A search that finds no destination waits 2 min before the next. A
+scan that comes back empty within 90 s of arriving marks the place as barren.
+
+**Visible.** The goal detail reads "heading to Lilyut Hills for quest 1234 Name (2.1 km to go)" /
+"... for quests suited to level 17" / "... to hunt monsters"; the log (`info`) has one line at the
+start ("progress: heading to ...") and one at the end ("progress: trip to ... arrived after 612 s
+(0 m of 2034 m to go)").
+
+**Not covered.** Zone-to-zone connections that need a carriage, an airship or a ferry (the walk
+fails and the destination rests); crossing a hostile zone is only avoided where the danger checks
+see it. The real-data tests (`tests/quest_real_data.rs`, ignored, need `AA_COMPACT` and
+`AA_SERVER_DATA`) run each race for 240 simulated minutes and print quests done, zones visited and
+trips.
+
 ## Improvements over the original (from the audit)
 
 - Immutable, shared compiled rotations (`Arc`) with a tiny per-bot state, instead of per-bot
