@@ -493,6 +493,8 @@ pub struct Combat {
     travelling_until_ms: u64,
     /// The target the controller picked to defend against (0 = it is no defence).
     defending: u32,
+    /// The target the controller took up to help the party (0 = it is no assist).
+    assisting: u32,
     /// What the controller saw of the fight against the current target.
     watch: Watch,
     /// How the last target was lost.
@@ -542,6 +544,7 @@ impl Combat {
             next_kite_ms: 0,
             travelling_until_ms: 0,
             defending: 0,
+            assisting: 0,
             watch: Watch::default(),
             loss: None,
             obstructed: 0,
@@ -569,6 +572,7 @@ impl Combat {
         }
         self.target = Some(target_obj);
         self.defending = 0;
+        self.assisting = 0;
         self.announced = false;
         self.last_goto = None;
         self.engaged_at_ms = None;
@@ -599,6 +603,7 @@ impl Combat {
     pub fn disengage(&mut self) {
         self.target = None;
         self.defending = 0;
+        self.assisting = 0;
         self.announced = false;
         self.last_goto = None;
         self.engaged_at_ms = None;
@@ -919,6 +924,12 @@ impl Combat {
                 ctx.log.debug(format!("defending against unit {obj}"));
                 ctx.combat.engage(obj);
                 ctx.combat.defending = obj;
+            } else if let Some(obj) = pick_assist(ctx, travelling) {
+                // (a team member's fight: help, and share the loot)
+                ctx.log
+                    .debug(format!("assisting the party against unit {obj}"));
+                ctx.combat.engage(obj);
+                ctx.combat.assisting = obj;
             }
         }
         let Some(obj) = ctx.combat.target else {
@@ -936,7 +947,8 @@ impl Combat {
             return Self::lose(ctx, LostReason::Gone);
         };
         if dead {
-            let ours = !is_char && ctx.state.kills.iter().any(|k| k.0 == obj);
+            let ours = !is_char
+                && (ctx.state.kills.iter().any(|k| k.0 == obj) || ctx.combat.assisting == obj);
             ctx.combat.disengage();
             if !is_char {
                 ctx.combat.kills += 1;
@@ -1475,6 +1487,10 @@ const FIGHT_LIMITS: ThreatLimits = ThreatLimits {
     react_range: REACT_RANGE,
 };
 
+/// How far a bot in a team goes to help a team member (standing, and travelling).
+const ASSIST_M: f32 = 45.0;
+const TRAVEL_ASSIST_M: f32 = TRAVEL_FIGHT_M;
+
 /// A bot on its way somewhere only turns on units that attack it right now and are close.
 const TRAVEL_LIMITS: ThreatLimits = ThreatLimits {
     window_ms: TRAVEL_THREAT_WINDOW_MS,
@@ -1510,6 +1526,46 @@ fn named_attacker(
         }
     }
     best.map(|b| b.0)
+}
+
+/// The monster a team member needs help with: one that attacks a member (the nearest first), else
+/// one a member targets. `ok` says whether a unit may be fought (hostile, alive, not given up).
+fn assist_target(
+    team: &super::party::TeamLog,
+    units: &rustc_hash::FxHashMap<u32, Unit>,
+    me: [f32; 3],
+    now_ms: u64,
+    max_dist: f32,
+    ok: impl Fn(u32, &Unit) -> bool,
+) -> Option<u32> {
+    let nearest = |objs: &mut dyn Iterator<Item = u32>| {
+        objs.filter_map(|o| units.get(&o).map(|u| (o, u)))
+            .filter(|(o, u)| u.dist2d(me) <= max_dist && ok(*o, u))
+            .min_by(|a, b| a.1.dist2d(me).total_cmp(&b.1.dist2d(me)))
+            .map(|(o, _)| o)
+    };
+    nearest(&mut team.attackers_at(now_ms).map(|a| a.0))
+        .or_else(|| nearest(&mut team.member_targets_at(now_ms).map(|t| t.1)))
+}
+
+/// The unit to help a team member against; `None` for a bot that is in no team (solo bots
+/// behave as they always did).
+fn pick_assist(ctx: &Ctx<'_>, travelling: bool) -> Option<u32> {
+    let team = ctx.state.team().filter(|t| t.in_team())?;
+    let faction = ctx.state.me.faction;
+    let (world, state, now) = (ctx.world, &*ctx.state, ctx.now_ms);
+    assist_target(
+        team,
+        &state.units,
+        state.me.pos,
+        now,
+        if travelling {
+            TRAVEL_ASSIST_M
+        } else {
+            ASSIST_M
+        },
+        |obj, u| attackable(world, faction, u).is_some() && !state.avoids(obj, u.id, now),
+    )
 }
 
 /// The unit to defend against: one that targets the bot, else (when the bot is losing hit
@@ -1675,6 +1731,106 @@ mod tests {
         units.get_mut(&1).unwrap().flags = 0;
         units.get_mut(&1).unwrap().kind = UnitKind::Character;
         assert_eq!(pick(&units, &[(1, now - 100)], &TRAVEL_LIMITS), None);
+    }
+
+    fn team_with(members: &[(u32, u32)]) -> crate::bot::party::TeamLog {
+        // members are (char id, object id)
+        let mut t = crate::bot::party::TeamLog {
+            team_id: 9,
+            owner: members[0].0,
+            ..Default::default()
+        };
+        for &(c, o) in members {
+            t.members.push(crate::bot::party::Member {
+                char_id: c,
+                level: 20,
+                obj_id: o,
+            });
+        }
+        t
+    }
+
+    fn character(char_id: u32, pos: [f32; 3]) -> Unit {
+        Unit {
+            kind: UnitKind::Character,
+            id: char_id,
+            ..npc(pos)
+        }
+    }
+
+    #[test]
+    fn a_team_member_in_a_fight_gets_help_and_a_bot_without_a_team_none() {
+        // me = object 1 (char 10); a friend = object 2 (char 20); three monsters
+        let mut units = rustc_hash::FxHashMap::default();
+        units.insert(2, character(20, [3.0, 0.0, 0.0]));
+        units.insert(50, npc([12.0, 0.0, 0.0])); // fights the friend
+        units.insert(51, npc([30.0, 0.0, 0.0])); // the friend targets it
+        units.insert(52, npc([100.0, 0.0, 0.0])); // far away
+        let mut team = team_with(&[(10, 1), (20, 2)]);
+        let now = 50_000;
+        let ok = |_: u32, _: &Unit| true;
+        let pick = |team: &crate::bot::party::TeamLog, max: f32| {
+            assist_target(team, &units, [0.0; 3], now, max, ok)
+        };
+        // nothing is going on
+        assert_eq!(pick(&team, ASSIST_M), None);
+        // the friend targets monster 51
+        team.on_target(2, 51, 1, &units, now - 1_000);
+        assert_eq!(pick(&team, ASSIST_M), Some(51));
+        // a monster that attacks the friend comes first, even though the friend targets another
+        team.on_target(50, 2, 1, &units, now - 500);
+        assert_eq!(pick(&team, ASSIST_M), Some(50));
+        // travelling: only what is close
+        assert_eq!(pick(&team, TRAVEL_ASSIST_M), Some(50));
+        team.on_target(50, 0, 1, &units, now - 400); // it stopped attacking
+        assert_eq!(pick(&team, TRAVEL_ASSIST_M), None, "51 is 30 m away");
+        // old news is forgotten
+        assert_eq!(
+            assist_target(&team, &units, [0.0; 3], now + 2 * 12_000, ASSIST_M, ok),
+            None
+        );
+        // a monster far away is no concern, and a unit the bot may not fight is skipped
+        team.on_target(2, 52, 1, &units, now - 100);
+        assert_eq!(pick(&team, ASSIST_M), None);
+        let not_51 = |o: u32, _: &Unit| o != 51;
+        team.on_target(2, 51, 1, &units, now - 100);
+        assert_eq!(
+            assist_target(&team, &units, [0.0; 3], now, ASSIST_M, not_51),
+            None
+        );
+        // the bot itself is never the one it helps
+        team.on_target(1, 51, 1, &units, now);
+        assert_eq!(
+            team.member_targets_at(now).filter(|t| t.0 == 1).count(),
+            0,
+            "the controller ignores the bot's own target"
+        );
+    }
+
+    #[test]
+    fn a_bot_that_left_its_team_helps_nobody() {
+        let mut units = rustc_hash::FxHashMap::default();
+        units.insert(2, character(20, [3.0, 0.0, 0.0]));
+        units.insert(51, npc([30.0, 0.0, 0.0]));
+        let mut team = team_with(&[(10, 1), (20, 2)]);
+        team.on_target(2, 51, 1, &units, 1_000);
+        assert_eq!(
+            assist_target(&team, &units, [0.0; 3], 2_000, ASSIST_M, |_, _| true),
+            Some(51)
+        );
+        team.apply(
+            &aa_proto::sc_activity::ActivityEvent::LeftTeam {
+                team_id: 9,
+                kicked: false,
+                dismissed: false,
+            },
+            3_000,
+        );
+        assert!(!team.in_team());
+        assert_eq!(
+            assist_target(&team, &units, [0.0; 3], 3_100, ASSIST_M, |_, _| true),
+            None
+        );
     }
 
     // the travelling limits are the narrower ones, and a defence is not dropped the moment it

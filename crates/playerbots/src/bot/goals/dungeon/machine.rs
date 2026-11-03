@@ -325,7 +325,11 @@ impl Machine {
     /// A run that starts in [`Phase::Gather`] (`has_order` false) or [`Phase::Prep`].
     pub fn new(has_order: bool, now_ms: u64) -> Machine {
         Machine {
-            phase: if has_order { Phase::Prep } else { Phase::Gather },
+            phase: if has_order {
+                Phase::Prep
+            } else {
+                Phase::Gather
+            },
             since_ms: now_ms,
             last_ms: 0,
             tries: 0,
@@ -350,11 +354,6 @@ impl Machine {
     /// The phase.
     pub fn phase(&self) -> Phase {
         self.phase
-    }
-
-    /// Bot clock at which the phase began.
-    pub fn since_ms(&self) -> u64 {
-        self.since_ms
     }
 
     /// When the bot arrived inside (0 = not yet).
@@ -720,8 +719,8 @@ impl Machine {
         if waited > OUT_MS {
             return Intent::Done;
         }
-        let resend = self.sent_out_ms == 0
-            || now.saturating_sub(self.sent_out_ms) >= TEAM_RESEND_MS;
+        let resend =
+            self.sent_out_ms == 0 || now.saturating_sub(self.sent_out_ms) >= TEAM_RESEND_MS;
         if f.leader {
             let others = f.team.size.saturating_sub(1);
             if (others == 0 || waited > LEADER_OUT_WAIT_MS) && resend {
@@ -811,7 +810,13 @@ mod tests {
             ..facts(10)
         };
         assert_eq!(m.step(&gm), Intent::RaiseLevel);
-        assert_eq!(m.step(&Facts { now_ms: 2_000, ..gm }), Intent::Wait);
+        assert_eq!(
+            m.step(&Facts {
+                now_ms: 2_000,
+                ..gm
+            }),
+            Intent::Wait
+        );
         assert_eq!(m.phase(), Phase::Prep);
         let raised = Facts {
             level: 18,
@@ -864,10 +869,7 @@ mod tests {
             Intent::Invite(2)
         );
         // everybody is in: on to the entrance
-        assert_eq!(
-            m.step(&lead(20_000, 0, 3, true)),
-            Intent::GoToDoor
-        );
+        assert_eq!(m.step(&lead(20_000, 0, 3, true)), Intent::GoToDoor);
         assert_eq!(m.phase(), Phase::Travel);
     }
 
@@ -944,7 +946,13 @@ mod tests {
             ..facts(100)
         };
         assert_eq!(m.step(&stale), Intent::LeaveTeam);
-        assert_eq!(m.step(&Facts { now_ms: 200, ..stale }), Intent::Wait);
+        assert_eq!(
+            m.step(&Facts {
+                now_ms: 200,
+                ..stale
+            }),
+            Intent::Wait
+        );
         // a member that never gets in fails
         let mut m = at_team();
         assert_eq!(m.step(&facts(TEAM_MS + 1)), Intent::Fail(Fail::Team));
@@ -976,7 +984,10 @@ mod tests {
         for _ in 0..MOTION_RETRIES - 1 {
             assert_eq!(m.step(&f(400, Trip::Failed, false)), Intent::GoToDoor);
         }
-        assert_eq!(m.step(&f(500, Trip::Failed, false)), Intent::Fail(Fail::Stuck));
+        assert_eq!(
+            m.step(&f(500, Trip::Failed, false)),
+            Intent::Fail(Fail::Stuck)
+        );
         // arriving ends the trip
         let mut m = at_travel();
         assert_eq!(m.step(&f(600, Trip::Idle, true)), Intent::Stand);
@@ -1028,7 +1039,10 @@ mod tests {
         let mut m2 = at_muster(2);
         assert_eq!(m2.step(&f(5_000, true, 3, 2)), Intent::Stand);
         assert_eq!(m2.step(&f(5_000 + STAGGER_MS, true, 3, 2)), Intent::Stand);
-        assert_eq!(m2.step(&f(5_000 + 2 * STAGGER_MS, true, 3, 2)), Intent::Wait);
+        assert_eq!(
+            m2.step(&f(5_000 + 2 * STAGGER_MS, true, 3, 2)),
+            Intent::Wait
+        );
         assert_eq!(m2.phase(), Phase::Enter);
         // the others do not come: after the wait the bot goes if somebody else is there
         let mut m = at_muster(0);
@@ -1178,7 +1192,10 @@ mod tests {
         assert_eq!(m.step(&f(5_000, true, 3, 2)), Intent::Stand);
         // rank 0 and 1 went in: only this bot is left at the door, but the party was complete
         assert_eq!(m.step(&f(5_000 + STAGGER_MS, false, 1, 2)), Intent::Stand);
-        assert_eq!(m.step(&f(5_000 + 2 * STAGGER_MS, false, 1, 2)), Intent::Wait);
+        assert_eq!(
+            m.step(&f(5_000 + 2 * STAGGER_MS, false, 1, 2)),
+            Intent::Wait
+        );
         assert_eq!(m.phase(), Phase::Enter);
     }
 
@@ -1408,7 +1425,13 @@ mod tests {
             ..inside(12_000)
         };
         assert_eq!(m.step(&near), Intent::CastExit);
-        assert_eq!(m.step(&Facts { now_ms: 13_000, ..near }), Intent::Wait);
+        assert_eq!(
+            m.step(&Facts {
+                now_ms: 13_000,
+                ..near
+            }),
+            Intent::Wait
+        );
         assert_eq!(
             m.step(&Facts {
                 now_ms: 12_000 + EXIT_GAP_MS,
@@ -1452,7 +1475,13 @@ mod tests {
         assert_eq!(intent, Intent::LeaveTeam);
         assert!(m.exit_failed());
         // then it waits for the server to move it, and fails when it does not
-        assert_eq!(m.step(&Facts { now_ms: t + 1_000, ..near }), Intent::Wait);
+        assert_eq!(
+            m.step(&Facts {
+                now_ms: t + 1_000,
+                ..near
+            }),
+            Intent::Wait
+        );
         assert_eq!(
             m.step(&Facts {
                 now_ms: t + EXIT_STUCK_MS + 1,

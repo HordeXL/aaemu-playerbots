@@ -648,4 +648,166 @@ mod tests {
         };
         assert_eq!((o.kind, o.meet_at), (PairKind::Trade, (450.0, 0.0)));
     }
+
+    // ---- parties for dungeons ----------------------------------------------------------------
+
+    fn site(idx: u16, group: u32, min: u8, max: u8, party: u8, at: (f32, f32)) -> Site {
+        Site {
+            idx,
+            zone_group: group,
+            level_min: min,
+            level_max: max,
+            max_party: party,
+            at,
+        }
+    }
+
+    fn wish(bot: u32, at: (f32, f32), level: u8) -> Wish {
+        Wish {
+            bot,
+            at,
+            level,
+            alliance: 7,
+            skip: 0,
+            raise: false,
+            jump: false,
+        }
+    }
+
+    fn parties(rec: &Recorder) -> Vec<(u32, PartyOrder)> {
+        rec.sent
+            .lock()
+            .iter()
+            .filter_map(|(bot, cmd)| match cmd {
+                BotCmd::Party(o) => Some((*bot, (**o).clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn three_wishes_for_one_dungeon_form_a_party_led_by_the_highest_level() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_sites(vec![site(0, 50, 18, 55, 3, (100.0, 100.0))]);
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Party(wish(1, (0.0, 0.0), 20)), t0);
+        c.handle(CoordMsg::Party(wish(2, (10.0, 0.0), 30)), t0);
+        assert!(parties(&rec).is_empty(), "two are not enough at first");
+        c.handle(CoordMsg::Party(wish(3, (20.0, 0.0), 25)), t0);
+        let sent = parties(&rec);
+        assert_eq!(sent.len(), 3, "every member is told");
+        let order = &sent[0].1;
+        assert!(sent.iter().all(|(_, o)| o == order), "one order for all");
+        assert_eq!(order.leader, 2, "the highest level leads");
+        assert_eq!(order.members[0], 2);
+        let mut m: Vec<u32> = order.members.iter().copied().collect();
+        m.sort_unstable();
+        assert_eq!(m, [1, 2, 3]);
+        assert_eq!(order.purpose, PartyPurpose::Dungeon { zone_group: 50 });
+        assert_eq!(c.wishing(), 0);
+        assert_eq!(c.formed().len(), 1);
+        assert_eq!(c.formed()[0].party_id, order.party_id);
+    }
+
+    #[test]
+    fn a_pair_is_formed_only_after_the_wait_and_never_across_alliances() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_sites(vec![site(0, 50, 18, 55, 3, (0.0, 0.0))]);
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Party(wish(1, (0.0, 0.0), 20)), t0);
+        c.handle(CoordMsg::Party(wish(2, (5.0, 0.0), 20)), t0);
+        assert!(parties(&rec).is_empty());
+        c.expire(t0 + Duration::from_secs(party::RELAX_AFTER_SECS - 5));
+        assert!(parties(&rec).is_empty(), "not yet");
+        c.expire(t0 + Duration::from_secs(party::RELAX_AFTER_SECS + 1));
+        assert_eq!(parties(&rec).len(), 2, "a party of two after the wait");
+        // a bot of the other alliance is left out
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_sites(vec![site(0, 50, 18, 55, 3, (0.0, 0.0))]);
+        c.handle(CoordMsg::Party(wish(1, (0.0, 0.0), 20)), t0);
+        c.handle(CoordMsg::Party(wish(2, (5.0, 0.0), 20)), t0);
+        let foe = Wish {
+            alliance: 8,
+            ..wish(3, (6.0, 0.0), 20)
+        };
+        c.handle(CoordMsg::Party(foe), t0);
+        assert!(parties(&rec).is_empty());
+        c.expire(t0 + Duration::from_secs(party::RELAX_AFTER_SECS + 1));
+        let sent = parties(&rec);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(b, _)| *b != 3));
+        assert_eq!(c.wishing(), 1, "the foe goes on waiting");
+    }
+
+    #[test]
+    fn the_level_the_range_and_the_blocked_dungeons_decide_who_goes_where() {
+        let (rec, _h, c) = coordinator();
+        // a low dungeon (18-25) and a high one (31-55), both at the same place
+        let mut c = c.with_sites(vec![
+            site(0, 50, 18, 25, 3, (0.0, 0.0)),
+            site(1, 45, 31, 55, 5, (0.0, 0.0)),
+        ]);
+        let t0 = Instant::now();
+        // too high for the low one, too low for the high one without a raise: nobody goes
+        c.handle(CoordMsg::Party(wish(1, (0.0, 0.0), 28)), t0);
+        c.handle(CoordMsg::Party(wish(2, (1.0, 0.0), 28)), t0);
+        c.handle(CoordMsg::Party(wish(3, (2.0, 0.0), 28)), t0);
+        assert!(parties(&rec).is_empty());
+        c.handle(CoordMsg::Cancel { bot: 1 }, t0);
+        c.handle(CoordMsg::Cancel { bot: 2 }, t0);
+        c.handle(CoordMsg::Cancel { bot: 3 }, t0);
+        assert_eq!(c.wishing(), 0, "a cancel withdraws the wish");
+        // GM bots below the range may be raised: the dungeon with the smaller gap wins
+        for b in 1..=3u32 {
+            let w = Wish {
+                raise: true,
+                ..wish(b, (b as f32, 0.0), 10)
+            };
+            c.handle(CoordMsg::Party(w), t0);
+        }
+        let sent = parties(&rec);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].1.zone_group(), 50, "18 is closer to 10 than 31 is");
+        // bots that cannot enter the low dungeon (the server refused it) go to the high one
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_sites(vec![
+            site(0, 50, 18, 25, 3, (0.0, 0.0)),
+            site(1, 45, 18, 55, 5, (0.0, 0.0)),
+        ]);
+        for b in 1..=3u32 {
+            let w = Wish {
+                skip: 1 << 0,
+                ..wish(b, (b as f32, 0.0), 20)
+            };
+            c.handle(CoordMsg::Party(w), t0);
+        }
+        let sent = parties(&rec);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].1.zone_group(), 45);
+    }
+
+    #[test]
+    fn a_dungeon_party_does_not_disturb_duels_and_a_second_wish_replaces_the_first() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_sites(vec![site(0, 50, 18, 55, 3, (0.0, 0.0))]);
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Party(wish(1, (0.0, 0.0), 20)), t0);
+        c.handle(CoordMsg::Party(wish(1, (1.0, 0.0), 21)), t0);
+        assert_eq!(c.wishing(), 1, "one wish per bot");
+        c.handle(req(PairKind::Duel, 7, (0.0, 0.0)), t0);
+        c.handle(req(PairKind::Duel, 8, (3.0, 0.0)), t0);
+        assert_eq!(pairs(&rec).len(), 2, "the duel pair is still made");
+        assert_eq!(c.wishing(), 1);
+        // without sites a wish is never answered
+        let (rec, _h, c) = coordinator();
+        let mut c = c;
+        for b in 1..=3u32 {
+            c.handle(CoordMsg::Party(wish(b, (0.0, 0.0), 20)), t0);
+        }
+        assert!(parties(&rec).is_empty());
+        assert_eq!(c.wishing(), 3);
+        // wishes that waited too long are dropped
+        c.expire(t0 + WISH_TTL + Duration::from_secs(1));
+        assert_eq!(c.wishing(), 0);
+    }
 }

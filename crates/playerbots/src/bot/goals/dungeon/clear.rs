@@ -270,6 +270,7 @@ pub struct Clearing {
     no_rest_until_ms: u64,
     regroup_since_ms: u64,
     regroup_stop: u16,
+    missing_boss: u32,
 }
 
 fn flat(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -317,6 +318,11 @@ impl Clearing {
         s.now_ms.saturating_sub(self.regroup_since_ms) < REGROUP_MS
     }
 
+    /// The template of a boss that never showed at its stop, once (0 = none).
+    pub fn take_missing_boss(&mut self) -> u32 {
+        std::mem::take(&mut self.missing_boss)
+    }
+
     /// One tick of the leader (the combat controller is idle).
     pub fn leader(&mut self, route: &[Stop], s: &Sight<'_>) -> Action {
         if self.rest(s) {
@@ -325,12 +331,7 @@ impl Clearing {
         let Some(stop) = self.cursor.current(route).copied() else {
             return Action::Done;
         };
-        let target = nearest(
-            s.mobs.iter().map(|m| (m.obj, m.pos)),
-            s.me,
-            s.me,
-            ENGAGE_M,
-        );
+        let target = nearest(s.mobs.iter().map(|m| (m.obj, m.pos)), s.me, s.me, ENGAGE_M);
         let facts = StopFacts {
             now_ms: s.now_ms,
             dist: stop.dist2d(s.me),
@@ -351,9 +352,11 @@ impl Clearing {
                 }
             }
             StopStep::Fight => target.map_or(Action::Hold, Action::Engage),
-            StopStep::Hold | StopStep::Next | StopStep::Skip | StopStep::BossMissing => {
+            StopStep::BossMissing => {
+                self.missing_boss = stop.boss;
                 Action::Hold
             }
+            StopStep::Hold | StopStep::Next | StopStep::Skip => Action::Hold,
             StopStep::Done => Action::Done,
         }
     }
@@ -424,10 +427,10 @@ mod tests {
         let me = [0.0, 0.0, 0.0];
         let anchor = [30.0, 0.0, 0.0];
         let cands = [
-            (1, [31.0, 0.0, 0.0]),   // next to the anchor, 31 m from me
-            (2, [10.0, 0.0, 0.0]),   // 10 m from me, 20 from the anchor
-            (3, [200.0, 0.0, 0.0]),  // far from the anchor
-            (4, [29.0, 20.0, 0.0]),  // 20 m from the anchor
+            (1, [31.0, 0.0, 0.0]),  // next to the anchor, 31 m from me
+            (2, [10.0, 0.0, 0.0]),  // 10 m from me, 20 from the anchor
+            (3, [200.0, 0.0, 0.0]), // far from the anchor
+            (4, [29.0, 20.0, 0.0]), // 20 m from the anchor
         ];
         assert_eq!(nearest(cands.into_iter(), anchor, me, 25.0), Some(2));
         assert_eq!(nearest(cands.into_iter(), anchor, me, 5.0), Some(1));
@@ -444,14 +447,20 @@ mod tests {
         // at the stop with monsters: fight, the quiet clock restarts
         assert_eq!(c.step(&at(5_000, 3.0, true), 2), StopStep::Fight);
         assert_eq!(c.step(&at(6_000, 3.0, false), 2), StopStep::Hold);
-        assert_eq!(c.step(&at(6_000 + QUIET_MS - 1, 3.0, false), 2), StopStep::Hold);
+        assert_eq!(
+            c.step(&at(6_000 + QUIET_MS - 1, 3.0, false), 2),
+            StopStep::Hold
+        );
         assert_eq!(c.step(&at(6_000 + QUIET_MS, 3.0, false), 2), StopStep::Next);
         assert_eq!(c.next, 1);
         // a new monster before the quiet is over resets it
         assert_eq!(c.step(&at(10_000, 3.0, false), 2), StopStep::Hold);
         assert_eq!(c.step(&at(12_000, 3.0, true), 2), StopStep::Fight);
         assert_eq!(c.step(&at(13_000, 3.0, false), 2), StopStep::Hold);
-        assert_eq!(c.step(&at(13_000 + QUIET_MS, 3.0, false), 2), StopStep::Next);
+        assert_eq!(
+            c.step(&at(13_000 + QUIET_MS, 3.0, false), 2),
+            StopStep::Next
+        );
         assert_eq!(c.step(&at(20_000, 3.0, false), 2), StopStep::Done);
         assert_eq!(c.left(2), 0);
     }
@@ -516,7 +525,14 @@ mod tests {
             boss: 0,
         }];
         assert_eq!(Cursor::default().current(&route), Some(&route[0]));
-        assert_eq!(Cursor { next: 1, ..Cursor::default() }.current(&route), None);
+        assert_eq!(
+            Cursor {
+                next: 1,
+                ..Cursor::default()
+            }
+            .current(&route),
+            None
+        );
     }
 
     fn stop(x: f32, y: f32, boss: u32) -> Stop {

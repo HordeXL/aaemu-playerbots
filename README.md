@@ -96,6 +96,9 @@ Safety of the GM lines:
   gates); `false` keeps them off portals.
 * `[behavior] dungeons = true` (default): bots may form parties and enter instance dungeons (goal
   `dungeon`); `false` keeps them out of both.
+* `[behavior] dungeon_level_up = false` (default): with `bots.gm_bootstrap`, `true` lets a bot below a
+  dungeon's level range raise its level to the range's minimum with the GM `/level` command
+  (logged); `false` keeps dungeons to the bots whose level fits.
 * `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
   them on land.
 

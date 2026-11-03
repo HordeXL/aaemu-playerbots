@@ -873,7 +873,9 @@ impl Bot {
         if let Some(p) = r.resurrected {
             self.motion.teleported(p);
             self.next_rez_ms = 0;
-            self.brain.queue(GoalKind::Rest, None);
+            if !self.brain.in_dungeon_run() {
+                self.brain.queue(GoalKind::Rest, None);
+            }
             self.log.say("resurrected");
         }
         if let Some((reason, msg)) = r.kicked {
@@ -1102,6 +1104,7 @@ fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
 fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
     d.has_loot
         || d.quest_glow != 0
+        || world.is_dungeon_door(d.template)
         || world
             .doodad(d.template)
             .is_some_and(|t| t.flags != DoodadFlags::NONE)

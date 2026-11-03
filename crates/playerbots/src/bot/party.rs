@@ -273,7 +273,9 @@ impl TeamLog {
 
     /// Whether unit `obj` is a member of the team other than the bot.
     fn is_member_unit(&self, obj: u32, units: &FxHashMap<u32, Unit>) -> bool {
-        self.members.iter().any(|m| m.obj_id != 0 && m.obj_id == obj)
+        self.members
+            .iter()
+            .any(|m| m.obj_id != 0 && m.obj_id == obj)
             || units
                 .get(&obj)
                 .is_some_and(|u| u.kind == UnitKind::Character && self.has(u.id))
@@ -462,9 +464,9 @@ pub fn usable(world: &World, d: &Dungeon) -> bool {
         && d.required_item == 0
         && d.max_players >= MIN_PARTY as u16
         && !d.entrances.is_empty()
-        && world.dungeon_world(d).is_some_and(|w| {
-            w.zone_keys.len() == 1 && w.spawn_for_zone(d.zone_key).is_some()
-        })
+        && world
+            .dungeon_world(d)
+            .is_some_and(|w| w.zone_keys.len() == 1 && w.spawn_for_zone(d.zone_key).is_some())
 }
 
 /// The index of the dungeon in `World::dungeons()` whose zone group is `zone_group`.
@@ -704,7 +706,12 @@ impl PartyBoard {
     }
 
     /// The leader's target if it was set within `fresh`.
-    pub fn target(&self, party: u32, now: std::time::Instant, fresh: std::time::Duration) -> Option<u32> {
+    pub fn target(
+        &self,
+        party: u32,
+        now: std::time::Instant,
+        fresh: std::time::Duration,
+    ) -> Option<u32> {
         self.entries
             .lock()
             .iter()
@@ -772,7 +779,10 @@ mod tests {
             100
         ));
         let inv = t.invite.clone().unwrap();
-        assert_eq!((inv.from_char, &*inv.from_name, inv.at_ms), (5, "Lead", 100));
+        assert_eq!(
+            (inv.from_char, &*inv.from_name, inv.at_ms),
+            (5, "Lead", 100)
+        );
         // joining clears it and fills the members
         t.apply(&joined(9, 5, &[(5, 50), (6, 60)]), 200);
         assert!(t.in_team() && t.invite.is_none());
@@ -944,7 +954,10 @@ mod tests {
             m.note_entry(50, 100 + i);
         }
         assert!(m.blocked(50, 3, 1_000), "three entries used up");
-        assert!(!m.blocked(50, 3, 1_000 + ENTRY_WINDOW_MS), "the window passed");
+        assert!(
+            !m.blocked(50, 3, 1_000 + ENTRY_WINDOW_MS),
+            "the window passed"
+        );
         // the server refused a group for ten minutes
         m.back_off(47, 600_000);
         assert!(m.blocked(47, 3, 1_000));
