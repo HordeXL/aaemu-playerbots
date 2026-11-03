@@ -46,8 +46,6 @@ const RECORD_WAIT_MS: u64 = 10_000;
 const DELETE_WAIT_MS: u64 = 4_000;
 /// Another record is not tried within this long of the last failure, ms.
 const RECORD_RETRY_MS: u64 = 5 * 60_000;
-/// Two entries closer than this are one place: no new record near an existing one.
-const ENTRY_NEAR_M: f32 = 600.0;
 /// The most Memory Ink a GM top-up adds.
 const INK_TOPUP: u32 = 3;
 /// Stones added on top of what the gate needs when a GM tops up.
@@ -74,7 +72,7 @@ const RECALL_OFF_MS: u64 = 30 * 60_000;
 const STALE_MS: u64 = 20_000;
 /// Gates not in the unit view and older than this are forgotten, ms.
 const GATE_FORGET_MS: u64 = 60_000;
-/// The file the learned zone origin cells are kept in, next to the baked data.
+/// The file the learned zone origin cells are kept in, next to the roster.
 const ORIGINS_FILE: &str = "portal_zone_origins.txt";
 
 // ---- counters ------------------------------------------------------------------------------------
@@ -487,8 +485,14 @@ fn refresh(ctx: &Ctx<'_>, inner: &mut Inner) {
     }
     let portals = &ctx.world.travel().portals;
     let recall_at = |id: u32| portals.recall(id).map(|r| (r.zone_key, [r.pos.x, r.pos.y]));
-    let dir = ctx.cfg.data.baked.as_deref();
+    let dir = ctx.cfg.bots.roster.parent();
     let recorded = inner.recorded.take();
+    if let Some(r) = recorded {
+        // (the entry arrived: the next record is a while away)
+        inner.next_record_ms = ctx.now_ms + RECORD_GAP_MS;
+        ctx.log.say(format!("travel: recorded book entry {}", r.id));
+        tracing::info!(bot = %ctx.persona.name, entry = r.id, "portals: recorded");
+    }
     let book = &mut inner.book;
     with_origins(dir, |origins| {
         if let Some(r) = recorded {
@@ -1014,57 +1018,69 @@ fn record_step(ctx: &mut Ctx<'_>, inner: &mut Inner, goal: Option<GoalKind>) -> 
         }
         Rec::Idle => {}
     }
-    if let Some(r) = inner.recorded {
-        // (the entry arrived: log it once, `refresh` learns the zone cell at the next look)
-        ctx.log.say(format!("travel: recorded book entry {}", r.id));
-        tracing::info!(bot = %ctx.persona.name, entry = r.id, "portals: recorded");
-        inner.next_record_ms = now + jittered(RECORD_GAP_MS, ctx);
-        refresh(ctx, inner);
-        return false;
-    }
-    if now < inner.next_record_ms
-        || now < inner.next_probe_ms
-        || inner.auto.is_some()
-        || !calm(ctx, goal)
-    {
-        return false;
-    }
-    inner.next_probe_ms = now + 4_000;
     let pos = ctx.state.me.pos;
+    let calm = calm(ctx, goal);
+    let input = places::RecordIn {
+        now_ms: now,
+        next_record_ms: inner.next_record_ms,
+        next_probe_ms: inner.next_probe_ms,
+        busy: inner.auto.is_some(),
+        calm,
+        nearest_entry_m: inner.book.nearest_private([pos[0], pos[1]]).map(|(d, _)| d),
+        ink: ctx.state.item_count(MEMORY_INK_ITEM),
+        gm: ctx.gm_allowed(),
+        entries: inner.book.private.len(),
+    };
+    if now >= inner.next_record_ms && now >= inner.next_probe_ms && input.calm {
+        inner.next_probe_ms = now + 4_000;
+    }
     let homes: SmallVec<[[f32; 3]; 2]> = ctx.state.houses.iter().map(|h| h.pos).collect();
-    let Some(spot) = places::worth(ctx.world, pos, &homes) else {
+    let mut found = None;
+    let decision = places::decide(&input, || {
+        found = places::worth(ctx.world, pos, &homes);
+        found
+    });
+    let Some(spot) = found else {
         return false;
     };
-    if inner
-        .book
-        .nearest_private([pos[0], pos[1]])
-        .is_some_and(|(d, _)| d < ENTRY_NEAR_M)
-    {
-        inner.next_probe_ms = now + 30_000;
-        return false;
-    }
-    let ink = ctx.state.item_count(MEMORY_INK_ITEM);
-    if ink < 1 {
-        if ctx.gm(&format!("/item add self {MEMORY_INK_ITEM} {INK_TOPUP}")) {
-            ctx.log.say("travel: GM top-up of Memory Ink");
-            inner.next_probe_ms = now + 3_000;
-        } else {
+    match decision {
+        places::Decision::Wait => {
+            if input
+                .nearest_entry_m
+                .is_some_and(|d| d < places::ENTRY_NEAR_M)
+            {
+                inner.next_probe_ms = now + 30_000;
+            }
+            return false;
+        }
+        places::Decision::TopUpInk => {
+            if ctx.gm(&format!("/item add self {MEMORY_INK_ITEM} {INK_TOPUP}")) {
+                ctx.log.say("travel: GM top-up of Memory Ink");
+                inner.next_probe_ms = now + 3_000;
+            } else {
+                inner.next_record_ms = now + RECORD_GAP_MS;
+            }
+            return false;
+        }
+        places::Decision::NoInk => {
             inner.next_record_ms = now + RECORD_GAP_MS;
+            return false;
         }
-        return false;
-    }
-    if inner.book.private.len() >= book::MAX_PRIVATE {
-        if let Some(id) = inner.book.least_useful() {
-            ctx.send(cs::delete_portal(cs::PORTAL_KIND_PRIVATE, id));
-            inner.rec = Rec::Delete { id, sent_ms: now };
-            Counters::bump(&STATS.deletes);
-            ctx.log
-                .say(format!("travel: the book is full; deleting entry {id}"));
-            return true;
+        places::Decision::MakeRoom => {
+            if let Some(id) = inner.book.least_useful() {
+                ctx.send(cs::delete_portal(cs::PORTAL_KIND_PRIVATE, id));
+                inner.rec = Rec::Delete { id, sent_ms: now };
+                Counters::bump(&STATS.deletes);
+                ctx.log
+                    .say(format!("travel: the book is full; deleting entry {id}"));
+                return true;
+            }
+            inner.next_record_ms = now + RECORD_GAP_MS;
+            return false;
         }
-        inner.next_record_ms = now + RECORD_GAP_MS;
-        return false;
+        places::Decision::Record => {}
     }
+    let ink = input.ink;
     let name = places::name_for(
         ctx.world,
         pos,
@@ -1092,10 +1108,6 @@ fn finish_record(ctx: &mut Ctx<'_>, inner: &mut Inner, why: &str) {
     Counters::bump(&STATS.records_failed);
     ctx.log.say(format!("travel: the record failed ({why})"));
     tracing::info!(bot = %ctx.persona.name, why, "portals: record failed");
-}
-
-fn jittered(ms: u64, ctx: &mut Ctx<'_>) -> u64 {
-    ms / 2 + ctx.rng.u64(0..=ms)
 }
 
 /// The idle bot that sees another bot's gate nearby may step through it (now and then).

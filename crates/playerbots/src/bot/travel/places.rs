@@ -95,6 +95,76 @@ pub fn worth(world: &World, pos: [f32; 3], homes: &[[f32; 3]]) -> Option<Spot> {
     entrance.then_some(Spot::Dungeon)
 }
 
+/// Two entries closer than this are one place: no new record near an existing one.
+pub const ENTRY_NEAR_M: f32 = 600.0;
+/// The most entries the bot keeps in its book.
+pub const MAX_ENTRIES: usize = super::book::MAX_PRIVATE;
+
+/// What the recording duty knows when it decides.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordIn {
+    /// Bot clock.
+    pub now_ms: u64,
+    /// Not before this bot clock.
+    pub next_record_ms: u64,
+    /// The place was last looked at before this bot clock.
+    pub next_probe_ms: u64,
+    /// A journey or another portal job is under way.
+    pub busy: bool,
+    /// The bot is calm (no fight, standing, not in an instance, not mid-trade, ...).
+    pub calm: bool,
+    /// Distance to the nearest book entry whose position is known.
+    pub nearest_entry_m: Option<f32>,
+    /// Memory Ink in the bag.
+    pub ink: i64,
+    /// GM commands may top up the ink.
+    pub gm: bool,
+    /// Entries in the book.
+    pub entries: usize,
+}
+
+/// What the recording duty does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Not now (too early, busy, not calm, nothing worth recording here, an entry is near).
+    Wait,
+    /// Add Memory Ink with a GM command, then try again.
+    TopUpInk,
+    /// There is no ink and none can be had: not for a long while.
+    NoInk,
+    /// The book is full: delete the least useful entry first.
+    MakeRoom,
+    /// Record the spot.
+    Record,
+}
+
+/// The recording rules: at most one record per ~10 minutes, only when calm, only at a spot that is
+/// worth it and not within [`ENTRY_NEAR_M`] of an entry, with ink (a GM top-up when allowed), and
+/// never more than [`MAX_ENTRIES`] entries in the book. `spot` is asked last (it is the costly
+/// question).
+pub fn decide(i: &RecordIn, spot: impl FnOnce() -> Option<Spot>) -> Decision {
+    if i.now_ms < i.next_record_ms || i.now_ms < i.next_probe_ms || i.busy || !i.calm {
+        return Decision::Wait;
+    }
+    if spot().is_none() {
+        return Decision::Wait;
+    }
+    if i.nearest_entry_m.is_some_and(|d| d < ENTRY_NEAR_M) {
+        return Decision::Wait;
+    }
+    if i.ink < 1 {
+        return if i.gm {
+            Decision::TopUpInk
+        } else {
+            Decision::NoInk
+        };
+    }
+    if i.entries >= MAX_ENTRIES {
+        return Decision::MakeRoom;
+    }
+    Decision::Record
+}
+
 /// The name for a new entry at `pos`: the nearest recall point's name (a town), else the zone's,
 /// made unique among `taken`, at most [`MAX_NAME_CHARS`] characters.
 pub fn name_for<'a>(
@@ -152,6 +222,75 @@ pub fn unique_name<'a>(base: &str, taken: impl Iterator<Item = &'a str> + Clone)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input() -> RecordIn {
+        RecordIn {
+            now_ms: 1_000_000,
+            next_record_ms: 0,
+            next_probe_ms: 0,
+            busy: false,
+            calm: true,
+            nearest_entry_m: None,
+            ink: 2,
+            gm: false,
+            entries: 3,
+        }
+    }
+
+    const TOWN: fn() -> Option<Spot> = || Some(Spot::Town);
+
+    #[test]
+    fn a_calm_bot_at_a_good_spot_with_ink_records() {
+        assert_eq!(decide(&input(), TOWN), Decision::Record);
+    }
+
+    #[test]
+    fn records_are_rate_limited_and_need_a_calm_bot() {
+        let mut i = input();
+        i.next_record_ms = i.now_ms + 1;
+        assert_eq!(decide(&i, TOWN), Decision::Wait);
+        let mut i = input();
+        i.next_probe_ms = i.now_ms + 1;
+        assert_eq!(decide(&i, TOWN), Decision::Wait);
+        let mut i = input();
+        i.busy = true;
+        assert_eq!(decide(&i, TOWN), Decision::Wait);
+        let mut i = input();
+        i.calm = false;
+        assert_eq!(decide(&i, TOWN), Decision::Wait);
+        // the place is only looked up when everything else allows it
+        let mut i = input();
+        i.calm = false;
+        decide(&i, || panic!("the spot is the last question"));
+    }
+
+    #[test]
+    fn only_worthwhile_spots_far_from_an_entry_are_recorded() {
+        assert_eq!(decide(&input(), || None), Decision::Wait);
+        let mut i = input();
+        i.nearest_entry_m = Some(ENTRY_NEAR_M - 1.0);
+        assert_eq!(decide(&i, TOWN), Decision::Wait);
+        i.nearest_entry_m = Some(ENTRY_NEAR_M + 1.0);
+        assert_eq!(decide(&i, TOWN), Decision::Record);
+    }
+
+    #[test]
+    fn ink_comes_from_gm_or_the_bot_waits_long() {
+        let mut i = input();
+        i.ink = 0;
+        assert_eq!(decide(&i, TOWN), Decision::NoInk);
+        i.gm = true;
+        assert_eq!(decide(&i, TOWN), Decision::TopUpInk);
+    }
+
+    #[test]
+    fn a_full_book_makes_room_first() {
+        let mut i = input();
+        i.entries = MAX_ENTRIES;
+        assert_eq!(decide(&i, TOWN), Decision::MakeRoom);
+        i.entries = MAX_ENTRIES - 1;
+        assert_eq!(decide(&i, TOWN), Decision::Record);
+    }
 
     #[test]
     fn names_are_cut_cleaned_and_unique() {
