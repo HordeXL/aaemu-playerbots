@@ -21,6 +21,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Player trade** | The coordinator pairs two bots; they meet, open the trade window, put up goods and/or money, lock and confirm. A trade request from a real player is accepted when the bot is idle. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and later "goes home" to rest there. |
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
+| **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See `docs/DESIGN.md`. |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see below). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see below). |

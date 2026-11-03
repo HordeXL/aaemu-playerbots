@@ -14,7 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{WaterMap, CELL_M};
 
@@ -96,7 +96,7 @@ pub enum RouteError {
 type Cell = (i32, i32);
 
 /// The open cell nearest to `(x, y)` within [`SNAP_CELLS`] (the cell itself when it is open).
-fn snap(map: &WaterMap, x: f32, y: f32, cfg: &RouteCfg<'_>) -> Option<Cell> {
+fn snap(map: &WaterMap, x: f32, y: f32, cfg: &RouteCfg<'_>, closed: &Closed) -> Option<Cell> {
     let (c0, r0) = map.cell_of(x, y)?;
     let mut best: Option<(f32, Cell)> = None;
     for k in 0..=SNAP_CELLS {
@@ -106,7 +106,7 @@ fn snap(map: &WaterMap, x: f32, y: f32, cfg: &RouteCfg<'_>) -> Option<Cell> {
                     continue;
                 }
                 let (c, r) = (c0 + dc, r0 + dr);
-                if !usable(map, c, r, cfg) {
+                if !usable(map, c, r, cfg, closed) {
                     continue;
                 }
                 let (cx, cy) = map.center_of(c, r);
@@ -124,21 +124,34 @@ fn snap(map: &WaterMap, x: f32, y: f32, cfg: &RouteCfg<'_>) -> Option<Cell> {
     best.map(|b| b.1)
 }
 
-/// Whether the search may stand in cell `(c, r)`.
-fn usable(map: &WaterMap, c: i32, r: i32, cfg: &RouteCfg<'_>) -> bool {
-    if !map.open_cell(c, r, cfg.clear) {
-        return false;
-    }
-    if cfg.avoid.is_empty() {
-        return true;
-    }
-    let (x, y) = map.center_of(c, r);
-    // a cell is closed when any part of it can touch a disc
-    !cfg.avoid.iter().any(|d| {
+/// The cells the discs to avoid close: a cell is closed when any part of it can touch a disc.
+/// Made once per search, so that a test of a cell is a lookup however many discs there are.
+type Closed = FxHashSet<Cell>;
+
+fn closed_cells(map: &WaterMap, avoid: &[Disc]) -> Closed {
+    let mut closed = Closed::default();
+    for d in avoid {
         let reach = d.r + CELL_M * 0.75;
-        let (dx, dy) = (x - d.x, y - d.y);
-        dx * dx + dy * dy <= reach * reach
-    })
+        let Some((c0, r0)) = map.cell_of(d.x, d.y) else {
+            continue;
+        };
+        let span = (reach / CELL_M).ceil() as i32 + 1;
+        for r in r0 - span..=r0 + span {
+            for c in c0 - span..=c0 + span {
+                let (x, y) = map.center_of(c, r);
+                let (dx, dy) = (x - d.x, y - d.y);
+                if dx * dx + dy * dy <= reach * reach {
+                    closed.insert((c, r));
+                }
+            }
+        }
+    }
+    closed
+}
+
+/// Whether the search may stand in cell `(c, r)`.
+fn usable(map: &WaterMap, c: i32, r: i32, cfg: &RouteCfg<'_>, closed: &Closed) -> bool {
+    map.open_cell(c, r, cfg.clear) && (closed.is_empty() || !closed.contains(&(c, r)))
 }
 
 /// Octile distance between two cells in metres: the exact cost of the cheapest 8-connected path.
@@ -155,8 +168,9 @@ pub fn route(
     to: (f32, f32),
     cfg: &RouteCfg<'_>,
 ) -> Result<Route, RouteError> {
-    let start = snap(map, from.0, from.1, cfg).ok_or(RouteError::StartBlocked)?;
-    let goal = snap(map, to.0, to.1, cfg).ok_or(RouteError::GoalBlocked)?;
+    let closed = closed_cells(map, cfg.avoid);
+    let start = snap(map, from.0, from.1, cfg, &closed).ok_or(RouteError::StartBlocked)?;
+    let goal = snap(map, to.0, to.1, cfg, &closed).ok_or(RouteError::GoalBlocked)?;
     let cols = map.cols() as i64;
     let id = |c: Cell| (i64::from(c.1) * cols + i64::from(c.0)) as u32;
     let cell_of = |n: u32| ((i64::from(n) % cols) as i32, (i64::from(n) / cols) as i32);
@@ -188,12 +202,15 @@ pub fn route(
                     continue;
                 }
                 let next = (c + dc, r + dr);
-                if !usable(map, next.0, next.1, cfg) {
+                if !usable(map, next.0, next.1, cfg, &closed) {
                     continue;
                 }
                 let diagonal = dr != 0 && dc != 0;
                 // no cutting corners: both cells beside the step must be usable too
-                if diagonal && !(usable(map, c + dc, r, cfg) && usable(map, c, r + dr, cfg)) {
+                if diagonal
+                    && !(usable(map, c + dc, r, cfg, &closed)
+                        && usable(map, c, r + dr, cfg, &closed))
+                {
                     continue;
                 }
                 let step = if diagonal {
@@ -298,10 +315,19 @@ pub fn line_clear(
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len = (dx * dx + dy * dy).sqrt();
     let steps = (len / LOS_STEP_M).ceil().max(1.0) as u32;
+    // (only the discs the leg's bounding box touches can matter)
+    let (lo, hi) = ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)));
+    let near: Vec<&Disc> = cfg
+        .avoid
+        .iter()
+        .filter(|d| {
+            d.x + d.r >= lo.0 && d.x - d.r <= hi.0 && d.y + d.r >= lo.1 && d.y - d.r <= hi.1
+        })
+        .collect();
     for s in 0..=steps {
         let t = s as f32 / steps as f32;
         let (x, y) = (a.0 + dx * t, a.1 + dy * t);
-        if cfg.avoid.iter().any(|d| d.contains(x, y)) {
+        if near.iter().any(|d| d.contains(x, y)) {
             return false;
         }
         let near_end = [ends.0, ends.1].iter().any(|e| {

@@ -11,14 +11,19 @@ use aa_world::World;
 
 /// How far from the chosen sea point a landing beach is looked for.
 pub const LANDING_SEARCH_M: f32 = 350.0;
-/// Radius of the area closed around a hostile sea monster's spawn.
-pub const DANGER_R: f32 = 140.0;
-/// Most discs the planner is given (it tests every cell it looks at against all of them).
-pub const MAX_DANGER: usize = 48;
+/// Radius of the area closed around an aggressive sea monster's spawn (140 m shuts the whole of
+/// Castaway Strait to a trip, 100 m leaves routes).
+pub const DANGER_R: f32 = 100.0;
+/// Most discs the planner is given (they are rasterised once per search, so this only bounds the
+/// set's size).
+pub const MAX_DANGER: usize = 400;
 /// Candidate destinations tried before the trip becomes a loop.
 const ATTEMPTS: u32 = 16;
 /// The water route of a trip is this much longer than the straight line at most.
 const DETOUR: f32 = 2.2;
+/// A trip's water route is at most this much longer than the configured longest crossing (a boat
+/// does 3 m/s; the whole trip has 40 minutes).
+const MAX_ROUTE: f32 = 1.2;
 /// Cells of water a sea route keeps around its path.
 pub const ROUTE_CLEAR: i32 = 2;
 /// The search bound of the planning routes (cells reached).
@@ -118,7 +123,7 @@ pub fn plan_trip(
             continue;
         }
         if let Ok(r) = route(map, launch.water, landing.water, &rc) {
-            if r.length <= DETOUR * straight {
+            if r.length <= DETOUR * straight && r.length <= MAX_ROUTE * cfg.max_m {
                 return Ok(Plan {
                     launch,
                     landing,
@@ -145,7 +150,7 @@ pub fn plan_trip(
         ) else {
             continue;
         };
-        if out.length <= DETOUR * d {
+        if out.length <= DETOUR * d && out.length + back.length <= MAX_ROUTE * cfg.max_m {
             return Ok(Plan {
                 launch,
                 landing: launch,
@@ -199,8 +204,8 @@ pub fn sail_route(
     None
 }
 
-/// Circles around the spawns of hostile monsters that live on the water within `radius` of
-/// `center`: sea monsters the boat must stay clear of. A monster is hostile when the bot's
+/// Circles around the spawns of aggressive monsters that live on the water within `radius` of
+/// `center`: sea monsters the boat must stay clear of. A monster counts when the bot's
 /// `faction` is hostile to its faction (any aggressive monster when the faction is unknown); at
 /// most [`MAX_DANGER`] discs, nearest to `center` first, spawns inside a disc already made add
 /// none.
@@ -222,11 +227,10 @@ pub fn danger_zones(
             let Some(t) = world.npc(template) else {
                 return;
             };
-            let hostile = if faction == 0 {
-                t.aggressive
-            } else {
-                world.relation(faction, t.faction_id) == aa_world::Relation::Hostile
-            };
+            // (a monster that does not attack on sight leaves a boat alone)
+            let hostile = t.aggressive
+                && (faction == 0
+                    || world.relation(faction, t.faction_id) == aa_world::Relation::Hostile);
             if hostile {
                 found.push((
                     dist(center, (pos.x, pos.y)),

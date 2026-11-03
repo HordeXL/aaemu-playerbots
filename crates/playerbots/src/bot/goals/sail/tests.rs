@@ -120,6 +120,8 @@ struct Script {
     no_attach: bool,
     /// The bind is not answered at all.
     ignore_bind: bool,
+    /// The bind is always answered "too far".
+    always_too_far: bool,
     ignore_discard: bool,
     ignore_despawn: bool,
     /// The hull has no engine.
@@ -429,6 +431,11 @@ impl Rig {
                     if self.script.ignore_bind {
                         continue;
                     }
+                    if self.script.always_too_far {
+                        self.errors
+                            .push((self.now + 100, StateError::Msg(emsg::TOO_FAR_AWAY)));
+                        continue;
+                    }
                     let near = self.plant.as_ref().is_some_and(|p| {
                         (p.pos.0 - self.pos[0]).hypot(p.pos.1 - self.pos[1]) <= 4.0
                     });
@@ -561,6 +568,30 @@ fn a_loop_goes_out_to_sea_and_comes_back_to_the_beach() {
         }
     }
     assert!(loops > 0, "no seed made a loop");
+}
+
+#[test]
+fn a_boat_slower_than_its_data_is_reported_once() {
+    let mut rig = Rig::new(working(), 5);
+    // the data says 12.8 m/s; the hull does 6.4
+    rig.pick.top_speed = 12.8;
+    assert_eq!(rig.run(TRIP_MS), GoalStatus::Done);
+    assert_eq!(rig.keys, [format!("sail:slow_boat:{SCROLL}")]);
+}
+
+#[test]
+fn the_planned_routes_fit_the_trip_limit() {
+    for seed in 0..40 {
+        let ops = TestOps::new(seed);
+        let Ok(plan) = ops.plan((60.0, 480.0), &[]) else {
+            continue;
+        };
+        assert!(
+            plan.route_m <= 1.2 * SHORT.max_m + 1.0,
+            "seed {seed}: {}",
+            plan.route_m
+        );
+    }
 }
 
 #[test]
@@ -773,6 +804,26 @@ fn a_bind_nobody_answers_is_reported_and_the_boat_is_cleared() {
         GoalStatus::Failed(FailReason::Other("the bind got no answer"))
     );
     assert_eq!(rig.keys, ["sail:bind_no_response"]);
+    assert!(rig.gone());
+}
+
+#[test]
+fn a_server_that_always_says_too_far_is_a_bot_side_report() {
+    let mut rig = Rig::new(
+        Script {
+            scroll: true,
+            always_too_far: true,
+            ..Script::default()
+        },
+        3,
+    );
+    let st = rig.run(TRIP_MS);
+    assert!(matches!(st, GoalStatus::Failed(_)), "{st:?}");
+    assert!(
+        rig.keys.contains(&"sail:bind_reach".to_string()),
+        "{:?}",
+        rig.keys
+    );
     assert!(rig.gone());
 }
 

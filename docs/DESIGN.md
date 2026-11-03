@@ -196,9 +196,10 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
 - **Plan** (`goals/sail/trip.rs`): the nearest beach with open water in front of it is the launch
   (`find_shore`: land 3 m behind the stand point, water 12 to 28 m off the beach); the landing is a
   beach near a random open-water point 1 to 3 km away whose sea route is at most 2.2 times the
-  straight line; otherwise a sightseeing loop out to a point at sea and back to the launch. Hostile
-  monsters that live on the water (`danger_zones`: the spawns of NPC templates the bot's faction is
-  hostile to, e.g. 8563 / 13012 near (15344, 16346)) close a 140 m disc each to the planner.
+  straight line; otherwise a sightseeing loop out to a point at sea and back to the launch. Aggressive
+  monsters that live on the water (`danger_zones`: the spawns of NPC templates that attack on sight
+  and that the bot's faction is hostile to, e.g. 8563 / 13012 near (15344, 16346); at most 400)
+  close a 100 m disc each to the planner (140 m shuts the whole of Castaway Strait to a trip).
 - **Sea map** (`aa-world::water`, `World::water()`): 16 m cells from the 4 m height grid, built on
   first use by up to four threads (about 1.4 s in a debug build, a tenth in release) and shared by
   all bots: a cell is sea when every height sample it touches is a real terrain sample under 98 m.
@@ -249,6 +250,16 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
   summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea map
   is 664 KiB once. `size_of::<Bot>()` went from 3152 to 3160 bytes (limit 3200), `Goal` is 152
   bytes (limit 160).
+- **Live behaviour** (QA server, rowboat scroll 17906, slave 15): the boat takes 10 to 20 s from the
+  cast to the bind, the helm probe finds the documented steering sign, the boat holds its heading
+  within a degree on the straights and its top speed is 3.2 m/s (`ship_models.velocity` 6.4 divided
+  by 2: the `MoveSpeedMul` of 2.0 the data estimate assumes is not in effect, so `sail:slow_boat`
+  files a low-severity report). A crossing of 1.6 to 3.4 km takes 9 to 18 minutes, landing, despawn
+  and the swim ashore about 20 seconds. The server keeps a despawned (or logged out with) boat in its
+  `slaves` table and puts it back on the water at login, at its old position: the Gear phase
+  despawns such a boat first. A scroll is not consumed by the cast.
+- **Limits**: sea only; the bot that is made to leave the goal at sea (a forced goal, a rest) is left
+  swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done.
 - **Tests**: the water mask, the planner (detour, no route, discs), the shore finder, the heading
   controller (also with an inverted wheel and other hulls), the route follower, and the whole
   machine against a scripted server (`goals/sail/tests.rs`: a rowboat with the server's turn

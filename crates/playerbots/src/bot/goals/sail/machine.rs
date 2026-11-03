@@ -29,7 +29,7 @@ const AREA: &str = "rust/crates/aaemu-game/src/systems/vehicles/";
 /// A boat must be at least this fast (m/s) to be worth the trip.
 pub const MIN_SPEED: f32 = 4.0;
 /// A trip (all phases) ends after this long.
-const TRIP_LIMIT_MS: u64 = 30 * 60_000;
+const TRIP_LIMIT_MS: u64 = 40 * 60_000;
 /// A boat that was already there at the start must be gone within this long.
 const STALE_BOAT_MS: u64 = 15_000;
 /// How long to wait for a GM-added scroll to show up in the bag.
@@ -58,6 +58,8 @@ const BOARD_LIMIT_MS: u64 = 60_000;
 const NO_ATTACH_MS: u64 = 3000;
 /// Wait for the first ship movement after the bind.
 const FIRST_SAMPLE_MS: u64 = 6000;
+/// The log line about a sailing trip comes this often.
+const STATUS_MS: u64 = 60_000;
 /// The stuck window: less than [`STUCK_MOVE_M`] of progress in this time with the engine on.
 const STUCK_WINDOW_MS: u64 = 8000;
 const STUCK_MOVE_M: f32 = 3.0;
@@ -253,6 +255,8 @@ pub struct Machine {
     helm: Helm,
     last_cmd: Option<(Cmd, u64)>,
     sail_ms: u64,
+    status_ms: u64,
+    top_seen: f32,
     win: ((f32, f32), u64),
     stuck: u8,
     reverse_until_ms: u64,
@@ -284,6 +288,8 @@ mod once {
     pub const DEAD_WHEEL: u16 = 64;
     pub const NO_SAMPLE: u16 = 128;
     pub const NO_PROBE: u16 = 256;
+    pub const BIND_REACH: u16 = 512;
+    pub const SLOW: u16 = 1024;
 }
 
 fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -342,6 +348,8 @@ impl Machine {
             helm: Helm::default(),
             last_cmd: None,
             sail_ms: 0,
+            status_ms: 0,
+            top_seen: 0.0,
             win: ((0.0, 0.0), 0),
             stuck: 0,
             reverse_until_ms: 0,
@@ -423,6 +431,12 @@ impl Machine {
                 return GoalStatus::Failed(FailReason::Timeout);
             }
             if self.stale_ms == 0 || now - self.stale_ms >= 4000 {
+                if self.stale_ms == 0 {
+                    acts.push(Act::Say(format!(
+                        "sail: removing the boat {} left over",
+                        b.obj
+                    )));
+                }
                 self.stale_ms = now.max(1);
                 if io.sailor.is_some_and(|s| s.my_seat_on_boat() != 0) {
                     acts.push(Act::Discard(b.tl));
@@ -679,6 +693,24 @@ impl Machine {
                         if m == emsg::SLAVE_CANNOT_BIND || m == emsg::TOO_FAR_AWAY =>
                     {
                         // too far for the server: get closer than the first try
+                        if self.reach == BIND_REACH_CLOSE_M && self.once(once::BIND_REACH) {
+                            // (already as close as the bot can swim to the hull's middle: the
+                            // bot's idea of the distance is wrong)
+                            acts.push(Act::Report(Box::new(
+                                issue(
+                                    IssueKind::Other,
+                                    "sail:bind_reach".into(),
+                                    "The server says the bot is too far from a boat it stands next to",
+                                    "a bind within a few metres of the hull to be accepted",
+                                    format!(
+                                        "error {m} with the bot {:.1} m from the hull's reported position",
+                                        dist2(xy(io.pos), boat_xy(io, s).unwrap_or(xy(io.pos)))
+                                    ),
+                                    Suspect::Bot,
+                                )
+                                .severity(Severity::Low),
+                            )));
+                        }
                         self.reach = BIND_REACH_CLOSE_M;
                     }
                     StateError::Msg(m) if m == emsg::SLAVE_ALREADY_HAS_MASTER => {
@@ -840,14 +872,40 @@ impl Machine {
         if g.arrived {
             self.brake_ms = 0;
             self.enter(Phase::Land, now);
+            if self.top_seen < 0.75 * io.pick.top_speed && self.once(once::SLOW) {
+                let template = io
+                    .sailor
+                    .and_then(|s| s.boat.as_ref())
+                    .map_or(0, |b| b.template);
+                acts.push(Act::Report(Box::new(
+                    issue(
+                        IssueKind::Other,
+                        format!("sail:slow_boat:{}", io.pick.item),
+                        "A boat is slower than its data says",
+                        "a top speed near ship_models.velocity * MoveSpeedMul / 2",
+                        format!(
+                            "top speed seen {:.1} m/s over a trip of {:.0} m, the data says {:.1} m/s",
+                            self.top_seen,
+                            route_len(&self.route),
+                            io.pick.top_speed
+                        ),
+                        Suspect::Unknown,
+                    )
+                    .severity(Severity::Low)
+                    .fact("template", template)
+                    .fact("item", io.pick.item),
+                )));
+            }
             acts.push(Act::Say(format!(
-                "sail: arrived (sign {}, flips {})",
+                "sail: arrived (sign {}, flips {}, top speed seen {:.1} m/s)",
                 self.helm.sign(),
-                self.helm.flips()
+                self.helm.flips(),
+                self.top_seen
             )));
             return GoalStatus::Running;
         }
         let fwd = tr.cur.forward_speed();
+        self.top_seen = self.top_seen.max(fwd);
         let err = wrap_pi(g.target_yaw - tr.cur.yaw);
         let rate = tr.yaw_rate();
         let mut cmd = Cmd {
@@ -858,6 +916,17 @@ impl Machine {
             acts.push(Act::Say(format!(
                 "sail: the wheel turned the other way; steering sign {}",
                 self.helm.sign()
+            )));
+        }
+        if now.saturating_sub(self.status_ms) >= STATUS_MS {
+            self.status_ms = now;
+            acts.push(Act::Say(format!(
+                "sail: {:.1} m/s, throttle {} steering {}, {:.0} deg off, {:.0} m to go",
+                fwd,
+                cmd.throttle,
+                cmd.steering,
+                err.to_degrees(),
+                g.dist_end
             )));
         }
         // stuck: no progress with the engine on
