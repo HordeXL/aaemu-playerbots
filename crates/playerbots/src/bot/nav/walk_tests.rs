@@ -960,3 +960,26 @@ fn asking_for_the_same_goal_again_keeps_the_route() {
     let s = rig.metrics.snapshot(true);
     assert_eq!((s.trips, s.trips_cancelled), (3, 1));
 }
+
+#[test]
+fn a_goal_that_stops_the_walk_in_range_counts_it_as_arrived() {
+    let mut rig = Rig::new(
+        testmesh::grid((0.0, 0.0), (40, 20), CELL, |_, _| false),
+        [10.0, 50.0, FLOOR_Z],
+        Opts::default(),
+    );
+    rig.go(100.0, 50.0, 2.0);
+    // (the goal is in range when the stop radius and a few metres are left)
+    while rig.motion.remaining().unwrap() > 6.0 {
+        assert_eq!(rig.tick(250), MotionStatus::Moving);
+    }
+    rig.motion.stop();
+    let s = rig.metrics.snapshot(true);
+    assert_eq!((s.trips, s.trips_arrived, s.trips_cancelled), (1, 1, 0));
+    // far from the goal the same stop is a cancelled trip
+    rig.go(10.0, 50.0, 2.0);
+    rig.tick(250);
+    rig.motion.stop();
+    let s = rig.metrics.snapshot(true);
+    assert_eq!((s.trips, s.trips_arrived, s.trips_cancelled), (2, 1, 1));
+}

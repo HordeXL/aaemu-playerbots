@@ -67,6 +67,8 @@ const LONG_INDOOR_RUN_M: f32 = 25.0;
 /// Cost (metres) added to the node a bot got stuck on, and to the nodes next to it.
 const STUCK_PENALTY_M: f32 = 80.0;
 const STUCK_PENALTY_NEAR_M: f32 = 40.0;
+/// A trip a goal stops with the bot this close (metres) to the stop point counts as arrived.
+const STOP_NEAR_M: f32 = 6.0;
 /// A trip started again toward a goal this close (metres) to the goal it has goes on instead.
 const SAME_GOAL_M: f32 = 1.0;
 /// Extra time a trip may take beyond what its route needs at 3 m/s.
@@ -362,6 +364,21 @@ impl NavState {
                 self.link.metrics.trip_ended(how, t.walked_m, t.straight_m);
             }
         }
+    }
+
+    /// The goal stopped the trip with the bot at `pos` (`Motion::stop`): when that is at the
+    /// destination, the trip counts as arrived (goals stop a walk themselves as soon as they are
+    /// in range), otherwise as cancelled.
+    pub fn stopped_at(&mut self, pos: [f32; 3]) {
+        let near = self
+            .trip
+            .as_ref()
+            .is_some_and(|t| d2(pos, t.goal) - t.radius <= STOP_NEAR_M);
+        self.end(if near {
+            TripEnd::Arrived
+        } else {
+            TripEnd::Cancelled
+        });
     }
 
     /// Whether a trip is under way.

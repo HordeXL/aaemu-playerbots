@@ -471,7 +471,10 @@ impl Motion {
         self.path.clear();
         self.pending_tp = None;
         self.status = MotionStatus::Idle;
-        self.nav_end(TripEnd::Cancelled);
+        let pos = self.pos;
+        if let Some(n) = self.nav.as_deref_mut() {
+            n.stopped_at(pos);
+        }
     }
 
     /// Turns towards (x, y); a stopped update with the new facing follows if the bot stands.

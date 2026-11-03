@@ -145,7 +145,10 @@ impl Planner {
     /// Queues a request; the job comes back when the queue is full.
     pub fn submit(&self, job: Job) -> Result<(), Box<Job>> {
         let mut q = self.shared.queue.lock();
-        if q.len() >= self.shared.capacity || self.shared.stop.load(Ordering::Relaxed) {
+        if self.threads.is_empty()
+            || q.len() >= self.shared.capacity
+            || self.shared.stop.load(Ordering::Relaxed)
+        {
             return Err(Box::new(job));
         }
         q.push_back(job);
