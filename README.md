@@ -98,6 +98,14 @@ Safety of the GM lines:
   `dungeon`); `false` keeps them out of both.
 * `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
   them on land.
+* `[behavior] navmesh = true` (default): bots walk routes on the navigation mesh baked from the
+  client (`nav_main_world.bin`, one more per instance world) instead of straight lines: around
+  walls, cliffs and water, along roads, with rounded corners and a slower pace over the last metres.
+  Short trips are planned on the bot's own task, long ones by two planner threads; a goal the mesh
+  cannot reach, or a planner that answers late, falls back to the straight line. `false` keeps the
+  straight lines. Without the baked mesh the option does nothing. Counters (searches inline and
+  pooled, latency, fallbacks, stuck events, trips) are in `/api/stats` under `nav` and in the log
+  once a minute.
 
 ## Chat and the LLM
 

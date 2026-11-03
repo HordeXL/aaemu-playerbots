@@ -122,9 +122,9 @@ pub struct BotDetail {
     /// The last chat lines the bot heard or said, oldest first (`t` is unix milliseconds).
     #[serde(default)]
     pub chat: Vec<LogLine>,
-    /// The route the bot is walking, as map-plane `[x, y]` points in metres, nearest waypoint
-    /// first (empty when it is not following one). Filled by the motion controller; the UI does
-    /// not draw it yet.
+    /// The route the bot is walking, as map-plane `[x, y]` points in metres, the bot first and at
+    /// most 32 points (empty when it is not moving; two points for a straight line). Filled by
+    /// the motion controller; the UI draws it for the selected bot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<[f32; 2]>,
 }
@@ -173,6 +173,59 @@ pub struct HubStats {
     /// Server issues whose entry was written to the team's issue queue.
     #[serde(default)]
     pub queued_issues: u32,
+    /// Navigation (path finding and walking) counters of the whole process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nav: Option<NavStats>,
+}
+
+/// Counters of the navigation motion, all bots together, since the process started. Latencies
+/// are in microseconds.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct NavStats {
+    /// Path finding is on (`behavior.navmesh`).
+    pub enabled: bool,
+    /// Searches run on the bot's own task (short trips).
+    pub queries_inline: u64,
+    /// Searches run on the planner threads (long trips).
+    pub queries_pooled: u64,
+    /// Searches that found a route to the goal.
+    pub found: u64,
+    /// Searches that hit the expansion cap (the bot walks the route found and asks again).
+    pub partial: u64,
+    /// Searches that proved the goal unreachable.
+    pub unreachable: u64,
+    /// Searches whose start or goal is not on the mesh.
+    pub no_mesh: u64,
+    /// Searches made to continue a partial or very long route.
+    pub replans: u64,
+    /// Searches made because a bot did not get anywhere.
+    pub stuck_replans: u64,
+    /// Times the stuck detector fired.
+    pub stuck_events: u64,
+    /// Trips that fell back to the straight line.
+    pub legacy_fallbacks: u64,
+    /// Planner answers that did not come within the wait (the bot walked the straight line).
+    pub plan_timeouts: u64,
+    /// Requests the planner queue refused because it was full.
+    pub queue_full: u64,
+    /// Planner answers that arrived for a trip that was over.
+    pub stale_results: u64,
+    /// Median / 99th percentile of the time a search took.
+    pub compute_p50_us: u64,
+    pub compute_p99_us: u64,
+    /// Median / 99th percentile of queue wait plus search for pooled requests.
+    pub wait_p50_us: u64,
+    pub wait_p99_us: u64,
+    /// Requests waiting for a planner thread now, and the most so far.
+    pub queue_depth: u32,
+    pub queue_max: u32,
+    /// Trips of 15 m or more, and how they ended.
+    pub trips: u64,
+    pub trips_arrived: u64,
+    pub trips_failed: u64,
+    pub trips_cancelled: u64,
+    /// Walked distance over the straight distance, arrived trips only (1.0 = straight).
+    pub detour_ratio: f32,
 }
 
 /// What a map marker stands for. Serialized as `snake_case`.

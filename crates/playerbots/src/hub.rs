@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use crate::bot::cmd::{BotCmd, GoalChoice};
 use crate::bot::goals::social::gate::{BotNames, ChatHub};
 use crate::bot::goals::social::SlotSocial;
+use crate::bot::nav::NavService;
 use crate::contest::Contest;
 use crate::issues::logtail::{words, LineHook};
 use crate::issues::{view, IssueReport, IssueTasks, Issues, LogLevel};
@@ -327,6 +328,8 @@ pub struct Hub {
     pub chat: ChatHub,
     /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
     pub contest: Contest,
+    /// Navigation: the planner pool and the counters, see [`crate::bot::nav`].
+    pub nav: NavService,
     /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
     issue_svc: Arc<Issues>,
     /// Server log lines handed to bots in the current second (second, lines).
@@ -357,6 +360,7 @@ impl Hub {
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
             contest: Contest::new(),
+            nav: NavService::default(),
             issue_svc: Arc::new(Issues::disabled()),
             log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),
@@ -437,6 +441,7 @@ impl Hub {
             },
         );
         self.rss.lock().refresh(false);
+        self.nav.tick();
     }
 
     /// Records (or replaces) the house marker of a bot.
@@ -693,6 +698,7 @@ impl BotHub for Hub {
             uptime_secs: self.uptime_secs(),
             open_issues: issue_counts.open,
             queued_issues: issue_counts.queued,
+            nav: Some(self.nav.stats()),
             llm: self.llm.as_ref().map(|l| {
                 let u = l.usage();
                 let s = &self.chat.gate.stats;

@@ -43,5 +43,5 @@ pub use server::{router, serve, serve_listener, WebConfig, TOKEN_HEADER};
 pub use types::{
     Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueActionRequest,
     IssueDetail, IssueSample, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind,
-    QuestLine, WorldRect,
+    NavStats, QuestLine, WorldRect,
 };
