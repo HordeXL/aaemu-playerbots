@@ -157,6 +157,11 @@ pub trait Env {
     fn send(&mut self, out: Out);
     /// Sends a GM command; `false` when GM commands are off.
     fn gm(&mut self, line: &str) -> bool;
+    /// Whether a far trip to (x, y) would go by portal (a gate or a recall beats the walk), so
+    /// that it is asked for in one piece instead of in walking legs.
+    fn portal_trip(&mut self, _x: f32, _y: f32) -> bool {
+        false
+    }
     /// Starts a trip to (x, y), stopping `radius` metres short (a GM `/move` when long).
     fn travel(&mut self, x: f32, y: f32, radius: f32);
     /// How long (metres) a leg of a walk is: the straight line cannot do much more than
@@ -292,6 +297,10 @@ impl Env for Live<'_, '_> {
 
     fn gm(&mut self, line: &str) -> bool {
         self.0.gm(line)
+    }
+
+    fn portal_trip(&mut self, x: f32, y: f32) -> bool {
+        crate::bot::travel::has_route(self.0, x, y)
     }
 
     fn travel(&mut self, x: f32, y: f32, radius: f32) {
@@ -965,7 +974,7 @@ impl TradeRun {
         }
         // A new leg: the whole way when it is short or a `/move`, else a stretch of it.
         let leg = env.leg_m();
-        if d <= leg + 20.0 || env.would_teleport(d) {
+        if d <= leg + 20.0 || env.would_teleport(d) || env.portal_trip(dest[0], dest[1]) {
             env.travel(dest[0], dest[1], radius);
         } else {
             let k = leg / d;

@@ -607,6 +607,7 @@ impl Bot {
             || self.combat.busy()
             || !self.state.threats.is_empty()
             || self.state.trade.active()
+            || self.state.travel.busy()
             || !self.state.me.spawned;
         Duration::from_millis(if active { b.tick_ms } else { b.idle_tick_ms })
     }

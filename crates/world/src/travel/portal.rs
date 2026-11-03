@@ -175,6 +175,9 @@ pub struct Portals {
     tome_returns: Vec<(u32, u32, u32)>,
     /// `(zone key, zone_groups.target_id)` sorted: the "continent" the reagent choice uses.
     continents: Vec<(u16, u8)>,
+    /// `(skill, buffs)`: the buffs on the caster that make the server refuse the skill with
+    /// `SKILL_REQ_FAIL` (`skill_reqs`), for the record, open and recall skills; buffs sorted.
+    blockers: Vec<(u32, Box<[u32]>)>,
 }
 
 impl Portals {
@@ -242,6 +245,8 @@ impl Portals {
         continents.sort_unstable();
         continents.dedup_by_key(|c| c.0);
 
+        let blockers = load_blockers(conn);
+
         Ok(Portals {
             kit,
             recalls,
@@ -252,7 +257,24 @@ impl Portals {
             tomes,
             tome_returns,
             continents,
+            blockers,
         })
+    }
+
+    /// The buffs on the caster that make the server refuse `skill` (one of the record, open and
+    /// recall skills) with `SKILL_REQ_FAIL`: stun, landing, a trade pack, the peace-zone auras, ...
+    /// Sorted; empty for other skills or when the database has no `skill_reqs`.
+    pub fn blocking_buffs(&self, skill: u32) -> &[u32] {
+        self.blockers
+            .iter()
+            .find(|b| b.0 == skill)
+            .map_or(&[], |b| &b.1)
+    }
+
+    /// The first of `buffs` that blocks `skill`, if any.
+    pub fn blocked_by(&self, skill: u32, buffs: impl IntoIterator<Item = u32>) -> Option<u32> {
+        let list = self.blocking_buffs(skill);
+        buffs.into_iter().find(|b| list.binary_search(b).is_ok())
     }
 
     /// The fixed portal items / skills / NPCs.
@@ -280,6 +302,14 @@ impl Portals {
     /// Recall points whose sub zone is `sub_zone` (the entries a visit adds to the book).
     pub fn recalls_in_sub_zone(&self, sub_zone: u32) -> impl Iterator<Item = &RecallPoint> {
         self.recalls.iter().filter(move |r| r.sub_zone == sub_zone)
+    }
+
+    /// Recall points within `radius` metres (horizontal) of `pos`.
+    pub fn recalls_within(&self, pos: Vec3, radius: f32) -> impl Iterator<Item = &RecallPoint> {
+        let r2 = radius * radius;
+        self.recalls
+            .iter()
+            .filter(move |r| r.pos.dist2d_sq(pos) <= r2)
     }
 
     /// Respawn points.
@@ -371,6 +401,136 @@ impl Portals {
             + self.tomes.capacity() * std::mem::size_of::<MemoryTome>()
             + self.tome_returns.capacity() * 12
             + self.continents.capacity() * std::mem::size_of::<(u16, u8)>()
+            + self
+                .blockers
+                .iter()
+                .map(|b| b.1.len() * 4 + 24)
+                .sum::<usize>()
+    }
+}
+
+/// Metres per zone origin cell (the wire offsets of a book entry count from `origin * 1024`).
+pub const ZONE_CELL_M: f32 = 1024.0;
+
+/// The origin cell `(cx, cy)` that turns the wire offset `off` of a Teleport Book entry into the
+/// world position `world` (`world = off + cell * 1024`). `None` when the difference is not a whole
+/// number of cells within `tolerance` metres: then one of the two is not the same spot.
+pub fn origin_cell(world: (f32, f32), off: (f32, f32), tolerance: f32) -> Option<(i32, i32)> {
+    let axis = |w: f32, o: f32| {
+        let cells = ((w - o) / ZONE_CELL_M).round();
+        if !cells.is_finite() || (w - o - cells * ZONE_CELL_M).abs() > tolerance {
+            return None;
+        }
+        Some(cells as i32)
+    };
+    Some((axis(world.0, off.0)?, axis(world.1, off.1)?))
+}
+
+/// The zone origin cells learned so far (`zone key -> (cell x, cell y)`).
+///
+/// The server sends a Teleport Book entry as an offset from the origin cell of its zone
+/// (`world.xml` of the client, which the bots do not read), so a bot learns each zone's cell from
+/// a spot whose world position it knows: the place it stood when it recorded the entry, or a recall
+/// point (`recalls.json` has world positions). The table is tiny (one entry per zone) and is kept
+/// in a text form (`zone x y` per line) so a run can keep it for the next one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZoneOrigins {
+    cells: Vec<(u16, i32, i32)>,
+}
+
+impl ZoneOrigins {
+    /// Most zones kept (the main world has about a hundred).
+    pub const MAX: usize = 512;
+
+    /// A table that knows no zone (usable in a `static`).
+    pub const EMPTY: ZoneOrigins = ZoneOrigins { cells: Vec::new() };
+
+    /// The origin cell of `zone`.
+    pub fn get(&self, zone: u16) -> Option<(i32, i32)> {
+        self.cells
+            .binary_search_by_key(&zone, |c| c.0)
+            .ok()
+            .map(|i| (self.cells[i].1, self.cells[i].2))
+    }
+
+    /// Remembers the origin cell of `zone`; returns whether that changed anything.
+    pub fn learn(&mut self, zone: u16, cell: (i32, i32)) -> bool {
+        match self.cells.binary_search_by_key(&zone, |c| c.0) {
+            Ok(i) => {
+                let changed = (self.cells[i].1, self.cells[i].2) != cell;
+                self.cells[i] = (zone, cell.0, cell.1);
+                changed
+            }
+            Err(i) if self.cells.len() < Self::MAX => {
+                self.cells.insert(i, (zone, cell.0, cell.1));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Learns the cell of `zone` from an entry with the wire offset `off` that is known to be at
+    /// world position `world`; `None` when the two do not differ by whole cells within
+    /// `tolerance` metres (nothing is learned), else whether the table changed.
+    pub fn learn_from(
+        &mut self,
+        zone: u16,
+        world: (f32, f32),
+        off: (f32, f32),
+        tolerance: f32,
+    ) -> Option<bool> {
+        let cell = origin_cell(world, off, tolerance)?;
+        Some(self.learn(zone, cell))
+    }
+
+    /// World `(x, y)` of an entry of `zone` with the wire offset `off`. Zone 0 sends world
+    /// coordinates already; an unknown zone gives `None`.
+    pub fn world_xy(&self, zone: u16, off: (f32, f32)) -> Option<(f32, f32)> {
+        if zone == 0 {
+            return Some(off);
+        }
+        let (cx, cy) = self.get(zone)?;
+        Some((
+            off.0 + cx as f32 * ZONE_CELL_M,
+            off.1 + cy as f32 * ZONE_CELL_M,
+        ))
+    }
+
+    /// Number of zones known.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Whether no zone is known.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// One `zone x y` line per zone.
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        for (zone, x, y) in &self.cells {
+            s.push_str(&format!("{zone} {x} {y}\n"));
+        }
+        s
+    }
+
+    /// Reads the text form; lines that do not parse are skipped.
+    pub fn from_text(text: &str) -> ZoneOrigins {
+        let mut o = ZoneOrigins::default();
+        for line in text.lines() {
+            let mut it = line.split_whitespace().map(str::parse::<i64>);
+            if let (Some(Ok(z)), Some(Ok(x)), Some(Ok(y)), None) =
+                (it.next(), it.next(), it.next(), it.next())
+            {
+                if let (Ok(z), Ok(x), Ok(y)) =
+                    (u16::try_from(z), i32::try_from(x), i32::try_from(y))
+                {
+                    o.learn(z, (x, y));
+                }
+            }
+        }
+        o
     }
 }
 
@@ -454,6 +614,86 @@ fn attach_gate_skills(conn: &Connection, gates: &mut [WorldGate]) -> Result<()> 
         g.skills = skills.into_boxed_slice();
     }
     Ok(())
+}
+
+/// The buffs that block the portal skills, from `skill_reqs`: a requirement that is about the
+/// caster's own buffs refuses `skill` when `skill` is listed and the requirement denies the listed
+/// skills (`default_result`), or when it is not listed and the requirement only lets the listed
+/// skills through. A database without the tables gives no blockers (the server still refuses).
+fn load_blockers(conn: &Connection) -> Vec<(u32, Box<[u32]>)> {
+    const SKILLS: [u32; 3] = [RECORD_PORTAL_SKILL, OPEN_PORTAL_SKILL, RECALL_SKILL];
+    // (id, buff, buff tag, deny the listed skills)
+    let mut reqs: Vec<(u32, u32, u32, bool)> = Vec::new();
+    let read = each_row(
+        conn,
+        "SELECT id, buff_id, buff_tag_id, default_result FROM skill_reqs WHERE target IN ('f', 'F', 0, '0')",
+        |r| reqs.push((r.u32(0), r.u32(1), r.u32(2), r.flag(3))),
+    );
+    if read.is_err() {
+        return Vec::new();
+    }
+    let mut listed: Vec<(u32, u32)> = Vec::new(); // (req, skill)
+    let mut listed_tags: Vec<(u32, u32)> = Vec::new(); // (req, skill tag)
+    let mut skill_tags: Vec<(u32, u32)> = Vec::new(); // (skill, tag)
+    let mut buff_tags: Vec<(u32, u32)> = Vec::new(); // (buff tag, buff)
+    let ok = each_row(
+        conn,
+        "SELECT skill_req_id, skill_id FROM skill_req_skills",
+        |r| {
+            if SKILLS.contains(&r.u32(1)) {
+                listed.push((r.u32(0), r.u32(1)));
+            }
+        },
+    )
+    .and_then(|()| {
+        each_row(
+            conn,
+            "SELECT skill_req_id, skill_tag_id FROM skill_req_skill_tags",
+            |r| listed_tags.push((r.u32(0), r.u32(1))),
+        )
+    })
+    .and_then(|()| {
+        each_row(conn, "SELECT skill_id, tag_id FROM tagged_skills", |r| {
+            if SKILLS.contains(&r.u32(0)) {
+                skill_tags.push((r.u32(0), r.u32(1)));
+            }
+        })
+    })
+    .and_then(|()| {
+        each_row(conn, "SELECT tag_id, buff_id FROM tagged_buffs", |r| {
+            buff_tags.push((r.u32(0), r.u32(1)))
+        })
+    });
+    if ok.is_err() {
+        return Vec::new();
+    }
+    SKILLS
+        .iter()
+        .map(|&skill| {
+            let tags: Vec<u32> = skill_tags
+                .iter()
+                .filter(|t| t.0 == skill)
+                .map(|t| t.1)
+                .collect();
+            let mut buffs: Vec<u32> = Vec::new();
+            for &(id, buff, tag, deny_listed) in &reqs {
+                let is_listed = listed.contains(&(id, skill))
+                    || listed_tags.iter().any(|l| l.0 == id && tags.contains(&l.1));
+                if is_listed != deny_listed {
+                    continue;
+                }
+                if buff != 0 {
+                    buffs.push(buff);
+                }
+                if tag != 0 {
+                    buffs.extend(buff_tags.iter().filter(|b| b.0 == tag).map(|b| b.1));
+                }
+            }
+            buffs.sort_unstable();
+            buffs.dedup();
+            (skill, buffs.into_boxed_slice())
+        })
+        .collect()
 }
 
 fn load_reagents(conn: &Connection, table: &str) -> Result<Box<[PortalReagent]>> {
@@ -612,6 +852,11 @@ mod tests {
              CREATE TABLE zones (id INT, zone_key INT, group_id INT);
              CREATE TABLE zone_groups (id INT, target_id INT);
              CREATE TABLE localized_texts (id INT, tbl_name TEXT, tbl_column_name TEXT, idx INT, en_us TEXT);
+             CREATE TABLE skill_reqs (id INT, target TEXT, buff_id INT, buff_tag_id INT, default_result TEXT);
+             CREATE TABLE skill_req_skills (id INT, skill_req_id INT, skill_id INT);
+             CREATE TABLE skill_req_skill_tags (id INT, skill_req_id INT, skill_tag_id INT);
+             CREATE TABLE tagged_skills (id INT, tag_id INT, skill_id INT);
+             CREATE TABLE tagged_buffs (id INT, tag_id INT, buff_id INT);
              INSERT INTO items VALUES (4045, 11216), (4053, 0), (417, 0), (4052, 0);
              INSERT INTO npcs VALUES (3891);
              INSERT INTO skill_reagents VALUES (809, 11215, 4053, 1);
@@ -625,6 +870,12 @@ mod tests {
              INSERT INTO zones VALUES (1, 179, 1), (2, 187, 2), (3, 300, NULL);
              INSERT INTO zone_groups VALUES (1, 3), (2, 4);
              INSERT INTO localized_texts VALUES (1, 'return_points', 'name', 243, 'Nuian Start');
+             INSERT INTO skill_reqs VALUES (1, 'f', 2149, NULL, 'f'), (2, 'f', NULL, 911, 'f'),
+               (3, 'f', NULL, 306, 't'), (4, 't', 777, NULL, 'f');
+             INSERT INTO skill_req_skills VALUES (1, 1, 11216), (2, 1, 10594);
+             INSERT INTO skill_req_skill_tags VALUES (1, 3, 50);
+             INSERT INTO tagged_skills VALUES (1, 50, 10594);
+             INSERT INTO tagged_buffs VALUES (1, 911, 5), (2, 911, 6), (3, 306, 90), (4, 306, 91);
              INSERT INTO doodad_func_groups VALUES (1, 841, 1), (2, 842, 1);
              INSERT INTO doodad_funcs VALUES (10, 1, 3, 'DoodadFuncBinding', 14602), (11, 2, 4, 'DoodadFuncBinding', 0);
              INSERT INTO doodad_func_bindings VALUES (3, 15), (4, 99);",
@@ -688,6 +939,25 @@ mod tests {
         };
         let funcs = DoodadTravelFuncs::load(conn).unwrap();
         Portals::load(&inp, &funcs).unwrap()
+    }
+
+    #[test]
+    fn buffs_that_block_the_portal_skills_come_from_skill_reqs() {
+        let conn = fixture();
+        let p = load(&conn, &data_dir());
+        // the peace-zone aura (2149) lists the open and recall skills but not the record skill;
+        // the landing tag (5, 6) lets only listed skills through; the pack tag (90, 91) denies the
+        // recall skill, which its skill tag lists; requirement 4 is about the target
+        assert_eq!(p.blocking_buffs(RECORD_PORTAL_SKILL), &[5, 6, 2149]);
+        assert_eq!(p.blocking_buffs(OPEN_PORTAL_SKILL), &[5, 6]);
+        assert_eq!(p.blocking_buffs(RECALL_SKILL), &[5, 6, 90, 91]);
+        assert!(p.blocking_buffs(1234).is_empty());
+        assert_eq!(p.blocked_by(RECORD_PORTAL_SKILL, [7, 2149, 6]), Some(2149));
+        assert_eq!(p.blocked_by(OPEN_PORTAL_SKILL, [7, 2149]), None);
+        assert_eq!(p.blocked_by(RECALL_SKILL, std::iter::empty()), None);
+        // a database without the tables gives no blockers
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(load_blockers(&bare).is_empty());
     }
 
     #[test]
@@ -815,5 +1085,80 @@ mod tests {
         assert!(p.world_gates().is_empty());
         assert!(p.nearest_recall(Vec3::default()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recalls_within_a_radius() {
+        let conn = fixture();
+        let dir = data_dir();
+        let p = load(&conn, &dir);
+        let here = Vec3::new(15500.0, 15400.0, 0.0);
+        let ids: Vec<u32> = p.recalls_within(here, 200.0).map(|r| r.id).collect();
+        assert_eq!(ids, vec![243]);
+        assert_eq!(p.recalls_within(here, 10.0).count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_origin_cell_is_the_whole_cells_between_world_and_offset() {
+        // a spot at world (15578.04, 15382.12) with the wire offset (218.04, -1001.88)
+        let cell = origin_cell((15578.04, 15382.12), (218.04, -1001.88), 0.5);
+        assert_eq!(cell, Some((15, 16)));
+        // a spot that is not a whole number of cells away is no origin
+        assert_eq!(origin_cell((100.0, 100.0), (50.0, 50.0), 2.0), None);
+        // the tolerance covers a position that is a little off
+        assert_eq!(origin_cell((2048.8, 1024.0), (0.0, 0.0), 1.0), Some((2, 1)));
+        assert_eq!(origin_cell((2051.0, 1024.0), (0.0, 0.0), 1.0), None);
+        assert_eq!(origin_cell((f32::NAN, 0.0), (0.0, 0.0), 1.0), None);
+        // negative offsets are fine
+        assert_eq!(
+            origin_cell((10.0, 10.0), (-1014.0, -1014.0), 0.1),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn zone_origins_learn_resolve_and_round_trip() {
+        let mut o = ZoneOrigins::default();
+        assert!(o.is_empty());
+        assert_eq!(o.world_xy(179, (1.0, 2.0)), None, "unknown zone");
+        assert_eq!(
+            o.world_xy(0, (1.0, 2.0)),
+            Some((1.0, 2.0)),
+            "zone 0 is world"
+        );
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 100.0), 3.0),
+            None,
+            "the second axis is no whole cell"
+        );
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 22.0), 3.0),
+            Some(true)
+        );
+        assert_eq!(o.get(179), Some((15, 15)));
+        assert_eq!(
+            o.learn_from(179, (15578.0, 15382.0), (218.0, 22.0), 3.0),
+            Some(false)
+        );
+        assert_eq!(
+            o.world_xy(179, (10.0, 20.0)),
+            Some((10.0 + 15360.0, 20.0 + 15360.0))
+        );
+        o.learn(5, (-1, 2));
+        o.learn(900, (3, 4));
+        let text = o.to_text();
+        assert_eq!(ZoneOrigins::from_text(&text), o);
+        // bad lines are skipped
+        let back = ZoneOrigins::from_text(
+            "7 1 2
+nope
+8 1
+9 1 2 3
+70000 1 1
+",
+        );
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.get(7), Some((1, 2)));
     }
 }

@@ -220,6 +220,53 @@ Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight li
 - **Web.** `Bot::publish` writes the rest of the route (at most 32 points, Ramer-Douglas-Peucker
   decimated) into the hub slot; the map draws it for the selected bot.
 
+## Portal travel (`bot/travel/`)
+
+Bots record Teleport Book entries, open gates to them and use gates; `[behavior] portals` switches it
+all off.
+
+- `book.rs` the bot's picture of the book: private entries (id, zone key, wire offsets, world
+  position once known), visited recall districts (their positions come from `recalls.json`) and the
+  bound recall point. The wire sends an entry as an offset from the origin cell of its zone
+  (`ZoneOrigins` in `aa-world`, one cell per zone, learned from a recall district or from the spot the
+  bot stood on when it recorded, shared by all bots and kept in `portal_zone_origins.txt` next to the
+  roster).
+- `plan.rs` the route as a pure function: walk, gate to the entry nearest the destination (within
+  400 m) or recall, by estimated seconds; trips under 1.2 km are walked.
+- `journey.rs` `Journey`, the state machine any goal or the party code drives: `Journey::new(dest)`
+  opens a gate (top-up of the book, stones and ink with `Ctx::gm`, cooldown wait, cast, wait for the
+  bot's own gate NPC 3891, get within 3.5 m, `CSUsePortal`, detect the move), or recalls;
+  `Journey::follow_gate(owner)` goes through the gate that character opened. `step(&Snap) -> Acts +
+  JourneyStatus` is pure and tested; every wait has a deadline and a typed `JourneyFail`
+  (`NoRoute`, `NoBook`, `NoReagents`, `OpenRefused(code)`, `NoGate`, `GateGone`, `UseRefused(error)`,
+  `NoTeleport`, ...). A failed journey never retries: the caller walks and the destination is walked
+  for two minutes.
+- `drive.rs` the glue: `Journey::tick(ctx)`, `far_trip` (the hook of `Ctx::travel`: a far trip goes to
+  an implicit journey when the planner finds a route, goals need no change; `has_route` lets the trade
+  run ask for a far trip in one piece instead of walking legs), `duty` (called by the brain every tick:
+  steps the implicit journey, records entries, visits recall districts with `CSNotifySubZone` like the
+  client, lets an idle bot hop through another bot's gate now and then, and keeps the goal waiting while
+  a cast or a gate is under way) and the detectors that file issues (record cast with no entry, gate
+  cast accepted and stones taken but no gate, `SCUnitPortalUsed` without a teleport, `CSUsePortal`
+  refused or unanswered, refused skill starts).
+- `places.rs` where a spot is worth an entry (a recall point within 120 m, two quest givers within
+  60 m, a pack buyer within 40 m, a dungeon entrance within 40 m, the bot's house), the recording rules
+  (`decide`: one record per 10 minutes, calm, no entry within 600 m, ink, book of at most 20 entries,
+  the most redundant entry goes first) and the entry names.
+
+Server rules the live run showed (all of them are data, not bugs): a bot with a trade pack gets
+`SCErrorMsg` 610 on `CSUsePortal` and result 50 on the open skill (a buff of the pack), so a laden bot
+plans no gate and opens or follows none (`JourneyFail::Laden`); the record skill 11215 is not on the
+`skill_reqs` whitelist of the peace-zone buffs (2149 around a Nui statue, 2221, 4828), so it is refused
+with result 50 there. `Portals::blocking_buffs(skill)` reads such buffs (and stun, landing, ...) from
+`skill_reqs` for the record, open and recall skills; the bot waits for one to go (`JourneyFail::Blocked`
+after 15 s) instead of casting into a refusal; with `bots.long_travel_teleport_m` set a GM
+`/move` is faster than any gate, so far trips are left to it.
+
+`TravelState` is one pointer (the data is a lazily created `Box<Inner>`); `size_of::<Bot>()` grew by 8
+bytes. The server events it needs are routed by `state::route` (the portal events and the answers to
+skills 11215, 11216, 10594 and 16841); `apply_unit_state` tells it about gate NPCs (with their owner).
+
 ## Data directory
 
 `playerbots bake` writes (see `docs/DATA-FORMATS.md`):
