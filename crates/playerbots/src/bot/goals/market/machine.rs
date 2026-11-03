@@ -83,6 +83,8 @@ pub struct Facts {
     pub there: bool,
     /// The last walk was abandoned.
     pub stuck: bool,
+    /// The portal doodad is in view, however far.
+    pub portal_seen: bool,
     /// The portal doodad is in view and within reach.
     pub portal_ready: bool,
     /// The exit doodad is in view and within reach.
@@ -109,6 +111,7 @@ impl Facts {
             loading: false,
             there: false,
             stuck: false,
+            portal_seen: false,
             portal_ready: false,
             exit_ready: false,
             peer_m: None,
@@ -280,8 +283,9 @@ impl Machine {
                     } else if f.portal_ready && f.there {
                         acts.push(Act::Stop);
                         self.go(Phase::Enter, now);
-                    } else if f.there && !f.portal_ready {
-                        // (at the spawn point and no doodad: wait a little, then say so)
+                    } else if f.there && !f.portal_seen {
+                        // (at the spawn point and no doodad: wait a little, then say so; a doodad
+                        // in view that is out of reach is walked up to below)
                         if self.blind_ms == 0 {
                             self.blind_ms = now.max(1);
                             acts.push(Act::Stop);
@@ -701,6 +705,25 @@ mod tests {
         });
         assert!(!st.acts.contains(&Act::Report(Problem::PortalMissing)));
         assert_eq!(m.phase(), Phase::Enter);
+    }
+
+    #[test]
+    fn a_portal_in_view_but_out_of_reach_is_walked_up_to_not_reported() {
+        let mut m = Machine::new(Role::Seller, Meet::Mirage, 0);
+        let far = Facts {
+            there: true,
+            portal_seen: true,
+            portal_ready: false,
+            ..facts(0)
+        };
+        for s in 1..40u64 {
+            let st = m.step(&Facts {
+                now_ms: s * 1000,
+                ..far
+            });
+            assert_eq!(st.acts.as_slice(), [Act::ToPortal], "second {s}");
+        }
+        assert_eq!(m.phase(), Phase::Go);
     }
 
     #[test]

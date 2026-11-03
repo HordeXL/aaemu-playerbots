@@ -407,6 +407,7 @@ impl Run {
             loading: place.loading(),
             there,
             stuck,
+            portal_seen: portal.is_some(),
             portal_ready,
             exit_ready,
             peer_m: peer.map(|(_, p, _)| flat(pos, p)),
