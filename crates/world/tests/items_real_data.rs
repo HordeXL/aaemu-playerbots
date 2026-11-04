@@ -63,3 +63,41 @@ fn item_facts_of_known_items() {
         table.bytes() / table.len()
     );
 }
+
+/// The quest items: the quest category, quest-only loot and the items the quest tables hand out.
+/// None of them may be tradable, while the plain materials a quest merely asks for stay so.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn quest_items_are_never_tradable() {
+    let Some(paths) = paths() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let w = World::load(&paths).expect("load main_world");
+    let table = w.item_table();
+
+    // "Dark Shadow Talisman": a quest item that is sellable and unbound in the data
+    let talisman = w.item_facts(7716).expect("item 7716");
+    assert_eq!(w.item_name(7716), Some("Dark Shadow Talisman"));
+    assert!(talisman.sellable && talisman.bind == bind::NORMAL);
+    assert!(talisman.quest && !talisman.tradable());
+
+    // Copper Ore and Hay Bale (a gather target of quests) are ordinary materials
+    for (id, name) in [(3411, "Copper Ore"), (3712, "Hay Bale")] {
+        let f = w.item_facts(id).expect("a plain material");
+        assert_eq!(w.item_name(id), Some(name));
+        assert!(!f.quest && f.tradable(), "{name}");
+    }
+
+    let quest = table.iter().filter(|(_, f)| f.quest).count();
+    let both = table
+        .iter()
+        .filter(|(_, f)| f.quest && f.tradable())
+        .count();
+    assert!(quest > 3000, "{quest} quest items");
+    assert_eq!(both, 0, "quest items that are tradable");
+    println!(
+        "{quest} quest items of {} templates, {both} of them tradable",
+        table.len()
+    );
+}
