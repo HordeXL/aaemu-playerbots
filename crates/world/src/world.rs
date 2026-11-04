@@ -16,6 +16,7 @@ use crate::doodad::{DoodadData, DoodadTemplate};
 use crate::economy::{Craft, Economy};
 use crate::event::Events;
 use crate::faction::{Factions, Relation};
+use crate::farm::Farming;
 use crate::geom::{IdMap, StrTable, Vec3};
 use crate::housing::{AreaIndex, Housing, HousingDesign};
 use crate::items::{ItemFacts, ItemTable};
@@ -167,6 +168,8 @@ pub struct World {
     travel: Travel,
     /// Tower defence events ("rifts"): their places, levels and kill targets.
     events: Events,
+    /// Crops, seed vendors and the public farms.
+    farm: Farming,
     /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
     water: OnceLock<Option<WaterMap>>,
     /// Where the quests are, built at the first [`World::quest_atlas`].
@@ -271,6 +274,10 @@ impl World {
             Events::load(&conn, &npcs, &npc_spawns, &zone_group).context("load events")?
         };
 
+        let farm = Farming::load(&conn, &npcs, &|n| npc_spawns.has(n))
+            .context("load farming data")?
+            .with_areas(&baked.farm_areas);
+
         let world = World {
             baked,
             factions,
@@ -296,6 +303,7 @@ impl World {
             spheres,
             travel,
             events,
+            farm,
             water: OnceLock::new(),
             quest_atlas: OnceLock::new(),
             group_spots: OnceLock::new(),
@@ -323,6 +331,8 @@ impl World {
             instance_worlds = world.travel.dungeons.worlds().all().len(),
             boat_scrolls = world.travel.boats.scrolls().len(),
             events = world.events.all().len(),
+            crops = world.farm.crops().len(),
+            farm_areas = world.farm.areas().len(),
             factions = world.factions.len(),
             terrain = world.baked.terrain.is_some(),
             memory_kib = world.memory_estimate() / 1024,
@@ -377,6 +387,7 @@ impl World {
         ];
         v.extend(self.travel.memory_breakdown());
         v.push(("events", self.events.bytes()));
+        v.push(("farming", self.farm.bytes()));
         v.push((
             "water map",
             self.water
@@ -405,6 +416,11 @@ impl World {
     /// Tower defence events ("rifts"); see [`crate::event`].
     pub fn events(&self) -> &Events {
         &self.events
+    }
+
+    /// Crops, seed vendors and the public farms; see [`crate::farm`].
+    pub fn farm(&self) -> &Farming {
+        &self.farm
     }
 
     /// The sea map boats are planned on, built from the baked terrain the first time it is asked
