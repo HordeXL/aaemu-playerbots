@@ -40,6 +40,7 @@ use super::cmd::{BotCmd, PairKind, PairOrder, PairRole};
 use super::guild::forming::Wishes as GuildWishes;
 use super::guild::plan::GuildWish;
 use super::party::{self, PartyOrder, PartyPurpose, Site, Wish};
+use super::pvp::squad::{self, Standby};
 use crate::hub::Hub;
 
 /// Where the coordinator's orders go: the hub in production, a recorder in tests.
@@ -132,6 +133,8 @@ pub enum CoordMsg {
     Party(Wish),
     /// A bot wants to sign a charter with others and found a guild.
     Guild(GuildWish),
+    /// A bot waits at an ambush post and offers itself to a squad (see [`squad`]).
+    Ambush(Standby),
 }
 
 /// The cheap, cloneable end bots talk to the coordinator with.
@@ -156,6 +159,12 @@ impl CoordHandle {
     /// Asks for a founding team for a guild. False when the coordinator's inbox is full.
     pub fn request_guild(&self, wish: GuildWish) -> bool {
         self.tx.try_send(CoordMsg::Guild(wish)).is_ok()
+    }
+
+    /// Offers a bot waiting at an ambush post to a squad. False when the coordinator's inbox is
+    /// full (offer again later).
+    pub fn standby(&self, offer: Standby) -> bool {
+        self.tx.try_send(CoordMsg::Ambush(offer)).is_ok()
     }
 
     /// Withdraws a request.
@@ -190,6 +199,12 @@ struct Wishing {
     since: Instant,
 }
 
+/// A bot waiting at an ambush post.
+struct Standing {
+    offer: Standby,
+    since: Instant,
+}
+
 /// A party that was formed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Formed {
@@ -211,6 +226,7 @@ pub struct Coordinator {
     recent: Vec<Recent>,
     sites: Vec<Site>,
     wishing: Vec<Wishing>,
+    standing: Vec<Standing>,
     formed: Vec<Formed>,
     next_party: u32,
     /// The wishes for a founding team (set by [`Coordinator::with_guilds`]).
@@ -229,6 +245,7 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
             recent: Vec::new(),
             sites: Vec::new(),
             wishing: Vec::new(),
+            standing: Vec::new(),
             formed: Vec::new(),
             next_party: 1,
             guilds: None,
@@ -289,12 +306,24 @@ impl Coordinator {
                 if let Some(g) = self.guilds.as_mut() {
                     g.cancel(bot);
                 }
+                self.standing.retain(|s| s.offer.bot != bot);
             }
             CoordMsg::Guild(wish) => {
                 if let Some(g) = self.guilds.as_mut() {
                     g.add(wish, now);
                     self.form_guilds(now);
                 }
+            }
+            CoordMsg::Ambush(offer) => {
+                // (an offer renews the earlier one but keeps its place in the line)
+                match self.standing.iter_mut().find(|s| s.offer.bot == offer.bot) {
+                    Some(s) => {
+                        s.offer = offer;
+                        s.since = now;
+                    }
+                    None => self.standing.push(Standing { offer, since: now }),
+                }
+                self.form_squads();
             }
             CoordMsg::Party(wish) => {
                 self.wishing.retain(|w| w.wish.bot != wish.bot);
@@ -328,9 +357,12 @@ impl Coordinator {
         if let Some(g) = self.guilds.as_mut() {
             g.expire(now);
         }
+        self.standing
+            .retain(|s| now.saturating_duration_since(s.since) < squad::STANDBY_TTL);
         self.pair_up(now);
         self.form_parties(now);
         self.form_guilds(now);
+        self.form_squads();
     }
 
     /// Forms founding teams out of the wishes until no more can be formed and orders every
@@ -356,6 +388,45 @@ impl Coordinator {
                         // (no founder, no founding: the place in the book is free again)
                         book.release(team.party_id);
                     }
+                }
+            }
+        }
+    }
+
+    /// Number of bots waiting at an ambush post for a squad.
+    pub fn standing(&self) -> usize {
+        self.standing.len()
+    }
+
+    /// Forms ambush squads out of the standby offers and orders every member.
+    fn form_squads(&mut self) {
+        if self.standing.len() < 2 {
+            return;
+        }
+        let offers: Vec<Standby> = self.standing.iter().map(|s| s.offer).collect();
+        let (squads, used) = squad::plan(&offers);
+        if squads.is_empty() {
+            return;
+        }
+        for &i in used.iter().rev() {
+            self.standing.remove(i);
+        }
+        for q in squads {
+            let party_id = self.next_party;
+            self.next_party = self.next_party.wrapping_add(1).max(1);
+            tracing::info!(party = party_id, bots = ?q.members, "ambush squad formed");
+            for &bot in &q.members {
+                let order = PartyOrder {
+                    party_id,
+                    leader: q.members[0],
+                    members: q.members.clone(),
+                    purpose: PartyPurpose::Ambush {
+                        x: q.post.0.round() as i32,
+                        y: q.post.1.round() as i32,
+                    },
+                };
+                if let Err(e) = self.sink.send(bot, BotCmd::Party(Box::new(order))) {
+                    tracing::debug!("squad order to {bot}: {e}");
                 }
             }
         }
@@ -1015,5 +1086,66 @@ mod tests {
         c.handle(req(PairKind::Duel, 8, (3.0, 0.0)), t0);
         assert_eq!(pairs(&rec).len(), 2, "the duel pair is made");
         assert_eq!(c.guild_wishes(), 1, "the wish waits");
+    }
+
+    fn standby(bot: u32, x: f32, alliance: u32) -> Standby {
+        Standby {
+            bot,
+            at: (x, 0.0),
+            alliance,
+            level: 30,
+            max_squad: 3,
+        }
+    }
+
+    /// The ambush orders sent so far: `(bot, order)`.
+    fn ambushes(rec: &Recorder) -> Vec<(u32, PartyOrder)> {
+        rec.sent
+            .lock()
+            .iter()
+            .map(|(bot, cmd)| match cmd {
+                BotCmd::Party(o) => (*bot, (**o).clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bots_waiting_close_together_are_ordered_into_an_ambush_squad() {
+        let (rec, _h, mut c) = coordinator();
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Ambush(standby(1, 0.0, 148)), t0);
+        assert_eq!(c.standing(), 1);
+        // another alliance, and one too far away, do not join
+        c.handle(CoordMsg::Ambush(standby(2, 10.0, 149)), t0);
+        c.handle(CoordMsg::Ambush(standby(3, 5_000.0, 148)), t0);
+        assert!(rec.sent.lock().is_empty());
+        c.handle(CoordMsg::Ambush(standby(4, 30.0, 148)), t0);
+        let sent = ambushes(&rec);
+        assert_eq!(sent.len(), 2, "one order per member");
+        for (bot, o) in &sent {
+            assert_eq!(o.members.as_slice(), [1, 4]);
+            assert_eq!(o.leader, 1);
+            assert_eq!(o.purpose, PartyPurpose::Ambush { x: 0, y: 0 });
+            assert!(o.has_member(*bot));
+        }
+        assert_eq!(sent[0].1.party_id, sent[1].1.party_id);
+        // the squad's members left the list, the others still wait
+        assert_eq!(c.standing(), 2);
+    }
+
+    #[test]
+    fn a_standby_offer_is_renewed_withdrawn_and_expires() {
+        let (rec, _h, mut c) = coordinator();
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Ambush(standby(1, 0.0, 148)), t0);
+        c.handle(CoordMsg::Ambush(standby(1, 2.0, 148)), t0);
+        assert_eq!(c.standing(), 1, "one offer per bot");
+        c.handle(CoordMsg::Cancel { bot: 1 }, t0);
+        assert_eq!(c.standing(), 0);
+        c.handle(CoordMsg::Ambush(standby(5, 0.0, 148)), t0);
+        c.expire(t0 + squad::STANDBY_TTL + Duration::from_secs(1));
+        assert_eq!(c.standing(), 0);
+        assert!(rec.sent.lock().is_empty());
     }
 }

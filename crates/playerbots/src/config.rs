@@ -371,6 +371,8 @@ pub struct PvpCfg {
     pub max_squad: u8,
     /// A bot below this many percent of its hit points breaks off a fight.
     pub retreat_hp_pct: u8,
+    /// Most characters one bot kills in one war of a zone group; it leaves the war after that.
+    pub war_kill_cap: u8,
 }
 
 impl Default for PvpCfg {
@@ -386,6 +388,7 @@ impl Default for PvpCfg {
             only_names: Vec::new(),
             max_squad: 3,
             retreat_hp_pct: 35,
+            war_kill_cap: 10,
         }
     }
 }
@@ -795,6 +798,10 @@ impl Config {
         ensure!(
             pv.retreat_hp_pct <= 100,
             "pvp.retreat_hp_pct must be in 0..=100"
+        );
+        ensure!(
+            (1..=100).contains(&pv.war_kill_cap),
+            "pvp.war_kill_cap must be in 1..=100"
         );
         for (key, names) in [
             ("never_names", &pv.never_names),
@@ -1441,12 +1448,15 @@ emote = true
         assert!(!p.enabled && p.defend && !p.attack_bots && !p.attack_players);
         assert!(!p.gank && !p.warzone);
         assert!(p.never_names.is_empty() && p.only_names.is_empty());
-        assert_eq!((p.max_squad, p.retreat_hp_pct), (3, 35));
+        assert_eq!((p.max_squad, p.retreat_hp_pct, p.war_kill_cap), (3, 35, 10));
         let ex = Config::parse(Config::example()).unwrap().pvp;
         assert!(!ex.enabled && ex.defend && !ex.attack_bots && !ex.attack_players);
         assert!(!ex.gank && !ex.warzone);
         assert!(ex.never_names.is_empty() && ex.only_names.is_empty());
-        assert_eq!((ex.max_squad, ex.retreat_hp_pct), (3, 35));
+        assert_eq!(
+            (ex.max_squad, ex.retreat_hp_pct, ex.war_kill_cap),
+            (3, 35, 10)
+        );
         assert_documented(
             "pvp",
             &[
@@ -1460,10 +1470,11 @@ emote = true
                 "only_names = []",
                 "max_squad = 3",
                 "retreat_hp_pct = 35",
+                "war_kill_cap = 10",
             ],
         );
         let cfg = Config::parse(
-            "[pvp]\nenabled = true\ndefend = false\nattack_bots = true\nattack_players = true\ngank = true\nwarzone = true\nnever_names = [\"Admin\", \"Gm Bob\"]\nonly_names = [\"Rival\"]\nmax_squad = 5\nretreat_hp_pct = 0\n",
+            "[pvp]\nenabled = true\ndefend = false\nattack_bots = true\nattack_players = true\ngank = true\nwarzone = true\nnever_names = [\"Admin\", \"Gm Bob\"]\nonly_names = [\"Rival\"]\nmax_squad = 5\nretreat_hp_pct = 0\nwar_kill_cap = 4\n",
         )
         .unwrap();
         let p = cfg.pvp;
@@ -1471,7 +1482,7 @@ emote = true
         assert!(p.gank && p.warzone);
         assert_eq!(p.never_names, ["Admin", "Gm Bob"]);
         assert_eq!(p.only_names, ["Rival"]);
-        assert_eq!((p.max_squad, p.retreat_hp_pct), (5, 0));
+        assert_eq!((p.max_squad, p.retreat_hp_pct, p.war_kill_cap), (5, 0, 4));
         for bad in [
             "[pvp]\ngangk = true\n",
             "[pvp]\nattack_players = \"yes\"\n",
@@ -1482,6 +1493,8 @@ emote = true
             "[pvp]\nmax_squad = 51\n",
             "[pvp]\nretreat_hp_pct = 101\n",
             "[pvp]\nretreat_hp_pct = -1\n",
+            "[pvp]\nwar_kill_cap = 0\n",
+            "[pvp]\nwar_kill_cap = 101\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

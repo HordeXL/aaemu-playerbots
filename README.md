@@ -28,6 +28,7 @@ whatever it is doing. Most features have a switch in `[behavior]`, `[social]`, `
 | **Quests** | Journal first, then story, then the nearest side quest: walks to the giver, accepts, does the objectives (talk, kill, gather, use an item or doodad, reach a sphere) and turns in. Failures back off, repeated ones quarantine the quest. |
 | **Grinding** | Kills level-appropriate monsters near the bot and loots them. |
 | **Duels** | A coordinator pairs two idle bots; they meet at a flag, fight with their PvP rotation and rest afterwards. |
+| **PvP** | Off by default (`[pvp]`). Bots fight back, retreat when hurt, ambush hostile trade-pack carriers (alone or in a squad, then collect and sell the dropped pack) and fight in zones at war; they never attack a friendly character, a character in its home zone or a name in `never_names`. |
 | **Player trade** | Two bots meet, open the trade window, put up goods and money, lock and confirm. Trades with real players are off unless `trade_with_players` is set (and never while `gm_bootstrap` is on). |
 | **Trade-chat market** | Bots with honestly gathered surplus advertise in trade chat, answer buyers (price, one counter, the place), meet them in town or on Mirage Isle and trade only a window that holds exactly what was agreed (`[market]`, see `docs/OPERATING.md`). |
 | **Trade runs** | Crafts a trade pack at a specialty workbench, carries it to the NPC that buys it, sells it and collects the payment mail. |

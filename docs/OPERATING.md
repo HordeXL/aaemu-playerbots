@@ -27,7 +27,7 @@ reads it (default `playerbots.toml`).
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
 | `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds`, `accept_player_invites` and `churn_per_hour` (see [Guilds](#guilds-guild)). |
-| `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad` and `retreat_hp_pct`. |
+| `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct` and `war_kill_cap`. |
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones`. |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
@@ -75,7 +75,9 @@ for a minute. The bot defends itself whatever it is doing.
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
 | **Guild** | A bot with no guild that can pay the charter asks the coordinator for a founding team (a duty, whatever it is doing); five bots of one faction found a guild together. What a bot does in its guild afterwards (answer invitations, recruit, promote, talk, leave) is a duty that runs whatever the goal is. Needs `[guild] enabled`; see [Guilds](#guilds-guild). |
-| **Gank, Warzone, Event, Companion, Farm** | Reserved: ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
+| **Gank** | Off until `[pvp] enabled` and `gank`, and someone may be attacked (`attack_bots`, or `attack_players` without `gm_bootstrap`). Plans an ambush post on the route between a specialty workbench and the NPC that buys its pack (outside the victims' home zones, where the server protects them; conflict zones and wars score higher), waits there and attacks a carrier of the hostile alliance when the odds are fair. Bots that wait close together form a squad of up to `max_squad` through the coordinator, so a stronger carrier can be taken. When the carrier dies the dropped pack is picked up (within 3 m, skill 11361) and a trade run sells it. It gives up on stronger groups, at the retreat line, on a protected target and after a death. See [Player versus player](#player-versus-player-pvp). |
+| **Warzone** | Off until `[pvp] enabled` and `warzone`. Scored while a reachable land zone group is at war (conflict or war) with enough time left and the bot has not yet killed `war_kill_cap` characters in it: goes there, patrols from spot to spot, fights allowed characters when the odds are fair, regroups when hurt and leaves at peace. See [Player versus player](#player-versus-player-pvp). |
+| **Event, Companion, Farm** | Reserved: join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -171,6 +173,7 @@ checked now so the features can be added without changing the file.
 | | `only_names` | `[]` | When not empty: the only real players that may be attacked. |
 | | `max_squad` | `3` | Most bots that attack together (1 to 50). |
 | | `retreat_hp_pct` | `35` | A bot below this many percent of its hit points breaks off a fight (0 to 100). |
+| | `war_kill_cap` | `10` | Most characters one bot kills in one war of a zone group before it leaves the war (1 to 100). |
 | `[events]` | `enabled` | `false` | Master switch of the event features (goal `event`). |
 | | `max_bots_per_event` | `6` | At most this many bots join one event. |
 | | `max_share` | `0.25` | At most this share (0 to 1) of all bots takes part in events at once. |
@@ -187,6 +190,42 @@ checked now so the features can be added without changing the file.
 | | `max_plots` | `5` | One bot tends at most this many plots. |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
+
+### Player versus player (`[pvp]`)
+
+Everything is off until `[pvp] enabled`. One set of rules (`bot/pvp/rules.rs`) decides who a bot
+may attack, for the defence, the `gank` goal and the `warzone` goal alike:
+
+- Only a character of the hostile alliance (Nuian against Haranyan). A friendly or neutral
+  character is never a target, and the bots never use the force attack to change that.
+- Never a character in the home zone of its alliance: the server accepts the casts there and drops
+  the damage without a word. A bot does not start such a fight (the zone owner comes from the
+  baked zone grid, which is coarse at zone borders), and when casts are accepted for five seconds
+  and nothing is hurt it gives the fight up, leaves that character alone for three minutes and
+  logs `protected`.
+- Never a name in `never_names` (game masters, friends), also not in self-defence. `only_names`
+  narrows the real players that may be attacked.
+- Our own bots only with `attack_bots`; real players only with `attack_players`, and never while
+  `bots.gm_bootstrap` is on (what a GM-bootstrapped bot holds may be minted). A gank target must
+  carry a trade pack.
+- Never from inside a town's peace aura.
+
+**Self-defence** (`defend`): a hostile character that hits the bot is fought back, whatever
+`attack_bots` and `attack_players` say. Below `retreat_hp_pct` the bot breaks off, shuns the
+attacker and runs to the recall point of its alliance's home zone (or straight away); a fight
+that lasts longer than four minutes or a target more than 70 m away is dropped.
+
+**Gank.** The post comes from the trade routes (`bot/pvp/post.rs`), the squads from the coordinator
+(`bot/pvp/squad.rs`; a bot that waits offers itself every 25 s, bots of one alliance within 500 m
+and 12 levels of each other are ordered together through the party plumbing). The odds
+(`bot/pvp/fight.rs`: level and hit points of the bot and its friends within 40 m against the
+target and its allies within 30 m) say attack (a ratio up to 1.25), wait for a squad (up to 3) or
+leave it alone. Only the log tells what happened: `gank: ...` lines in the bot's event log.
+
+**Warzone.** The conflict state of every zone group comes from the server; sea groups are skipped
+(the bots are on foot). Kills are counted per `(zone group, end of the state)`; at `war_kill_cap`
+the bot leaves that war. The server awards honor for a kill in a conflict zone, which the bot logs
+at the end of the goal (`pvp: honor ...`).
 
 ## Guilds (`[guild]`)
 

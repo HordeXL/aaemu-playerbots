@@ -1154,6 +1154,97 @@ fn conflict_zone_state() {
 }
 
 #[test]
+fn unit_equipments_changed() {
+    // systems/economy/item_packets.rs:64: bc obj, u8 count, then per slot u8 slot and Item.Write
+    // (the empty item is the 4-byte zero template)
+    let mut s = PacketStream::new();
+    s.write_bc(0x0400).write_u8(2);
+    s.write_u8(26);
+    write_item(&mut s, 28_091, 0x1122_3344_5566, 2, 1, 1);
+    s.write_u8(15).write_i32(0);
+    let ev = game(sc::SCUnitEquipmentsChangedPacket, &s);
+    assert_eq!(
+        ev,
+        WorldEvent::UnitEquipmentsChanged {
+            obj: 0x0400,
+            slots: smallvec::smallvec![(26, 28_091), (15, 0)],
+        }
+    );
+    // a pack put down (the slot is emptied) is the single empty form
+    let mut s = PacketStream::new();
+    s.write_bc(0x0400).write_u8(1).write_u8(26).write_i32(0);
+    assert_eq!(
+        game(sc::SCUnitEquipmentsChangedPacket, &s),
+        WorldEvent::UnitEquipmentsChanged {
+            obj: 0x0400,
+            slots: smallvec::smallvec![(26, 0)],
+        }
+    );
+    // nothing changed
+    let mut s = PacketStream::new();
+    s.write_bc(7).write_u8(0);
+    assert_eq!(
+        game(sc::SCUnitEquipmentsChangedPacket, &s),
+        WorldEvent::UnitEquipmentsChanged {
+            obj: 7,
+            slots: smallvec::smallvec![],
+        }
+    );
+    // an item of an unknown detail type is a malformed packet, a count that cannot fit too
+    let mut s = PacketStream::new();
+    s.write_bc(0x0400).write_u8(1).write_u8(26);
+    s.write_u32(5)
+        .write_u64(1)
+        .write_u8(0)
+        .write_u8(0)
+        .write_i32(1)
+        .write_u8(77);
+    assert!(parse(1, sc::SCUnitEquipmentsChangedPacket, s.as_bytes()).is_err());
+    let mut s = PacketStream::new();
+    s.write_bc(0x0400).write_u8(200);
+    assert!(parse(1, sc::SCUnitEquipmentsChangedPacket, s.as_bytes()).is_err());
+    // the packet is a game packet only
+    let mut s = PacketStream::new();
+    s.write_bc(7).write_u8(0);
+    assert_eq!(
+        parse(2, sc::SCUnitEquipmentsChangedPacket, s.as_bytes()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn pvp_points() {
+    use aa_proto::sc_world::pvp_points;
+    // packets/g2c_misc.rs:104 (body checked in the server's own test: [5,0,0, 2, 10,0,0,0]):
+    // bc unit, u8 kind, i32 point
+    let mut s = PacketStream::new();
+    s.write_bc(5).write_u8(2).write_i32(10);
+    assert_eq!(s.as_bytes(), [5, 0, 0, 2, 10, 0, 0, 0]);
+    assert_eq!(
+        game(sc::SCUnitPvPPointsChangedPacket, &s),
+        WorldEvent::PvpPoints {
+            obj: 5,
+            kind: 2,
+            points: 10
+        }
+    );
+    let mut s = PacketStream::new();
+    s.write_bc(0x0400)
+        .write_u8(pvp_points::HONOR)
+        .write_i32(-1234);
+    assert_eq!(
+        game(sc::SCUnitPvPPointsChangedPacket, &s),
+        WorldEvent::PvpPoints {
+            obj: 0x0400,
+            kind: 0,
+            points: -1234
+        }
+    );
+    truncation_is_rejected(sc::SCUnitPvPPointsChangedPacket, s.as_bytes(), 8);
+    assert_eq!(pvp_points::HOSTILE_KILLS, 1);
+}
+
+#[test]
 fn conflict_states_have_the_server_values() {
     use aa_proto::sc_world::conflict_state as cs;
     // data/world_data.rs:189 (`ZoneConflictType`)

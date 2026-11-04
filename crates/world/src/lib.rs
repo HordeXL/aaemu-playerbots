@@ -51,4 +51,4 @@ pub use skill::{mana_level_scale, SkillInfo};
 pub use spawns::SpawnStats;
 pub use travel::Travel;
 pub use uses::{ItemUses, SkillNeed};
-pub use world::{World, WorldPaths};
+pub use world::{World, WorldPaths, ZoneInfo};

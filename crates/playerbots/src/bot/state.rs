@@ -49,6 +49,9 @@ pub const U_DEAD: u8 = 1;
 pub const U_LOOT: u8 = 2;
 /// Unit flag: the unit belongs to a player (summon, pet).
 pub const U_OWNED: u8 = 4;
+/// Unit flag: the backpack slot of the character is occupied (a carried trade pack, a glider);
+/// the template is in [`PvpMem`] (`BotState::pack_of`).
+pub const U_PACK: u8 = 8;
 
 /// What kind of unit the server shows. Houses, transfers, mates and shipyards are not tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +91,7 @@ pub struct Unit {
     pub faction: u32,
     /// Level.
     pub level: u8,
-    /// `U_DEAD | U_LOOT | U_OWNED`.
+    /// `U_DEAD | U_LOOT | U_OWNED | U_PACK`.
     pub flags: u8,
     /// Name, characters only.
     pub name: Option<Box<str>>,
@@ -108,6 +111,11 @@ impl Unit {
     /// Whether a player owns the unit.
     pub fn owned(&self) -> bool {
         self.flags & U_OWNED != 0
+    }
+
+    /// Whether the character's backpack slot is occupied (see [`U_PACK`]).
+    pub fn carries_pack(&self) -> bool {
+        self.flags & U_PACK != 0
     }
 
     /// Horizontal distance to `p`.
@@ -424,6 +432,10 @@ pub struct BotState {
     /// What the bot knows about its guild (expedition) and what the guild duty plans (one pointer
     /// until the first guild packet or duty tick), see [`super::guild`].
     pub guild: super::guild::GuildState,
+    /// What the bot remembers of fights with characters: the carriers in view, the characters it
+    /// shuns, the run in progress, its kills (owned by the pvp feature, see [`super::pvp`]);
+    /// allocated by the first carrier in view or fight.
+    pub pvp: Option<Box<super::pvp::PvpMem>>,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -504,6 +516,17 @@ impl BotState {
     /// The unit with object id `obj`.
     pub fn unit(&self, obj: u32) -> Option<&Unit> {
         self.units.get(&obj)
+    }
+
+    /// The template of the item in the backpack slot of character `obj` (a carried trade pack);
+    /// 0 when the slot is empty or the character is not in view.
+    pub fn pack_of(&self, obj: u32) -> u32 {
+        self.pvp.as_ref().map_or(0, |p| p.pack_of(obj))
+    }
+
+    /// The pvp memory, created on first use.
+    pub fn pvp_mut(&mut self) -> &mut super::pvp::PvpMem {
+        self.pvp.get_or_insert_with(Default::default)
     }
 
     /// The bag count of item `template` (all stacks).
@@ -662,6 +685,31 @@ impl BotState {
                 for o in objs {
                     self.units.remove(o);
                     self.threats.retain(|t| t.0 != *o);
+                    if let Some(p) = self.pvp.as_mut() {
+                        p.forget(*o);
+                    }
+                }
+            }
+            WorldEvent::UnitEquipmentsChanged { obj, slots } => {
+                // (the own equipment follows the item tasks)
+                if *obj != self.me.obj {
+                    for &(slot, template) in slots.iter() {
+                        if slot == aa_proto::sc_world::BACKPACK_SLOT {
+                            self.note_pack(*obj, template);
+                        }
+                    }
+                }
+            }
+            WorldEvent::PvpPoints { obj, kind, points } => {
+                if *obj == self.me.obj && self.me.obj != 0 {
+                    let mem = self.pvp_mut();
+                    match *kind {
+                        aa_proto::sc_world::pvp_points::HONOR => mem.honor = *points,
+                        aa_proto::sc_world::pvp_points::HOSTILE_KILLS => {
+                            mem.hostile_kills = *points
+                        }
+                        _ => {}
+                    }
                 }
             }
             WorldEvent::UnitMoved { obj, pos, .. } => {
@@ -924,6 +972,27 @@ impl BotState {
             mem.team.member_targets.clear();
             mem.team.attackers.clear();
         }
+        if let Some(p) = self.pvp.as_mut() {
+            p.clear_view();
+        }
+    }
+
+    /// Notes that character `obj`'s backpack slot holds `template` (0 = nothing now).
+    fn note_pack(&mut self, obj: u32, template: u32) {
+        let Some(u) = self.units.get_mut(&obj) else {
+            return;
+        };
+        if u.kind != UnitKind::Character {
+            return;
+        }
+        if template != 0 {
+            u.flags |= U_PACK;
+        } else {
+            u.flags &= !U_PACK;
+        }
+        if template != 0 || self.pvp.is_some() {
+            self.pvp_mut().set_pack(obj, template);
+        }
     }
 
     fn apply_unit_state(&mut self, info: &UnitInfo) {
@@ -990,6 +1059,9 @@ impl BotState {
                 self.now_ms,
             );
         }
+        if kind == UnitKind::Character && info.backpack != 0 {
+            flags |= U_PACK;
+        }
         self.units.insert(
             info.obj,
             Unit {
@@ -1003,6 +1075,10 @@ impl BotState {
                 name: (kind == UnitKind::Character).then(|| info.name.clone()),
             },
         );
+        if kind == UnitKind::Character && (info.backpack != 0 || self.pvp.is_some()) {
+            // (the server repeats the whole state of a unit that comes into view again)
+            self.pvp_mut().set_pack(info.obj, info.backpack);
+        }
     }
 
     /// The own hit points say the bot is dead although no death event told so (a character that
@@ -1044,11 +1120,30 @@ impl BotState {
             self.threats.clear();
             self.watch.death.death_packet();
             self.watch.tracker.clear();
+            if self
+                .units
+                .get(&killer)
+                .is_some_and(|u| u.kind == UnitKind::Character)
+            {
+                let now = self.now_ms;
+                let mem = self.pvp_mut();
+                mem.killed_by = Some((killer, now));
+                mem.deaths += 1;
+            }
             return;
         }
+        let mut was_character = false;
         if let Some(u) = self.units.get_mut(&obj) {
             u.flags |= U_DEAD;
             u.hp = 0;
+            was_character = u.kind == UnitKind::Character;
+            // (a dead carrier drops its pack: it is a doodad on the ground now)
+            u.flags &= !U_PACK;
+        }
+        if was_character {
+            if let Some(p) = self.pvp.as_mut() {
+                p.set_pack(obj, 0);
+            }
         }
         self.threats.retain(|t| t.0 != obj);
         if killer == self.me.obj && self.me.obj != 0 {
@@ -1056,6 +1151,9 @@ impl BotState {
                 self.kills.remove(0);
             }
             self.kills.push((obj, self.now_ms));
+            if was_character {
+                self.pvp_mut().kills += 1;
+            }
         }
     }
 
@@ -1399,6 +1497,7 @@ mod tests {
                 duration_ms: 0,
                 charge: 0,
             }]),
+            backpack: 0,
             complete: true,
         }
     }

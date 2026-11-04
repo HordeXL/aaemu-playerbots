@@ -341,6 +341,7 @@ impl Brain {
                 let kind = match order.purpose {
                     PartyPurpose::Dungeon { .. } => GoalKind::Dungeon,
                     PartyPurpose::Guild => GoalKind::Guild,
+                    PartyPurpose::Ambush { .. } => GoalKind::Gank,
                 };
                 self.queue(kind, None);
                 self.party = Some(order.clone());

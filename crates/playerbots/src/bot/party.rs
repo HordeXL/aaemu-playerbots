@@ -59,6 +59,14 @@ pub enum PartyPurpose {
     /// Sign the charter of a new guild: the leader founds it, the others sign (the guild feature,
     /// [`super::guild`]).
     Guild,
+    /// Lie in wait together for trade pack carriers (the gank goal, see
+    /// [`pvp::squad`](super::pvp::squad)).
+    Ambush {
+        /// The leader's post, whole metres (x).
+        x: i32,
+        /// The leader's post, whole metres (y).
+        y: i32,
+    },
 }
 
 /// The coordinator's order to one member of a party.
@@ -91,6 +99,7 @@ impl PartyOrder {
             PartyPurpose::Dungeon { zone_group } => zone_group,
             // (a charter has no dungeon)
             PartyPurpose::Guild => 0,
+            PartyPurpose::Ambush { .. } => 0,
         }
     }
 }

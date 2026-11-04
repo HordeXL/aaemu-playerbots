@@ -286,13 +286,13 @@ already name its goal.
 | Hook | Where | Owner |
 | --- | --- | --- |
 | `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `bot/guild/`, `config.rs` | guilds (done, see [Guilds](#guilds-botguild-goal-guild)) |
-| `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` | `bot/goals/gank.rs`, `config.rs` | pvp |
-| `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table | `bot/goals/warzone.rs`, `config.rs` | pvp |
+| `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` (done, see [PvP](#pvp-botpvp-goals-gank-and-warzone)) | `bot/goals/gank.rs`, `config.rs` | pvp |
+| `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table (done) | `bot/goals/warzone.rs`, `config.rs` | pvp |
 | `Event` goal (`goals::event`), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
 | `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
 | `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
 | `[population]` (the web UI's population director: `enabled`, `dry_run`, `max_spawn_per_min`, `min_action_gap_secs`) | `config.rs` | web director |
-| `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
+| `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`, `war_kill_cap`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
 | `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
 | `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
 
@@ -369,6 +369,39 @@ reports, the config). `tests/guild_real_data.rs` (ignored without the server dat
 drives the real brain against the real world: an owner promoting and recruiting its own faction
 only, the invitation policy, whispers for an invitation, a hand-over before a leave and the rest
 after it, a founder gathering a team, a wish reaching the coordinator.
+
+## PvP (`bot/pvp/`, goals `gank` and `warzone`)
+
+Everything is behind `[pvp] enabled`. The pieces:
+
+| Piece | Where | What |
+| --- | --- | --- |
+| Rules | `bot/pvp/rules.rs` | Pure: may the bot attack a character, for a defence, a hunt or a gank? Mirrors the server's `can_attack`: the hostile relation is by mother faction (Nuia 148 against Haranya 149); a character is protected where its alliance owns the zone (the target's mother faction is the zone's faction or its mother; a zone without an owner counts as the neutral faction 2); the town peace buffs (2149, 2221, 4828) forbid combat skills. Then the operator's limits. |
+| Self-defence | `bot/pvp/defence.rs`, `bot/pvp/fight.rs`, `bot/combat.rs` | `defence::pick` finds the character that attacks the bot (the controller's threat list, or a character that lost hit points next to the bot); `fight::judge` ends a fight with a character (retreat, the protected-zone signature, time); `fight::start_flee` runs. The controller has a `fleeing` flag, so goals that do not own combat wait. |
+| Post planner | `bot/pvp/post.rs` | Pure: walks the line between each workbench and the best buyer of its best pack, keeps the points outside the victims' land and scores them (pack price, conflict zone, war, the first point past the home land, minus the way). |
+| Squads | `bot/pvp/squad.rs`, `bot/coordinator.rs`, `bot/party.rs` | A waiting bot sends a `Standby` offer; the coordinator groups offers of one alliance and sends every member a `BotCmd::Party` with `PartyPurpose::Ambush { x, y }`, which the brain turns into a gank goal that knows its squad. The squad needs no further messages: all members pick the same carrier (`squad::pick_target`) and take turns at the doodad. |
+| Gank | `bot/goals/gank.rs` | `Plan -> ToPost -> Lurk -> Fight -> Collect`. `verdict` and `CollectJob` are pure. A finished gank with a pack in the backpack slot continues as a trade run (`Gank::resumes_run`, the same hand-over the rest goal uses), whose carry-only plan sells it. |
+| Warzone | `bot/goals/warzone.rs` | `Plan -> Go -> Patrol <-> Fight -> Regroup`; pure `wars`, `pick_war`, `engage`, `patrol_spot`. |
+
+**State.** `BotState::pvp` is one pointer (`Option<Box<PvpMem>>`, allocated by the first use): the
+backpack templates of the characters in view, the shun table, blocked posts, the flee in progress,
+war kill counts and the last honor the server said. The one cheap per-unit fact is the `U_PACK`
+flag in `Unit::flags` (the backpack slot is occupied). `size_of::<Bot>()` is 3184 bytes (limit
+3200).
+
+**Protocol.** The backpack is equipment slot 26 (`BACKPACK_SLOT`); a character's state packet carries
+it in its equipment block, `SCUnitEquipmentsChangedPacket` (0x094: `u8 count`, then `u8 slot` and an
+item or four zero bytes per slot) updates it, and `SCUnitPvPPointsChangedPacket` (0x204: `u8 kind`,
+`i32 points`; kind 0 honor, kind 1 hostile faction kills) follows every kill of a hostile character.
+When a character dies its pack drops as a doodad (one of the `put_down_backpack_effects` doodads,
+`World::is_pack_doodad`) that anybody with an empty backpack slot picks up with the doodad's func
+skill (11361) within a few metres; the pack goes straight to slot 26. The doodad is kept in the
+view although it has no flags the bots otherwise care about.
+
+**Zone groups.** `World::zone_info_at` gives the zone group and the owning faction of a point,
+`World::zone_group_spots` the spots (every fourth sector centre) of a conflict zone group, and
+`World::is_conflict_group` the groups that take part in the zone conflicts (`conflict_zones`, not
+closed).
 
 ## Navigation motion (`bot/nav/`)
 

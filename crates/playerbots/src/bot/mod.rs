@@ -34,6 +34,7 @@ pub mod motion;
 pub mod nav;
 pub mod party;
 pub mod place;
+pub mod pvp;
 pub mod rotation;
 pub mod session;
 pub mod state;
@@ -1197,10 +1198,12 @@ fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
     d.mul_f32(0.5 + rng.f32())
 }
 
-/// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it.
+/// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it
+/// (or it is a trade pack on the ground, which the gank goal picks up).
 fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
     d.has_loot
         || d.quest_glow != 0
+        || world.is_pack_doodad(d.template)
         || world.is_dungeon_door(d.template)
         || world.is_mirage_door(d.template)
         || world
