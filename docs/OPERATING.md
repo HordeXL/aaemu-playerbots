@@ -28,7 +28,7 @@ reads it (default `playerbots.toml`).
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
 | `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds` and `accept_player_invites` (see [Switched-off features](#switched-off-features)). |
 | `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad` and `retreat_hp_pct`. |
-| `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones`. |
+| `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones` (see [World events](#world-events-events)). |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
 | `[farm]` | Farming, off by default: `enabled` and `max_plots`. |
@@ -74,7 +74,8 @@ for a minute. The bot defends itself whatever it is doing.
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
-| **Guild, Gank, Warzone, Event, Companion, Farm** | Reserved: found or join a guild, ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
+| **Event** | Joins a rift (a tower defence event) while one runs, walks to the defended target, kills the monsters of the current wave next to other bots and leaves when it ends. Needs `[events] enabled`; see [World events](#world-events-events). |
+| **Guild, Gank, Warzone, Companion, Farm** | Reserved: found or join a guild, ambush trade-pack carriers, fight in zones at war, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -155,8 +156,9 @@ Safety of the GM lines:
 
 These sections are all off by default; `enabled = false` (or the `false` default of the switch named
 below) keeps the bots exactly as they were without them. The goals they belong to are reserved and
-not implemented yet (see [Goals and behaviour](#goals-and-behaviour)); the settings are read and
-checked now so the features can be added without changing the file.
+not implemented yet (see [Goals and behaviour](#goals-and-behaviour)), except the event goal, which
+is described in [World events](#world-events-events); the settings are read and checked now so the
+features can be added without changing the file.
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
@@ -176,11 +178,11 @@ checked now so the features can be added without changing the file.
 | | `only_names` | `[]` | When not empty: the only real players that may be attacked. |
 | | `max_squad` | `3` | Most bots that attack together (1 to 50). |
 | | `retreat_hp_pct` | `35` | A bot below this many percent of its hit points breaks off a fight (0 to 100). |
-| `[events]` | `enabled` | `false` | Master switch of the event features (goal `event`). |
+| `[events]` | `enabled` | `false` | Master switch of the event features (goal `event`; see [World events](#world-events-events)). |
 | | `max_bots_per_event` | `6` | At most this many bots join one event. |
-| | `max_share` | `0.25` | At most this share (0 to 1) of all bots takes part in events at once. |
+| | `max_share` | `0.25` | At most this share (0 to 1) of the online bots that are high enough for the event takes part in events at once. |
 | | `join_delay_secs` | `[10, 120]` | A bot waits a random number of seconds in `[low, high]` before it joins. |
-| | `avoid_war_zones` | `true` | Bots stay out of zones at war. |
+| | `avoid_war_zones` | `true` | With `enabled`: the quest, grind and wander goals choose no destination in a zone group at war, and bots do not join an event there. |
 | `[party]` | `join_player_parties` | `false` | Bots join the parties of real players when invited (goal `companion`). |
 | | `chat_commands` | `false` | Bots obey party chat commands of the player who leads the party. |
 | | `follow_into_dungeons` | `false` | A bot in a player's party follows it into instance dungeons. |
@@ -192,6 +194,65 @@ checked now so the features can be added without changing the file.
 | | `max_plots` | `5` | One bot tends at most this many plots. |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
+
+## World events (`[events]`)
+
+The server runs *rifts*: tower defence events (definitions in its `tower_defs` table, for example
+the Crimson Rift) in which controller NPCs summon waves of monsters that march on a defended
+target. A wave ends when the monsters it waits for are dead (everybody's kills count) or its timer
+runs out, and the next one begins; the event ends after its last wave or at its time cap. With
+`[events] enabled = true` the bots help.
+
+* **What a bot does.** While an event runs, a bot that is between small things (idle, wandering,
+  resting, grinding, questing; never in a duel, trade, trade run, dungeon or on a boat, and never
+  when you forced a goal) and is high enough for the event's monsters, healthy (70 % hit points
+  or more), not in an instance and not too far away, takes a slot, waits its join delay and
+  goes. A long trip may use the portals (and the GM `/move` when `bots.long_travel_teleport_m` is
+  set). At the defended target it stays within 40 m of it, picks the nearest monster that is a kill
+  target of the *current* wave and that no other bot has claimed, and fights it with its normal
+  rotation. It never attacks the event's controllers (the summoners and the rift itself). It
+  leaves when the event ends or is ended by the server, when its hit points fall below 40 %
+  (it stays away from that event for 5 minutes), after dying three times in the event, or when
+  nothing has come to fight for 8 minutes (10 minutes away).
+* **The crowd is limited.** `max_bots_per_event` bots at most take part in one event, and at most
+  `max_share` of the online bots that are high enough for it take part in events at all (with 20
+  such bots, `max_bots_per_event = 6` and `max_share = 0.3` it is 6). A bot waits a random time in
+  `join_delay_secs` (the same every time for the same bot and event) before it asks, so a hundred
+  bots do not arrive on the same second.
+* **War zones.** `avoid_war_zones` (on by default) makes the quest, grind and wander goals choose no
+  destination in a zone group the server reports at war, and keeps bots from joining an event there.
+  It does not move a bot that already stands in such a zone group, and the `warzone` and `gank`
+  goals ignore it. It only acts with `[events] enabled`.
+* **The server.** The server starts its events by schedule (`tower_def_spawners`) or by the GM command
+  `/towerdef start <def id>`; it announces them to everybody in the world, so every bot hears of
+  them whatever it does. What else was seen of the server's events is in
+  [What the server does with events](#what-the-server-does-with-events-as-of-the-last-live-run).
+* **Server issues.** The bots report an event whose wave never showed any monster, a wave that
+  did not advance after its kills and an event that outlived its cap (see [ISSUES.md](ISSUES.md)).
+
+The web UI shows the bots in the goal as `event` with a line such as `event: holding the Crimson Rift
+(wave 2), 4 kills`, and the bots' event logs have `event: joining ...`, `event: at the ...` and
+`event: leaving ... (why)` lines.
+
+### What the server does with events (as of the last live run)
+
+Seen while building the feature against the Rust server; the bots cope with all of it.
+
+* Events start by schedule (`tower_def_spawners`, the times come from the spawn data) or with the
+  GM command `/towerdef start <id>` **in the zone group of the GM**; most definitions are
+  *unavailable* there ("Missing NPC spawner ... positions in zone group 20"; `/towerdef list` shows why),
+  so in the Cinderstone zone group only the Crimson Rift (3) and the Grimghast Rift (13) can run.
+* The server tells a bot about a running event when it enters the world (a list), so bots started in
+  the middle of an event find it ("found in progress"); `SCTowerDefList` gives the position of the
+  target unit **as it stood when the list was sent**, and the Crimson Rift's target units walk a
+  path. The bots follow the live unit once they see it.
+* A rift sits in a zone group that is at war (conflict state 6) part of the time. With
+  `avoid_war_zones` on (the default) bots do not join then.
+* The rifts' monsters are strong (levels 40 to 50, many at once): a bot whose levels came from
+  `/level` and that has not learned its skills (the server refuses them with `SkillReqFail`) is not
+  a fighter, so most bots in the live run left hurt and died. Real kills need real characters.
+* An event nobody fights stays in its wave until its time cap (3600 s for the two rifts), when the
+  server ends it; that is how a rift without players behaves, not a fault.
 
 ## Selling (`[market]`)
 

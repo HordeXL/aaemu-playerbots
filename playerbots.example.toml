@@ -161,11 +161,14 @@ retreat_hp_pct = 35
 enabled = false
 # At most this many bots join one event ...
 max_bots_per_event = 6
-# ... and at most this share (0 to 1) of all bots takes part in events at once.
+# ... and at most this share (0 to 1) of the online bots that are high enough for the event takes
+# part in events at once.
 max_share = 0.25
 # A bot waits a random number of seconds in this range [low, high] before it joins.
 join_delay_secs = [10, 120]
-# Bots stay out of zones at war.
+# With "enabled": the quest, grind and wander goals choose no destination in a zone group at war and
+# bots do not join an event there. (The server's rifts usually run in a zone group that is at war part
+# of the time: set this to false to let the bots help then too.)
 avoid_war_zones = true
 
 [party]
