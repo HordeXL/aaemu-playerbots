@@ -184,9 +184,14 @@ impl Loss {
     /// alone for a long time. (A target that left the view or ran away is just gone.)
     pub fn unreachable(self) -> bool {
         match self.reason {
-            LostReason::Stalled | LostReason::Blocked | LostReason::Protected => true,
+            LostReason::Stalled | LostReason::Blocked => true,
             LostReason::Timeout => !self.dealt,
-            LostReason::Gone | LostReason::Far | LostReason::Travel | LostReason::Retreat => false,
+            // (a character the bot cannot hurt is shunned for a shorter time, see `pvp_aftermath`)
+            LostReason::Gone
+            | LostReason::Far
+            | LostReason::Travel
+            | LostReason::Retreat
+            | LostReason::Protected => false,
         }
     }
 }

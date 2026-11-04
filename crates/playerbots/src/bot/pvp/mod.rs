@@ -20,6 +20,7 @@ pub mod defence;
 pub mod fight;
 pub mod post;
 pub mod rules;
+pub mod scan;
 pub mod squad;
 pub mod walk;
 
@@ -70,6 +71,12 @@ pub struct PvpMem {
     packs: SmallVec<[(u32, u32); 4]>,
     /// Characters the bot leaves alone for a while.
     shunned: SmallVec<[Shun; MAX_SHUNNED]>,
+    /// Ambush posts the bot could not use: `(x, y in whole metres, until bot clock ms)`.
+    bad_posts: SmallVec<[([i32; 2], u64); 3]>,
+    /// The gank goal is not scored before this bot clock (ms).
+    pub gank_next_ms: u64,
+    /// The warzone goal is not scored before this bot clock (ms).
+    pub war_next_ms: u64,
     /// Kills per war (warzone goal), newest last.
     wars: SmallVec<[WarKills; MAX_WARS]>,
     /// The run in progress, if any.
@@ -148,6 +155,24 @@ impl PvpMem {
         self.shunned
             .iter()
             .any(|s| s.obj == obj && now_ms < s.until_ms)
+    }
+
+    /// Remembers that the ambush post at (x, y) did not work: no post within 150 m of it is used
+    /// before `until_ms`.
+    pub fn block_post(&mut self, pos: [f32; 2], until_ms: u64) {
+        if self.bad_posts.len() >= 3 {
+            self.bad_posts.remove(0);
+        }
+        self.bad_posts
+            .push(([pos[0].round() as i32, pos[1].round() as i32], until_ms));
+    }
+
+    /// Whether a post close to `pos` is blocked at `now_ms`.
+    pub fn post_blocked(&self, pos: [f32; 2], now_ms: u64) -> bool {
+        self.bad_posts.iter().any(|(p, until)| {
+            now_ms < *until
+                && ((p[0] as f32 - pos[0]).powi(2) + (p[1] as f32 - pos[1]).powi(2)).sqrt() < 150.0
+        })
     }
 
     /// Kills made in the war of `zone_group` that ends at `end_unix_s`.

@@ -35,6 +35,16 @@ const FACTION_NEUTRAL: u32 = 2;
 /// 4828), which the server's `skill_reqs` whitelist lets only a few skills through.
 pub const PEACE_BUFFS: [u32; 3] = [2149, 2221, 4828];
 
+/// The alliance a bot of alliance `mine` is hostile to: the other of the two player alliances;
+/// 0 for a bot of no alliance (nobody is its enemy).
+pub fn enemy_alliance(mine: u32) -> u32 {
+    match mine {
+        NUIA => HARIHARA,
+        HARIHARA => NUIA,
+        _ => 0,
+    }
+}
+
 /// The static facts the rules need. Implemented by [`World`]; the tests use a synthetic one.
 pub trait Geo {
     /// How faction `a` regards faction `b`.
@@ -219,10 +229,10 @@ impl<'a, G: Geo + ?Sized> Rules<'a, G> {
             match who {
                 Who::Bot if !self.cfg.attack_bots => return Err(Why::BotsOff),
                 Who::Player if !self.players_ok => return Err(Why::PlayersOff),
-                Who::Player if !self.cfg.only_names.is_empty() => {
-                    if !listed(&self.cfg.only_names, t.name) {
-                        return Err(Why::NotListed);
-                    }
+                Who::Player
+                    if !self.cfg.only_names.is_empty() && !listed(&self.cfg.only_names, t.name) =>
+                {
+                    return Err(Why::NotListed);
                 }
                 _ => {}
             }
@@ -316,7 +326,7 @@ pub(crate) mod tests {
             }
             Some(if x < 1000.0 {
                 NUIA
-            } else if x >= 5000.0 && x < 9000.0 {
+            } else if (5000.0..9000.0).contains(&x) {
                 HARIHARA
             } else {
                 0

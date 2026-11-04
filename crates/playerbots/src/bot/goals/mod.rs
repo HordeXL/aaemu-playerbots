@@ -161,7 +161,7 @@ impl Goal {
             GoalKind::Auction => Goal::Auction(Auction::default()),
             GoalKind::Market => Goal::Market(Market::default()),
             GoalKind::Guild => Goal::Guild(Guild::new()),
-            GoalKind::Gank => Goal::Gank(Gank::new()),
+            GoalKind::Gank => Goal::Gank(Gank::with_order(party)),
             GoalKind::Warzone => Goal::Warzone(Warzone::new()),
             GoalKind::Event => Goal::Event(Event::new()),
             GoalKind::Companion => Goal::Companion(Companion::new()),
@@ -255,7 +255,10 @@ impl Goal {
             Goal::Auction(g) => return g.tick(ctx),
             Goal::Market(g) => return g.tick(ctx),
             Goal::Guild(g) => return g.tick(ctx),
-            Goal::Gank(g) => return g.tick(ctx),
+            Goal::Gank(g) => match g.tick(ctx) {
+                GoalStatus::Done => g.resumes_run(ctx),
+                status => return status,
+            },
             Goal::Warzone(g) => return g.tick(ctx),
             Goal::Event(g) => return g.tick(ctx),
             Goal::Companion(g) => return g.tick(ctx),
@@ -264,8 +267,9 @@ impl Goal {
         if !resume {
             return GoalStatus::Done;
         }
-        // The rest cut a trade run short while the bot carried a pack: the run goes on.
-        ctx.log.say("goal: trade run (the pack is still carried)");
+        // The rest cut a trade run short while the bot carried a pack (or a gank took one): the
+        // run goes on and sells it.
+        ctx.log.say("goal: trade run (the pack is carried)");
         let mut run = TradeRun::default();
         run.start(ctx);
         *self = Goal::TradeRun(run);
@@ -477,8 +481,6 @@ mod tests {
     fn the_wave_one_stubs_are_goals_that_own_nothing() {
         for kind in [
             GoalKind::Guild,
-            GoalKind::Gank,
-            GoalKind::Warzone,
             GoalKind::Event,
             GoalKind::Companion,
             GoalKind::Farm,

@@ -56,6 +56,14 @@ pub enum PartyPurpose {
         /// orders by).
         zone_group: u32,
     },
+    /// Lie in wait together for trade pack carriers (the gank goal, see
+    /// [`pvp::squad`](super::pvp::squad)).
+    Ambush {
+        /// The leader's post, whole metres (x).
+        x: i32,
+        /// The leader's post, whole metres (y).
+        y: i32,
+    },
 }
 
 /// The coordinator's order to one member of a party.
@@ -86,6 +94,7 @@ impl PartyOrder {
     pub fn zone_group(&self) -> u32 {
         match self.purpose {
             PartyPurpose::Dungeon { zone_group } => zone_group,
+            PartyPurpose::Ambush { .. } => 0,
         }
     }
 }
