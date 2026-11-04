@@ -196,6 +196,40 @@ dry_run = true
 max_spawn_per_min = 10
 # ... and waits at least this many seconds between two of its actions (at least 1).
 min_action_gap_secs = 60
+# The start values of the policy that the web UI's Director tab edits live.
+# Bots online, all together, that the director will not exceed when it starts more.
+max_online = 50
+# Each side (Nuia, Haranya) keeps at least this many bots.
+min_per_side = 0
+# A side aims for this many characters (players plus bots) per 100 players on the other side.
+mirror_pct = 100
+# No side gets more bots than this from the director.
+per_side_cap = 20
+# The most bots one action starts or stops.
+step = 3
+# Bots above the target that a side keeps before the director stops some it started.
+hysteresis = 2
+# The director may stop the bots it started.
+despawn = true
+# It stops starting bots above this much process memory (MB) ...
+backoff_rss_mb = 3072
+# ... above this many packets per second from the server ...
+backoff_packets_in = 30000
+# ... after this many failed or short sessions within five minutes ...
+backoff_login_failures = 8
+# ... with this many open server issues. 0 ignores a limit.
+backoff_open_issues = 50
+# Keeps the numbers, wishes and goal weights between runs (a path; unset = in memory only). The kill
+# switch and dry_run always start as written here, whatever the last run ended with.
+# policy_file = "population.policy.json"
+# The game server's web API, for the exact number of players online, the server status and the
+# auction house's lots. Empty = not used. The key is read from the environment variable named
+# below (or from the first line of server_api_key_file); it is never logged or shown.
+server_api = ""
+server_api_key_env = ""
+# server_api_key_file = "server-api.key"
+# Seconds between two polls of the API (at least 5).
+server_poll_secs = 30
 
 [farm]
 # Bots plant and harvest crops (goal "farm"). Off until enabled.

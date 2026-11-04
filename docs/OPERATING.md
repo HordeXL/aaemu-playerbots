@@ -184,10 +184,7 @@ features can be added without changing the file.
 | `[party]` | `join_player_parties` | `false` | Bots join the parties of real players when invited (goal `companion`). |
 | | `chat_commands` | `false` | Bots obey party chat commands of the player who leads the party. |
 | | `follow_into_dungeons` | `false` | A bot in a player's party follows it into instance dungeons. |
-| `[population]` | `enabled` | `false` | Master switch of the population director. |
-| | `dry_run` | `true` | The director only logs what it would do. |
-| | `max_spawn_per_min` | `10` | It starts at most this many bots per minute (0 = none). |
-| | `min_action_gap_secs` | `60` | Seconds between two of its actions (at least 1). |
+| `[population]` | `enabled` | `false` | Master switch of the population director (see [World metrics and the population director](#world-metrics-and-the-population-director), which lists every key). |
 | `[farm]` | `enabled` | `false` | Master switch of the farming features (goal `farm`). |
 | | `max_plots` | `5` | One bot tends at most this many plots. |
 
@@ -552,6 +549,166 @@ route (reads included) refuses a request whose `Host` is not a loopback name (a 
 in a browser can otherwise read the bots' state); a POST with the right token is exempt, as it
 cannot come from such a page. Despawning a bot keeps its slot, account and character: spawning
 again reuses the stopped bots first and creates a new roster entry only when none is free.
+
+The World, Economy and Director views, the heat overlay and the director are described in
+[World metrics and the population director](#world-metrics-and-the-population-director).
+
+## World metrics and the population director
+
+The side panel of the web UI has three views that look at the world instead of at single bots, and
+a director that can log bots in and out because of what they show. The metrics are always on; only
+the director is switched by `[population] enabled` (and it starts as a dry run).
+
+### What the bots can see
+
+A bot sees the characters within about 128 m. Every bot hands the characters in view that are not
+one of ours to the **census**: character id, name, level, side, continent, zone and position. A
+player counts for 60 seconds after the last bot saw it, and the census holds at most 2048 players.
+So the census is a **lower bound** of the players online: a player in a corner of the map that no
+bot passes is not in it. The World view shows the coverage when it can.
+
+The side of a character is the mother faction of its faction (Nuia 148, Haranya 149); the continent
+is the zone group of the zone it stands in (west, east, Auroria, sea). A bot's snapshot carries both
+(`mother_faction`, `alliance`, `continent`, `zone_key`); before a bot is in the world, its side is
+the side of its race.
+
+### The views
+
+* **World.** Tiles: players seen, bots online, players on the server, coverage, watched area. A
+  table of continent by side (players seen / bots online), with a `+` in the home continent of each
+  side (starts bots of that side) and a `-` wherever bots are (stops idle ones). A form to start or
+  stop bots by side, race and continent. Busiest zones, the players in view (name, level, side,
+  zone, age), what the online bots do (their goals) and what the game server says about itself.
+  "Players on the server" and "unlocated" (players the server counts that no bot sees) need the
+  server API, see below.
+* **Heat** (checkbox above the map): 512 m squares with players (red) and bots (blue).
+* **Economy.** The scarcest items first, with the scarcity bar, lots on the auction house, the
+  market price against the vendor price, the price change over 30 minutes and the buy / sell lines
+  in trade chat. `Grow` makes an item a *wish*; wishes are listed below the table with their time
+  left. Hover a row for the reasons.
+* **Director.** Mode (off, dry run, live, holding), the kill switch, the dry-run switch, the two
+  sides (players, bots, the director's own bots, target), process health and its limits, the policy
+  numbers, goal weights and the log of everything the director did or would do.
+
+`#tab=world`, `#tab=economy` and `#tab=director` open a view from a link (`&heat=1` turns the heat on).
+The raw data is `GET /api/world`, `GET /api/economy` and `GET /api/director`; the director's policy is
+changed with `POST /api/director/policy` (a JSON object with the fields to change, e.g.
+`{"dry_run":false}`), and `POST /api/command` takes `spawn_where` and `despawn_where`
+(`{"type":"spawn_where","count":3,"filter":{"alliance":"nuia","race":"elf","continent":"west"}}`,
+every filter key optional). These POSTs need the token like every other one.
+
+**Filtered spawn and despawn.** A spawn picks free bots of the roster that match (the race decides
+the side and the continent a bot starts on: Nuian and Elf are Nuia and start in the west, Hariharan
+and Ferre are Haranya and start in the east) and grows the roster with matching races from
+`bots.races` when there are too few. A despawn matches by where the bot is now (its side and the
+continent it stands on) and picks the most harmless bots first: ones that stand, rest or wander,
+then ones that walk to a quest or grind, last ones that carry a trade pack. It never stops a bot
+that is fighting, dead, logging in, trading, dueling, in a dungeon, on a boat, at a market or
+auction, in a guild or event task, a warzone or a gank (those goals finish first). Bots that never
+logged in leave the start queue first.
+
+### Economy and scarcity
+
+The board follows up to 1500 items from three kinds of evidence, all bounded:
+
+* the **price notes** of the bots (what they learned at the auction house: the market quote, how
+  many lots they saw, five at most); every bot hands in its fresh notes every ten seconds, and the
+  board keeps the latest note of six bots per item and a short price history;
+* **trade chat**: a shout, trade or group-finding line that offers or asks for an item counts as a
+  sell or a buy line for ten minutes. All bots near a speaker hear the same line, so it is counted
+  once. A real player's line counts in full, a bot's a quarter (the bots' own advertisements must
+  not drive the scarcity they would react to);
+* the **server's auction list** (with `server_api` and its key): the exact number of lots and the
+  median price per item; when it is fresh (ten minutes) it replaces the bots' guess at the supply.
+
+The scarcity score runs from 0 (plenty) to 1 and adds four parts: few lots (`0.45 / (1 + lots / 2)`,
+none for sale is the full 0.45), a price far above the vendor price (up to 0.25 at four times), a
+rising price (up to 0.15 at +50 % in half an hour) and more people asking than offering in chat (up to
+0.15). The farming goal reads it through `population::economy::ScarcityView` (`scarcity`,
+`most_scarce`, `wished`), which `hub.pop` implements.
+
+### The director
+
+Once a second the director looks at the players per side (the census) and the bots per side and
+decides, by the rule **mirror**, how many bots each side should have:
+
+```
+target[side] = min(per_side_cap, max(min_per_side, ceil(mirror_pct / 100 * players[other side]) - players[side]))
+```
+
+When the east is heavy with players, the west gets bots until it has as many characters (players
+plus bots) as the east, within the caps. A side that is short gets bots, up to `step` per action,
+the shortest side first, and never above `max_online` bots in all. A side that has more than
+`hysteresis` bots above its target loses the whole surplus, `step` per action, but **only bots the
+director started itself** that have been up for 3 minutes and are safe to stop (see above): bots you
+started by hand or at start-up are never touched. The dead band keeps a player at the edge of a
+bot's view from making bots come and go.
+
+**Safety.**
+
+* It is **off** by default (`enabled = false`), and with `dry_run = true` (also the default) it only
+  writes down what it would do, to the log of the Director view and the process log (`pb_pop`). The
+  switches always start as `[population]` says, whatever the last run ended with (`policy_file` keeps
+  only the numbers, wishes and goal weights).
+* The kill switch of the Director view turns the whole director off at once; going live asks for
+  confirmation. If the configuration has `enabled = false` it cannot be switched on from the UI.
+* One action at a time, `min_action_gap_secs` apart, at most `max_spawn_per_min` bots a minute
+  (both are hard limits from the configuration that the UI cannot lift), at most `step` bots per
+  action, at most `max_online` bots and `per_side_cap` per side (every count is also bounded by the
+  roster limit of 5000 bots).
+* **Back-off**: while the bot process is over a limit it starts no bots (it may still stop some). The
+  limits: memory, packets per second from the server, failed or short sessions in the last five
+  minutes, open server issues. The reason is shown ("on hold: ...") and logged once.
+* Every action, every refusal and every policy change is in the log with its reason. A dry run keeps
+  the pace of a live run and does not repeat itself.
+
+**Goal weights and wishes.** The Director view can scale the score of each goal for every bot
+(0.1 to 3; blank is 1), applied while the director is live. Wishes (from the Economy view, or the
+scarcest items when `auto_boost` is above 0) are recorded for the farming goal; while the director is
+live and any wish exists, the `farm` goal is scored 1.5 times higher unless you set a weight for it.
+Nothing grows crops yet, so this changes nothing until the farming goal exists.
+
+**`[population]` keys.**
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch of the director (the metrics are always on). |
+| `dry_run` | `true` | The director only logs what it would do. |
+| `max_spawn_per_min` | `10` | Hard limit: bots it starts per minute (0 = none). |
+| `min_action_gap_secs` | `60` | Hard limit: seconds between two of its actions (at least 1). |
+| `max_online` | `50` | Start values of the policy (editable live in the Director view): bots online in all. |
+| `min_per_side` | `0` | Each side keeps at least this many bots. |
+| `mirror_pct` | `100` | Characters per 100 players on the other side (0 to 1000). |
+| `per_side_cap` | `20` | No side gets more bots than this from the director. |
+| `step` | `3` | The most bots one action starts or stops (1 to 1000). |
+| `hysteresis` | `2` | Bots above the target that a side keeps. |
+| `despawn` | `true` | The director may stop the bots it started. |
+| `backoff_rss_mb` | `3072` | Start no bots above this process memory (0 = ignore). |
+| `backoff_packets_in` | `30000` | ... above this many packets per second (0 = ignore). |
+| `backoff_login_failures` | `8` | ... after this many failed or short sessions in five minutes. |
+| `backoff_open_issues` | `50` | ... with this many open server issues. |
+| `policy_file` | unset | Keeps the numbers, wishes and goal weights between runs. |
+| `server_api` | `""` | The game server's web API (`http://host:port`); empty = not used. |
+| `server_api_key_env` | `""` | Name of the environment variable that holds the API's bearer key. |
+| `server_api_key_file` | unset | A file whose first line is the key (used when the variable is unset). |
+| `server_poll_secs` | `30` | Seconds between two polls (at least 5). |
+
+The operator-only numbers `auto_boost` (automatic wishes, 0 to 16, default 0) and `auto_boost_min`
+(scarcity from which an item becomes a wish, default 0.7) are set in the Director view.
+
+### The server API (optional)
+
+With `server_api` set, a background task polls the game server's own web API every
+`server_poll_secs`: `GET /status` (public: uptime, players online, job counts), and with the key
+`GET /api/world/logged-characters` (the exact list of online characters: the ones that are not our
+bots are the real players, so the World view can say how many no bot sees) and, every fourth poll,
+`GET /api/auction/list` (the exact lots, for the economy board). Without the key only `/status` is
+used, and its `Players online` count (which includes every bot of every process) has our own bots
+in the world taken off it ("approx." in the tile). The key comes from the environment variable named
+in `server_api_key_env` or the first line of `server_api_key_file`; it is held in memory only, sent
+only as the `Authorization` header and never logged, shown or written into an error text. The poll is
+read-only and fails soft: an unreachable server is a line in the World view. Responses are cut at
+16 MB, redirects are not followed and the request times out after 5 seconds.
 
 ## Memory and scale
 

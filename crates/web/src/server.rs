@@ -16,6 +16,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::population::PolicyPatch;
 use crate::types::{BotHub, Command, IssueActionRequest};
 
 /// Header that carries the operator token on `POST` requests when one is configured.
@@ -23,6 +24,7 @@ pub const TOKEN_HEADER: &str = "x-playerbots-token";
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
+const POPULATION_JS: &str = include_str!("../assets/population.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
 /// Path the hub's map image is served at (and the `image_url` a hub reports for it).
@@ -160,6 +162,7 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/population.js", get(population_js))
         .route("/style.css", get(style_css))
         .route(MAP_PATH, get(map_png))
         .route("/api/bots", get(api_bots))
@@ -169,9 +172,13 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/api/map", get(api_map))
         .route("/api/issues", get(api_issues))
         .route("/api/issues/{fp}", get(api_issue))
+        .route("/api/world", get(api_world))
+        .route("/api/economy", get(api_economy))
+        .route("/api/director", get(api_director))
         .route("/api/bots/{id}/command", post(api_bot_command))
         .route("/api/command", post(api_command))
         .route("/api/issues/{fp}/action", post(api_issue_action))
+        .route("/api/director/policy", post(api_policy))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -341,6 +348,10 @@ async fn app_js() -> Response {
     static_page("text/javascript; charset=utf-8", APP_JS)
 }
 
+async fn population_js() -> Response {
+    static_page("text/javascript; charset=utf-8", POPULATION_JS)
+}
+
 async fn style_css() -> Response {
     static_page("text/css; charset=utf-8", STYLE_CSS)
 }
@@ -462,7 +473,40 @@ async fn api_issue(State(st): State<Arc<AppState>>, Path(fp): Path<String>) -> R
     }
 }
 
+async fn api_world(State(st): State<Arc<AppState>>) -> Response {
+    json_response(&st.hub.world())
+}
+
+async fn api_economy(State(st): State<Arc<AppState>>) -> Response {
+    json_response(&st.hub.economy())
+}
+
+async fn api_director(State(st): State<Arc<AppState>>) -> Response {
+    json_response(&st.hub.director())
+}
+
 // ---------------------------------------------------------------- commands (POST)
+
+async fn api_policy(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(e) = authorize(&st, &headers) {
+        return e.into_response();
+    }
+    if !is_json(&headers) {
+        return ApiError::bad_request("send the policy as Content-Type: application/json")
+            .into_response();
+    }
+    let patch: PolicyPatch = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => return ApiError::bad_request(format!("invalid policy: {e}")).into_response(),
+    };
+    if let Err(msg) = patch.validate(&Command::GOALS) {
+        return ApiError::bad_request(msg).into_response();
+    }
+    match st.hub.set_policy(patch) {
+        Ok(()) => json_response(&serde_json::json!({ "ok": true })),
+        Err(msg) => ApiError::bad_request(msg).into_response(),
+    }
+}
 
 async fn api_issue_action(
     State(st): State<Arc<AppState>>,

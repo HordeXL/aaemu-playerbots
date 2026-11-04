@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
-    IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind, QuestLine, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, DirectorView, EconomyView, HubStats,
+    IssueAction, IssueDetail, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind,
+    PolicyPatch, QuestLine, WorldRect, WorldView,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
@@ -27,6 +28,8 @@ use crate::bot::nav::NavService;
 use crate::contest::Contest;
 use crate::issues::logtail::{words, LineHook};
 use crate::issues::{view, IssueReport, IssueTasks, Issues, LogLevel};
+use crate::population::select::{Selector, StopRule};
+use crate::population::Population;
 
 /// Entries of a bot's event log.
 pub const LOG_LINES: usize = 32;
@@ -193,6 +196,16 @@ pub enum SupCmd {
     Spawn(u32),
     /// Stop `n` bots.
     Despawn(u32),
+    /// Start `n` bots that match `sel` (the roster grows with matching races when it has too few);
+    /// `owned`: the population director started them and may stop them again.
+    SpawnWhere { n: u32, sel: Selector, owned: bool },
+    /// Stop up to `n` bots that match `sel` and are safe to stop (see
+    /// [`crate::population::select::stop_rank`]).
+    DespawnWhere {
+        n: u32,
+        sel: Selector,
+        rule: StopRule,
+    },
 }
 
 #[derive(Debug)]
@@ -353,6 +366,8 @@ pub struct Hub {
     map: MapAsset,
     supervisor: mpsc::Sender<SupCmd>,
     llm: Option<Arc<pb_llm::Llm>>,
+    /// What the bots know about the world's players and goods, and the population director.
+    pub pop: Population,
 }
 
 impl Hub {
@@ -387,7 +402,22 @@ impl Hub {
             map,
             supervisor: p.supervisor,
             llm: p.llm,
+            pop: Population::inert(),
         }
+    }
+
+    /// Uses `pop` for the census, the economy board and the population director (the default does
+    /// nothing). Call before the hub is shared.
+    pub fn with_population(mut self, pop: Population) -> Hub {
+        self.pop = pop;
+        self
+    }
+
+    /// Hands an order to the supervisor without waiting.
+    pub(crate) fn order(&self, cmd: SupCmd) -> Result<(), String> {
+        self.supervisor
+            .try_send(cmd)
+            .map_err(|_| "the supervisor is busy, try again".to_string())
     }
 
     /// Adds a slot for a bot (or returns the existing one).
@@ -456,6 +486,7 @@ impl Hub {
         self.rss.lock().refresh(false);
         self.nav.tick();
         self.tick_events();
+        self.pop.tick(self);
     }
 
     /// While an event runs: tells the board how many bots are online and how high they are, and
@@ -569,6 +600,31 @@ impl Hub {
             return;
         }
         deliver_log_line(&self.chat.names, &|| self.slots(), level, line);
+    }
+
+    /// A filtered spawn needs a bot to start: a roster entry of a matching race, or a configured
+    /// race to create one with. Refuses early (and in words) what the supervisor could not do.
+    fn check_spawn_filter(&self, sel: &Selector) -> Result<(), String> {
+        if sel.is_all() || !sel.races(self.pop.races()).is_empty() {
+            return Ok(());
+        }
+        let every_race: Vec<u8> = (1..=8).collect();
+        if sel.races(&every_race).is_empty() {
+            return Err(
+                "no race matches that filter: the Nuia races start on the west continent, \
+                 the Haranya races on the east continent"
+                    .to_string(),
+            );
+        }
+        let has_entry = self.slots().iter().any(|s| {
+            s.with(|g| crate::config::race_id(&g.snap.race))
+                .is_some_and(|r| sel.matches_race(r))
+        });
+        if has_entry {
+            Ok(())
+        } else {
+            Err("no bot and no configured race (bots.races) matches that filter".to_string())
+        }
     }
 
     fn per_bot_bytes(rss: &Rss, online: u32) -> u64 {
@@ -796,6 +852,22 @@ impl BotHub for Hub {
         self.issue_svc.action(fingerprint, view::action(action))
     }
 
+    fn world(&self) -> WorldView {
+        self.pop.world_view(self)
+    }
+
+    fn economy(&self) -> EconomyView {
+        self.pop.economy_view()
+    }
+
+    fn director(&self) -> DirectorView {
+        self.pop.director_view(self)
+    }
+
+    fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {
+        self.pop.set_policy(patch)
+    }
+
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
         cmd.validate(bot)?;
         match bot {
@@ -812,6 +884,20 @@ impl BotHub for Hub {
                     .supervisor
                     .try_send(SupCmd::Despawn(count))
                     .map_err(|_| "the supervisor is busy, try again".to_string()),
+                Command::SpawnWhere { count, filter } => {
+                    let sel = Selector::from_filter(&filter)?;
+                    self.check_spawn_filter(&sel)?;
+                    self.order(SupCmd::SpawnWhere {
+                        n: count,
+                        sel,
+                        owned: false,
+                    })
+                }
+                Command::DespawnWhere { count, filter } => self.order(SupCmd::DespawnWhere {
+                    n: count,
+                    sel: Selector::from_filter(&filter)?,
+                    rule: StopRule::default(),
+                }),
                 other => {
                     // Pause, Resume and Goal reach every bot. A full queue only skips that bot.
                     let bot_cmd = to_bot_cmd(other)?;
@@ -845,7 +931,10 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
             to: to.trim().to_string(),
             text: text.trim().to_string(),
         },
-        Command::Spawn { .. } | Command::Despawn { .. } => {
+        Command::Spawn { .. }
+        | Command::Despawn { .. }
+        | Command::SpawnWhere { .. }
+        | Command::DespawnWhere { .. } => {
             return Err("spawn and despawn are global commands".into())
         }
     })

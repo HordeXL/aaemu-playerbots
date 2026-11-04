@@ -302,6 +302,8 @@ impl Bot {
                     if online >= HEALTHY_SESSION {
                         backoff = min;
                         self.outage_reported = false;
+                    } else {
+                        self.shared.hub.pop.note_failed_session();
                     }
                     if let Some(f) = fault {
                         self.report_fault(f, &why);
@@ -1003,8 +1005,35 @@ impl Bot {
         self.real_near = self
             .state
             .any_character_within(WATCH_RADIUS, |id| hub.is_bot_char(id));
+        self.feed_population();
         self.watch_server();
         self.publish(conn);
+    }
+
+    /// Hands the players in view to the census and, every ten seconds (staggered by bot id), the
+    /// fresh auction price notes to the economy board.
+    fn feed_population(&mut self) {
+        let hub = &self.shared.hub;
+        let now = crate::hub::unix_ms();
+        crate::population::census::observe(
+            &self.state,
+            &hub.pop.census,
+            &*self.shared.world,
+            &|id| hub.is_bot_char(id),
+            self.entry.id,
+            now,
+        );
+        if self.secs.wrapping_add(self.entry.id).is_multiple_of(10) {
+            if let Some(m) = self.state.market.get() {
+                crate::population::economy::sample_notes(
+                    &hub.pop.economy,
+                    self.entry.id,
+                    m.auction.prices(),
+                    self.state.now_ms,
+                    now,
+                );
+            }
+        }
     }
 
     /// The once-a-second pass of the detectors that look at time: requests the server never
@@ -1098,6 +1127,11 @@ impl Bot {
         let hub = &self.shared.hub;
         let guild_info =
             guild::snapshot_if_changed(&mut self.state.guild, |c| hub.is_bot_char(c), char_id);
+        let mother = if me.faction != 0 {
+            world.mother_faction(me.faction)
+        } else {
+            0
+        };
         self.slot.with(|g| {
             if let Some(info) = guild_info {
                 g.snap.guild = info;
@@ -1125,6 +1159,12 @@ impl Bot {
             }
             if zone_changed {
                 s.zone = zone_key.and_then(|k| world.zone_name(k)).map(str::to_owned);
+                s.zone_key = zone_key.unwrap_or(0);
+                s.continent = crate::population::region::continent_of_zone(&**world, s.zone_key);
+            }
+            if mother != 0 && s.mother_faction != mother {
+                s.mother_faction = mother;
+                s.alliance = crate::population::region::alliance_of_mother(mother);
             }
             if with_extra {
                 g.extra.clear();
@@ -1186,6 +1226,7 @@ pub fn initial_snapshot(entry: &RosterEntry, archetype: &Archetype) -> pb_web::B
         class: archetype.name.clone(),
         level: 1,
         hp_pct: 100,
+        alliance: crate::population::region::alliance_of_race(entry.race),
         activity: Activity::Offline,
         ..pb_web::BotSnapshot::default()
     }

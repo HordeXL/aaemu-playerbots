@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::population::{
+    Alliance, Continent, DirectorView, EconomyView, PolicyPatch, SpawnFilter, WorldView,
+};
+
 /// What a bot is doing right now. Serialized as `snake_case` (`"trade_run"`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +83,18 @@ pub struct BotSnapshot {
     pub y: f32,
     pub z: f32,
     pub zone: Option<String>,
+    /// Mother faction id of the bot's faction (0 = unknown); the alliance comes from it.
+    #[serde(default)]
+    pub mother_faction: u32,
+    /// The side the bot plays (by its race until it is in the world).
+    #[serde(default)]
+    pub alliance: Alliance,
+    /// The continent the bot stands on (`unknown` while offline).
+    #[serde(default)]
+    pub continent: Continent,
+    /// Zone key of the position (0 = none).
+    #[serde(default)]
+    pub zone_key: u16,
     pub activity: Activity,
     /// Short goal name ("quest", "grind", …).
     pub goal: String,
@@ -334,6 +350,20 @@ pub enum Command {
     Despawn {
         count: u32,
     },
+    /// Global: log in `count` more bots that match the filter (their race decides the side and
+    /// the home continent). The roster grows with matching races when too few are free.
+    SpawnWhere {
+        count: u32,
+        #[serde(default)]
+        filter: SpawnFilter,
+    },
+    /// Global: log out up to `count` bots that match the filter, idle and resting ones first; a bot
+    /// that trades, duels, runs a dungeon or meets a buyer is left alone.
+    DespawnWhere {
+        count: u32,
+        #[serde(default)]
+        filter: SpawnFilter,
+    },
 }
 
 impl Command {
@@ -429,6 +459,15 @@ impl Command {
                     Err(format!("count must be 1..={}", Command::MAX_COUNT))
                 } else {
                     Ok(())
+                }
+            }
+            Command::SpawnWhere { count, filter } | Command::DespawnWhere { count, filter } => {
+                if bot.is_some() {
+                    Err("spawn/despawn are global: POST /api/command".into())
+                } else if *count == 0 || *count > Command::MAX_COUNT {
+                    Err(format!("count must be 1..={}", Command::MAX_COUNT))
+                } else {
+                    filter.validate()
                 }
             }
         }
@@ -548,6 +587,24 @@ pub trait BotHub: Send + Sync + 'static {
     /// Applies an operator action to an issue. The error text is shown to the operator.
     fn issue_action(&self, _fingerprint: &str, _action: IssueAction) -> Result<(), String> {
         Err("issue reports are not available".into())
+    }
+
+    /// Players and bots by continent and side, zones, heat, and what the game server says.
+    fn world(&self) -> WorldView {
+        WorldView::default()
+    }
+    /// Scarce items, prices and supply.
+    fn economy(&self) -> EconomyView {
+        EconomyView::default()
+    }
+    /// The population director: policy, targets, health and the log of its actions.
+    fn director(&self) -> DirectorView {
+        DirectorView::default()
+    }
+    /// Changes the director's policy (only the fields present change). The error text is shown to
+    /// the operator.
+    fn set_policy(&self, _patch: PolicyPatch) -> Result<(), String> {
+        Err("the population director is not available".into())
     }
 }
 

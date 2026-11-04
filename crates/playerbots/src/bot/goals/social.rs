@@ -700,8 +700,11 @@ fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
     // (the market features hear the shout, trade and group-finding channels and the whispers
     // besides us; what they do with them is no business of the routing below)
     let market = &mut ctx.state.market;
+    let (hub, world) = (ctx.hub, ctx.world);
     crate::bot::market::forward_chat(&lines, |kind, sender, text, at_ms| {
-        market.on_chat(kind, sender, text, at_ms)
+        market.on_chat(kind, sender, text, at_ms);
+        // (the economy board counts what the world's players ask for and offer)
+        hub.pop.hear(hub, world, kind, sender, text);
     });
     // (the guild feature hears the guild chat and the whispers that ask for an invitation)
     let claimed = crate::bot::guild::forward_chat(ctx, &lines);

@@ -442,7 +442,9 @@ pub struct PartyCfg {
 }
 
 /// `[population]`: the population director of the web UI, which starts and stops bots to follow
-/// the players. Off by default; with `dry_run` it only says what it would do.
+/// the players. Off by default; with `dry_run` it only says what it would do. The policy keys
+/// (`max_online` ... `backoff_open_issues`) are the start values of the policy the operator edits in
+/// the web UI; `max_spawn_per_min` and `min_action_gap_secs` are hard limits the UI cannot lift.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PopulationCfg {
@@ -454,6 +456,40 @@ pub struct PopulationCfg {
     pub max_spawn_per_min: u32,
     /// Seconds between two of its actions (at least 1).
     pub min_action_gap_secs: u64,
+    /// Bots online, all together, that it will not exceed when it starts more.
+    pub max_online: u32,
+    /// Each side keeps at least this many bots.
+    pub min_per_side: u32,
+    /// A side aims for this many characters (players plus bots) per 100 players on the other side.
+    pub mirror_pct: u32,
+    /// No side gets more bots than this from the director.
+    pub per_side_cap: u32,
+    /// The most bots one action starts or stops.
+    pub step: u32,
+    /// Bots above the target a side keeps before the director stops some.
+    pub hysteresis: u32,
+    /// The director may stop the bots it started.
+    pub despawn: bool,
+    /// Stops starting bots above this much process memory in megabytes (0 = ignore).
+    pub backoff_rss_mb: u32,
+    /// ... above this many packets per second from the server (0 = ignore).
+    pub backoff_packets_in: u32,
+    /// ... after this many failed or short sessions within five minutes (0 = ignore).
+    pub backoff_login_failures: u32,
+    /// ... with this many open server issues (0 = ignore).
+    pub backoff_open_issues: u32,
+    /// Where the policy's numbers, wishes and goal weights are kept between runs; empty = in memory
+    /// only. `enabled` and `dry_run` are not restored from it: they start as configured.
+    pub policy_file: Option<PathBuf>,
+    /// The game server's web API (`http://host:port`); empty = not used. Adds the exact number of
+    /// players online, the server's status and the auction house's lots to the web UI.
+    pub server_api: String,
+    /// The name of the environment variable that holds the API's bearer key.
+    pub server_api_key_env: String,
+    /// A file whose first line is the API's bearer key (used when the variable is not set).
+    pub server_api_key_file: Option<PathBuf>,
+    /// Seconds between two polls of the server API (at least 5).
+    pub server_poll_secs: u64,
 }
 
 impl Default for PopulationCfg {
@@ -463,8 +499,60 @@ impl Default for PopulationCfg {
             dry_run: true,
             max_spawn_per_min: 10,
             min_action_gap_secs: 60,
+            max_online: 50,
+            min_per_side: 0,
+            mirror_pct: 100,
+            per_side_cap: 20,
+            step: 3,
+            hysteresis: 2,
+            despawn: true,
+            backoff_rss_mb: 3072,
+            backoff_packets_in: 30_000,
+            backoff_login_failures: 8,
+            backoff_open_issues: 50,
+            policy_file: None,
+            server_api: String::new(),
+            server_api_key_env: String::new(),
+            server_api_key_file: None,
+            server_poll_secs: 30,
         }
     }
+}
+
+impl PopulationCfg {
+    /// The policy the web UI starts with.
+    pub fn policy(&self) -> pb_web::Policy {
+        pb_web::Policy {
+            active: self.enabled,
+            dry_run: self.dry_run,
+            max_online: self.max_online,
+            min_per_side: self.min_per_side,
+            mirror_pct: self.mirror_pct,
+            per_side_cap: self.per_side_cap,
+            step: self.step,
+            hysteresis: self.hysteresis,
+            despawn: self.despawn,
+            backoff_rss_mb: self.backoff_rss_mb,
+            backoff_packets_in: self.backoff_packets_in,
+            backoff_login_failures: self.backoff_login_failures,
+            backoff_open_issues: self.backoff_open_issues,
+            ..pb_web::Policy::default()
+        }
+    }
+}
+
+/// Whether `url` is an `http://` or `https://` address with a host and no credentials in it.
+fn plain_http_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// `[farm]`: bots that plant and harvest crops (goal `farm`). Off by default.
@@ -835,6 +923,48 @@ impl Config {
         ensure!(
             po.min_action_gap_secs >= 1,
             "population.min_action_gap_secs must be at least 1"
+        );
+        for (key, v) in [
+            ("max_online", po.max_online),
+            ("min_per_side", po.min_per_side),
+            ("per_side_cap", po.per_side_cap),
+        ] {
+            ensure!(
+                v <= MAX_BOTS,
+                "population.{key} {v} is above the limit of {MAX_BOTS}"
+            );
+        }
+        ensure!(
+            po.mirror_pct <= 1000,
+            "population.mirror_pct must be at most 1000"
+        );
+        ensure!(
+            (1..=1000).contains(&po.step),
+            "population.step must be in 1..=1000"
+        );
+        ensure!(
+            po.hysteresis <= 1000,
+            "population.hysteresis must be at most 1000"
+        );
+        ensure!(
+            po.server_poll_secs >= 5,
+            "population.server_poll_secs must be at least 5"
+        );
+        ensure!(
+            po.server_api.is_empty() || plain_http_url(&po.server_api),
+            "population.server_api must be an http:// or https:// address without a login in it \
+             (the key goes in server_api_key_env or server_api_key_file)"
+        );
+        ensure!(
+            po.server_api_key_env.is_empty()
+                || (po
+                    .server_api_key_env
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !po
+                        .server_api_key_env
+                        .starts_with(|c: char| c.is_ascii_digit())),
+            "population.server_api_key_env must be the NAME of an environment variable"
         );
         ensure!(
             self.farm.max_plots <= 1000,
@@ -1607,6 +1737,20 @@ emote = true
                 "dry_run = true",
                 "max_spawn_per_min = 10",
                 "min_action_gap_secs = 60",
+                "max_online = 50",
+                "min_per_side = 0",
+                "mirror_pct = 100",
+                "per_side_cap = 20",
+                "step = 3",
+                "hysteresis = 2",
+                "despawn = true",
+                "backoff_rss_mb = 3072",
+                "backoff_packets_in = 30000",
+                "backoff_login_failures = 8",
+                "backoff_open_issues = 50",
+                "server_api = \"\"",
+                "server_api_key_env = \"\"",
+                "server_poll_secs = 30",
             ],
         );
         let cfg = Config::parse(
@@ -1622,9 +1766,35 @@ emote = true
             "[population]\nmax_spawn_per_min = 5001\n",
             "[population]\nmax_spawn_per_min = -1\n",
             "[population]\nenabled = \"on\"\n",
+            "[population]\nmax_online = 5001\n",
+            "[population]\nper_side_cap = 5001\n",
+            "[population]\nmirror_pct = 1001\n",
+            "[population]\nstep = 0\n",
+            "[population]\nserver_poll_secs = 4\n",
+            "[population]\nserver_api = \"ftp://x\"\n",
+            "[population]\nserver_api = \"http://user:secret@127.0.0.1:1280\"\n",
+            "[population]\nserver_api = \"http://\"\n",
+            "[population]\nserver_api_key_env = \"sk-abc def\"\n",
+            "[population]\nserver_api_key_env = \"1KEY\"\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_population_policy_starts_from_the_keys() {
+        let cfg = Config::parse(
+            "[population]\nenabled = true\ndry_run = false\nmax_online = 80\nmirror_pct = 150\n\
+             step = 5\nserver_api = \"http://127.0.0.1:1280\"\nserver_api_key_env = \"AAEMU_API_KEY\"\n",
+        )
+        .unwrap();
+        let p = cfg.population.policy();
+        assert!(p.active && !p.dry_run);
+        assert_eq!((p.max_online, p.mirror_pct, p.step), (80, 150, 5));
+        assert!(cfg.population.server_api_key_file.is_none());
+        let off = Config::default().population.policy();
+        assert!(!off.active && off.dry_run);
+        assert_eq!(off.hysteresis, 2);
     }
 
     #[test]
