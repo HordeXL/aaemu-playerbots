@@ -406,6 +406,15 @@ impl Brain {
         }
         super::goals::dungeon::unsolicited(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
+        // A rift is running and the bot is free enough to help: the event goal replaces the small
+        // things (never an operator's choice, and not while the goal cools down after a failure).
+        if !matches!(self.choice, GoalChoice::Forced(_))
+            && !self.is_disabled(GoalKind::Event)
+            && !self.cooldown_until.active(GoalKind::Event, now)
+            && super::goals::event::duty(ctx, self.goal.as_ref().map(Goal::kind))
+        {
+            self.start_goal(ctx, GoalKind::Event, None);
+        }
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
         } else if self.hurt_and_idle(ctx) {

@@ -257,7 +257,7 @@ impl Goal {
             Goal::Guild(g) => return g.tick(ctx),
             Goal::Gank(g) => return g.tick(ctx),
             Goal::Warzone(g) => return g.tick(ctx),
-            Goal::Event(g) => return g.tick(ctx),
+            Goal::Event(g) => return g.tick(ctx, combat),
             Goal::Companion(g) => return g.tick(ctx),
             Goal::Farm(g) => return g.tick(ctx),
         };
