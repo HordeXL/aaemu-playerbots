@@ -597,7 +597,7 @@ function renderDetail() {
     const li = h('li');
     li.append(
       h('span', null, (p.crop || 'crop') + ' on ' + (p.land || 'land')),
-      h('span', null, p.state + (p.honest ? '' : ' (minted seed)')),
+      h('span', null, p.state + (p.honest ? '' : " (not the bot's own)")),
     );
     li.title = Math.round(p.x) + ', ' + Math.round(p.y);
     pf.append(li);

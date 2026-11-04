@@ -702,7 +702,7 @@ impl Machine {
                     sow.doodad,
                     spot[0],
                     spot[1],
-                    if honest { "" } else { " (minted seed)" }
+                    if honest { "" } else { " (not clean)" }
                 )));
                 sow.sent_ms = io.now_ms;
                 sow.faced_ms = 0;
@@ -1034,7 +1034,7 @@ impl Machine {
         acts.push(Act::Say(format!(
             "farm: harvesting doodad {} (skill {skill}){}",
             plot.doodad,
-            if plot.honest { "" } else { " (minted seed)" }
+            if plot.honest { "" } else { " (not clean)" }
         )));
         self.reap.skill = skill;
         self.reap.sent_ms = io.now_ms;
