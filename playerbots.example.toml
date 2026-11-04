@@ -210,7 +210,8 @@ backoff_packets_in = 30000
 backoff_login_failures = 8
 # ... with this many open server issues. 0 ignores a limit.
 backoff_open_issues = 50
-# Keeps the policy between runs (a path; unset = in memory only).
+# Keeps the numbers, wishes and goal weights between runs (a path; unset = in memory only). The kill
+# switch and dry_run always start as written here, whatever the last run ended with.
 # policy_file = "population.policy.json"
 # The game server's web API, for the exact number of players online, the server status and the
 # auction house's lots. Empty = not used. The key is read from the environment variable named

@@ -470,7 +470,8 @@ pub struct PopulationCfg {
     pub backoff_login_failures: u32,
     /// ... with this many open server issues (0 = ignore).
     pub backoff_open_issues: u32,
-    /// Where the policy is kept between runs; empty = in memory only.
+    /// Where the policy's numbers, wishes and goal weights are kept between runs; empty = in memory
+    /// only. `enabled` and `dry_run` are not restored from it: they start as configured.
     pub policy_file: Option<PathBuf>,
     /// The game server's web API (`http://host:port`); empty = not used. Adds the exact number of
     /// players online, the server's status and the auction house's lots to the web UI.

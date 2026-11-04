@@ -328,7 +328,15 @@ impl Director {
         let mut policy = cfg.policy();
         if let Some(path) = &cfg.policy_file {
             match load_policy(path) {
-                Ok(Some(p)) => policy = p,
+                // (the switches always start as the configuration says: a restart is as safe as
+                // the configuration, whatever the operator did in the last run)
+                Ok(Some(p)) => {
+                    policy = Policy {
+                        active: policy.active,
+                        dry_run: policy.dry_run,
+                        ..p
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(target: "pb_pop", "policy file {}: {e}", path.display()),
             }
@@ -1580,7 +1588,8 @@ mod tests {
         let again = Director::new(&cfg);
         let p = again.policy();
         assert_eq!(p.max_online, 77);
-        assert!(p.dry_run);
+        assert!(!p.dry_run, "the switches start as the configuration says");
+        assert_eq!(p.active, cfg.enabled);
         // a file with a policy that is switched on is not trusted when the config is off
         let off = Director::new(&PopulationCfg {
             enabled: false,
