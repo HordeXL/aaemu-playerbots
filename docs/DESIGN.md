@@ -288,7 +288,7 @@ already name its goal.
 | `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `bot/guild/`, `config.rs` | guilds (done, see [Guilds](#guilds-botguild-goal-guild)) |
 | `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` (done, see [PvP](#pvp-botpvp-goals-gank-and-warzone)) | `bot/goals/gank.rs`, `config.rs` | pvp |
 | `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table (done) | `bot/goals/warzone.rs`, `config.rs` | pvp |
-| `Event` goal (`goals::event`), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
+| `Event` goal (`goals::event`, built: see [Events](#events-goal-event)), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
 | `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
 | `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
 | `[population]` (the web UI's population director: `enabled`, `dry_run`, `max_spawn_per_min`, `min_action_gap_secs`) | `config.rs` | web director |
@@ -296,8 +296,8 @@ already name its goal.
 | `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
 | `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
 
-Every stub goal fails with `NotImplemented` (the brain then switches it off for the bot) and its
-`score` is 0, so no bot picks it; forcing one from the web UI does no harm. A feature scores its goal
+Every stub goal (the event goal is no longer one) fails with `NotImplemented` (the brain then
+switches it off for the bot) and its `score` is 0, so no bot picks it; forcing one from the web UI does no harm. A feature scores its goal
 through its own `score(ctx, base)` (gate on its `[section]`; the brain applies none of its factors to
 it) and turns the stub's methods into the real thing (`owns_combat` for the pvp goals).
 
@@ -402,6 +402,74 @@ view although it has no flags the bots otherwise care about.
 `World::zone_group_spots` the spots (every fourth sector centre) of a conflict zone group, and
 `World::is_conflict_group` the groups that take part in the zone conflicts (`conflict_zones`, not
 closed).
+
+## Events (goal `event`)
+
+The server runs *rifts*: tower defence events (its `tower_defs` tables) in which controller NPCs
+summon waves of monsters. An event is keyed by (definition id, zone group) in world 0; the waves are
+"steps", a 1-based index into the definition's progs ordered by id. A wave ends when its timer ran out
+(if it has one) and/or every kill target it names has died (`cond_comp_by_and` picks AND or OR); kills
+count for anyone in the zone group. The event ends after its last wave, by `/towerdef end` or at
+`force_end_time` (3600 s for the Crimson Rift).
+
+* **Packets** (`aa-proto` `sc_event.rs`, wired in `sc_world.rs`): `SCTowerDefList` 0x16b, `Start` 0x16c,
+  `End` 0x16d, `WaveStart` 0x16e become `WorldEvent::{TowerDefList, TowerDefStart, TowerDefEnd,
+  TowerDefWave}`. A list entry is 41 bytes (def `u32`, zone group `u16`, zone `u32`, spot `u32`, target
+  object `bc`, x and y as fixed-point `i64`, z `f32`, step `u32`); the count is checked against the body.
+  The server sends a list on world entry and after each start and wave. Its position is where the
+  *target unit* stood at that moment, and the target of the Crimson Rift **walks a path** (about 1 m/s),
+  so a bot that sees the unit (`state.unit(obj)`) follows its live position (`live_rally`).
+* **Data** (`aa-world` `event.rs`): `Events::load` joins `tower_defs`, `tower_def_progs`, spawn targets,
+  kill targets, `npc_spawner_npcs` and the conflict zones with the NPC spawn data. An `EventDef` has the
+  controllers (spawner, step, template, position, zone group), the kill targets per step (template and
+  count), the timer, the time cap, the level range (the levels of the kill-target NPCs; a definition
+  without kill targets has 0 and is not joinable) and the war zone group of a conflict definition.
+* **The board** (`playerbots` `events/board.rs`, `hub.events`): the process-wide `EventBoard`. The first
+  bot to hear a packet posts it (`on_server_event`, called by the bot loop after `state.apply`); the
+  others find it there. One short mutex plus an atomic count, so a bot with no event running reads one
+  atomic. It keeps the running events, the step and its start, the target, the slots (leases that
+  the goal renews every tick, `LEASE_MS` 25 s), the join delays, the bars (hurt 5 min, idle 10 min, three
+  deaths) and the evidence of the detectors. Flood control: `max_bots_per_event`; `max_share` of the
+  online bots that are high enough for the event (`Population`, rebuilt by `Hub::tick` once a second
+  while an event runs; unknown means no share cap); the join delay is a deterministic draw in
+  `join_delay_secs` from (bot, definition, first seen). It logs `event started / wave / target / ended`
+  on target `pb_events`.
+* **The goal** (`bot/goals/event.rs`, decisions in `event/plan.rs` and `event/pick.rs`):
+  `Event{run: Option<Box<Run>>}` is one pointer, so `Bot` stays within its size budget. `duty` (called by
+  the brain every tick, one atomic read when idle) starts it in place of none, wander, rest, grind or
+  quest; `score` (12) does the same when the brain draws. `offer` is the eligibility: `enabled`, a
+  running event, level at least the definition's, hit points 70 % or more, not away (instance, loading,
+  dead), not a war definition, the zone group not at war with `avoid_war_zones`, a way short enough
+  (4000 m on foot, 15000 m with portals, any with GM `/move`), the join delay over, a free slot.
+  Phases: *Go* (`Ctx::travel`, so a long trip takes portals or `/move`; trips are limited in time and
+  continued while they gain) and *Hold* (within 40 m of the target, at an own spot in a ring of 6 to
+  18 m so bots spread). In *Hold* the bot fights the nearest unit that is a kill target of the current
+  wave, else a monster of another wave of the event (a straggler), within 55 m of the target and 70 m of
+  the bot, one nobody holds before one somebody holds (`hub.contest` claims). Controllers (the Rift
+  itself, the summoners) and every monster that is not the event's own are never attacked: a wave that
+  names no kill targets (the first, a timer) is waited out. It leaves when the event ends, below
+  40 % hit points, after three deaths, or after 8 minutes of nothing to fight (the wave timer and three
+  minutes when that is longer; a new wave restarts the wait).
+* **War zones** (`bot/war.rs`): `Ctx::in_war_zone(x, y)` is `[events] enabled`, `avoid_war_zones` and the
+  zone group at (x, y) (`World::zone_key_at`, `travel.zone_groups`) at conflict or war in
+  `BotState::zone_states`. Grind (`find_spawn`), wander (`random_point` filter) and the quest planner
+  (`plan_target`, `find_candidate`) do not choose such a destination; the `warzone` and `gank` goals never
+  ask. A bot already inside is not moved out.
+* **Detectors** (`events/detect.rs`, pure `judge`, run by `EventBoard::sweep_witnessed` about once a
+  second): *no wave monster*: a participant stood at the target for 30 s, 60 s plus the walk from the
+  farthest controller (4 m/s, at most 240 s) after the wave began, and no unit of the wave and no
+  kill was seen (`event-wave-no-npcs def D wave N`); *stuck wave*: every kill the wave waits for was
+  seen but the event stayed in the wave 30 s later (`event-wave-stuck def D wave N`); *not ended*: the
+  event outlived its cap by 60 s (`event-not-ended def D`). Each is told once per wave (per event for
+  the last) and is filed for each of up to three bots that stood in the event (so it is an issue seen
+  by several bots, with their trail), suspect server, area `systems/instances/tower_def.rs`. A stale
+  event is dropped from the board 120 s later.
+
+Deviations from the brief, on purpose: the "no wave monster" wait is 60 s *plus the walk* (the
+summoners stand up to 1500 m from the target); `max_share` counts the online bots that are high enough
+for the event, not all bots (so a share of 0.3 of 20 such bots is 6 whatever else is online); a bot
+does not fight monsters that are merely near the target when the wave names no kill targets (the first
+live run did, and the camp around the Grimghast Rift killed the bots in under a minute).
 
 ## Navigation motion (`bot/nav/`)
 

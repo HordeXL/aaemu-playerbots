@@ -40,6 +40,7 @@ pub mod session;
 pub mod state;
 pub mod travel;
 pub mod vehicle;
+pub mod war;
 pub mod watch;
 pub mod zones;
 
@@ -332,6 +333,7 @@ impl Bot {
     fn go_offline(&mut self) {
         self.online_since = None;
         self.shared.hub.contest.release_bot(self.entry.id);
+        self.shared.hub.events.release_bot(self.entry.id);
         self.motion.leave_world();
         self.slot.set_offline();
     }
@@ -683,6 +685,12 @@ impl Bot {
         if let ServerEvent::Activity(aa_proto::sc_activity::ActivityEvent::Guild(g)) = &ev {
             guild::observe(&self.shared.hub.guilds, g);
         }
+        crate::events::on_server_event(
+            &self.shared.hub.events,
+            &self.shared.world,
+            &ev,
+            &self.state,
+        );
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);

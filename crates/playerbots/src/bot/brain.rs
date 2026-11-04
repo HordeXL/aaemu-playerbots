@@ -9,8 +9,10 @@
 //!
 //! The dungeon, sail, auction, market, guild, gank, warzone, event, companion and farm goals are the
 //! exception: the features that own them score them from the whole tick context (`own_scores`),
-//! with none of the factors above (the guild, gank, warzone, event, companion and farm goals are
-//! stubs and score 0 until their features exist).
+//! with none of the factors above (the guild, gank, warzone, companion and farm goals are stubs and
+//! score 0 until their features exist). The event goal also has a duty hook: a running event it may
+//! join pulls a bot out of the small goals at once ([`super::goals::event::duty`]), so a rift does
+//! not wait for the end of a grind.
 //!
 //! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
 //! pack recipe, housing without GM help or a design item) are left out of the draw up front
@@ -131,7 +133,7 @@ fn own_scores(
     s[market] = own_score(blocked, market, || {
         super::goals::market::score(ctx, base[market])
     });
-    // (the wave-one goals are stubs: 0 until their features exist)
+    // (the wave-one goals that are not built yet are stubs: 0 until their features exist)
     let wave_one: [(GoalKind, OwnScore); 6] = [
         (GoalKind::Guild, super::goals::guild::score),
         (GoalKind::Gank, super::goals::gank::score),
@@ -410,6 +412,15 @@ impl Brain {
         // Guild duty: answers invitations, recruits, promotes and talks whatever the bot does.
         super::guild::duty(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
+        // A rift is running and the bot is free enough to help: the event goal replaces the small
+        // things (never an operator's choice, and not while the goal cools down after a failure).
+        if !matches!(self.choice, GoalChoice::Forced(_))
+            && !self.is_disabled(GoalKind::Event)
+            && !self.cooldown_until.active(GoalKind::Event, now)
+            && super::goals::event::duty(ctx, self.goal.as_ref().map(Goal::kind))
+        {
+            self.start_goal(ctx, GoalKind::Event, None);
+        }
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
         } else if self.hurt_and_idle(ctx) {

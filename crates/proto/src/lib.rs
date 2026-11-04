@@ -31,6 +31,7 @@ pub mod pos;
 pub mod sc;
 pub mod sc_activity;
 pub mod sc_emote;
+pub mod sc_event;
 pub mod sc_travel;
 pub mod sc_world;
 pub mod stream;

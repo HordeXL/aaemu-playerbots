@@ -451,7 +451,9 @@ fn plan_target(ctx: &Ctx<'_>) -> Option<Dest> {
     let me = (state.me.pos[0], state.me.pos[1]);
     let atlas = atlas(world);
     let memory = state.quest_mem.as_ref().and_then(|m| m.progress.as_deref());
-    let blocked = |x: f32, y: f32| memory.is_some_and(|p| p.blocked(x, y, now));
+    // (a place in a zone group at war is not a destination either)
+    let blocked =
+        |x: f32, y: f32| memory.is_some_and(|p| p.blocked(x, y, now)) || ctx.in_war_zone(x, y);
     let risky = |from: (f32, f32), to: (f32, f32)| {
         progress::deadly(world, faction, level, from, to) || progress::cut_off(world, from, to)
     };
@@ -918,6 +920,9 @@ impl Inner {
                 let Some(quest) = world.quest(quest_id) else {
                     return;
                 };
+                if ctx.in_war_zone(p.x, p.y) {
+                    return;
+                }
                 let dist = ((p.x - me[0]).powi(2) + (p.y - me[1]).powi(2)).sqrt();
                 // Cheap checks first; the data checks run only for a quest that would win.
                 let cand = Candidate {

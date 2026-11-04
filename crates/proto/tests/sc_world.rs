@@ -1270,6 +1270,160 @@ fn conflict_states_have_the_server_values() {
     assert_eq!(cs::name(8), "unknown");
 }
 
+// ---- tower defence events (rifts) ----------------------------------------------------------
+
+/// `TowerDefKey` (systems/instances/packets.rs:101): `u32 definition, u16 zone group`.
+fn write_event_key(s: &mut PacketStream, def: u32, zone_group: u16) {
+    s.write_u32(def).write_u16(zone_group);
+}
+
+#[test]
+fn tower_def_start_and_end() {
+    use aa_proto::sc_event::EventId;
+    // systems/instances/tests.rs `tower_def_packets_are_byte_exact`: key 12 / 5, zone 129
+    let mut s = PacketStream::new();
+    write_event_key(&mut s, 12, 5);
+    s.write_u32(129);
+    assert_eq!(s.as_bytes(), [12, 0, 0, 0, 5, 0, 129, 0, 0, 0]);
+    let id = EventId {
+        def: 12,
+        zone_group: 5,
+    };
+    assert_eq!(
+        game(sc::SCTowerDefStartPacket, &s),
+        WorldEvent::TowerDefStart { id, zone_key: 129 }
+    );
+    assert_eq!(
+        game(sc::SCTowerDefEndPacket, &s),
+        WorldEvent::TowerDefEnd { id, zone_key: 129 }
+    );
+    truncation_is_rejected(sc::SCTowerDefStartPacket, s.as_bytes(), 10);
+    truncation_is_rejected(sc::SCTowerDefEndPacket, s.as_bytes(), 10);
+    // the packets are game packets only
+    assert_eq!(
+        parse(2, sc::SCTowerDefStartPacket, s.as_bytes()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn tower_def_wave_start() {
+    use aa_proto::sc_event::EventId;
+    // systems/instances/tests.rs: key 12 / 5, zone 129, step 3
+    let bytes = [12, 0, 0, 0, 5, 0, 129, 0, 0, 0, 3, 0, 0, 0];
+    let mut s = PacketStream::new();
+    write_event_key(&mut s, 12, 5);
+    s.write_u32(129).write_u32(3);
+    assert_eq!(s.as_bytes(), bytes);
+    assert_eq!(
+        game(sc::SCTowerDefWaveStartPacket, &s),
+        WorldEvent::TowerDefWave {
+            id: EventId {
+                def: 12,
+                zone_group: 5
+            },
+            zone_key: 129,
+            step: 3,
+        }
+    );
+    truncation_is_rejected(sc::SCTowerDefWaveStartPacket, s.as_bytes(), 14);
+}
+
+#[test]
+fn tower_def_list() {
+    use aa_proto::sc_event::{EventId, TowerDefInfo};
+    // systems/instances/tests.rs `tower_def_packets_are_byte_exact`: one entry, the target at
+    // (100.5, 2000.25, 30) with object id 0x0A0B0C in wave 4
+    let mut s = PacketStream::new();
+    s.write_u8(1);
+    write_event_key(&mut s, 12, 5);
+    s.write_u32(129)
+        .write_u32(2)
+        .write_bc(0x0A0B0C)
+        .write_i64(((100.5f32 * 4096.0) as i64) << 32)
+        .write_i64(((2000.25f32 * 4096.0) as i64) << 32)
+        .write_f32(30.0)
+        .write_u32(4);
+    assert_eq!(s.len(), 1 + 41);
+    let info = TowerDefInfo {
+        id: EventId {
+            def: 12,
+            zone_group: 5,
+        },
+        zone_key: 129,
+        spot_id: 2,
+        target_obj: 0x0A0B0C,
+        pos: (100.5, 2000.25, 30.0),
+        step: 4,
+    };
+    assert!(info.has_target());
+    assert_eq!(
+        game(sc::SCTowerDefListPacket, &s),
+        WorldEvent::TowerDefList(vec![info].into_boxed_slice())
+    );
+    truncation_is_rejected(sc::SCTowerDefListPacket, s.as_bytes(), 42);
+
+    // an event without a live target: object id and position are zero
+    let mut s = PacketStream::new();
+    s.write_u8(2);
+    write_event_key(&mut s, 3, 20);
+    s.write_u32(257)
+        .write_u32(9846)
+        .write_bc(0)
+        .write_i64(0)
+        .write_i64(0)
+        .write_f32(0.0)
+        .write_u32(0);
+    write_event_key(&mut s, 13, 20);
+    s.write_u32(257)
+        .write_u32(14335)
+        .write_bc(77)
+        .write_i64(((-12.5f32 * 4096.0) as i64) << 32)
+        .write_i64(((3.0f32 * 4096.0) as i64) << 32)
+        .write_f32(-1.5)
+        .write_u32(1);
+    let WorldEvent::TowerDefList(list) = game(sc::SCTowerDefListPacket, &s) else {
+        panic!("not a list");
+    };
+    assert_eq!(list.len(), 2);
+    assert!(!list[0].has_target());
+    assert_eq!(list[0].pos, (0.0, 0.0, 0.0));
+    assert_eq!((list[0].id.def, list[0].spot_id), (3, 9846));
+    assert_eq!(list[1].target_obj, 77);
+    assert_eq!(list[1].pos, (-12.5, 3.0, -1.5));
+    assert_eq!(list[1].step, 1);
+    truncation_is_rejected(sc::SCTowerDefListPacket, s.as_bytes(), 1 + 2 * 41);
+
+    // no events at all (what a character gets after an event ended)
+    let mut s = PacketStream::new();
+    s.write_u8(0);
+    assert_eq!(
+        game(sc::SCTowerDefListPacket, &s),
+        WorldEvent::TowerDefList(Vec::new().into_boxed_slice())
+    );
+}
+
+#[test]
+fn tower_def_list_count_is_checked_against_the_body() {
+    // systems/instances/tests.rs `tower_def_list_count_and_payload_are_bounded...`: 41 bytes each
+    for supplied in [0u8, 100] {
+        let mut s = PacketStream::new();
+        s.write_u8(supplied);
+        for id in 1..=u32::from(supplied) {
+            s.write_u32(id).write_raw(&[0; 37]);
+        }
+        assert_eq!(s.len(), 1 + usize::from(supplied) * 41);
+        let WorldEvent::TowerDefList(list) = game(sc::SCTowerDefListPacket, &s) else {
+            panic!("not a list");
+        };
+        assert_eq!(list.len(), usize::from(supplied));
+    }
+    // a count the body cannot hold is rejected before anything is allocated for it
+    let mut s = PacketStream::new();
+    s.write_u8(200).write_raw(&[0; 41]);
+    assert!(parse(1, sc::SCTowerDefListPacket, s.as_bytes()).is_err());
+}
+
 // ---- dispatcher ----------------------------------------------------------------------------
 
 #[test]

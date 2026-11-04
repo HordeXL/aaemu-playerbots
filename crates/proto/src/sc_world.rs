@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::opcodes::{pp, sc};
 use crate::pos::convert_long_to_coord;
+use crate::sc_event::{self, EventId, TowerDefInfo};
 use crate::sc_travel::{self, MySlaveInfo, PortalEntry, ShipMotion};
 use crate::stream::{MarshalError, PacketStream};
 
@@ -648,6 +649,33 @@ pub enum WorldEvent {
         /// When the state ends, in Unix seconds (0 when it does not).
         end_unix_s: i64,
     },
+    /// `SCTowerDefListPacket` (systems/instances/packets.rs:735): every tower defence event
+    /// ("rift") running in the world instance, with its wave and the position of its target.
+    /// Sent on each start, wave and end and when the character changes zone.
+    TowerDefList(Box<[TowerDefInfo]>),
+    /// `SCTowerDefStartPacket` (systems/instances/packets.rs:756): an event started.
+    TowerDefStart {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+    },
+    /// `SCTowerDefEndPacket` (systems/instances/packets.rs:774): an event ended.
+    TowerDefEnd {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+    },
+    /// `SCTowerDefWaveStartPacket` (systems/instances/packets.rs:793): a wave of an event began.
+    TowerDefWave {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+        /// The wave (from 1).
+        step: u32,
+    },
 
     // ---- doodads -----------------------------------------------------------------------
     /// `SCDoodadCreatedPacket` (one doodad, `Doodad.Write` models/doodad.rs:247) or
@@ -1039,6 +1067,11 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCConflictZoneStatePacket => read_conflict_zone_state,
         sc::SCUnitEquipmentsChangedPacket => read_unit_equipments_changed,
         sc::SCUnitPvPPointsChangedPacket => read_pvp_points,
+        // tower defence events (rifts)
+        sc::SCTowerDefListPacket => sc_event::read_list,
+        sc::SCTowerDefStartPacket => sc_event::read_start,
+        sc::SCTowerDefEndPacket => sc_event::read_end,
+        sc::SCTowerDefWaveStartPacket => sc_event::read_wave,
         // portals
         sc::SCCharacterPortalsPacket => sc_travel::read_portal_book,
         sc::SCCharacterReturnDistrictsPacket => sc_travel::read_return_districts,

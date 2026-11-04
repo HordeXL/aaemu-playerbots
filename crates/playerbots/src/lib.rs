@@ -19,6 +19,7 @@ pub mod archetype;
 pub mod bot;
 pub mod config;
 pub mod contest;
+pub mod events;
 pub mod gm;
 pub mod hub;
 pub mod issues;

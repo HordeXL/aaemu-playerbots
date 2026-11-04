@@ -330,6 +330,9 @@ pub struct Hub {
     pub chat: ChatHub,
     /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
     pub contest: Contest,
+    /// The world events (rifts) that are running and the bots that take part, see
+    /// [`crate::events`].
+    pub events: crate::events::EventBoard,
     /// Navigation: the planner pool and the counters, see [`crate::bot::nav`].
     pub nav: NavService,
     /// What the leaders of dungeon parties tell their members (owned by the dungeons feature).
@@ -367,6 +370,7 @@ impl Hub {
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
             contest: Contest::new(),
+            events: Default::default(),
             nav: NavService::default(),
             board: Default::default(),
             guilds: Default::default(),
@@ -451,6 +455,39 @@ impl Hub {
         );
         self.rss.lock().refresh(false);
         self.nav.tick();
+        self.tick_events();
+    }
+
+    /// While an event runs: tells the board how many bots are online and how high they are, and
+    /// files the issues its detectors found.
+    fn tick_events(&self) {
+        if !self.events.any() {
+            return;
+        }
+        let levels = self.slots().into_iter().filter_map(|s| {
+            s.with(|g| {
+                (!matches!(g.snap.activity, Activity::Offline | Activity::Connecting))
+                    .then_some(g.snap.level)
+            })
+        });
+        let pop = crate::events::Population::from_levels(levels);
+        for w in self.events.sweep_witnessed(Some(pop)) {
+            // The bots that stood in the event saw the problem: each files it with its own
+            // context, so one rift that goes wrong is an issue seen by several bots.
+            let mut filed = false;
+            for bot in w.bots {
+                if let Some(slot) = self.slot(bot) {
+                    let r = slot.with(|inner| {
+                        crate::issues::attach_context(w.report.clone(), inner, 0, None)
+                    });
+                    self.report_issue(r);
+                    filed = true;
+                }
+            }
+            if !filed {
+                self.report_issue(w.report);
+            }
+        }
     }
 
     /// Records (or replaces) the house marker of a bot.
