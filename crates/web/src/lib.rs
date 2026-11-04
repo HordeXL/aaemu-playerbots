@@ -15,9 +15,13 @@
 //! GET  /api/map                MapInfo
 //! GET  /api/issues             [IssueSummary]       (server problems the bots collected)
 //! GET  /api/issues/{fp}        IssueDetail          (404 if unknown; fp is `pb:` and 8 hex digits)
+//! GET  /api/world              WorldView            (players and bots by continent and side, heat, server)
+//! GET  /api/economy            EconomyView          (scarce items, prices, supply)
+//! GET  /api/director           DirectorView         (policy, targets, health, the log of its actions)
 //! POST /api/bots/{id}/command  Command as JSON      -> {"ok":true} or 400 {"error":"…"}
 //! POST /api/command            Command as JSON (global commands: spawn, despawn, pause all, …)
 //! POST /api/issues/{fp}/action {"action":"queue"|"ignore"|"resolve"|"reopen"} -> {"ok":true} or 400
+//! POST /api/director/policy    PolicyPatch as JSON  -> {"ok":true} or 400 {"error":"…"}
 //! ```
 //!
 //! With [`WebConfig::token`] set, `POST`s need the header `x-playerbots-token: <token>` (401
@@ -36,9 +40,15 @@
 //! # Ok(()) }
 //! ```
 
+mod population;
 mod server;
 mod types;
 
+pub use population::{
+    ActionRecord, Alliance, BoostRequest, BoostWish, Continent, DirectorView, EconomySources,
+    EconomyView, HealthView, HeatCell, ItemRow, PlayerSeen, Policy, PolicyPatch, RegionCell,
+    ServerView, SideRow, SpawnFilter, WorldTotals, WorldView, ZoneRow,
+};
 pub use server::{router, serve, serve_listener, WebConfig, TOKEN_HEADER};
 pub use types::{
     Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueActionRequest,

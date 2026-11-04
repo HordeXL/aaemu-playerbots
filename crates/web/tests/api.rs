@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
-    IssueSample, IssueSummary, LogLine, MapInfo, Marker, MarkerKind, QuestLine, WebConfig,
-    WorldRect,
+    Activity, Alliance, BotDetail, BotHub, BotSnapshot, Command, Continent, DirectorView,
+    EconomyView, HubStats, IssueAction, IssueDetail, IssueSample, IssueSummary, ItemRow, LogLine,
+    MapInfo, Marker, MarkerKind, PlayerSeen, PolicyPatch, QuestLine, RegionCell, WebConfig,
+    WorldRect, WorldView,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,6 +22,7 @@ struct TestHub {
     commands: Mutex<Vec<(Option<u32>, Command)>>,
     with_image: bool,
     actions: Mutex<Vec<(String, IssueAction)>>,
+    policies: Mutex<Vec<PolicyPatch>>,
 }
 
 const ISSUE: &str = "pb:6f3b2e1c";
@@ -173,6 +175,55 @@ impl BotHub for TestHub {
             return Err("it is not closed".into());
         }
         self.actions.lock().unwrap().push((fp.to_string(), action));
+        Ok(())
+    }
+
+    fn world(&self) -> WorldView {
+        WorldView {
+            at_ms: 1_700_000_000_000,
+            ttl_secs: 60,
+            cells: vec![RegionCell {
+                continent: Continent::East,
+                alliance: Alliance::Haranya,
+                players_seen: 4,
+                bots_online: 1,
+            }],
+            players: vec![PlayerSeen {
+                name: "Alice".into(),
+                level: 30,
+                alliance: Alliance::Haranya,
+                continent: Continent::East,
+                ..PlayerSeen::default()
+            }],
+            ..WorldView::default()
+        }
+    }
+
+    fn economy(&self) -> EconomyView {
+        EconomyView {
+            items: vec![ItemRow {
+                template: 3412,
+                name: "Copper".into(),
+                scarcity: 0.8,
+                ..ItemRow::default()
+            }],
+            ..EconomyView::default()
+        }
+    }
+
+    fn director(&self) -> DirectorView {
+        DirectorView {
+            available: true,
+            mode: "dry_run".into(),
+            ..DirectorView::default()
+        }
+    }
+
+    fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {
+        if patch.active == Some(true) {
+            return Err("the director is switched off in the configuration".into());
+        }
+        self.policies.lock().unwrap().push(patch);
         Ok(())
     }
 }
@@ -1068,5 +1119,218 @@ async fn issue_actions_need_the_token_and_the_right_origin() {
             .status,
         200
     );
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_population_views_are_served() {
+    let s = Server::start(None, false).await;
+
+    let w = s.get("/api/world").await;
+    assert_eq!(w.status, 200);
+    assert!(w.header("content-type").starts_with("application/json"));
+    let w = w.json();
+    assert_eq!(w["ttl_secs"], 60);
+    assert_eq!(w["cells"][0]["continent"], "east");
+    assert_eq!(w["cells"][0]["alliance"], "haranya");
+    assert_eq!(w["cells"][0]["players_seen"], 4);
+    assert_eq!(w["players"][0]["name"], "Alice");
+    assert_eq!(w["server"]["configured"], false);
+    assert!(w["totals"]["players_server"].is_null());
+
+    let e = s.get("/api/economy").await.json();
+    assert_eq!(e["items"][0]["template"], 3412);
+    assert!((e["items"][0]["scarcity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+
+    let d = s.get("/api/director").await.json();
+    assert_eq!(d["available"], true);
+    assert_eq!(d["mode"], "dry_run");
+    assert_eq!(d["policy"]["dry_run"], true);
+    assert_eq!(d["policy"]["active"], false);
+    s.shutdown().await;
+}
+
+#[test]
+fn a_bare_hub_answers_the_population_calls_with_empty_views() {
+    struct Bare;
+    impl BotHub for Bare {
+        fn snapshots(&self) -> Vec<BotSnapshot> {
+            Vec::new()
+        }
+        fn detail(&self, _: u32) -> Option<BotDetail> {
+            None
+        }
+        fn stats(&self) -> HubStats {
+            HubStats::default()
+        }
+        fn markers(&self) -> Vec<Marker> {
+            Vec::new()
+        }
+        fn map_info(&self) -> MapInfo {
+            MapInfo::default()
+        }
+        fn map_image(&self) -> Option<Vec<u8>> {
+            None
+        }
+        fn command(&self, _: Option<u32>, _: Command) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    assert!(Bare.world().cells.is_empty());
+    assert!(Bare.economy().items.is_empty());
+    assert!(!Bare.director().available);
+    assert!(Bare.set_policy(PolicyPatch::default()).is_err());
+}
+
+#[tokio::test]
+async fn policy_changes_reach_the_hub_after_they_are_checked() {
+    let s = Server::start(None, false).await;
+    let url = "/api/director/policy";
+
+    let r = s
+        .post(url, &[], r#"{"dry_run":false,"max_online":60}"#)
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["ok"], true);
+    {
+        let seen = s.hub.policies.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].dry_run, Some(false));
+        assert_eq!(seen[0].max_online, Some(60));
+        assert_eq!(seen[0].mirror_pct, None);
+    }
+
+    // bad numbers, unknown keys and bad JSON never reach the hub
+    for body in [
+        r#"{"max_online":999999}"#,
+        r#"{"step":0}"#,
+        r#"{"goal_bias":{"fly":1.0}}"#,
+        r#"{"mirror":100}"#,
+        r#"{"max_online":-3}"#,
+        "{nope",
+        "",
+    ] {
+        let r = s.post(url, &[], body).await;
+        assert_eq!(r.status, 400, "{body}: {}", r.text());
+        assert!(r.json()["error"].is_string());
+    }
+    // the hub's own refusal is shown as it is
+    let r = s.post(url, &[], r#"{"active":true}"#).await;
+    assert_eq!(r.status, 400);
+    assert!(r.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("configuration"));
+    assert_eq!(s.hub.policies.lock().unwrap().len(), 1);
+
+    // JSON only
+    let r = s
+        .request(
+            "POST",
+            url,
+            &[("Content-Type", "text/plain")],
+            Some(r#"{"dry_run":true}"#),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn policy_changes_need_the_token_and_the_right_origin() {
+    let s = Server::start(Some("sekrit"), false).await;
+    let url = "/api/director/policy";
+    let body = r#"{"dry_run":true}"#;
+    for headers in [vec![], vec![("x-playerbots-token", "nope")]] {
+        assert_eq!(s.post(url, &headers, body).await.status, 401);
+    }
+    // authorisation comes before the body is looked at
+    assert_eq!(s.post(url, &[], "{nope").await.status, 401);
+    assert!(s.hub.policies.lock().unwrap().is_empty());
+    let ok = [("x-playerbots-token", "sekrit")];
+    assert_eq!(s.post(url, &ok, body).await.status, 200);
+    assert_eq!(s.hub.policies.lock().unwrap().len(), 1);
+    // the reads stay open
+    assert_eq!(s.get("/api/director").await.status, 200);
+    s.shutdown().await;
+
+    let s = Server::start(None, false).await;
+    let r = s
+        .post(url, &[("Origin", "http://evil.example")], body)
+        .await;
+    assert_eq!(r.status, 403);
+    assert!(s.hub.policies.lock().unwrap().is_empty());
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn filtered_spawn_and_despawn_commands_are_checked_and_reach_the_hub() {
+    let s = Server::start(None, false).await;
+    let r = s
+        .post(
+            "/api/command",
+            &[],
+            r#"{"type":"spawn_where","count":3,"filter":{"alliance":"nuia"}}"#,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = s
+        .post(
+            "/api/command",
+            &[],
+            r#"{"type":"despawn_where","count":2,"filter":{"continent":"east","race":"ferre"}}"#,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // a missing filter means every bot
+    let r = s
+        .post("/api/command", &[], r#"{"type":"spawn_where","count":1}"#)
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    {
+        let seen = s.hub.commands.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        match &seen[0].1 {
+            Command::SpawnWhere { count, filter } => {
+                assert_eq!(*count, 3);
+                assert_eq!(filter.alliance.as_deref(), Some("nuia"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &seen[1].1 {
+            Command::DespawnWhere { count, filter } => {
+                assert_eq!(*count, 2);
+                assert_eq!(filter.continent.as_deref(), Some("east"));
+                assert_eq!(filter.race.as_deref(), Some("ferre"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &seen[2].1,
+            Command::SpawnWhere { count: 1, filter } if filter.is_empty()
+        ));
+    }
+    for body in [
+        r#"{"type":"spawn_where","count":0}"#,
+        r#"{"type":"spawn_where","count":1001}"#,
+        r#"{"type":"spawn_where","count":1,"filter":{"alliance":"orcs"}}"#,
+        r#"{"type":"despawn_where","count":1,"filter":{"race":"dwarf"}}"#,
+        r#"{"type":"despawn_where","count":1,"filter":{"continent":"moon"}}"#,
+        r#"{"type":"spawn_where","count":1,"filter":{"alliances":"nuia"}}"#,
+        r#"{"type":"spawn_where"}"#,
+    ] {
+        let r = s.post("/api/command", &[], body).await;
+        assert_eq!(r.status, 400, "{body}: {}", r.text());
+    }
+    // they are global
+    let r = s
+        .post(
+            "/api/bots/1/command",
+            &[],
+            r#"{"type":"spawn_where","count":1}"#,
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert_eq!(s.hub.commands.lock().unwrap().len(), 3);
     s.shutdown().await;
 }
