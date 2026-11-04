@@ -752,6 +752,10 @@ pub enum ActivityEvent {
     /// An answer of the auction house (`SCAuctionPosted`, `SCAuctionSearched`, `SCAuctionBid`,
     /// `SCAuctionCanceled`, `SCAuctionLowestPrice`); see [`crate::auction`].
     Auction(Box<crate::auction::AuctionEvent>),
+    // ---- guilds --------------------------------------------------------------------------
+    /// A packet about guilds (expeditions): the member list, an invitation, a join or leave, a
+    /// role change; see [`crate::guild`].
+    Guild(Box<crate::guild::GuildEvent>),
 }
 
 type Reader = fn(&mut PacketStream) -> Result<ActivityEvent, MarshalError>;
@@ -1082,9 +1086,12 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
             })
         },
         sc::SCSpecialtyCurrentPacket => specialty_current,
-        // the auction house answers live in `crate::auction`
+        // the auction house answers live in `crate::auction`, the guild packets in `crate::guild`
         _ => {
-            return Ok(crate::auction::parse(level, opcode, body)?.map(|a| E::Auction(Box::new(a))))
+            if let Some(a) = crate::auction::parse(level, opcode, body)? {
+                return Ok(Some(E::Auction(Box::new(a))));
+            }
+            return Ok(crate::guild::parse(level, opcode, body)?.map(|g| E::Guild(Box::new(g))));
         }
     };
     read(&mut PacketStream::from_bytes(body)).map(Some)
