@@ -66,8 +66,9 @@ impl NameIndex {
     }
 }
 
-/// The index of the tradable items of `world`, built on first use and shared by all bots (a
-/// process loads one world).
+/// The index of the tradable items of `world` (sellable, unbound, not quest items), built on first
+/// use and shared by all bots (a process loads one world). A line that asks for or offers any
+/// other item names nothing the bots know, so they never answer it.
 pub fn global(world: &World) -> &'static NameIndex {
     static INDEX: OnceLock<NameIndex> = OnceLock::new();
     INDEX.get_or_init(|| {

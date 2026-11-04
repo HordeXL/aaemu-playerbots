@@ -62,7 +62,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Quest** | Picks a quest (journal first, then story, then the nearest side quest), walks to the giver, accepts, does the objectives (talk, kill, gather, use an item or doodad, reach a sphere) and turns in. Failures back off and repeated ones quarantine the quest. |
 | **Grind** | Kills level-appropriate monsters near the bot and loots them. |
 | **Duel** | A coordinator pairs two idle bots; they meet at a flag, challenge, accept, fight with their PvP rotation and rest afterwards. |
-| **Player trade** | The coordinator pairs two bots; they meet, open the trade window, put up goods and/or money, lock and confirm. A trade request from a real player is accepted when the bot is idle. |
+| **Player trade** | The coordinator pairs two bots; they meet, open the trade window, put up goods and/or money, lock and confirm. A trade request from a real player is accepted when the bot is idle. A bot puts up only tradable items it does not hold back for a quest (see [Selling](#selling-market)). |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and later "goes home" to rest there. |
 | **Auction** | Walks to the nearest auctioneer, lists surplus goods, buys a bargain and goes home (see [Auction house](#auction-house)). Needs `[market] enabled` and `auction`. |
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
@@ -167,9 +167,20 @@ quest rewards and supplies (37, 38), gathering skill effects (42, 43) and vendor
 GM-made goods (11), trades, mail and auction returns never count. Whatever leaves the bag, for any
 reason, is taken off the ledger first, so the ledger errs on the side of selling less; it holds at
 most 64 item kinds per bot and is forgotten when the connection is lost. Of what is left, only
-items that are sellable and not bound (`ItemFacts::tradable`) are offered, and a reserve of 10 is
-kept of items the bot may use itself (anything that casts a skill when used, anything a quest asks
-to gather).
+items that are tradable (`ItemFacts::tradable`) are offered, and the bot keeps back a part of them.
+
+* **Tradable** means sellable (a vendor takes it), unbound (`bind_id` 1) and not a quest item. A
+  quest item is one in the quest item category, one that only drops during a quest, or one that a
+  quest tells the bot to take (an item that starts a quest, a quest step's obtained or supplied
+  items; the reward step's items are ordinary). The materials a quest merely asks the bot to
+  gather or use (hay bales, seeds) are not quest items. An item the table does not know is not
+  tradable. The same test decides everything below: a bot never sells, asks for, buys or hands
+  over an item that is not tradable.
+* **Kept back** per item kind is the larger of two numbers: a reserve of 10 of items the bot may
+  use itself (anything that casts a skill when used, anything a quest asks to gather), and what the
+  bot's active quests still ask of it (the gather and use counts of their objectives, summed).
+  An item a quest needs in full is never offered, listed, or put up in a trade, and a deal agreed
+  in chat is dropped when a quest taken in the meantime needs the goods.
 
 ### Auction house
 
@@ -196,8 +207,10 @@ a state machine that lasts a few minutes:
 5. **Browse and buy.** Only when `bots.gm_bootstrap` is off: with gold above 2,000 copper the bot
    looks at the cheapest lots (the first pages) and buys out up to two of them: a lot that costs at
    most 75 % of what a vendor would pay for it, or a consumable the bot can use itself (it casts a
-   skill and the item's level fits) that costs no more than a shop asks. It spends at most a
-   quarter of its money (50,000 copper at most) per visit.
+   skill and the item's level fits) that costs no more than a shop asks. A lot of an item that is
+   not tradable (a quest item, a bound or an unsellable one) is never bought, however cheap: no
+   vendor would take it back. It spends at most a quarter of its money (50,000 copper at most) per
+   visit.
 6. **Linger** a few seconds, then leave.
 
 The results arrive as mail (types 13 cancelled lot, 14 sale, 15 expired lot or outbid refund, 16
@@ -217,7 +230,9 @@ totals the bot's visits, lots posted, fees, sales, purchases and timeouts.
 The chat market is a duty every bot runs next to its goal, plus the goal `market` for the meeting.
 
 * **Ads.** A bot with clean surplus posts a `WTS` line in the trade channel; one that needs goods
-  posts a `WTB` line. Wording varies, prices come from the vendor values of the item (a little
+  posts a `WTB` line (only for tradable goods). Item names that a line is read against are those
+  of tradable items, so a request for a quest or bound item finds no match and gets no answer.
+  Wording varies, prices come from the vendor values of the item (a little
   over half way between what a vendor pays and asks), lines are plain text of at most 200
   characters with no item links. A bot posts only when somebody could read it (other bots or a
   player in the same zone group's trade chat), at most every `ad_interval_secs` (with jitter),
@@ -240,7 +255,7 @@ The chat market is a duty every bot runs next to its goal, plus the goal `market
   a mismatch (one copper for the goods, a swapped item, an offer changed after the lock, the wrong
   character) or on a timeout. Requests from anybody else during a meeting are declined.
 * **Economy safety.** Only the clean ledger is sold, never GM-made goods, trade, mail or auction
-  returns. Real players are served only with `sell_to_players = true`, never while
+  returns, and only tradable items beyond what the bot's quests need. Real players are served only with `sell_to_players = true`, never while
   `bots.gm_bootstrap` is on. Everything is off with `enabled = false` or `chat_ads = false`.
 * **Issue detectors** (see Server issue reports): a portal doodad that is not in view 20 s after
   the bot reached its spawn point (the data places it, the server does not show it), a portal

@@ -115,7 +115,8 @@ pub struct World {
     housing: Housing,
     areas: AreaIndex,
     items: StrTable,
-    /// Trade facts (price, binding, stacking, auction categories) of every item template.
+    /// Trade facts (price, binding, stacking, auction categories, quest item) of every item
+    /// template.
     item_facts: ItemTable,
     item_uses: ItemUses,
     zones: Zones,
@@ -610,8 +611,9 @@ impl World {
         self.items.get(id)
     }
 
-    /// The trade facts of item `template` (vendor prices, binding, stacking, auction categories);
-    /// `None` for an unknown template. See [`ItemFacts::tradable`].
+    /// The trade facts of item `template` (vendor prices, binding, stacking, auction categories,
+    /// whether it is a quest item); `None` for an unknown template. See [`ItemFacts::tradable`]:
+    /// a bot never asks for, sells, buys or trades away an item that is not.
     pub fn item_facts(&self, template: u32) -> Option<&ItemFacts> {
         self.item_facts.get(template)
     }

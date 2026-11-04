@@ -9,6 +9,10 @@
 //!   with players. It hears the shout, trade and group-finding chat and the whispers through
 //!   [`MarketState::on_chat`], forwarded by the social duty.
 //!
+//! None of them deals in an item that is not tradable (not sellable, soul-bound or a quest item,
+//! see [`aa_world::ItemFacts::tradable`]) or in the part of an item the bot's active quests still
+//! need ([`needs`]).
+//!
 //! The per-bot budget is tight (`size_of::<Bot>() < 3200` is asserted): [`MarketState`] is one
 //! pointer, and the [`Inner`] behind it is allocated by the first thing that needs it (the ledger
 //! when the bot first gains an item it may sell), so a bot that never gained one costs eight
@@ -17,6 +21,7 @@
 pub mod ads;
 pub mod auction;
 pub mod ledger;
+pub mod needs;
 
 use aa_proto::sc::ServerEvent;
 use aa_world::World;
@@ -25,6 +30,7 @@ use rustc_hash::FxHashMap;
 use self::ads::AdState;
 use self::auction::AuctionMemory;
 use self::ledger::{Ledger, Touched};
+use self::needs::QuestNeeds;
 use super::state::{ChatIn, Item};
 
 /// Hands the chat lines the market features care about (see [`ads::hears`]: shouts, trade and
@@ -77,15 +83,16 @@ impl MarketState {
     }
 
     /// What the bot may offer for sale now, as `(template, count)`: see
-    /// [`Ledger::sellable_surplus`].
+    /// [`Ledger::sellable_surplus`]. `needs` is what its active quests still need.
     pub fn sellable_surplus<'a>(
         &'a self,
         world: &'a World,
         bag: &'a FxHashMap<u16, Item>,
+        needs: &'a QuestNeeds,
     ) -> impl Iterator<Item = (u32, u32)> + 'a {
         self.get()
             .into_iter()
-            .flat_map(move |i| i.ledger.sellable_surplus(world, bag))
+            .flat_map(move |i| i.ledger.sellable_surplus(world, bag, needs))
     }
 
     /// An item task was applied to the bag: `touched` holds the bag counts of the templates it

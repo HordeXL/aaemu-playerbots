@@ -7,7 +7,7 @@
 //! meeting and the trade.
 
 use aa_proto::cs::{self, chat_type};
-use aa_world::World;
+use aa_world::{ItemFacts, World};
 use smallvec::SmallVec;
 
 use super::meet::{self, Side};
@@ -22,6 +22,7 @@ use crate::bot::market::ads::price::{PriceSource, VendorPrices};
 use crate::bot::market::ads::talk::{Medium, PlaceQ};
 use crate::bot::market::ads::{Env, Need, Rules, Surplus};
 use crate::bot::market::ledger::Ledger;
+use crate::bot::market::needs::QuestNeeds;
 use crate::bot::state::{Item, StateError, UnitKind};
 use crate::hub::unix_ms;
 
@@ -50,15 +51,17 @@ const WHISPER_ERR_MS: u64 = 6_000;
 /// Hurt below this, the bot does not go to a meeting.
 const FIT_PCT: u8 = 50;
 
-/// What a bot offers: its clean surplus, one stack's worth of each item at most (a trade puts up
-/// one stack), and not an item the server is known to refuse.
+/// What a bot offers: its clean surplus (tradable items only, less what its active quests need,
+/// `needs`), one stack's worth of each item at most (a trade puts up one stack), and not an item
+/// the server is known to refuse.
 pub fn surplus_of(
     ledger: &Ledger,
     world: &World,
     bag: &rustc_hash::FxHashMap<u16, Item>,
+    needs: &QuestNeeds,
 ) -> SmallVec<[Surplus; MAX_SURPLUS]> {
     let mut out: SmallVec<[Surplus; MAX_SURPLUS]> = SmallVec::new();
-    for (template, count) in ledger.sellable_surplus(world, bag) {
+    for (template, count) in ledger.sellable_surplus(world, bag, needs) {
         if out.len() >= MAX_SURPLUS || trade::is_bound(template) {
             continue;
         }
@@ -78,12 +81,14 @@ pub fn surplus_of(
 
 /// What a bot would buy: the shared trade goods it holds hardly any of (the order, and so the one
 /// it advertises first, changes every hour). A stand-in for the materials of the bot's own work,
-/// which no goal reports yet.
+/// which no goal reports yet. Only goods that are `tradable` (see
+/// [`aa_world::ItemFacts::tradable`]) are wanted: nobody sells the others.
 pub fn wanted_goods(
     bag: &rustc_hash::FxHashMap<u16, Item>,
     money: i64,
     bot: u32,
     unix_ms: u64,
+    tradable: impl Fn(u32) -> bool,
 ) -> SmallVec<[Need; WANTS]> {
     let mut out: SmallVec<[Need; WANTS]> = SmallVec::new();
     if money < SHOP_MONEY {
@@ -93,6 +98,9 @@ pub fn wanted_goods(
     let start = (u64::from(bot) + unix_ms / 3_600_000) as usize;
     for k in 0..WANTS {
         let template = goods[(start + k) % goods.len()];
+        if !tradable(template) {
+            continue;
+        }
         let have: i64 = bag
             .values()
             .filter(|i| i.template == template)
@@ -195,8 +203,11 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     }
 
     // what the bot has and wants
-    let surplus = surplus_of(&inner.ledger, world, &st.bag);
-    let needs = wanted_goods(&st.bag, money, bot_id, unix);
+    let quest_needs = QuestNeeds::of(world, &st.quests);
+    let surplus = surplus_of(&inner.ledger, world, &st.bag, &quest_needs);
+    let needs = wanted_goods(&st.bag, money, bot_id, unix, |t| {
+        world.item_facts(t).is_some_and(ItemFacts::tradable)
+    });
     let audience = board.audience(name, group, unix) + usize::from(real_near);
     let prices = VendorPrices(world);
     let index = names::global(world);
@@ -418,8 +429,8 @@ mod tests {
 
     #[test]
     fn a_poor_bot_or_one_with_enough_wants_nothing() {
-        assert!(wanted_goods(&bag(&[]), 100, 1, 0).is_empty());
-        let rich = wanted_goods(&bag(&[]), 10_000, 1, 0);
+        assert!(wanted_goods(&bag(&[]), 100, 1, 0, |_| true).is_empty());
+        let rich = wanted_goods(&bag(&[]), 10_000, 1, 0, |_| true);
         assert_eq!(rich.len(), WANTS);
         for n in &rich {
             assert!(trade::GOODS.contains(&n.template));
@@ -430,19 +441,31 @@ mod tests {
             .enumerate()
             .map(|(i, n)| (i as u16, n.template, 50))
             .collect();
-        assert!(wanted_goods(&bag(&held), 10_000, 1, 0).is_empty());
+        assert!(wanted_goods(&bag(&held), 10_000, 1, 0, |_| true).is_empty());
         // (one of them held: the other two are still wanted)
         assert_eq!(
-            wanted_goods(&bag(&held[..1]), 10_000, 1, 0).len(),
+            wanted_goods(&bag(&held[..1]), 10_000, 1, 0, |_| true).len(),
             WANTS - 1
         );
+    }
+
+    #[test]
+    fn a_good_that_is_not_tradable_is_never_wanted() {
+        // (a quest item, a bound or an unsellable good: nobody may sell it to the bot)
+        let blocked = trade::GOODS[2];
+        for hour in 0..7 {
+            let got = wanted_goods(&bag(&[]), 10_000, 3, hour * 3_600_000, |t| t != blocked);
+            assert_eq!(got.len(), WANTS - 1);
+            assert!(got.iter().all(|n| n.template != blocked));
+        }
+        assert!(wanted_goods(&bag(&[]), 10_000, 3, 0, |_| false).is_empty());
     }
 
     #[test]
     fn the_wish_changes_by_the_hour_and_by_the_bot() {
         let b = bag(&[]);
         let w = |bot, hour: u64| {
-            wanted_goods(&b, 10_000, bot, hour * 3_600_000)
+            wanted_goods(&b, 10_000, bot, hour * 3_600_000, |_| true)
                 .iter()
                 .map(|n| n.template)
                 .collect::<Vec<_>>()

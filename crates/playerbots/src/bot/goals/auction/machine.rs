@@ -613,6 +613,10 @@ impl Run {
             if env.mem().skipped(template, now) || env.mem().has_lot_of(template) {
                 continue;
             }
+            // (the stacks come from the sellable surplus, which holds tradable items only)
+            if !env.tradable(template) {
+                continue;
+            }
             let (Some(facts), Some(name)) = (env.facts(template), env.item_name(template)) else {
                 continue;
             };
@@ -769,7 +773,11 @@ impl Run {
         let quote = price::quote(&mut self.units);
         env.mem().note_price(cur.stack.template, quote, now);
         // a lot far under what a vendor pays is a find
-        if self.bargain.is_none() && self.budget > 0 && self.bought < MAX_BUYS {
+        if self.bargain.is_none()
+            && self.budget > 0
+            && self.bought < MAX_BUYS
+            && env.tradable(cur.stack.template)
+        {
             {
                 let budget = self.budget;
                 let money = env.state().me.money;
@@ -1110,6 +1118,9 @@ impl Run {
     fn look_at(&mut self, env: &mut dyn Env, me: u32, lots: &[Lot]) {
         let money = env.state().me.money;
         for lot in lots {
+            if !env.tradable(lot.template) {
+                continue;
+            }
             let Some(facts) = env.facts(lot.template) else {
                 continue;
             };

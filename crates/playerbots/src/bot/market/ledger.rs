@@ -27,6 +27,10 @@
 //! when the connection is lost: after a reconnect, or a restart, nothing the bot holds counts as
 //! clean until it gains more.
 //!
+//! What the ledger lets go is further limited by the item itself and by the bot's quests (see
+//! [`Ledger::sellable_surplus`]): quest items, soul-bound and unsellable items are never offered,
+//! and what an active quest still needs ([`QuestNeeds`]) stays in the bag.
+//!
 //! The ledger is bounded: at most [`MAX_TEMPLATES`] templates, 8 bytes each. When a new template
 //! comes and the ledger is full, the template with the smallest clean count goes.
 
@@ -35,6 +39,7 @@ use aa_world::World;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use super::needs::QuestNeeds;
 use crate::bot::state::{Item, SLOT_BAG};
 
 /// `ItemTaskType` values (the reason byte of `SCItemTaskSuccessPacket`, the server's
@@ -262,18 +267,20 @@ impl Ledger {
     }
 
     /// What the bot may offer for sale, as `(template, count)`: per template the clean count (and
-    /// never more than the bag holds), minus a [`RESERVE`] of the items it may need itself, for
-    /// the templates that are [`tradable`](aa_world::ItemFacts::tradable) (sellable and not bound).
-    /// Cheap enough to ask now and then (a pass over the bag per tracked template), not on every
-    /// tick.
+    /// never more than the bag holds), minus what the bot keeps ([`keep`]: a [`RESERVE`] of the
+    /// items it may need itself, or what its active quests need, `needs`, if that is more), for
+    /// the templates that are [`tradable`](aa_world::ItemFacts::tradable) (sellable, not bound
+    /// and not quest items). Cheap enough to ask now and then (a pass over the bag per tracked
+    /// template), not on every tick.
     pub fn sellable_surplus<'a>(
         &'a self,
         world: &'a World,
         bag: &'a FxHashMap<u16, Item>,
+        needs: &'a QuestNeeds,
     ) -> impl Iterator<Item = (u32, u32)> + 'a {
         self.surplus_by(bag, move |template| {
             let facts = world.item_facts(template)?;
-            facts.tradable().then(|| reserve(world, template))
+            facts.tradable().then(|| keep(world, needs, template))
         })
     }
 
@@ -293,6 +300,12 @@ impl Ledger {
     }
 }
 
+/// How many of `template` the bot keeps for itself: the [`reserve`], or what its active quests
+/// still need of it (`needs`) when that is more.
+pub fn keep(world: &World, needs: &QuestNeeds, template: u32) -> u32 {
+    reserve(world, template).max(needs.count(template))
+}
+
 /// How many of `template` the bot keeps for itself: [`RESERVE`] of a consumable or of an item a
 /// quest asks to gather, else none.
 pub fn reserve(world: &World, template: u32) -> u32 {
@@ -306,6 +319,7 @@ pub fn reserve(world: &World, template: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aa_world::ObjKind;
 
     fn bag_of(items: &[(u16, u32, i32)]) -> FxHashMap<u16, Item> {
         items
@@ -615,6 +629,27 @@ mod tests {
         let got: Vec<_> = l.surplus_by(&bag, rule).collect();
         // 70 in the bag but only 50 clean; 50 - 10; 8 - 10; the bag caps the clean count
         assert_eq!(got, [(1, 50), (2, 40), (6, 30)]);
+    }
+
+    #[test]
+    fn what_an_active_quest_needs_is_kept_back_in_full() {
+        let mut l = Ledger::default();
+        l.add(1, 50); // a quest needs 20 of it
+        l.add(2, 50); // a consumable (reserve 10) that a quest needs 25 of
+        l.add(3, 50); // a consumable that a quest needs 4 of: the reserve is more
+        l.add(4, 15); // a quest needs 20 of it, the bot has 15
+        let bag = bag_of(&[(0, 1, 50), (1, 2, 50), (2, 3, 50), (3, 4, 15)]);
+        let needs = QuestNeeds::from_kinds(&[
+            ObjKind::UseItem { item: 1, count: 20 },
+            ObjKind::UseItem { item: 2, count: 25 },
+            ObjKind::UseItem { item: 3, count: 4 },
+            ObjKind::UseItem { item: 4, count: 20 },
+        ]);
+        let reserve_of = |t: u32| if matches!(t, 2 | 3) { RESERVE } else { 0 };
+        let rule = |t: u32| Some(reserve_of(t).max(needs.count(t)));
+        let got: Vec<_> = l.surplus_by(&bag, rule).collect();
+        // 50 - 20; 50 - max(10, 25); 50 - max(10, 4); 15 - 20 is nothing
+        assert_eq!(got, [(1, 30), (2, 25), (3, 40)]);
     }
 
     #[test]
