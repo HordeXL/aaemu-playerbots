@@ -105,6 +105,12 @@ How the detectors judge, what is reportable, the queue file and the privacy rule
   duel flags and trade outlets, a searchable bot list, per-bot state, quests, chat and event log, the
   Issues panel and the process stats. Commands: pause or resume, force a goal, make two bots duel or
   trade, say a line, whisper, spawn and despawn bots.
+* **World metrics and a population director**: World, Economy and Director views in the web UI show
+  where the players and the bots are by continent and side (and on the map as heat), which items are
+  scarce, and what the director does. The director can log bots in and out to follow the players
+  (the west gets bots when the east fills up) within caps, and it is off, then a dry run, by default.
+  Spawn and despawn by side, race and continent. Optional use of the game server's web API for exact
+  counts. See [docs/OPERATING.md](docs/OPERATING.md#world-metrics-and-the-population-director).
 * **Optional LLM** (DeepSeek, or any OpenAI-compatible `chat/completions` endpoint): bots answer
   players with a short in-character line and, with the director on, now and then choose a goal. It is
   off by default, never on the tick path, rate limited and budgeted per UTC day, and its output is

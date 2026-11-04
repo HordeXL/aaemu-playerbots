@@ -291,7 +291,7 @@ already name its goal.
 | `Event` goal (`goals::event`), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
 | `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
 | `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
-| `[population]` (the web UI's population director: `enabled`, `dry_run`, `max_spawn_per_min`, `min_action_gap_secs`) | `config.rs` | web director |
+| `[population]` (the web UI's population director and the server API poll, see [Population](#population-census-economy-board-and-director)) | `config.rs`, `population/` | web director (done) |
 | `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
 | `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
 | `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
@@ -550,6 +550,54 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
   physics, GM scroll, refused places, no boat, no seat, ignored bind / discard / despawn, a dead
   engine, a boat aground, an interruption at every point of the trip, a late boat of an interrupted
   cast). Real-data check: `AA_BAKED=... cargo test -p aa-world --test water_real -- --ignored`.
+
+## Population: census, economy board and director
+
+Everything lives in `crates/playerbots/src/population/` and hangs on the hub as `hub.pop`
+(`Population`); the web types are in `crates/web/src/population.rs`.
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| `Geo`, `alliance_of_*`, `place_at` | `region.rs` | Side of a faction or race (mother faction 148 / 149), continent of a zone (`zone_groups.target_id`: 3 west, 4 east, 5 Auroria, 1 / 2 / 6 seas). A trait, so the tests use a table instead of a `World`. |
+| `Census` | `census.rs` | Real players in view of a bot: a bounded map (2048) keyed by character id, 60 s time to live. `observe` runs in the bot's once-a-second housekeeping and takes the characters in `state.units` that are not the bot and not ours (`Hub::is_bot_char`). |
+| `Economy` | `economy.rs` | Items (1500 at most): per-bot price observations, price history, chat lines, the server's lots; `score` -> 0..1; `ScarcityView` for the farming goal. Chat is counted once per line (hash of speaker and text within 20 s). |
+| `ServerApi`, `poll_once` | `serverapi.rs` | The optional poller of the game server's web API; key in a `Secret`, fail-soft, bounded body. |
+| `world_view` | `view.rs` | The World panel from bot rows (one per slot, read without copying text) and the census: cells, zones, heat squares (512 m), the watched area (128 m cells), coverage. |
+| `Selector`, `stop_rank`, `pick_stops` | `select.rs` | A checked spawn filter; how willingly a running bot is stopped; the despawn choice. |
+| `Director`, `plan`, `targets` | `director.rs` | The policy, the pure planner, pacing, back-off, the action log, the policy file. |
+| `GoalBias` | `mod.rs` | Per-goal multipliers (atomics); the brain applies them at the end of `scores_now`. |
+
+**Feeding the board.** A bot does three small things in `housekeeping` / `route_inbox` / `publish`:
+hands the players in view to the census (once a second, taking the census lock only when there are
+any), hands its fresh `PriceNote`s to the economy (every ten seconds, staggered by bot id) and files
+the trade chat it hears through the same `forward_chat` sink the market uses. `publish` fills the
+snapshot's `mother_faction`, `alliance`, `continent` and `zone_key`. No new per-bot state exists:
+the board deduplicates by bot id instead of keeping a watermark in the bot, so
+`size_of::<Bot>()` is unchanged.
+
+**The director's loop.** `Hub::tick` (once a second) calls `Population::tick`: rows from the slots,
+the census per side, the director's own bots (a set kept by the supervisor, with a count of those
+that may be stopped now: up for 3 minutes and doing something `stop_rank` allows), the process
+health from `stats()`, then `Director::step`. `plan` is a pure function of the policy and those
+numbers (see the rule and the safety list in
+[OPERATING.md](OPERATING.md#world-metrics-and-the-population-director)); `step` adds the pacing
+(gap, bots per minute), the dry-run bookkeeping, a floor for bots it just queued (they count
+towards their side for 2 minutes, until they show as online) and the log. A live order goes to the
+supervisor as `SupCmd::SpawnWhere` or `DespawnWhere`; the supervisor writes a `result` line into
+the log when it has acted.
+
+**Supervisor.** `Book::spawn_matching` starts only roster entries that match the selector and grows
+the roster (`ensure_roster_races`) with the races the selector allows among `bots.races`; the
+`MAX_BOTS` limit counts the whole roster. `despawn_where` takes matching bots out of the start queue
+first, then asks `pick_stops` for the running ones. Ownership (`Population::own`, `disown`) is kept
+by the supervisor, so a bot the operator started is never the director's.
+
+**Deviations and choices.** The census is a lower bound by nature (about 128 m around each bot); the
+server API gives the exact count when a key is set. A policy file never restores the kill switch or
+`dry_run`: a restart is as safe as the configuration. Wishes only record the want for the farming
+goal and nudge its weight; the goal itself is another feature. The economy treats a bot's chat
+line as a quarter of a player's so that the bots' stand-in advertisements do not drive the
+scarcity they then react to.
 
 ## Data directory
 

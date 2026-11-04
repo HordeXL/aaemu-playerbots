@@ -49,7 +49,7 @@ const P = {
   tab: 'bots', world: null, economy: null, director: null,
   last: { world: -Infinity, economy: -Infinity, director: -Infinity },
   busy: { world: false, economy: false, director: false },
-  heat: lsGet('pb_heat') === '1' || /[#&]heat=1/.test(location.hash),
+  heat: lsGet('pb_heat') === '1' || /[#&]heat=1(?:&|$)/.test(location.hash),
   ok: { world: true, economy: true, director: true },
 };
 const E = {}; // elements
@@ -737,10 +737,10 @@ function drawHeat(ctx, v) {
     }
   }
   ctx.font = '11px system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'bottom';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
   ctx.fillStyle = v.colors.label;
-  ctx.fillText('Heat: red = players, blue = bots (512 m squares)', 8, H - 8);
+  ctx.fillText('Heat: red = players, blue = bots (512 m squares)', W - 10, 8);
   ctx.restore();
 }
 
