@@ -56,6 +56,12 @@ pub struct RouteCfg<'a> {
     pub max_nodes: u32,
     /// Places the route must stay out of.
     pub avoid: &'a [Disc],
+    /// How far (cells) a start or goal point may be moved to reach an open cell
+    /// ([`SNAP_CELLS`]); a hull that needs a wide margin needs more.
+    pub snap_cells: i32,
+    /// Within this distance (m) of the route's ends a leg may run over any sea cell, not only
+    /// open ones (48 m).
+    pub end_slack_m: f32,
 }
 
 impl Default for RouteCfg<'_> {
@@ -65,6 +71,8 @@ impl Default for RouteCfg<'_> {
             shore_penalty: 0.6,
             max_nodes: 40_000,
             avoid: &[],
+            snap_cells: SNAP_CELLS,
+            end_slack_m: END_SLACK_M,
         }
     }
 }
@@ -95,11 +103,12 @@ pub enum RouteError {
 
 type Cell = (i32, i32);
 
-/// The open cell nearest to `(x, y)` within [`SNAP_CELLS`] (the cell itself when it is open).
+/// The open cell nearest to `(x, y)` within [`RouteCfg::snap_cells`] (the cell itself when it is
+/// open).
 fn snap(map: &WaterMap, x: f32, y: f32, cfg: &RouteCfg<'_>, closed: &Closed) -> Option<Cell> {
     let (c0, r0) = map.cell_of(x, y)?;
     let mut best: Option<(f32, Cell)> = None;
-    for k in 0..=SNAP_CELLS {
+    for k in 0..=cfg.snap_cells {
         for dr in -k..=k {
             for dc in -k..=k {
                 if dr.abs().max(dc.abs()) != k {
@@ -304,7 +313,7 @@ fn smooth(map: &WaterMap, pts: &[(f32, f32)], cfg: &RouteCfg<'_>) -> Vec<(f32, f
 }
 
 /// Whether the straight leg `a` to `b` stays over open water (over any sea within
-/// [`END_SLACK_M`] of the route's `ends`) and out of the discs to avoid.
+/// [`RouteCfg::end_slack_m`] of the route's `ends`) and out of the discs to avoid.
 pub fn line_clear(
     map: &WaterMap,
     a: (f32, f32),
@@ -332,7 +341,7 @@ pub fn line_clear(
         }
         let near_end = [ends.0, ends.1].iter().any(|e| {
             let (ex, ey) = (x - e.0, y - e.1);
-            ex * ex + ey * ey <= END_SLACK_M * END_SLACK_M
+            ex * ex + ey * ey <= cfg.end_slack_m * cfg.end_slack_m
         });
         let ok = if near_end {
             map.sea_at(x, y)
@@ -344,6 +353,135 @@ pub fn line_clear(
         }
     }
     true
+}
+
+/// A turn of at least this many radians (about 149 degrees) is a hairpin for [`round_corners`].
+const HAIRPIN_TURN: f32 = 2.6;
+
+/// The half circle that turns a hull round at the vertex `b` of a hairpin: along the leg `u` to
+/// `radius` before `b`, then half a circle of `radius` to the side `side` (+1 = to port) that ends
+/// `2 * radius` beside the way out, heading back, and on to `c`. The circle's far point is `b`, so
+/// the turn stays in the water the route was planned in. `None` when the leg in is shorter than
+/// `1.2 * radius`, when the way on from the circle's end to `c` would bend by more than about 50
+/// degrees, or when the circle or that way is not `ok` water on either side.
+fn u_turn(
+    b: (f32, f32),
+    c: (f32, f32),
+    u: (f32, f32),
+    len_in: f32,
+    radius: f32,
+    side: f32,
+    ok: &dyn Fn(f32, f32) -> bool,
+) -> Option<Vec<(f32, f32)>> {
+    if len_in < 1.2 * radius {
+        return None;
+    }
+    let p1 = (b.0 - u.0 * radius, b.1 - u.1 * radius);
+    for side in [side, -side] {
+        let lat = (-u.1 * side, u.0 * side);
+        let centre = (p1.0 + lat.0 * radius, p1.1 + lat.1 * radius);
+        let a1 = (p1.1 - centre.1).atan2(p1.0 - centre.0);
+        let n = ((radius * std::f32::consts::PI / 20.0).ceil() as usize).max(4);
+        let arc: Vec<(f32, f32)> = (0..=n)
+            .map(|k| {
+                let a = a1 + std::f32::consts::PI * side * k as f32 / n as f32;
+                (centre.0 + radius * a.cos(), centre.1 + radius * a.sin())
+            })
+            .collect();
+        let end = arc[n];
+        let (dx, dy) = (c.0 - end.0, c.1 - end.1);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+        // the way on must head back, within about 50 degrees of the reverse of the way out
+        if -(dx * u.0 + dy * u.1) / len < 0.64 {
+            continue;
+        }
+        let steps = (len / 16.0).ceil() as usize;
+        let way_ok = (1..=steps).all(|k| {
+            let f = k as f32 / steps as f32;
+            ok(end.0 + dx * f, end.1 + dy * f)
+        });
+        if way_ok && arc.iter().all(|p| ok(p.0, p.1)) {
+            return Some(arc);
+        }
+    }
+    None
+}
+
+/// Rounds the corners of a polyline with arcs of `radius` metres, for a hull that cannot turn on
+/// the spot. At every vertex that turns by more than a few degrees the two legs are cut back by
+/// `radius * tan(turn / 2)` (at most 45 percent of the shorter leg, so that neighbouring corners
+/// do not meet) and the arc between the cut points replaces the vertex. An arc whose points are not
+/// all `ok` (open enough water for the hull) is tried again with a smaller radius, three times, and
+/// then the corner is left sharp. A hairpin (the route turns back on itself, as the loop of a trip
+/// does at its far end) cannot be filleted, its cuts grow without bound: it becomes a half circle
+/// of `radius` bulging past the vertex, and the way back runs `2 * radius` beside the way out
+/// (see [`u_turn`]). The end points are kept.
+pub fn round_corners(
+    points: &[(f32, f32)],
+    radius: f32,
+    ok: &dyn Fn(f32, f32) -> bool,
+) -> Vec<(f32, f32)> {
+    if points.len() < 3 || radius < 1.0 {
+        return points.to_vec();
+    }
+    let dir = |a: (f32, f32), b: (f32, f32)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        (dx / len.max(1e-3), dy / len.max(1e-3), len)
+    };
+    let mut out = vec![points[0]];
+    for i in 1..points.len() - 1 {
+        let (a, b, c) = (points[i - 1], points[i], points[i + 1]);
+        let (ux, uy, len_in) = dir(a, b);
+        let (wx, wy, len_out) = dir(b, c);
+        let cos = (ux * wx + uy * wy).clamp(-1.0, 1.0);
+        let turn = cos.acos();
+        let cross = ux * wy - uy * wx;
+        let side = if cross >= 0.0 { 1.0f32 } else { -1.0 };
+        if turn >= HAIRPIN_TURN {
+            if let Some(bulb) = u_turn(b, c, (ux, uy), len_in, radius, side, ok) {
+                out.extend(bulb);
+                continue;
+            }
+        }
+        if turn < 0.15 || turn > 3.0 {
+            out.push(b);
+            continue;
+        }
+        let half = (turn / 2.0).tan();
+        let limit = 0.45 * len_in.min(len_out);
+        let mut r = radius.min(limit / half);
+        let mut placed = false;
+        for _ in 0..4 {
+            let t = r * half;
+            let p1 = (b.0 - ux * t, b.1 - uy * t);
+            // the arc's centre lies on the inner side of the turn
+            let centre = (p1.0 - uy * side * r, p1.1 + ux * side * r);
+            let a1 = (p1.1 - centre.1).atan2(p1.0 - centre.0);
+            let sweep = turn * side;
+            let n = ((r * turn / 20.0).ceil() as usize).max(2);
+            let arc: Vec<(f32, f32)> = (0..=n)
+                .map(|k| {
+                    let a = a1 + sweep * k as f32 / n as f32;
+                    (centre.0 + r * a.cos(), centre.1 + r * a.sin())
+                })
+                .collect();
+            if arc.iter().all(|p| ok(p.0, p.1)) {
+                out.extend(arc);
+                placed = true;
+                break;
+            }
+            r *= 0.7;
+            if r < 12.0 {
+                break;
+            }
+        }
+        if !placed {
+            out.push(b);
+        }
+    }
+    out.push(points[points.len() - 1]);
+    out
 }
 
 #[cfg(test)]
@@ -498,6 +636,135 @@ mod tests {
         );
         // a short route fits
         assert!(route(&m, at(10.5, 20.5), at(14.5, 20.5), &cfg).is_ok());
+    }
+
+    #[test]
+    fn corners_are_rounded_with_arcs_of_the_radius() {
+        // north 600 m, then east 600 m: a right-angle turn (to starboard, a negative cross)
+        let pts = [(0.0, 0.0), (0.0, 600.0), (600.0, 600.0)];
+        let r = round_corners(&pts, 140.0, &|_, _| true);
+        assert_eq!(r[0], pts[0]);
+        assert_eq!(*r.last().unwrap(), pts[2]);
+        assert!(r.len() > 6, "{}", r.len());
+        // the arc starts radius * tan(45 degrees) = 140 m before the corner and ends 140 m after
+        assert!(
+            (r[1].0).abs() < 0.01 && (r[1].1 - 460.0).abs() < 0.01,
+            "{:?}",
+            r[1]
+        );
+        let end = r[r.len() - 2];
+        assert!(
+            (end.0 - 140.0).abs() < 0.5 && (end.1 - 600.0).abs() < 0.5,
+            "{end:?}"
+        );
+        // every arc point is 140 m from the centre (140, 460) and the middle cuts the corner
+        for p in &r[1..r.len() - 1] {
+            let d = ((p.0 - 140.0).powi(2) + (p.1 - 460.0).powi(2)).sqrt();
+            assert!((d - 140.0).abs() < 0.5, "{p:?} {d}");
+        }
+        let mid = r[r.len() / 2];
+        assert!(mid.0 > 20.0 && mid.1 < 580.0, "{mid:?}");
+    }
+
+    #[test]
+    fn a_hairpin_becomes_a_half_circle_with_the_way_back_beside_the_way_out() {
+        // out 600 m north, back to a point 40 m beside the start: a turn of nearly 180 degrees
+        let pts = [(0.0, 0.0), (0.0, 600.0), (20.0, 40.0)];
+        let r = round_corners(&pts, 70.0, &|_, _| true);
+        assert_eq!(r[0], pts[0]);
+        assert_eq!(*r.last().unwrap(), pts[2]);
+        // the circle starts 70 m before the vertex and its far point is the vertex
+        assert!(
+            (r[1].0).abs() < 0.01 && (r[1].1 - 530.0).abs() < 0.01,
+            "{:?}",
+            r[1]
+        );
+        let far = r.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+        assert!((far - 600.0).abs() < 2.0, "{far}");
+        // the circle's points are 70 m from its centre, on the side the route turns to (here the
+        // way back is to starboard of the way out, a negative cross)
+        let centre = (70.0, 530.0);
+        for p in &r[1..r.len() - 2] {
+            let d = ((p.0 - centre.0).powi(2) + (p.1 - centre.1).powi(2)).sqrt();
+            assert!((d - 70.0).abs() < 0.5, "{p:?} {d}");
+        }
+        let end = r[r.len() - 2];
+        assert!(
+            (end.0 - 140.0).abs() < 0.5 && (end.1 - 530.0).abs() < 0.5,
+            "{end:?}"
+        );
+        // no corner of the result is tighter than the radius (the circumradius of every triple)
+        for w in r.windows(3) {
+            let (a, b, c) = (w[0], w[1], w[2]);
+            let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            let sides = dist(a, b) * dist(b, c) * dist(a, c);
+            if cross.abs() > 1e-3 {
+                assert!(sides / (2.0 * cross.abs()) > 60.0, "{a:?} {b:?} {c:?}");
+            }
+        }
+        // a hairpin that does not fit stays sharp
+        assert_eq!(round_corners(&pts, 70.0, &|_, y| y < 520.0), pts.to_vec());
+        // a short way in does not get a half circle either: the corner is cut inside the legs
+        let short = [(0.0, 0.0), (0.0, 60.0), (20.0, 10.0)];
+        let r = round_corners(&short, 70.0, &|_, _| true);
+        assert!(r.iter().all(|p| p.1 < 60.0 + 1e-3), "{r:?}");
+    }
+
+    fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn short_legs_get_a_smaller_arc_and_blocked_arcs_stay_sharp() {
+        let pts = [(0.0, 0.0), (0.0, 100.0), (100.0, 100.0)];
+        let r = round_corners(&pts, 300.0, &|_, _| true);
+        // the cut is limited to 45 percent of the legs: 45 m, an arc radius of 45 m
+        assert!((r[1].1 - 55.0).abs() < 0.01, "{:?}", r[1]);
+        // an arc over land is not made: the corner stays
+        let r = round_corners(&pts, 300.0, &|_, _| false);
+        assert_eq!(r, pts.to_vec());
+        // nearly straight and degenerate routes are left alone
+        let straight = [(0.0, 0.0), (0.0, 100.0), (1.0, 200.0)];
+        assert_eq!(
+            round_corners(&straight, 100.0, &|_, _| true),
+            straight.to_vec()
+        );
+        assert_eq!(
+            round_corners(&pts[..2], 100.0, &|_, _| true),
+            pts[..2].to_vec()
+        );
+    }
+
+    #[test]
+    fn a_wider_snap_and_slack_reach_open_water_far_from_the_start() {
+        // land at columns 0..=2 and a start in the shallows by it: with a margin of eight cells
+        // the open water begins at column 11, further than the default six cells of snapping
+        let land: Vec<(u32, u32)> = (0..60).flat_map(|r| (0..3).map(move |c| (c, r))).collect();
+        let m = sea(&land);
+        let start = at(3.5, 30.5);
+        let goal = at(50.5, 30.5);
+        let narrow = RouteCfg {
+            clear: 8,
+            ..RouteCfg::default()
+        };
+        assert_eq!(
+            route(&m, start, goal, &narrow),
+            Err(RouteError::StartBlocked)
+        );
+        let snapped = RouteCfg {
+            clear: 8,
+            snap_cells: 12,
+            ..RouteCfg::default()
+        };
+        let r = route(&m, start, goal, &snapped).unwrap();
+        // (the hull's own position joins the route only when a leg of sea reaches the open water)
+        assert_ne!(r.points[0], start);
+        let slack = RouteCfg {
+            end_slack_m: 160.0,
+            ..snapped
+        };
+        let r = route(&m, start, goal, &slack).unwrap();
+        assert_eq!(r.points[0], start);
     }
 
     #[test]

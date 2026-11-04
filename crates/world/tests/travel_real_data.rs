@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use aa_world::travel::boat::slave_kind;
+use aa_world::travel::ShipClass;
 use aa_world::{Vec3, World, WorldPaths};
 
 fn paths() -> Option<WorldPaths> {
@@ -649,6 +650,38 @@ fn ship_classes() {
         b.slave_template(75).unwrap().rack_points(),
         (60..=79).collect::<Vec<u8>>()
     );
+    // the constants the bots' tests use are these hulls
+    for (id, k) in [
+        (15, ShipClass::ROWBOAT),
+        (52, ShipClass::CLIPPER),
+        (21, ShipClass::CUTTER),
+    ] {
+        let c = class(id);
+        let same = |a: f32, b: f32| (a - b).abs() <= 0.01 * b.abs().max(1.0);
+        assert_eq!((c.slave, c.kind, c.size), (k.slave, k.kind, k.size), "{id}");
+        for (name, a, b) in [
+            ("top", c.top_speed, k.top_speed),
+            ("rate", c.turn_rate, k.turn_rate),
+            ("accel", c.turn_accel, k.turn_accel),
+            ("radius", c.radius, k.radius),
+            ("beam", c.beam, k.beam),
+            ("length", c.length, k.length),
+            ("height", c.height, k.height),
+            ("draft", c.draft, k.draft),
+            ("ahead", c.spawn_ahead, k.spawn_ahead),
+            ("side", c.spawn_side, k.spawn_side),
+            ("brake", c.brake, k.brake),
+            ("accel", c.accel, k.accel),
+            ("depth", c.box_depth, k.box_depth),
+        ] {
+            assert!(same(a, b), "{id} {name}: {a} vs {b}");
+        }
+        assert_eq!(
+            (c.portal_ms, c.cannons, c.racks, c.passengers),
+            (k.portal_ms, k.cannons, k.racks, k.passengers),
+            "{id}"
+        );
+    }
     // the families resolve to a scroll each
     for f in aa_world::travel::ShipFamily::ALL {
         let s = b

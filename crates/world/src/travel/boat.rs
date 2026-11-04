@@ -289,6 +289,11 @@ pub struct ShipClass {
     pub brake: f32,
     /// Acceleration in m/s^2 with full ahead throttle at low speed.
     pub accel: f32,
+    /// How far the hull box's centre lies ahead of the hull's origin (`mass_center_y`).
+    pub center_y: f32,
+    /// Water the hull box reaches down into at the summon, metres: the server tests the box
+    /// (the model's bounding box, or the mass box when there is none) against the terrain.
+    pub box_depth: f32,
     /// Cannons on the hull.
     pub cannons: u8,
     /// Pack racks on the hull.
@@ -298,6 +303,85 @@ pub struct ShipClass {
 }
 
 impl ShipClass {
+    /// The rowboat (slave 15), as the data has it; checked against the real data by the
+    /// `ship_classes` test of `travel_real_data`. For tests and for a bot without hull data.
+    pub const ROWBOAT: ShipClass = ShipClass {
+        slave: 15,
+        kind: slave_kind::BOAT,
+        size: HullSize::Small,
+        top_speed: 3.2,
+        turn_rate: 0.07592,
+        turn_accel: 0.12526,
+        radius: 42.15,
+        beam: 1.0,
+        length: 3.0,
+        height: 0.5,
+        draft: 0.6,
+        spawn_ahead: 1.5,
+        spawn_side: 1.5,
+        portal_ms: 0,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 0.0,
+        box_depth: 0.85,
+        cannons: 0,
+        racks: 0,
+        passengers: 1,
+    };
+
+    /// The clipper (slave 52); see [`ShipClass::ROWBOAT`].
+    pub const CLIPPER: ShipClass = ShipClass {
+        slave: 52,
+        kind: slave_kind::SPEEDBOAT,
+        size: HullSize::Medium,
+        top_speed: 6.5,
+        turn_rate: 0.1021,
+        turn_accel: 0.018979,
+        radius: 63.66,
+        beam: 4.0,
+        length: 8.0,
+        height: 7.0,
+        draft: 0.3,
+        spawn_ahead: 5.0,
+        spawn_side: 5.0,
+        portal_ms: 7000,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 0.0,
+        box_depth: 0.8,
+        cannons: 0,
+        racks: 0,
+        passengers: 0,
+    };
+
+    /// The Eznan cutter (slave 21); see [`ShipClass::ROWBOAT`].
+    pub const CUTTER: ShipClass = ShipClass {
+        slave: 21,
+        kind: slave_kind::SMALL_SAILING_SHIP,
+        size: HullSize::Large,
+        top_speed: 6.3,
+        turn_rate: 0.045379,
+        turn_accel: 0.012654,
+        radius: 138.8,
+        beam: 6.5,
+        length: 30.0,
+        height: 14.5,
+        draft: 2.2,
+        spawn_ahead: 30.0,
+        spawn_side: 20.0,
+        portal_ms: 7000,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 3.0,
+        box_depth: 13.45,
+        cannons: 8,
+        racks: 4,
+        passengers: 0,
+    };
+
     /// The class of a slave template.
     pub fn of(t: &SlaveTemplate) -> ShipClass {
         let top = t.top_speed();
@@ -346,6 +430,8 @@ impl ShipClass {
             int_per_real,
             brake: brake_int / int_per_real,
             accel: m.accel.max(0.1) / 2.0 / int_per_real,
+            center_y: m.center_y,
+            box_depth: (draft - m.center_z + m.height / 2.0).max(0.0),
             cannons: t.cannon_points().count().min(255) as u8,
             racks: t.racks.len().min(255) as u8,
             passengers: t.passenger_seats(),
@@ -358,6 +444,19 @@ impl ShipClass {
         match self.size {
             HullSize::Large => DEEP_FLOOR_M,
             _ => crate::water::NAV_FLOOR_M,
+        }
+    }
+
+    /// What the server's summon search needs around the caster for this hull, with `depth` metres
+    /// of water required under the footprint (0: any sea cell). See [`crate::water::LaunchReq`].
+    pub fn launch_req(&self, depth: f32) -> crate::water::LaunchReq {
+        crate::water::LaunchReq {
+            ahead: self.spawn_ahead,
+            side: self.spawn_side,
+            length: self.length,
+            beam: self.beam,
+            depth,
+            margin: 2.0,
         }
     }
 
