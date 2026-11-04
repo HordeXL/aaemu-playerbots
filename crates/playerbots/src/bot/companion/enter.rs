@@ -933,6 +933,6 @@ mod tests {
         ] {
             assert!(!w.word().is_empty());
         }
-        assert!(Machine::new().inside() == false);
+        assert!(!Machine::new().inside());
     }
 }

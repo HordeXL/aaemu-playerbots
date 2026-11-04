@@ -595,6 +595,13 @@ impl Combat {
         self.watch = Watch::default();
     }
 
+    /// Like [`Combat::engage`] for a target taken up to help the party (the kill is the bot's to
+    /// loot, as with the controller's own assists).
+    pub fn engage_assist(&mut self, target_obj: u32) {
+        self.engage(target_obj);
+        self.assisting = target_obj;
+    }
+
     /// A fresh start against the current target: forgets what the fight so far taught the
     /// controller (skill back-offs, range corrections, the stall watch) and keeps the target.
     pub fn restart_fight(&mut self) {

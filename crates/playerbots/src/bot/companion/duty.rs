@@ -58,7 +58,7 @@ fn name_key(name: &str) -> u64 {
 }
 
 /// The companion memory of the bot (made on first use).
-fn mem_of(state: &mut BotState) -> &mut Mem {
+pub fn mem_of(state: &mut BotState) -> &mut Mem {
     state
         .party_mem()
         .companion
@@ -66,7 +66,7 @@ fn mem_of(state: &mut BotState) -> &mut Mem {
 }
 
 /// The companion memory of the bot when it has one (reading it makes none).
-fn peek(state: &BotState) -> Option<&Mem> {
+pub fn peek(state: &BotState) -> Option<&Mem> {
     state.party.as_deref()?.companion.as_deref()
 }
 
@@ -477,7 +477,7 @@ fn send_replies(ctx: &mut Ctx<'_>) {
     }
 }
 
-fn say_to(ctx: &mut Ctx<'_>, to: &str, say: Say, arg: &str) {
+pub fn say_to(ctx: &mut Ctx<'_>, to: &str, say: Say, arg: &str) {
     let pick = ctx.rng.usize(..8);
     let due = ctx.now_ms + jitter(ctx, REPLY_PAUSE_MS);
     let text = command::line(say, pick, arg);

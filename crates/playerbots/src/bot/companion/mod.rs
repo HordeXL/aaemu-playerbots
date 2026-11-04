@@ -26,6 +26,7 @@ pub mod command;
 pub mod duty;
 pub mod enter;
 pub mod follow;
+pub mod lead;
 pub mod policy;
 pub mod upkeep;
 
@@ -35,7 +36,8 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 pub use duty::{
-    claims, duty, forward_chat, holding, in_player_party, leader_char, snapshot_if_changed,
+    claims, duty, forward_chat, holding, in_player_party, leader_char, mem_of, peek, say_to,
+    snapshot_if_changed,
 };
 
 /// How the companion behaves when nothing special is going on.
