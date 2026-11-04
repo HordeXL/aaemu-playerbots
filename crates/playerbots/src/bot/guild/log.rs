@@ -107,6 +107,10 @@ pub struct GuildLog {
     pub version: u32,
     pub(super) list_total: u32,
     pub(super) list_received: u32,
+    /// Id and name of the guild of the last invitation; the invitation itself is dropped once it
+    /// is answered, before the server confirms the join, and nothing else names a guild that was
+    /// joined.
+    pub(super) invited_to: Option<(u32, Box<str>)>,
 }
 
 impl GuildLog {
@@ -224,6 +228,7 @@ impl GuildLog {
                 guild,
                 guild_name,
             } => {
+                self.invited_to = Some((*guild, guild_name.clone()));
                 self.invite = Some(Invite {
                     guild: *guild,
                     inviter: *inviter,
@@ -245,8 +250,9 @@ impl GuildLog {
                         if self.id != *to {
                             self.enter(*to, now_ms);
                         }
-                        if let Some(inv) = self.invite.take().filter(|i| i.guild == *to) {
-                            self.name = inv.guild_name;
+                        self.invite = None;
+                        if let Some((_, name)) = self.invited_to.take().filter(|(g, _)| g == to) {
+                            self.name = name;
                         }
                         self.left = None;
                         return self.bump(true);
@@ -551,6 +557,39 @@ mod tests {
         // a character of another guild that a bot saw leave is none of the log's business
         assert!(!g.apply(&unit(99, 6, 0, false), ME, 302));
         assert_eq!(g.members.len(), 2);
+    }
+
+    #[test]
+    fn the_name_of_the_invitation_survives_the_answer() {
+        let mut g = GuildLog::default();
+        g.apply(
+            &GuildEvent::Invitation {
+                inviter: 1,
+                inviter_name: "Boss".into(),
+                guild: 5,
+                guild_name: "Silent Wardens".into(),
+            },
+            ME,
+            1000,
+        );
+        // (the duty drops the invitation when it sends the answer)
+        g.invite = None;
+        g.apply(&unit(ME, 0, 5, false), ME, 1500);
+        assert_eq!(&*g.name, "Silent Wardens");
+        // a join of another guild than the invited one keeps no stale name
+        let mut h = GuildLog::default();
+        h.apply(
+            &GuildEvent::Invitation {
+                inviter: 1,
+                inviter_name: "Boss".into(),
+                guild: 5,
+                guild_name: "Silent Wardens".into(),
+            },
+            ME,
+            1000,
+        );
+        h.apply(&unit(ME, 0, 6, false), ME, 1500);
+        assert_eq!(&*h.name, "");
     }
 
     #[test]
