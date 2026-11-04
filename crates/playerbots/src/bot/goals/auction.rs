@@ -11,7 +11,8 @@
 //! ```
 //!
 //! * **Plan**: the stacks to list ([`pick_stacks`]: whole bag stacks of items the provenance ledger
-//!   calls the bot's own, tradable, above a reserve of what it may use itself, worth a trip) and
+//!   calls the bot's own, tradable, above a reserve of what it may use itself and what its active
+//!   quests still need, worth a trip) and
 //!   whether it may buy (never while `bots.gm_bootstrap` is on: the gold would be GM-minted), then
 //!   the nearest auctioneer it can walk to ([`aa_world::World::nearest_auctioneer`]).
 //! * **Walk / Find**: to within 2.2 m of the NPC. Every request carries the NPC's object id twice;
@@ -54,6 +55,7 @@ use smallvec::SmallVec;
 use crate::bot::ctx::Ctx;
 use crate::bot::market::auction::price::{self, Facts};
 use crate::bot::market::auction::{AuctionMemory, Fault, Kind, Settled, WinWait};
+use crate::bot::market::needs::QuestNeeds;
 use crate::bot::motion::{MotionStatus, Pace};
 use crate::bot::state::{BotState, Item};
 use crate::config::BehaviorCfg;
@@ -274,8 +276,11 @@ fn buy_budget_of(ctx: &Ctx<'_>) -> Option<i64> {
 /// The stacks of the bag worth listing for `ctx`'s bot, see [`pick_stacks`].
 fn sell_stacks_of(ctx: &Ctx<'_>, max: usize) -> SmallVec<[Stack; MAX_LISTINGS]> {
     let (now, mem) = (ctx.now_ms, ctx.state.market.get());
+    let needs = QuestNeeds::of(ctx.world, &ctx.state.quests);
     let picked = pick_stacks(
-        ctx.state.market.sellable_surplus(ctx.world, &ctx.state.bag),
+        ctx.state
+            .market
+            .sellable_surplus(ctx.world, &ctx.state.bag, &needs),
         &ctx.state.bag,
         |t| facts_of(ctx.world, t),
         |t| mem.is_some_and(|m| m.auction.skipped(t, now) || m.auction.has_lot_of(t)),

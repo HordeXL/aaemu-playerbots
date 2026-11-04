@@ -22,6 +22,7 @@ use crate::bot::market::ads::price::{PriceSource, VendorPrices};
 use crate::bot::market::ads::talk::{Medium, PlaceQ};
 use crate::bot::market::ads::{Env, Need, Rules, Surplus};
 use crate::bot::market::ledger::Ledger;
+use crate::bot::market::needs::QuestNeeds;
 use crate::bot::state::{Item, StateError, UnitKind};
 use crate::hub::unix_ms;
 
@@ -50,15 +51,17 @@ const WHISPER_ERR_MS: u64 = 6_000;
 /// Hurt below this, the bot does not go to a meeting.
 const FIT_PCT: u8 = 50;
 
-/// What a bot offers: its clean surplus, one stack's worth of each item at most (a trade puts up
-/// one stack), and not an item the server is known to refuse.
+/// What a bot offers: its clean surplus (tradable items only, less what its active quests need,
+/// `needs`), one stack's worth of each item at most (a trade puts up one stack), and not an item
+/// the server is known to refuse.
 pub fn surplus_of(
     ledger: &Ledger,
     world: &World,
     bag: &rustc_hash::FxHashMap<u16, Item>,
+    needs: &QuestNeeds,
 ) -> SmallVec<[Surplus; MAX_SURPLUS]> {
     let mut out: SmallVec<[Surplus; MAX_SURPLUS]> = SmallVec::new();
-    for (template, count) in ledger.sellable_surplus(world, bag) {
+    for (template, count) in ledger.sellable_surplus(world, bag, needs) {
         if out.len() >= MAX_SURPLUS || trade::is_bound(template) {
             continue;
         }
@@ -195,7 +198,8 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     }
 
     // what the bot has and wants
-    let surplus = surplus_of(&inner.ledger, world, &st.bag);
+    let quest_needs = QuestNeeds::of(world, &st.quests);
+    let surplus = surplus_of(&inner.ledger, world, &st.bag, &quest_needs);
     let needs = wanted_goods(&st.bag, money, bot_id, unix);
     let audience = board.audience(name, group, unix) + usize::from(real_near);
     let prices = VendorPrices(world);

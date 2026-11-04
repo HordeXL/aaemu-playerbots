@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use aa_world::items::bind;
 use aa_world::{World, WorldPaths};
 use playerbots::bot::market::ledger::{reserve, RESERVE};
+use playerbots::bot::market::needs::QuestNeeds;
 use playerbots::bot::market::MarketState;
 use playerbots::bot::state::Item;
 use rustc_hash::FxHashMap;
@@ -70,7 +71,8 @@ fn the_surplus_follows_the_real_item_table() {
             )
         })
         .collect();
-    let got: Vec<(u32, u32)> = market.sellable_surplus(&world, &bag).collect();
+    let needs = QuestNeeds::default();
+    let got: Vec<(u32, u32)> = market.sellable_surplus(&world, &bag, &needs).collect();
     // only the tradable ones, the clean part (50 of 70), less the reserve of what can be used
     assert_eq!(
         got,
