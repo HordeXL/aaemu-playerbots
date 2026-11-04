@@ -48,6 +48,20 @@ Pixel (0,0) is the top-left corner = world (`min_x`, `max_y`).
 `id` is `housing_areas.id` in compact.sqlite3 (`value1` in the client's `housing_area.xml`);
 points are world x/y. `aa-world` joins group/category rules from compact.
 
+## `farm_areas.json` — public farm polygons
+
+```json
+[ { "id": 966, "zone_key": 195, "points": [[12520.0, 15370.0], [12570.0, 15370.0], ...] } ]
+```
+
+Same layout as `housing_areas.json`, from the client's `level_design/zone/<zone_key>/client/subzone_area.xml`
+(the area's own `Id`, the `sub_zones.id`; points as for the housing areas). Only the five sub zones the
+server hard-codes as public farms are kept (`PublicFarmManager.Load`): 966 and 998 field farms, 968
+nurseries, 967 ranches, 974 stables. A character plants for free (no labor) inside them, up to 10
+plots on a field farm and 5 on the other kinds. The file is optional: without it the bots plant on
+their own land only. Written by the full bake or alone by
+`cargo run -p aa-bake --release --example bake -- --pak <game_pak> --out <dir> --compact <compact.sqlite3> --only farms`.
+
 ## `quest_spheres.json` — quest sign spheres
 
 ```json

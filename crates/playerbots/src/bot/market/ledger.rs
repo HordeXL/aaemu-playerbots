@@ -14,11 +14,19 @@
 //! | 37, 38 | quest reward, quest supply |
 //! | 42, 43 | gathering skill effects (a skill that gives an item) |
 //! | 54 | bought from a vendor |
+//! | 17 | a harvest, only while the farm goal says the seeds were bought (see below) |
 //!
 //! Everything else adds nothing: GM (11), trade (48), mail (47), the auction house (46), swaps,
 //! splits and every reason this table does not list (reason 35 is also what the server's GM
 //! `/gold add` tags its purse change with; that carries no item). A gain is the growth of the
 //! bag's count of a template during one item task, so a stack that merges counts like a new one.
+//!
+//! A harvest is the one gain whose honesty is not in the reason: the farm goal opens a *harvest
+//! window* ([`MarketState::open_harvest`](super::MarketState::open_harvest)) around the harvest cast
+//! and says whether the seeds of the plot were bought. In an honest window reason 17 counts like
+//! the clean reasons; in a dishonest one (the seeds were minted with a GM command, or the bot
+//! cannot tell where they came from) nothing counts, whatever the reason. Outside a window reason
+//! 17 adds nothing.
 //!
 //! Whatever leaves the bag, for any reason (sold, traded, mailed, listed, used, destroyed,
 //! equipped), is taken off the ledger first, even if the ledger cannot know whether the items
@@ -69,6 +77,10 @@ pub mod reason {
     pub const MAIL: u8 = 47;
     /// A player trade.
     pub const TRADE: u8 = 48;
+    /// A seed was planted (`DoodadCreate`).
+    pub const DOODAD_CREATE: u8 = 14;
+    /// A doodad was used and gave an item (a harvest).
+    pub const DOODAD_INTERACTION: u8 = 17;
     /// An item was sold to a vendor.
     pub const STORE_SELL: u8 = 53;
     /// An item was bought from a vendor.

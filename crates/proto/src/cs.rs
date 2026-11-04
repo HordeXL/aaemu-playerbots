@@ -1356,6 +1356,77 @@ pub fn sell_backpack_goods(npc_obj: u32) -> Out {
     })
 }
 
+/// Currency of a `CSBuyItemsPacket` entry (the server's `shop_currency_type`): copper.
+pub const SHOP_MONEY: u8 = 0;
+
+/// One thing to buy with `CSBuyItemsPacket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuyItem {
+    /// Item template.
+    pub item: u32,
+    /// Grade (0 for everything an ordinary merchant sells).
+    pub grade: u8,
+    /// How many.
+    pub count: i32,
+    /// [`SHOP_MONEY`] (the other currencies are not a bot's business).
+    pub currency: u8,
+}
+
+/// `CSBuyItemsPacket`: buys goods from the merchant NPC `npc_obj` (within 3 m, and the item must
+/// be in the NPC's merchant pack at the entry's grade). Nothing is sent back to say no: a refused
+/// purchase is silent, a good one shows as an item task (reason 54) and less money. Server read:
+/// `systems/economy/store.rs:297`.
+///
+/// Body: `bc npc, bc 0 doodad, u32 0, u8 n_buy, u8 0 n_buy_back`, then per entry `u32 item,
+/// u8 grade, i32 count, u8 currency`, then `bool false use_aa_point`.
+pub fn buy_items(npc_obj: u32, goods: &[BuyItem]) -> Out {
+    game(cs::CSBuyItemsPacket, |s| {
+        s.write_bc(npc_obj)
+            .write_bc(0)
+            .write_u32(0)
+            .write_u8(goods.len().min(255) as u8)
+            .write_u8(0);
+        for g in goods.iter().take(255) {
+            s.write_u32(g.item)
+                .write_u8(g.grade)
+                .write_i32(g.count)
+                .write_u8(g.currency);
+        }
+        s.write_bool(false);
+    })
+}
+
+/// `CSCreateDoodadPacket`: plants a seed. The server checks that `item_id` (the bag item's
+/// instance id) is a seed of doodad `doodad`, that the spot is free and within 30 m, and charges
+/// the seed's labor unless the spot is a public farm or the character's house land. Server read:
+/// `systems/npcs/doodad/packets.rs:360`, handler `manager.rs:638`.
+///
+/// Body: `u32 doodad, fx64 x, fx64 y, f32 z, f32 z_rot, f32 scale, u64 item_id`.
+pub fn create_doodad(
+    doodad: u32,
+    pos: (f32, f32, f32),
+    z_rot: f32,
+    scale: f32,
+    item_id: u64,
+) -> Out {
+    game(cs::CSCreateDoodadPacket, |s| {
+        s.write_u32(doodad)
+            .write_i64(fx64(pos.0))
+            .write_i64(fx64(pos.1))
+            .write_f32(pos.2)
+            .write_f32(z_rot)
+            .write_f32(scale)
+            .write_u64(item_id);
+    })
+}
+
+/// `CSRequestCommonFarmList` (empty): asks for the character's crops on the public farms; the
+/// server answers with `SCResponseCommonFarmListPacket`. Server read:
+/// `systems/npcs/public_farm.rs` (`CSRequestCommonFarmList::read`).
+pub fn request_common_farm_list() -> Out {
+    game(cs::CSRequestCommonFarmList, |_| {})
+}
+
 /// `CSListMailPacket` (empty): opens the mailbox. Server read: `systems/economy/mail_packets.rs:470`.
 pub fn list_mail() -> Out {
     game(cs::CSListMailPacket, |_| {})

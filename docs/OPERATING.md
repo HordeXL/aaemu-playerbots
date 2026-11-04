@@ -32,7 +32,7 @@ reads it (default `playerbots.toml`).
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones` (see [World events](#world-events-events)). |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
-| `[farm]` | Farming, off by default: `enabled` and `max_plots`. |
+| `[farm]` | Farming, off by default: `enabled`, `max_plots`, `growth_rate`, `public_farms`, `own_land`, `replant` and `max_trip_m`. |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -80,7 +80,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Warzone** | Off until `[pvp] enabled` and `warzone`. Scored while a reachable land zone group is at war (conflict or war) with enough time left and the bot has not yet killed `war_kill_cap` characters in it: goes there, patrols from spot to spot, fights allowed characters when the odds are fair, regroups when hurt and leaves at peace. See [Player versus player](#player-versus-player-pvp). |
 | **Event** | Joins a rift (a tower defence event) while one runs, walks to the defended target, kills the monsters of the current wave next to other bots and leaves when it ends. Needs `[events] enabled`; see [World events](#world-events-events). |
 | **Companion** | A bot in the party of a real player follows the leader, helps in its fights, obeys a closed set of chat commands and, with `follow_into_dungeons`, goes through a dungeon door behind the leader. Needs `[party] join_player_parties`; see [Parties of real players](#parties-of-real-players-party). |
-| **Farm** | Reserved: plant and harvest crops. The goal exists (the web UI can name it) but is not implemented yet: a bot that is told to do it switches it off. Its settings are in [Switched-off features](#switched-off-features). |
+| **Farm** | Off until `[farm] enabled`. Plants, waits and harvests crops, and grows what the server is short of; see [Farming](#farming-farm). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -162,9 +162,10 @@ Safety of the GM lines:
 These sections are all off by default; `enabled = false` (or the `false` default of the switch named
 below) keeps the bots exactly as they were without them. The goals they belong to are reserved and
 not implemented yet (see [Goals and behaviour](#goals-and-behaviour)), except the event goal, which
-is described in [World events](#world-events-events), and the companion goal ([Parties of real
-players](#parties-of-real-players-party)); the settings are read and checked now so the features can
-be added without changing the file.
+is described in [World events](#world-events-events), the companion goal ([Parties of real
+players](#parties-of-real-players-party)) and the farm goal, described in
+[Farming](#farming-farm); the settings are read and checked now so the features can be added
+without changing the file.
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
@@ -192,7 +193,12 @@ be added without changing the file.
 | | `max_per_player` | `4` | At most this many of them in one player's party (1 to 4). |
 | `[population]` | `enabled` | `false` | Master switch of the population director (see [World metrics and the population director](#world-metrics-and-the-population-director), which lists every key). |
 | `[farm]` | `enabled` | `false` | Master switch of the farming features (goal `farm`). |
-| | `max_plots` | `5` | One bot tends at most this many plots. |
+| | `max_plots` | `5` | One bot tends at most this many plots (the server allows 10 on a public field farm, 5 on the other kinds). |
+| | `growth_rate` | `1.0` | The game server's `World.GrowthRate` (not on the wire): ripe times are planned with it. |
+| | `public_farms` | `true` | Plant on the public farms (needs `farm_areas.json` in the baked data). |
+| | `own_land` | `true` | Plant on the land of the bot's own houses. |
+| | `replant` | `true` | Plant the seeds a harvest gives back on the spot the crop stood. |
+| | `max_trip_m` | `4000.0` | The farthest a bot walks to a farm, a vendor or a plot (metres). |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
 
@@ -495,6 +501,66 @@ ship = "cutter"    # rowboat (default) | clipper | cutter | junk | yawl | schoon
 * Issue reports of the goal are `sail:*` (no boat, no seat, dead wheel, no thrust, slow boat, ignored
   despawn); see [ISSUES.md](ISSUES.md).
 
+## Farming (`[farm]`)
+
+With `[farm] enabled` bots plant crops, wait for them and harvest them, and they grow what the server
+is short of. The web UI shows the bots in the goal as `farm`, and the bot's detail view lists its
+plots (the crop, where, ripe or growing, honest or not). Everything below is off until `enabled`;
+the keys are in [Switched-off features](#switched-off-features).
+
+**One run.** The goal does one of two jobs per run.
+
+* *Harvest*, when a plot is due (ripe, or its growth time is over): walk to the crop, cast the
+  harvest skill (the labor-cost variants of the crop's `harvest` skill), wait for the crop to change
+  and, with `replant`, plant the seeds the harvest gave back on the same spot.
+* *Plant*, otherwise, while the bot has room for plots: choose a crop, buy its seeds from the nearest
+  seed vendor within `max_trip_m`, walk to a free spot, plant up to five seeds and go back to other
+  goals. A run ends after 25 minutes at the latest; a bot plants again five minutes after the end of a
+  run.
+
+**Which crop.** Every crop of the game data that grows on dry land is scored by profit per hour, time
+to ripen, distance to the seed vendor and what the bot already holds. On top of that comes the need:
+an item on the wish list (the Economy view, `auto_boost`, or the API) counts 3, an item that is scarce
+counts twice its scarcity, both damped by how much of the item the other bots already grow (the
+hub's farm board, halved at 40 units). A wished item beats any profit, so "boost Potato" shifts bots
+to potatoes, and thirty bots do not all plant the one scarce item.
+
+**Where.** The server lets a character plant anywhere on dry ground within 30 m, but a plot costs
+labor everywhere except in two places, which are the only ones the bots use:
+
+* the **garden of the bot's own house** (`own_land`), a square of twice the garden radius around it;
+* a **public farm** (`public_farms`), the farm sub zones. A character may have 10 crops on a field
+  farm and 5 on the other kinds (nursery, ranch, stable); `max_plots` caps the bot below that, and
+  the server's answer "farm is full" ends the run (the goal then rests for a minute). The farms come from `farm_areas.json`, baked from the
+  client pak by `playerbots bake` (a data directory baked before the farming feature needs a new bake, or
+  `cargo run -p aa-bake --release --example bake -- --only farms ...`; see
+  [DATA-FORMATS.md](DATA-FORMATS.md#farm_areasjson--public-farm-polygons));
+  without the file only gardens are used.
+
+A spot is drawn from the free ground of the place, at least 1.6 m from any other crop and 1.5 m from
+the edge of a farm. A spot the server refused (water, too close to a doodad or a unit, a restricted
+zone) is not tried again for ten minutes, a seed it refused to plant is left alone for thirty. Bots
+that pick a spot claim it with the other bots (`Contest` plot cells of 3 m), so two bots do not plant
+on the same square.
+
+**Growth time.** The ripe time is not on the wire. The bot plans with the crop's growth time from the
+data divided by `growth_rate`: set it to the server's `World.GrowthRate`. A plot is due when the
+server announced that the crop is ripe (a phase change) or the planned time is over; a bot that comes
+back to a crop that is still growing looks again five minutes later, so a wrong rate only costs
+visits, not crops.
+
+**Honest produce.** A harvest is something the bot may sell only when the seeds were bought. With
+`bots.gm_bootstrap`, a bot without a vendor or money may mint seeds with a GM command; the seeds are
+not clean, so the crop it gives is not either. The ledger opens a harvest window for the length of
+the harvest cast: a plot planted from clean seeds is `honest` and its produce counts as the bot's
+own (and may be sold, see [Selling](#selling-market)); a plot from minted seeds, or one found again
+after a reconnect, is not counted at all. The plot list in the web UI shows which is which.
+
+**Limits and memory.** A bot remembers at most 64 plots. The memory sits behind one pointer in the
+bot's market state, so a bot that never farms pays eight bytes. The farming bots publish what they are
+growing to the hub's board (at most 16 items each, dropped when the bot leaves) and the Economy
+view's "Growing" column is its sum.
+
 ## Selling (`[market]`)
 
 The market features let bots sell what they gather: the goal `auction` lists goods at the auction
@@ -771,7 +837,9 @@ The scarcity score runs from 0 (plenty) to 1 and adds four parts: few lots (`0.4
 none for sale is the full 0.45), a price far above the vendor price (up to 0.25 at four times), a
 rising price (up to 0.15 at +50 % in half an hour) and more people asking than offering in chat (up to
 0.15). The farming goal reads it through `population::economy::ScarcityView` (`scarcity`,
-`most_scarce`, `wished`), which `hub.pop` implements.
+`most_scarce`, `wished`), which `hub.pop` implements. The "Growing" column of the Economy table is
+what the farming bots have planted and not yet harvested, per item (the expected count; zero when
+no bot farms); an item that is being grown gets a row even when no bot noted a price for it.
 
 ### The director
 
@@ -812,7 +880,8 @@ bot's view from making bots come and go.
 (0.1 to 3; blank is 1), applied while the director is live. Wishes (from the Economy view, or the
 scarcest items when `auto_boost` is above 0) are recorded for the farming goal; while the director is
 live and any wish exists, the `farm` goal is scored 1.5 times higher unless you set a weight for it.
-Nothing grows crops yet, so this changes nothing until the farming goal exists.
+That only matters with `[farm] enabled`, and the planner also reads the wishes itself when it picks
+a crop (see [Farming](#farming-farm)).
 
 **`[population]` keys.**
 

@@ -634,6 +634,19 @@ pub struct FarmCfg {
     pub enabled: bool,
     /// One bot tends at most this many plots.
     pub max_plots: u32,
+    /// The game server's `World.GrowthRate` (crops grow this many times faster). It is not on the
+    /// wire; set it when the server does.
+    pub growth_rate: f32,
+    /// Bots plant on the public farms (the farm sub zones, needs `farm_areas.json` in the baked
+    /// data). Off: only on the land of their own houses.
+    pub public_farms: bool,
+    /// Bots plant on the land of their own houses.
+    pub own_land: bool,
+    /// A bot plants the seeds a harvest gives back on the spot it harvested.
+    pub replant: bool,
+    /// The farthest a bot walks to a farm, a vendor or a plot (metres); trips longer than
+    /// `bots.long_travel_teleport_m` use the GM `/move` when `bots.gm_bootstrap` is on.
+    pub max_trip_m: f32,
 }
 
 impl Default for FarmCfg {
@@ -641,6 +654,11 @@ impl Default for FarmCfg {
         Self {
             enabled: false,
             max_plots: 5,
+            growth_rate: 1.0,
+            public_farms: true,
+            own_land: true,
+            replant: true,
+            max_trip_m: 4_000.0,
         }
     }
 }
@@ -1055,6 +1073,16 @@ impl Config {
             self.farm.max_plots <= 1000,
             "farm.max_plots {} is above the limit of 1000",
             self.farm.max_plots
+        );
+        ensure!(
+            self.farm.growth_rate.is_finite() && (0.01..=10_000.0).contains(&self.farm.growth_rate),
+            "farm.growth_rate {} must be between 0.01 and 10000",
+            self.farm.growth_rate
+        );
+        ensure!(
+            self.farm.max_trip_m.is_finite() && (50.0..=100_000.0).contains(&self.farm.max_trip_m),
+            "farm.max_trip_m {} must be between 50 and 100000",
+            self.farm.max_trip_m
         );
         let c = &self.social;
         ensure!(
@@ -1904,7 +1932,20 @@ emote = true
         let ex = Config::parse(Config::example()).unwrap().farm;
         assert!(!ex.enabled);
         assert_eq!(ex.max_plots, 5);
-        assert_documented("farm", &["enabled = false", "max_plots = 5"]);
+        assert_eq!((ex.growth_rate, ex.max_trip_m), (1.0, 4_000.0));
+        assert!(ex.public_farms && ex.own_land && ex.replant);
+        assert_documented(
+            "farm",
+            &[
+                "enabled = false",
+                "max_plots = 5",
+                "growth_rate = 1.0",
+                "public_farms = true",
+                "own_land = true",
+                "replant = true",
+                "max_trip_m = 4000.0",
+            ],
+        );
         let cfg = Config::parse("[farm]\nenabled = true\nmax_plots = 0\n").unwrap();
         assert!(cfg.farm.enabled);
         assert_eq!(cfg.farm.max_plots, 0);
@@ -1913,6 +1954,9 @@ emote = true
             "[farm]\nmax_plots = 1001\n",
             "[farm]\nmax_plots = -1\n",
             "[farm]\nenabled = 1\n",
+            "[farm]\ngrowth_rate = 0.0\n",
+            "[farm]\ngrowth_rate = nan\n",
+            "[farm]\nmax_trip_m = 10.0\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

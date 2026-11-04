@@ -35,7 +35,27 @@ pub fn parse_housing_areas(
     zone_key: u32,
     origin: (i32, i32),
 ) -> anyhow::Result<Vec<HousingAreaPoly>> {
-    let doc = roxmltree::Document::parse(xml).context("parse housing_area.xml")?;
+    parse_area_polys(xml, zone_key, origin, true)
+}
+
+/// The polygons of one `subzone_area.xml` (same file layout as the housing areas, but the area's
+/// own `Id` is the `sub_zones.id`; the server's `parse_area_file`). Only the public farm sub zones
+/// matter to the bots, see [`aa_world::farm::FARM_SUB_ZONES`].
+pub fn parse_sub_zone_areas(
+    xml: &str,
+    zone_key: u32,
+    origin: (i32, i32),
+) -> anyhow::Result<Vec<HousingAreaPoly>> {
+    parse_area_polys(xml, zone_key, origin, false)
+}
+
+fn parse_area_polys(
+    xml: &str,
+    zone_key: u32,
+    origin: (i32, i32),
+    housing: bool,
+) -> anyhow::Result<Vec<HousingAreaPoly>> {
+    let doc = roxmltree::Document::parse(xml).context("parse area xml")?;
     let root = doc.root_element();
     let mut out = Vec::new();
     if root.tag_name().name() != "Objects" {
@@ -55,7 +75,12 @@ pub fn parse_housing_areas(
             .and_then(|v| v.trim().parse::<i32>().ok())
             .unwrap_or(0);
         for area in block.children().filter(|n| named(n, "Area")) {
-            let id = match area.attribute("value1").or_else(|| area.attribute("Id")) {
+            let id_attr = if housing {
+                area.attribute("value1").or_else(|| area.attribute("Id"))
+            } else {
+                area.attribute("Id")
+            };
+            let id = match id_attr {
                 Some(v) => parse_uint(v).ok_or_else(|| anyhow!("invalid area id {v:?}"))?,
                 None => 0,
             };
@@ -246,6 +271,40 @@ mod tests {
         // value1 absent -> Id fallback; invalid points skipped
         assert_eq!(a[1].id, 77);
         assert_eq!(a[1].points.len(), 2);
+    }
+
+    const SUB_ZONES: &str = r#"<Objects>
+ <Entity Name="farm" Pos="100,200,10" cellX="0" cellY="1">
+  <Area Id="966" value1="52">
+   <Points>
+    <Point Pos="0,0,0"/>
+    <Point Pos="60,0,0"/>
+    <Point Pos="60,40,1"/>
+    <Point Pos="0,40,0"/>
+   </Points>
+  </Area>
+  <Area Id="12"><Points><Point Pos="0,0,0"/><Point Pos="9,0,0"/><Point Pos="9,9,0"/></Points></Area>
+ </Entity>
+</Objects>"#;
+
+    #[test]
+    fn sub_zone_areas_use_the_area_id_not_the_housing_value() {
+        let a = parse_sub_zone_areas(SUB_ZONES, 182, (14, 13)).unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!((a[0].id, a[0].zone_key), (966, 182), "Id, not value1");
+        assert_eq!(a[1].id, 12);
+        let (ox, oy) = (14.0 * 1024.0 + 100.0, 14.0 * 1024.0 + 200.0);
+        assert_eq!(a[0].points[0], [ox, oy]);
+        assert_eq!(a[0].points[2], [ox + 60.0, oy + 40.0]);
+        assert!(polygon_contains(&a[0].points, [ox + 30.0, oy + 20.0]));
+        // the same file read as housing areas takes value1
+        let h = parse_housing_areas(SUB_ZONES, 182, (14, 13)).unwrap();
+        assert_eq!(h[0].id, 52);
+        assert_eq!(h[1].id, 12, "no value1: Id is the fallback");
+        // an area without an Id has id 0, which the bake drops
+        let none = "<Objects><Entity Name=\"a\"><Area><Points/></Area></Entity></Objects>";
+        assert_eq!(parse_sub_zone_areas(none, 1, (0, 0)).unwrap()[0].id, 0);
+        assert!(parse_sub_zone_areas("<Objects", 1, (0, 0)).is_err());
     }
 
     #[test]

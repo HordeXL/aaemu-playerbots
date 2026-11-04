@@ -247,8 +247,21 @@ server_poll_secs = 30
 [farm]
 # Bots plant and harvest crops (goal "farm"). Off until enabled.
 enabled = false
-# One bot tends at most this many plots.
+# One bot tends at most this many plots (the server allows 10 on a public field farm, 5 on the
+# other kinds).
 max_plots = 5
+# The game server's World.GrowthRate (crops grow this many times faster than the default 1.0). It is
+# not on the wire, so say it here when the server changed it; ripe times are planned with it.
+growth_rate = 1.0
+# Plant on the public farms (needs farm_areas.json in the baked data: re-run `playerbots bake`).
+public_farms = true
+# Plant on the land of the bot's own houses.
+own_land = true
+# Plant the seeds a harvest gives back on the spot the crop stood.
+replant = true
+# The farthest a bot walks to a farm, a vendor or a plot, in metres. With bots.gm_bootstrap and
+# bots.long_travel_teleport_m a longer trip is a GM /move.
+max_trip_m = 4000.0
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

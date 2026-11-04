@@ -1238,7 +1238,8 @@ impl Motion {
 
 /// Whether the server checks the distance between the bot and something for this packet: casts
 /// (`TOO_FAR`), opening and emptying a loot window (5 m), talking to an NPC or doodad, quest
-/// steps, crafting at a bench and selling a trade pack (2.5 m).
+/// steps, crafting at a bench, selling a trade pack (2.5 m), buying from a merchant (3 m) and
+/// planting a seed (30 m).
 pub fn range_checked(p: &Out) -> bool {
     p.level == LEVEL_GAME
         && matches!(
@@ -1253,6 +1254,8 @@ pub fn range_checked(p: &Out) -> bool {
                 | op::CSCompleteQuestContextPacket
                 | op::CSExecuteCraft
                 | op::CSSellBackpackGoodsPacket
+                | op::CSBuyItemsPacket
+                | op::CSCreateDoodadPacket
         )
 }
 

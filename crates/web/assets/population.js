@@ -458,7 +458,8 @@ function renderEconomy() {
   else {
     const tb = mkTable('items', [{ t: 'Item' }, { t: 'Scarcity' }, { t: 'Lots', n: true, title: 'on the auction house' },
       { t: 'Price', n: true, title: 'market price per item and how many times the vendor price' },
-      { t: '30 min', n: true, title: 'price change' }, { t: 'Chat', n: true, title: 'want to buy / want to sell lines' }, { t: '' }]);
+      { t: '30 min', n: true, title: 'price change' }, { t: 'Chat', n: true, title: 'want to buy / want to sell lines' },
+      { t: 'Growing', n: true, title: 'how many the bots' crops will give (the farming goal)' }, { t: '' }]);
     for (const it of items) {
       const sc = num(it.scarcity);
       const price = it.unit_price ? fmtMoney(it.unit_price) + (it.price_ratio ? ' (' + it.price_ratio.toFixed(1) + 'x)' : '') : '-';
@@ -469,7 +470,8 @@ function renderEconomy() {
       const tr = row([
         { el: name, title: '#' + it.template }, { el: bar(sc, sc >= 0.7 ? 'hot' : sc >= 0.4 ? 'warm' : ''), title: (it.reasons || []).join(', ') || 'plenty' },
         { t: (it.supply_source === 'server' ? '' : '~') + num(it.lots), n: true, title: it.supply_source === 'server' ? 'counted by the server' : 'seen by the bots (they look at five at most)' },
-        { t: price, n: true }, { t: trend, n: true }, { t: it.wtb || it.wts ? it.wtb + ' / ' + it.wts : '', n: true }, { el: b },
+        { t: price, n: true }, { t: trend, n: true }, { t: it.wtb || it.wts ? it.wtb + ' / ' + it.wts : '', n: true },
+        { t: it.growing ? '+' + Math.round(it.growing) : '', n: true, title: it.growing ? 'being grown by the bots' : '' }, { el: b },
       ]);
       tr.title = (it.reasons || []).join(' · ');
       tb.tBodies[0].append(tr);

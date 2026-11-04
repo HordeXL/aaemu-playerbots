@@ -626,6 +626,52 @@ fn economy() {
 }
 
 #[test]
+fn farming() {
+    // an Onion Seed bought three at a time from NPC 0x030201
+    let mut body = cat(&[&[1, 2, 3], &[0, 0, 0], &[0, 0, 0, 0], &[1, 0]]);
+    body.extend([0x6F, 0x3D, 0, 0, 0, 3, 0, 0, 0, 0]);
+    body.push(0); // use_aa_point
+    game(
+        cs::buy_items(
+            0x03_0201,
+            &[cs::BuyItem {
+                item: 15_727,
+                grade: 0,
+                count: 3,
+                currency: cs::SHOP_MONEY,
+            }],
+        ),
+        op::CSBuyItemsPacket,
+        &body,
+    );
+    // no goods: still a well-formed packet
+    game(
+        cs::buy_items(0x03_0201, &[]),
+        op::CSBuyItemsPacket,
+        &cat(&[&[1, 2, 3], &[0, 0, 0], &[0, 0, 0, 0], &[0, 0], &[0]]),
+    );
+    // plant doodad 2259 at (1, -2, 3.5), rotated 2.0, scale 1.0, with the bag item 0x0102030405060708
+    game(
+        cs::create_doodad(2259, (1.0, -2.0, 3.5), 2.0, 1.0, 0x0102_0304_0506_0708),
+        op::CSCreateDoodadPacket,
+        &cat(&[
+            &[0xD3, 0x08, 0, 0],
+            &X_1,
+            &Y_M2,
+            &F_3_5,
+            &F_2_0,
+            &F_1_0,
+            &[8, 7, 6, 5, 4, 3, 2, 1],
+        ]),
+    );
+    game(
+        cs::request_common_farm_list(),
+        op::CSRequestCommonFarmList,
+        &[],
+    );
+}
+
+#[test]
 fn opcodes_have_names() {
     assert_eq!(cs::spawn_character().name(), "CSSpawnCharacterPacket");
     assert_eq!(cs::ping(0).name(), "PingPacket");
