@@ -26,6 +26,7 @@ pub mod combat;
 pub mod coordinator;
 pub mod ctx;
 pub mod director;
+pub mod farm;
 pub mod goals;
 pub mod guild;
 pub mod manner;
@@ -336,6 +337,7 @@ impl Bot {
         self.online_since = None;
         self.shared.hub.contest.release_bot(self.entry.id);
         self.shared.hub.events.release_bot(self.entry.id);
+        self.shared.hub.farms.release_bot(self.entry.id);
         self.motion.leave_world();
         self.slot.set_offline();
     }
@@ -675,6 +677,19 @@ impl Bot {
                 return;
             }
         };
+        // (the crops of the bot are not kept as doodads in view: the farm memory follows them)
+        if self.shared.cfg.farm.enabled {
+            if let ServerEvent::World(w) = &ev {
+                if farm::observe(&mut self.state, &self.shared.world, w) {
+                    farm::publish(
+                        &self.shared.hub,
+                        self.entry.id,
+                        &self.state,
+                        &self.shared.world,
+                    );
+                }
+            }
+        }
         if let ServerEvent::World(WorldEvent::DoodadsCreated(list)) = &mut ev {
             let world = &self.shared.world;
             list.retain(|d| keep_doodad(world, d));

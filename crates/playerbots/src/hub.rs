@@ -353,6 +353,8 @@ pub struct Hub {
     /// What the bots share about guilds: who can be invited, the guilds, the foundings (owned by
     /// the guild feature, see [`crate::bot::guild`]).
     pub guilds: crate::bot::guild::GuildBook,
+    /// What the bots grow (owned by the farming feature, see [`crate::bot::farm`]).
+    pub farms: crate::bot::farm::board::FarmBoard,
     /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
     issue_svc: Arc<Issues>,
     /// Server log lines handed to bots in the current second (second, lines).
@@ -389,6 +391,7 @@ impl Hub {
             nav: NavService::default(),
             board: Default::default(),
             guilds: Default::default(),
+            farms: Default::default(),
             issue_svc: Arc::new(Issues::disabled()),
             log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),
