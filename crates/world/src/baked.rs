@@ -1,5 +1,5 @@
 //! Baked extras written by `aa-bake` (see `docs/DATA-FORMATS.md`): map calibration, housing area
-//! polygons, quest sign spheres and the zone sector grid.
+//! polygons, public farm polygons, quest sign spheres and the zone sector grid.
 //!
 //! CONTRACT (shared by the `aa-bake` writer and the `aa-world` reader). The types and function
 //! signatures in this file are fixed; implementations may change.
@@ -159,6 +159,8 @@ pub struct Baked {
     pub map: Option<MapCalibration>,
     pub housing_areas: Vec<HousingAreaPoly>,
     pub quest_spheres: Vec<QuestSphere>,
+    /// The public farm sub zone polygons (`farm_areas.json`; `id` is the sub zone id).
+    pub farm_areas: Vec<HousingAreaPoly>,
     pub zones: Option<ZoneGrid>,
     /// The navigation meshes (`nav_<world>.bin`): the main world's and the instance worlds'.
     pub navs: NavSet,
@@ -216,6 +218,7 @@ impl Baked {
                 read_json::<Vec<QuestSphere>>,
             )
             .unwrap_or_default(),
+            farm_areas: load_farm_areas(&dir.join("farm_areas.json")),
             zones: load_optional(
                 &dir.join(format!("zones_{world}.bin")),
                 "zone grid",
@@ -224,6 +227,19 @@ impl Baked {
             navs: NavSet::load(dir, world),
         }
     }
+}
+
+/// `farm_areas.json`: optional (an older bake does not have it, the bots then plant on their own
+/// land only), so a missing file is only noted.
+fn load_farm_areas(path: &Path) -> Vec<HousingAreaPoly> {
+    if !path.is_file() {
+        tracing::info!(
+            "baked farm areas not found: {} (re-run `playerbots bake` for public farms)",
+            path.display()
+        );
+        return Vec::new();
+    }
+    load_optional(path, "farm areas", read_json::<Vec<HousingAreaPoly>>).unwrap_or_default()
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
