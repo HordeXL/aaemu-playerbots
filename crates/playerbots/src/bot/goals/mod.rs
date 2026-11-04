@@ -3,9 +3,9 @@
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
 //! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`],
-//! [`Market`], [`Guild`], [`Gank`], [`Warzone`], [`Event`], [`Companion`] and [`Farm`] (the last
-//! six are stubs the guild, pvp, events, party and farming features fill in). A goal that reports
-//! [`FailReason::NotImplemented`] is switched off for good by the brain.
+//! [`Market`], [`Guild`], [`Gank`], [`Warzone`], [`Event`], [`Companion`] and [`Farm`] (all are
+//! built; a goal added as a stub reports [`FailReason::NotImplemented`] and is switched off for
+//! good by the brain).
 //!
 //! # Writing a goal
 //!
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wave_one_stubs_are_goals_that_own_nothing() {
+    fn the_wave_one_goals_start_idle_and_own_no_combat() {
         for kind in [
             GoalKind::Guild,
             GoalKind::Event,

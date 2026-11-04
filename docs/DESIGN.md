@@ -297,10 +297,11 @@ already name its goal.
 | `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
 | `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
 
-Every stub goal (the event and farm goals are no longer stubs) fails with `NotImplemented` (the brain then
-switches it off for the bot) and its `score` is 0, so no bot picks it; forcing one from the web UI does no harm. A feature scores its goal
-through its own `score(ctx, base)` (gate on its `[section]`; the brain applies none of its factors to
-it) and turns the stub's methods into the real thing (`owns_combat` for the pvp goals).
+All six goals are built now (no stub is left). A goal added as a stub fails with `NotImplemented` (the
+brain then switches it off for the bot) and its `score` is 0, so no bot picks it; forcing one from the
+web UI does no harm. A feature scores its goal through its own `score(ctx, base)` (gate on its
+`[section]`; the brain applies none of its factors to it) and turns the stub's methods into the real
+thing (`owns_combat` for the pvp goals).
 
 **The zone conflict table.** The server sends one `SCConflictZoneStatePacket` per zone group at world
 entry and one on every change: a `u16` zone group, a `u8` state (0 tension, 1 danger, 2 dispute,

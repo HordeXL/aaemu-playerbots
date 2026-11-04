@@ -160,12 +160,11 @@ Safety of the GM lines:
 ## Switched-off features
 
 These sections are all off by default; `enabled = false` (or the `false` default of the switch named
-below) keeps the bots exactly as they were without them. The goals they belong to are reserved and
-not implemented yet (see [Goals and behaviour](#goals-and-behaviour)), except the event goal, which
-is described in [World events](#world-events-events), the companion goal ([Parties of real
-players](#parties-of-real-players-party)) and the farm goal, described in
-[Farming](#farming-farm); the settings are read and checked now so the features can be added
-without changing the file.
+below) keeps the bots exactly as they were without them. Every goal they belong to is built (see
+[Goals and behaviour](#goals-and-behaviour)): the pvp goals are described in [Player versus
+player](#player-versus-player-pvp), the event goal in [World events](#world-events-events), the
+companion goal in [Parties of real players](#parties-of-real-players-party) and the farm goal in
+[Farming](#farming-farm).
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
