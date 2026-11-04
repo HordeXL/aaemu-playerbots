@@ -138,8 +138,8 @@ pub struct TeamMemberBrief {
 pub struct TeamPerson {
     /// Character id.
     pub char_id: u32,
-    /// `zones.id` of the member's transform (a sub-zone in the main world, the dungeon's zone in
-    /// an instance).
+    /// Zone key of the member's transform (the zone it stands in in the main world, the
+    /// dungeon's zone key in an instance: what `SCLoadInstance` carries).
     pub zone_id: u32,
     /// Instance id of the member's world (`0` in the main world).
     pub instance_id: u32,

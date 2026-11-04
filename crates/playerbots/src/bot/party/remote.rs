@@ -45,7 +45,7 @@ pub struct Remote {
     pub level: u8,
     /// Object id (0 when offline or not told yet).
     pub obj_id: u32,
-    /// `zones.id` of the member's position (0 until a position packet arrived).
+    /// Zone key of the member's position (0 until a position packet arrived).
     pub zone_id: u32,
     /// Instance id of the member's world (0 = the main world, also while unknown).
     pub instance_id: u32,

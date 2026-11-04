@@ -687,6 +687,10 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
             say_to(ctx, who, Say::AskLeader, &leader);
             return true;
         }
+        if t.size() >= crate::bot::party::MAX_PARTY {
+            say_to(ctx, who, Say::Full, "");
+            return true;
+        }
     }
     let running = None;
     let mut f = facts(ctx, running, 0);
@@ -707,7 +711,8 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
     f.in_team = false;
     match policy::judge(&f) {
         Ok(()) => {
-            ctx.send(cs::invite_to_team(0, true, who));
+            let team_id = team_of(ctx).map_or(0, |t| t.team_id);
+            ctx.send(cs::invite_to_team(team_id, true, who));
             mem_of(ctx.state).inviting = Some((who.into(), now));
             say_to(ctx, who, Say::InviteSent, "");
             ctx.log.say(format!("party: invited {who} (asked for it)"));

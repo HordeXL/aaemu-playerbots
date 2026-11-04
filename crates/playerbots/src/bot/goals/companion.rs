@@ -350,12 +350,21 @@ impl Run {
             dungeon_in(ctx).or(self.dungeon)
         } else if matches!(phase, Phase::Outside | Phase::Away) {
             match state {
-                Leader::Dungeon(_) => lead.rec.and_then(|r| {
-                    ctx.world
-                        .dungeons()
-                        .iter()
-                        .position(|d| d.zone_id == r.zone_id)
-                }),
+                Leader::Dungeon(_) => lead
+                    .rec
+                    .and_then(|r| {
+                        ctx.world
+                            .dungeons()
+                            .iter()
+                            .position(|d| u32::from(d.zone_key) == r.zone_id)
+                    })
+                    // (the entrance the leader was last seen at, when the zone is not a dungeon's)
+                    .or_else(|| {
+                        self.sight
+                            .near_entrance
+                            .then(|| dungeon_at(ctx, self.sight.pos))
+                            .flatten()
+                    }),
                 Leader::Vanished => dungeon_at(ctx, self.sight.pos),
                 _ => self.dungeon,
             }

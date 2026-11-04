@@ -23,7 +23,7 @@ pub const ENTRANCE_M: f32 = 14.0;
 pub struct Rec {
     /// Bot clock of the packet (0 = none yet).
     pub seen_ms: u64,
-    /// `zones.id` of the leader's position.
+    /// Zone key of the leader's position (an instance's zone key inside a dungeon).
     pub zone_id: u32,
     /// The instance of the leader's world (0 = the main world).
     pub instance_id: u32,
