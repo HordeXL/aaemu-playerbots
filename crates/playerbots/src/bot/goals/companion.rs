@@ -299,7 +299,11 @@ impl Run {
             comp::mem_of(ctx.state).dungeon = None;
         }
         self.word = phase_word(phase, mode);
-        self.assist(ctx, leader, assist_until);
+        let following = mode == Mode::Follow
+            && come == 0
+            && ask.is_none()
+            && matches!(phase, Phase::Outside | Phase::Inside);
+        self.assist(ctx, &lead, now < assist_until, following);
         let walk_to = self.target(ctx, &lead, mode, come, ask);
         self.carry_out(ctx, intent, walk_to, &lead, ask);
         GoalStatus::Running
@@ -560,28 +564,43 @@ impl Run {
 
     // ---- fights --------------------------------------------------------------------------------
 
-    /// An `assist` order points the bot at the leader's target.
-    fn assist(&mut self, ctx: &mut Ctx<'_>, leader: u32, until_ms: u64) {
+    /// Takes up the leader's target: always after an `assist` order, else while the bot follows
+    /// (see [`follow::should_assist`]).
+    fn assist(&mut self, ctx: &mut Ctx<'_>, lead: &Lead, ordered: bool, following: bool) {
         let now = ctx.now_ms;
-        if now >= until_ms || ctx.combat.target().is_some() {
+        if ctx.combat.target().is_some() || !(ordered || following) {
             return;
         }
         let Some(team) = ctx.state.team() else { return };
-        let Some(obj) = team.remote_of(leader).map(|r| r.obj_id).filter(|&o| o != 0) else {
-            return;
-        };
-        let Some(target) = team
-            .member_targets_at(now)
-            .find(|(m, _)| *m == obj)
-            .map(|(_, t)| t)
+        let Some(obj) = team
+            .remote_of(lead.char_id)
+            .map(|r| r.obj_id)
+            .filter(|&o| o != 0)
         else {
             return;
         };
+        let Some((target, at_ms)) = team.target_of(obj) else {
+            return;
+        };
+        let Some(u) = ctx.state.units.get(&target) else {
+            return;
+        };
         let faction = ctx.state.me.faction;
-        let ok = ctx.state.units.get(&target).is_some_and(|u| {
-            !u.dead() && crate::bot::combat::attackable(ctx.world, faction, u).is_some()
+        let fair_game = !u.dead()
+            && crate::bot::combat::attackable(ctx.world, faction, u).is_some()
+            && !ctx.state.avoids(target, u.id, now);
+        let leader = lead::position(lead.view, lead.rec, ctx.state.place.instance_id(), now);
+        let take = follow::should_assist(&follow::AssistIn {
+            now_ms: now,
+            ordered,
+            following,
+            target_at_ms: at_ms,
+            fair_game,
+            target: u.pos,
+            leader,
+            me: ctx.state.me.pos,
         });
-        if ok {
+        if take {
             ctx.combat.engage_assist(target);
             ctx.log
                 .debug(format!("companion: assisting against unit {target}"));

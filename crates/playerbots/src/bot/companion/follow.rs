@@ -116,6 +116,53 @@ pub fn decide(i: &Inputs) -> Action {
     }
 }
 
+/// A target the leader announced longer ago than this is not assisted.
+pub const ASSIST_AGE_MS: u64 = 10 * 60_000;
+/// The leader's target must stand this close (metres) to the leader: it is fighting it.
+pub const ASSIST_NEAR_LEADER_M: f32 = 20.0;
+/// ... and this close to the bot.
+pub const ASSIST_NEAR_ME_M: f32 = 45.0;
+
+/// What the assist decision looks at.
+#[derive(Debug, Clone, Copy)]
+pub struct AssistIn {
+    /// The bot clock.
+    pub now_ms: u64,
+    /// A player ordered `assist`: the leader's target is the bot's whatever the leader does.
+    pub ordered: bool,
+    /// The bot follows (not told to stay, come or wait at a dungeon) and walks no door trip.
+    pub following: bool,
+    /// Bot clock at which the leader announced the target.
+    pub target_at_ms: u64,
+    /// The target is in view, alive, hostile and not given up on.
+    pub fair_game: bool,
+    /// Where the target stands.
+    pub target: [f32; 3],
+    /// Where the leader stands, when known.
+    pub leader: Option<[f32; 3]>,
+    /// Where the bot stands.
+    pub me: [f32; 3],
+}
+
+/// Whether the bot takes the leader's last target as its own. The combat controller helps with
+/// the fights it hears of (a target announced within the last twelve seconds); a fight that began
+/// before the bot joined or went on for long is announced no more, so a following bot looks at the
+/// leader's last target itself: it takes it up when it is a monster the leader stands next to.
+pub fn should_assist(i: &AssistIn) -> bool {
+    if !i.fair_game || i.now_ms.saturating_sub(i.target_at_ms) > ASSIST_AGE_MS {
+        return false;
+    }
+    if flat(i.me, i.target) > ASSIST_NEAR_ME_M {
+        return false;
+    }
+    if i.ordered {
+        return true;
+    }
+    i.following
+        && i.leader
+            .is_some_and(|l| flat(l, i.target) <= ASSIST_NEAR_LEADER_M)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +226,57 @@ mod tests {
         j.moving = true;
         j.dest = Some((50.0, 0.0));
         assert_eq!(decide(&j), Action::Hold);
+    }
+
+    fn assist_in() -> AssistIn {
+        AssistIn {
+            now_ms: 1_000_000,
+            ordered: false,
+            following: true,
+            target_at_ms: 999_000,
+            fair_game: true,
+            target: [10.0, 0.0, 0.0],
+            leader: Some([12.0, 0.0, 0.0]),
+            me: [0.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn a_following_bot_takes_up_the_target_the_leader_stands_next_to() {
+        let mut i = assist_in();
+        assert!(should_assist(&i));
+        // (a fight that went on for minutes is still the leader's)
+        i.target_at_ms = 1_000_000 - ASSIST_AGE_MS;
+        assert!(should_assist(&i));
+        i.target_at_ms -= 1;
+        assert!(!should_assist(&i));
+        i.target_at_ms = 999_000;
+        // not a monster to fight, or too far from the leader or from the bot
+        i.fair_game = false;
+        assert!(!should_assist(&i));
+        i.fair_game = true;
+        i.leader = Some([10.0 + ASSIST_NEAR_LEADER_M + 1.0, 0.0, 0.0]);
+        assert!(!should_assist(&i));
+        i.leader = None;
+        assert!(!should_assist(&i));
+        i.leader = Some([12.0, 0.0, 0.0]);
+        i.target = [ASSIST_NEAR_ME_M + 1.0, 0.0, 0.0];
+        i.leader = Some(i.target);
+        assert!(!should_assist(&i));
+    }
+
+    #[test]
+    fn a_bot_that_does_not_follow_assists_only_when_ordered() {
+        let mut i = assist_in();
+        i.following = false;
+        assert!(!should_assist(&i));
+        i.ordered = true;
+        assert!(should_assist(&i));
+        // (an order does not need the leader next to the target, but the target must be near)
+        i.leader = None;
+        assert!(should_assist(&i));
+        i.target = [ASSIST_NEAR_ME_M + 1.0, 0.0, 0.0];
+        assert!(!should_assist(&i));
     }
 
     #[test]

@@ -305,6 +305,15 @@ impl TeamLog {
         self.changes += 1;
     }
 
+    /// The last target member `member_obj` announced `(target, bot clock)`, however long ago (the
+    /// server tells a change only, so a member that fights for minutes announces nothing).
+    pub fn target_of(&self, member_obj: u32) -> Option<(u32, u64)> {
+        self.member_targets
+            .iter()
+            .find(|t| t.0 == member_obj && t.1 != 0)
+            .map(|t| (t.1, t.2))
+    }
+
     /// Whether unit `obj` is a member of the team other than the bot.
     fn is_member_unit(&self, obj: u32, units: &FxHashMap<u32, Unit>) -> bool {
         self.members
