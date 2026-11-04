@@ -1361,7 +1361,8 @@ impl Inner {
 
 fn mock_economy(policy: &Policy) -> EconomyView {
     // (template, name, lots, unit price, vendor price, trend %, wtb, wts)
-    let rows: [(u32, &str, u32, u32, u32, f32, u32, u32); 10] = [
+    type Row = (u32, &'static str, u32, u32, u32, f32, u32, u32);
+    let rows: [Row; 10] = [
         (3412, "Copper", 0, 1500, 300, 22.0, 5, 0),
         (3411, "Copper Ore", 1, 900, 250, 12.0, 3, 1),
         (3712, "Hay Bale", 2, 640, 200, 8.0, 2, 0),
