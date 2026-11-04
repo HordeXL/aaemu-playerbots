@@ -69,7 +69,10 @@ recall points when that is faster than walking, and hop through each other's gat
 
 **Sailing.** A bot summons a rowboat from a scroll at a beach, sails it 1 to 3 km across the sea (to
 another beach or on a loop) with a heading controller that finds the wheel's direction by itself,
-then leaves the boat, despawns it and swims ashore. Sea only.
+then leaves the boat, despawns it and swims ashore. Sea only. `[sail] ship` lets the bots sail the
+bigger hulls instead (clipper, cutter, junk, yawl, merchant schooner, or a mix with `auto`): they
+launch where the server has room for the hull, steer with its real speed and turn radius, take
+rounded routes and berth out at sea.
 
 ![The web UI with seven bots sailing rowboats across the Arcadian Sea between two islands; one is selected and its detail panel shows the sail goal and its steering log](docs/images/webui-sail.png)
 
@@ -252,7 +255,8 @@ else is bounded: [docs/OPERATING.md](docs/OPERATING.md#memory-and-scale)).
 * Quest progression walks: a bot never rides a carriage or an airship, so a trip to a zone it
   can only reach that way fails and the destination rests for a while. A trip ends as soon as
   any quest comes within 1500 m, so a bot on its way can be drawn aside by a side quest.
-* Sailing is sea only (no lakes or rivers) and has no passengers yet.
+* Sailing is sea only (no lakes or rivers) and has no passengers yet; the bigger hulls sail with
+  their driver only (no crew, no cannons, no cargo).
 * Portal ink and stones, boat scrolls and the dungeon level-up need the GM bootstrap unless the bot
   already carries them.
 * Built for, and tested against, AAEmu-1.2-Rust and the 1.2 client (r208022) only.

@@ -10,10 +10,16 @@
 //! [`SlaveTemplate::summon_range`] of the caster; the caster then boards the driver seat
 //! (attach point 1) and steers with throttle / steering input, passengers take points 2 and up.
 //!
-//! The top speed follows the server's ship physics (`systems/ai/physics/ship.rs`):
-//! `ship_models.velocity * MoveSpeedMul / 2`, where `MoveSpeedMul` is the unit attribute (base
-//! 1000, so 1.0) plus the slave's `unit_modifiers` rows (the rowboat and the clipper both carry
-//! +1000, so 2.0), clamped to `unit_attribute_limits`.
+//! The top speed follows the server's ship physics (`systems/ai/physics/ship.rs`): the hull's
+//! internal speed is capped at `ship_models.velocity * MoveSpeedMul / 2` and the body moves at
+//! `speed * MoveSpeedMul / 4`, so the real top speed is `velocity * MoveSpeedMul^2 / 8`, where
+//! `MoveSpeedMul` is the unit attribute (base 1000, so 1.0) plus the slave's `unit_modifiers`
+//! rows (every boat carries +1000, so 2.0 and the real top speed is half of `velocity`: 3.2 m/s
+//! for the rowboat, 6.5 for the clipper), clamped to `unit_attribute_limits`.
+//!
+//! [`ShipClass`] sums up what a bot needs to know to drive a hull: speeds, the turn radius, the
+//! hull box, the draft, where the server puts a summoned hull, how long the summon takes, and the
+//! cannons and pack racks the hull carries.
 
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -37,6 +43,9 @@ pub mod slave_kind {
 const SPAWN_SLAVE_EFFECT: u32 = 60;
 /// The skill that casts the common boat scrolls.
 pub const SUMMON_BOAT_SKILL: u32 = 15802;
+/// The doodad template of a pack rack (`slave_doodad_bindings`): a trade pack is put in with skill
+/// 15307 and taken out with 15309.
+pub const PACK_RACK_DOODAD: u32 = 3446;
 /// Driver seat attach point.
 pub const DRIVER_POINT: u8 = 1;
 /// Passenger attach points are `PASSENGER_FIRST..=PASSENGER_LAST` (`Passenger0..Passenger6`).
@@ -87,15 +96,95 @@ pub struct SlaveTemplate {
     pub summon_range: u16,
     /// `slaves.mountable`.
     pub mountable: bool,
+    /// The rest of the ship model: size and the speed physics.
+    pub ship: ShipModelData,
+    /// `slaves.spawn_x_offset`: how far ahead of the caster the server starts looking for a spot
+    /// for the hull (it then tries one metre further for 40 steps).
+    pub spawn_x: f32,
+    /// `slaves.spawn_y_offset`: the lateral offsets (left and right) tried at every step.
+    pub spawn_y: f32,
+    /// `slaves.portal_time`: seconds after the summon during which the helm is ignored.
+    pub portal_time: f32,
     /// Bit `n` set = the model declares attach point `n` (`model_bindings`), for `n` in 1..=8.
     seats: u16,
+    /// Slaves attached to the hull (`slave_bindings`): cannons, harpoons.
+    children: Box<[ChildSlave]>,
+    /// Attach points of the pack racks (`slave_doodad_bindings`, doodad [`PACK_RACK_DOODAD`]).
+    racks: Box<[u8]>,
+}
+
+/// A slave attached to a hull.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildSlave {
+    /// The attach point on the hull.
+    pub point: u8,
+    /// The child's slave template (10 = cannon, 48 = harpoon gun).
+    pub slave: u32,
+    /// The child's `slave_kind_id` (8 = slave equipment, as the cannon; 7 = siege weapon).
+    pub kind: u8,
+}
+
+/// The cannon's slave template (`slave_bindings.slave_id`).
+pub const CANNON_SLAVE: u32 = 10;
+
+/// `ship_models`: the hull box and the speed physics of a ship model (all 0 without a ship model).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShipModelData {
+    /// `accel`: the forward acceleration (internal speed units per second at full throttle).
+    pub accel: f32,
+    /// `reverse_accel`.
+    pub reverse_accel: f32,
+    /// `reverse_velocity`.
+    pub reverse_velocity: f32,
+    /// `mass_box_size_x`: the beam in metres.
+    pub beam: f32,
+    /// `mass_box_size_y`: the length.
+    pub length: f32,
+    /// `mass_box_size_z`: the height.
+    pub height: f32,
+    /// `mass_center_y`: how far the box centre lies ahead of the hull's origin.
+    pub center_y: f32,
+    /// `mass_center_z`.
+    pub center_z: f32,
+    /// `keel_height`.
+    pub keel: f32,
 }
 
 impl SlaveTemplate {
-    /// Top speed in metres per second (`velocity * MoveSpeedMul / 2`, the server's physics cap
-    /// without wind).
+    /// Top speed in metres per second without wind: the internal speed cap is
+    /// `velocity * MoveSpeedMul / 2` and the body moves at `speed * MoveSpeedMul / 4`
+    /// (`systems/ai/physics/ship.rs`), so `velocity * MoveSpeedMul^2 / 8`.
     pub fn top_speed(&self) -> f32 {
-        self.velocity * self.move_speed_mul / 2.0
+        self.velocity * self.move_speed_mul * self.move_speed_mul / 8.0
+    }
+
+    /// Internal speed units per metre per second of real speed (`4 / MoveSpeedMul`, 2 for every
+    /// boat): the server's turn factor and acceleration work on the internal speed.
+    pub fn internal_per_real(&self) -> f32 {
+        4.0 / self.move_speed_mul.max(0.1)
+    }
+
+    /// Cannons the hull carries (its child slaves of a cannon kind).
+    pub fn cannon_points(&self) -> impl Iterator<Item = u8> + '_ {
+        self.children
+            .iter()
+            .filter(|c| c.slave == CANNON_SLAVE)
+            .map(|c| c.point)
+    }
+
+    /// The attach points of the pack racks.
+    pub fn rack_points(&self) -> &[u8] {
+        &self.racks
+    }
+
+    /// Slaves attached to the hull.
+    pub fn children(&self) -> &[ChildSlave] {
+        &self.children
+    }
+
+    /// What a bot needs to know to drive the hull; see [`ShipClass`].
+    pub fn class(&self) -> ShipClass {
+        ShipClass::of(self)
     }
 
     /// How the hull turns, from the server's ship physics (`systems/ai/physics/ship.rs`, per unit
@@ -141,6 +230,314 @@ impl SlaveTemplate {
     /// The slave is a boat (it is for every template in this table).
     pub fn is_boat(&self) -> bool {
         is_boat_kind(self.kind)
+    }
+}
+
+/// How big a hull is, which sets the water it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HullSize {
+    /// Under 6 m long: the rowboat.
+    Small,
+    /// 6 to 20 m: the clipper and the fishing boats.
+    Medium,
+    /// 20 m and more: the cutter, junk, yawl, schooner and the liner.
+    Large,
+}
+
+/// Terrain below this height (m) is deep enough for a [`HullSize::Large`] hull: 4.5 m of water.
+pub const DEEP_FLOOR_M: f32 = 95.5;
+
+/// What a bot needs to know to drive and berth one kind of hull, summed up from its slave
+/// template ([`SlaveTemplate::class`]). All figures are the real ones of the server's physics, not
+/// the nominal `ship_models` columns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShipClass {
+    /// `slaves.id`.
+    pub slave: u32,
+    /// `slaves.slave_kind_id`; see [`slave_kind`].
+    pub kind: u8,
+    /// The size class.
+    pub size: HullSize,
+    /// Top speed in m/s (see [`SlaveTemplate::top_speed`]).
+    pub top_speed: f32,
+    /// The turn rate the helm settles at in rad/s, at full turn factor (the kind's cap).
+    pub turn_rate: f32,
+    /// Angular acceleration at full helm in rad/s^2.
+    pub turn_accel: f32,
+    /// Turn radius at top speed in metres: `top_speed / turn_rate` (64 m for the clipper, 139 m
+    /// for the cutter, 216 m for the yawl, 42 m for the rowboat). A hull turns tighter at lower
+    /// speed.
+    pub radius: f32,
+    /// Beam of the hull box (`ship_models.mass_box_size_x`).
+    pub beam: f32,
+    /// Length of the hull box (`mass_box_size_y`).
+    pub length: f32,
+    /// Height of the hull box (`mass_box_size_z`).
+    pub height: f32,
+    /// A guess of how deep the keel lies below the waterline, metres: the offset the server gives
+    /// the hull at the summon.
+    pub draft: f32,
+    /// How far ahead of the caster the server starts looking for a spot (m).
+    pub spawn_ahead: f32,
+    /// The lateral offsets it tries at every step (m).
+    pub spawn_side: f32,
+    /// Milliseconds after the summon during which the server ignores the helm.
+    pub portal_ms: u32,
+    /// Internal speed units per real m/s (2 for every boat).
+    pub int_per_real: f32,
+    /// Deceleration in m/s^2 with full astern throttle.
+    pub brake: f32,
+    /// Acceleration in m/s^2 with full ahead throttle at low speed.
+    pub accel: f32,
+    /// How far the hull box's centre lies ahead of the hull's origin (`mass_center_y`).
+    pub center_y: f32,
+    /// Water the hull box reaches down into at the summon, metres: the server tests the box
+    /// (the model's bounding box, or the mass box when there is none) against the terrain.
+    pub box_depth: f32,
+    /// Cannons on the hull.
+    pub cannons: u8,
+    /// Pack racks on the hull.
+    pub racks: u8,
+    /// Passenger seats (attach points 2..=8 of the model).
+    pub passengers: u8,
+}
+
+impl ShipClass {
+    /// The rowboat (slave 15), as the data has it; checked against the real data by the
+    /// `ship_classes` test of `travel_real_data`. For tests and for a bot without hull data.
+    pub const ROWBOAT: ShipClass = ShipClass {
+        slave: 15,
+        kind: slave_kind::BOAT,
+        size: HullSize::Small,
+        top_speed: 3.2,
+        turn_rate: 0.07592,
+        turn_accel: 0.12526,
+        radius: 42.15,
+        beam: 1.0,
+        length: 3.0,
+        height: 0.5,
+        draft: 0.6,
+        spawn_ahead: 1.5,
+        spawn_side: 1.5,
+        portal_ms: 0,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 0.0,
+        box_depth: 0.85,
+        cannons: 0,
+        racks: 0,
+        passengers: 1,
+    };
+
+    /// The clipper (slave 52); see [`ShipClass::ROWBOAT`].
+    pub const CLIPPER: ShipClass = ShipClass {
+        slave: 52,
+        kind: slave_kind::SPEEDBOAT,
+        size: HullSize::Medium,
+        top_speed: 6.5,
+        turn_rate: 0.1021,
+        turn_accel: 0.018979,
+        radius: 63.66,
+        beam: 4.0,
+        length: 8.0,
+        height: 7.0,
+        draft: 0.3,
+        spawn_ahead: 5.0,
+        spawn_side: 5.0,
+        portal_ms: 7000,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 0.0,
+        box_depth: 0.8,
+        cannons: 0,
+        racks: 0,
+        passengers: 0,
+    };
+
+    /// The Eznan cutter (slave 21); see [`ShipClass::ROWBOAT`].
+    pub const CUTTER: ShipClass = ShipClass {
+        slave: 21,
+        kind: slave_kind::SMALL_SAILING_SHIP,
+        size: HullSize::Large,
+        top_speed: 6.3,
+        turn_rate: 0.045379,
+        turn_accel: 0.012654,
+        radius: 138.8,
+        beam: 6.5,
+        length: 30.0,
+        height: 14.5,
+        draft: 2.2,
+        spawn_ahead: 30.0,
+        spawn_side: 20.0,
+        portal_ms: 7000,
+        int_per_real: 2.0,
+        brake: 0.6,
+        accel: 0.25,
+        center_y: 3.0,
+        box_depth: 13.45,
+        cannons: 8,
+        racks: 4,
+        passengers: 0,
+    };
+
+    /// The class of a slave template.
+    pub fn of(t: &SlaveTemplate) -> ShipClass {
+        let top = t.top_speed();
+        let (turn_accel, turn_rate) = t.turn().unwrap_or((0.1254, 0.0759));
+        let m = &t.ship;
+        let length = if m.length > 0.0 { m.length } else { 3.0 };
+        let beam = if m.beam > 0.0 { m.beam } else { 1.0 };
+        // `summon_offset_z` of the server: the hull sits (center_z / 2 when below the waterline)
+        // plus the keel height under the surface
+        let draft = ((if m.center_z < 0.0 {
+            -m.center_z / 2.0
+        } else {
+            0.0
+        }) + m.keel)
+            .max(0.3);
+        let int_per_real = t.internal_per_real();
+        let size = if length < 6.0 {
+            HullSize::Small
+        } else if length < 20.0 {
+            HullSize::Medium
+        } else {
+            HullSize::Large
+        };
+        // (the opposing throttle: the larger of the two accelerations times 2.4, per internal
+        // speed unit and second, halved by the server's tick arithmetic)
+        let brake_int = m.accel.max(m.reverse_accel).max(0.1) * 2.4 / 2.0;
+        ShipClass {
+            slave: t.id,
+            kind: t.kind,
+            size,
+            top_speed: top,
+            turn_rate,
+            turn_accel,
+            radius: if turn_rate > 0.0 {
+                top / turn_rate
+            } else {
+                0.0
+            },
+            beam,
+            length,
+            height: m.height,
+            draft,
+            spawn_ahead: t.spawn_x,
+            spawn_side: t.spawn_y,
+            portal_ms: (t.portal_time.max(0.0) * 1000.0).round() as u32,
+            int_per_real,
+            brake: brake_int / int_per_real,
+            accel: m.accel.max(0.1) / 2.0 / int_per_real,
+            center_y: m.center_y,
+            box_depth: (draft - m.center_z + m.height / 2.0).max(0.0),
+            cannons: t.cannon_points().count().min(255) as u8,
+            racks: t.racks.len().min(255) as u8,
+            passengers: t.passenger_seats(),
+        }
+    }
+
+    /// The terrain height below which a sea cell is deep enough for the hull: 2 m of water for
+    /// the small and medium hulls ([`crate::water::NAV_FLOOR_M`]), [`DEEP_FLOOR_M`] for the large.
+    pub fn sea_floor_m(&self) -> f32 {
+        match self.size {
+            HullSize::Large => DEEP_FLOOR_M,
+            _ => crate::water::NAV_FLOOR_M,
+        }
+    }
+
+    /// What the server's summon search needs around the caster for this hull, with `depth` metres
+    /// of water required under the footprint (0: any sea cell). See [`crate::water::LaunchReq`].
+    pub fn launch_req(&self, depth: f32) -> crate::water::LaunchReq {
+        crate::water::LaunchReq {
+            ahead: self.spawn_ahead,
+            side: self.spawn_side,
+            length: self.length,
+            beam: self.beam,
+            depth,
+            margin: 2.0,
+        }
+    }
+
+    /// Cells of open water (16 m each) a route keeps around the hull: half its length, a third
+    /// of the turn radius (a turn cuts the corner) and half a cell, at least 2 and at most 6.
+    pub fn route_clear(&self) -> i32 {
+        let m = self.length / 2.0 + self.radius * 0.35 + crate::water::CELL_M * 0.5;
+        ((m / crate::water::CELL_M).ceil() as i32).clamp(2, 6)
+    }
+
+    /// Clearances to try, widest first (the planner falls back to a narrower margin when the
+    /// wide one has no route), ending with one cell.
+    pub fn route_clears(&self) -> Vec<i32> {
+        let mut v: Vec<i32> = (2..=self.route_clear()).rev().collect();
+        v.push(1);
+        v
+    }
+
+    /// Distance in metres the hull needs to stop from `speed` m/s with the brake at `throttle`
+    /// (0..=1 of full astern), counting the helm's lag of a third of a second.
+    pub fn stopping_m(&self, speed: f32, throttle: f32) -> f32 {
+        let a = (self.brake * throttle.clamp(0.05, 1.0)).max(0.01);
+        speed * 0.35 + speed * speed / (2.0 * a)
+    }
+}
+
+/// A kind of boat a bot may be told to sail (`[sail] ship` of the config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShipFamily {
+    /// The rowboat (slave 15).
+    Rowboat,
+    /// The clipper, in its variants (52 plain, 76 Adventurer's with a cannon, 14 harpoon).
+    Clipper,
+    /// The Eznan cutter (slave 21): 8 cannons, 4 pack racks.
+    Cutter,
+    /// The Lutesong junk (slave 92).
+    Junk,
+    /// The Growling yawl (slave 24).
+    Yawl,
+    /// The Merchant Schooner (slave 75): 2 cannons, 20 pack racks.
+    Schooner,
+}
+
+impl ShipFamily {
+    /// Every family.
+    pub const ALL: [ShipFamily; 6] = [
+        ShipFamily::Rowboat,
+        ShipFamily::Clipper,
+        ShipFamily::Cutter,
+        ShipFamily::Junk,
+        ShipFamily::Yawl,
+        ShipFamily::Schooner,
+    ];
+
+    /// The config name.
+    pub fn name(self) -> &'static str {
+        match self {
+            ShipFamily::Rowboat => "rowboat",
+            ShipFamily::Clipper => "clipper",
+            ShipFamily::Cutter => "cutter",
+            ShipFamily::Junk => "junk",
+            ShipFamily::Yawl => "yawl",
+            ShipFamily::Schooner => "schooner",
+        }
+    }
+
+    /// The family with this config name.
+    pub fn parse(name: &str) -> Option<ShipFamily> {
+        ShipFamily::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// The slave templates of the family, the preferred one first.
+    pub fn slaves(self) -> &'static [u32] {
+        match self {
+            ShipFamily::Rowboat => &[15],
+            ShipFamily::Clipper => &[52, 76, 14],
+            ShipFamily::Cutter => &[21],
+            ShipFamily::Junk => &[92],
+            ShipFamily::Yawl => &[24],
+            ShipFamily::Schooner => &[75],
+        }
     }
 }
 
@@ -210,12 +607,14 @@ impl Boats {
         let wanted: FxHashSet<u32> = items.iter().map(|i| i.3).collect();
         let slave_names = localized(conn, "slaves", "name");
         let mut rows: Vec<SlaveRow> = Vec::new();
+        let mut slave_kinds: FxHashMap<u32, u8> = FxHashMap::default();
         each_row(
             conn,
-            "SELECT id, name, model_id, mountable, level, slave_kind_id, spawn_valid_area_range \
-             FROM slaves",
+            "SELECT id, name, model_id, mountable, level, slave_kind_id, spawn_valid_area_range, \
+             spawn_x_offset, spawn_y_offset, portal_time FROM slaves",
             |r| {
                 let id = r.u32(0);
+                slave_kinds.insert(id, r.u8(5));
                 if wanted.contains(&id) && is_boat_kind(r.u8(5)) {
                     rows.push(SlaveRow {
                         id,
@@ -229,6 +628,9 @@ impl Boats {
                         level: r.u8(4),
                         kind: r.u8(5),
                         range: r.u16(6),
+                        spawn_x: r.f32(7),
+                        spawn_y: r.f32(8),
+                        portal_time: r.f32(9),
                     });
                 }
             },
@@ -239,6 +641,7 @@ impl Boats {
 
         let ship = ship_stats(conn, &models)?;
         let seats = model_seats(conn, &models)?;
+        let (mut children, racks) = hull_fittings(conn, &boat_slaves, &slave_kinds)?;
         let mods = SlaveModifiers::load(conn, &boat_slaves)?;
         check_hp_formulas(conn);
 
@@ -257,12 +660,22 @@ impl Boats {
                     kind: row.kind,
                     level: row.level,
                     max_hp: hp.max(0) as u32,
-                    velocity: ship.get(&row.model).map_or(0.0, |s| s.0),
-                    turn_accel: ship.get(&row.model).map_or(0.0, |s| s.1),
+                    velocity: ship.get(&row.model).map_or(0.0, |s| s.velocity),
+                    turn_accel: ship.get(&row.model).map_or(0.0, |s| s.turn_accel),
                     move_speed_mul: mods.move_speed_mul(m),
                     summon_range: row.range,
                     mountable: row.mountable,
+                    ship: ship.get(&row.model).map(|s| s.data).unwrap_or_default(),
+                    spawn_x: row.spawn_x,
+                    spawn_y: row.spawn_y,
+                    portal_time: row.portal_time,
                     seats: seats.get(&row.model).copied().unwrap_or(0),
+                    children: children.remove(&m).unwrap_or_default().into_boxed_slice(),
+                    racks: racks
+                        .get(&m)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_boxed_slice(),
                 },
             ));
         }
@@ -347,6 +760,36 @@ impl Boats {
         })
     }
 
+    /// The scroll to summon a boat of `family` with: one the bag holds (`bag_count` says how many
+    /// of an item), else the cheapest scroll of the family's preferred slave, else of the next
+    /// one. `None` when the data has no scroll of the family or its hull has no driver seat.
+    pub fn scroll_for(
+        &self,
+        family: ShipFamily,
+        bag_count: impl Fn(u32) -> i64,
+    ) -> Option<&BoatScroll> {
+        let drives = |s: &&BoatScroll| {
+            family.slaves().contains(&s.slave)
+                && self
+                    .slave_template(s.slave)
+                    .is_some_and(SlaveTemplate::has_driver_seat)
+        };
+        if let Some(held) = self
+            .scrolls
+            .iter()
+            .filter(drives)
+            .find(|s| bag_count(s.item) > 0)
+        {
+            return Some(held);
+        }
+        family.slaves().iter().find_map(|&slave| {
+            self.scrolls
+                .iter()
+                .filter(drives)
+                .find(|s| s.slave == slave)
+        })
+    }
+
     /// Approximate heap bytes held.
     pub fn bytes(&self) -> usize {
         self.scrolls.capacity() * std::mem::size_of::<BoatScroll>()
@@ -357,6 +800,12 @@ impl Boats {
                 .map(|s| s.merchants.len() * 4)
                 .sum::<usize>()
             + self.slaves.shallow_bytes()
+            + self
+                .slaves
+                .values()
+                .iter()
+                .map(|s| s.children.len() * std::mem::size_of::<ChildSlave>() + s.racks.len())
+                .sum::<usize>()
             + str_bytes(self.slaves.values().iter().map(|s| &*s.name))
     }
 }
@@ -369,14 +818,25 @@ struct SlaveRow {
     level: u8,
     kind: u8,
     range: u16,
+    spawn_x: f32,
+    spawn_y: f32,
+    portal_time: f32,
 }
 
-/// `model id -> (ship_models.velocity, ship_models.turn_accel)` for the models of the boats
-/// (`models.sub_type = 'ShipModel'`, `sub_id` = the ship model).
+/// The ship model columns [`Boats::load`] keeps.
+#[derive(Clone, Copy)]
+struct ShipStats {
+    velocity: f32,
+    turn_accel: f32,
+    data: ShipModelData,
+}
+
+/// `model id -> ship_models columns` for the models of the boats (`models.sub_type =
+/// 'ShipModel'`, `sub_id` = the ship model).
 fn ship_stats(
     conn: &rusqlite::Connection,
     models: &FxHashSet<u32>,
-) -> Result<FxHashMap<u32, (f32, f32)>> {
+) -> Result<FxHashMap<u32, ShipStats>> {
     let mut ship_of: FxHashMap<u32, u32> = FxHashMap::default();
     each_row(
         conn,
@@ -388,12 +848,31 @@ fn ship_stats(
         },
     )
     .context("read ship models of boats")?;
-    let mut stats_of_ship: FxHashMap<u32, (f32, f32)> = FxHashMap::default();
+    let mut stats_of_ship: FxHashMap<u32, ShipStats> = FxHashMap::default();
     each_row(
         conn,
-        "SELECT id, velocity, turn_accel FROM ship_models",
+        "SELECT id, velocity, turn_accel, accel, reverse_accel, reverse_velocity, \
+         mass_box_size_x, mass_box_size_y, mass_box_size_z, mass_center_y, mass_center_z, \
+         keel_height FROM ship_models",
         |r| {
-            stats_of_ship.insert(r.u32(0), (r.f32(1), r.f32(2)));
+            stats_of_ship.insert(
+                r.u32(0),
+                ShipStats {
+                    velocity: r.f32(1),
+                    turn_accel: r.f32(2),
+                    data: ShipModelData {
+                        accel: r.f32(3),
+                        reverse_accel: r.f32(4),
+                        reverse_velocity: r.f32(5),
+                        beam: r.f32(6).abs(),
+                        length: r.f32(7).abs(),
+                        height: r.f32(8).abs(),
+                        center_y: r.f32(9),
+                        center_z: r.f32(10),
+                        keel: r.f32(11),
+                    },
+                },
+            );
         },
     )
     .context("read ship_models")?;
@@ -401,6 +880,47 @@ fn ship_stats(
         .into_iter()
         .filter_map(|(model, ship)| Some((model, *stats_of_ship.get(&ship)?)))
         .collect())
+}
+
+/// The slaves attached to the hulls (`slave_bindings`, with the child's kind from
+/// `slave_kinds`) and the attach points of their pack racks (`slave_doodad_bindings`), by hull
+/// slave. A compact without the tables just has none.
+#[allow(clippy::type_complexity)]
+fn hull_fittings(
+    conn: &rusqlite::Connection,
+    hulls: &FxHashSet<u32>,
+    slave_kinds: &FxHashMap<u32, u8>,
+) -> Result<(FxHashMap<u32, Vec<ChildSlave>>, FxHashMap<u32, Vec<u8>>)> {
+    let mut children: FxHashMap<u32, Vec<ChildSlave>> = FxHashMap::default();
+    let _ = each_row(
+        conn,
+        "SELECT owner_id, slave_id, attach_point_id FROM slave_bindings \
+         WHERE owner_type = 'Slave' ORDER BY attach_point_id, id",
+        |r| {
+            let (owner, child) = (r.u32(0), r.u32(1));
+            if hulls.contains(&owner) {
+                children.entry(owner).or_default().push(ChildSlave {
+                    point: r.u8(2),
+                    slave: child,
+                    kind: slave_kinds.get(&child).copied().unwrap_or(0),
+                });
+            }
+        },
+    );
+    let mut racks: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+    let _ = each_row(
+        conn,
+        &format!(
+            "SELECT owner_id, attach_point_id FROM slave_doodad_bindings \
+             WHERE owner_type = 'Slave' AND doodad_id = {PACK_RACK_DOODAD} ORDER BY attach_point_id"
+        ),
+        |r| {
+            if hulls.contains(&r.u32(0)) {
+                racks.entry(r.u32(0)).or_default().push(r.u8(1));
+            }
+        },
+    );
+    Ok((children, racks))
 }
 
 /// `model id -> seat mask` from `model_bindings` (attach points 1..=8).
@@ -549,9 +1069,17 @@ mod tests {
              CREATE TABLE items (id INT, name TEXT, use_skill_id INT, price INT);
              CREATE TABLE item_summon_slaves (id INT, item_id INT, slave_id INT);
              CREATE TABLE slaves (id INT, name TEXT, model_id INT, mountable TEXT, level INT,
-               slave_kind_id INT, spawn_valid_area_range INT);
+               slave_kind_id INT, spawn_valid_area_range INT, spawn_x_offset REAL,
+               spawn_y_offset REAL, portal_time REAL);
              CREATE TABLE models (id INT, sub_id INT, sub_type TEXT);
-             CREATE TABLE ship_models (id INT, velocity REAL, turn_accel REAL);
+             CREATE TABLE ship_models (id INT, velocity REAL, turn_accel REAL, accel REAL,
+               reverse_accel REAL, reverse_velocity REAL, mass_box_size_x REAL,
+               mass_box_size_y REAL, mass_box_size_z REAL, mass_center_y REAL,
+               mass_center_z REAL, keel_height REAL);
+             CREATE TABLE slave_bindings (id INT, owner_id INT, owner_type TEXT, slave_id INT,
+               attach_point_id INT);
+             CREATE TABLE slave_doodad_bindings (id INT, owner_id INT, owner_type TEXT,
+               attach_point_id INT, doodad_id INT);
              CREATE TABLE model_bindings (id INT, owner_id INT, owner_type TEXT, attach_point_id INT);
              CREATE TABLE unit_modifiers (id INT, owner_id INT, owner_type TEXT, unit_attribute_id INT,
                unit_modifier_type_id INT, value INT);
@@ -564,17 +1092,31 @@ mod tests {
              INSERT INTO effects VALUES (10, 7, 'SpecialEffect'), (11, 8, 'SpecialEffect');
              INSERT INTO special_effects VALUES (7, 60), (8, 25);
              INSERT INTO items VALUES (17906, 's', 15802, 0), (15817, 's', 15802, 10000), (17626, 's', 15802, 50000),
-               (150, 'siege', 15802, 200000), (999, 'x', 12345, 5), (4045, 'book', 11216, 3000);
-             INSERT INTO item_summon_slaves VALUES (1, 17906, 15), (2, 15817, 15), (3, 17626, 52), (4, 150, 100), (5, 999, 15);
-             INSERT INTO slaves VALUES (15, 'rowboat', 129, 't', 50, 4, 50), (52, 'clipper', 128, 't', 50, 3, 50),
-               (100, 'tank', 5, 't', 50, 5, 50);
-             INSERT INTO models VALUES (129, 4, 'ShipModel'), (128, 3, 'ShipModel'), (5, 9, 'VehicleModel');
-             INSERT INTO ship_models VALUES (4, 6.4, 9.9), (3, 13.0, 1.5);
+               (150, 'siege', 15802, 200000), (999, 'x', 12345, 5), (4045, 'book', 11216, 3000),
+               (5223, 'cutter', 15802, 1250000);
+             INSERT INTO item_summon_slaves VALUES (1, 17906, 15), (2, 15817, 15), (3, 17626, 52), (4, 150, 100), (5, 999, 15),
+               (6, 5223, 21);
+             INSERT INTO slaves VALUES (15, 'rowboat', 129, 't', 50, 4, 50, 1.5, 1.5, 0),
+               (52, 'clipper', 128, 't', 50, 3, 50, 5, 5, 7),
+               (21, 'cutter', 393, 't', 50, 2, 50, 30, 20, 7),
+               (10, 'cannon', 117, 't', 50, 8, 50, 0, 0, 0),
+               (48, 'harpoon', 895, 't', 50, 7, 50, 0, 0, 0),
+               (100, 'tank', 5, 't', 50, 5, 50, 0, 0, 0);
+             INSERT INTO models VALUES (129, 4, 'ShipModel'), (128, 3, 'ShipModel'),
+               (393, 6, 'ShipModel'), (5, 9, 'VehicleModel');
+             INSERT INTO ship_models VALUES (4, 6.4, 9.9, 1, 1, 3.5, 1, 3, 0.5, 0, 0, 0.6),
+               (3, 13.0, 1.5, 1, 0.5, 5, 4, 8, 7, 0, 3, 0.1),
+               (6, 12.6, 1.0, 1, 0.5, 5, 6.5, 30, 14.5, 3, -4, 0.2);
+             INSERT INTO slave_bindings VALUES (1, 21, 'Slave', 10, 10), (2, 21, 'Slave', 10, 9),
+               (3, 21, 'Slave', 48, 12), (4, 15, 'Item', 10, 9);
+             INSERT INTO slave_doodad_bindings VALUES (1, 21, 'Slave', 61, 3446),
+               (2, 21, 'Slave', 60, 3446), (3, 21, 'Slave', 59, 2612), (4, 52, 'Slave', 60, 3446);
              INSERT INTO model_bindings VALUES (1, 129, 'Model', 1), (2, 129, 'Model', 2), (3, 129, 'Model', 35),
-               (4, 128, 'Model', 1), (5, 128, 'Model', 9), (6, 129, 'Object', 3);
+               (4, 128, 'Model', 1), (5, 128, 'Model', 9), (6, 129, 'Object', 3),
+               (7, 393, 'Model', 1);
              INSERT INTO unit_modifiers VALUES (1, 15, 'Slave', 10, 0, 1000), (2, 15, 'Slave', 6, 0, 1420),
                (3, 52, 'Slave', 10, 0, 1000), (4, 52, 'Slave', 6, 0, 2420), (5, 15, 'Item', 10, 0, 7777),
-               (6, 52, 'Slave', 10, 1, 50);
+               (6, 52, 'Slave', 10, 1, 50), (7, 21, 'Slave', 10, 0, 1000);
              INSERT INTO unit_attribute_limits VALUES (1, 10, -10000, 3000), (2, 6, -2000000000, 10000000);
              INSERT INTO unit_formulas VALUES (48, '(level * 70 + sta * 12)', 14, 2), (141, '10 + (level - 1) * 2', 24, 2);
              INSERT INTO merchants VALUES (1, 4242, 7), (2, 4243, 7);
@@ -615,7 +1157,15 @@ mod tests {
     fn scrolls_are_sorted_cheapest_first_and_only_boats_remain() {
         let b = load(&fixture());
         let order: Vec<(u32, u32)> = b.scrolls().iter().map(|s| (s.item, s.price)).collect();
-        assert_eq!(order, vec![(17906, 0), (15817, 10_000), (17626, 50_000)]);
+        assert_eq!(
+            order,
+            vec![
+                (17906, 0),
+                (15817, 10_000),
+                (17626, 50_000),
+                (5223, 1_250_000)
+            ]
+        );
         // the siege weapon scroll, the non-SpawnSlave skill and the book are not boat scrolls
         assert!(b.scroll(150).is_none() && b.scroll(999).is_none() && b.scroll(4045).is_none());
         assert_eq!(&*b.scroll(17906).unwrap().name, "Scroll: Sharani's Rowboat");
@@ -650,7 +1200,9 @@ mod tests {
         assert!((accel - 0.1254).abs() < 0.001, "{accel}");
         assert!((cap.to_degrees() - 4.35).abs() < 1e-3);
         assert_eq!(row.move_speed_mul, 2.0);
-        assert!((row.top_speed() - 6.4).abs() < 1e-5);
+        // the body moves at speed * msm / 4 and the speed is capped at velocity * msm / 2: the
+        // rowboat does 3.2 m/s on the water, not 6.4
+        assert!((row.top_speed() - 3.2).abs() < 1e-5, "{}", row.top_speed());
         // level 50: sta 108, 50 * 70 + 108 * 12 = 4796, + 1420
         assert_eq!(row.max_hp, 6216);
 
@@ -658,9 +1210,10 @@ mod tests {
         assert!(clipper.has_driver_seat() && clipper.passenger_seats() == 0);
         // +1000 flat, then +50 percent: 2000 * 1.5 = 3000 (the limit)
         assert_eq!(clipper.move_speed_mul, 3.0);
-        assert!((clipper.top_speed() - 13.0 * 3.0 / 2.0).abs() < 1e-4);
+        // (the fixture's clipper carries a percent modifier too: 3.0 instead of 2.0)
+        assert!((clipper.top_speed() - 13.0 * 9.0 / 8.0).abs() < 1e-4);
         assert_eq!(clipper.max_hp, 3500 + 108 * 12 + 2420);
-        assert!(row.is_boat() && b.slave_templates().len() == 2);
+        assert!(row.is_boat() && b.slave_templates().len() == 3);
     }
 
     #[test]
@@ -669,7 +1222,100 @@ mod tests {
         assert_eq!(b.cheapest_scroll(0.0).map(|s| s.item), Some(17906));
         assert_eq!(b.cheapest_scroll(7.0).map(|s| s.item), Some(17626));
         assert!(b.cheapest_scroll(100.0).is_none());
+        // the rowboat is not 4 m/s fast
+        assert_eq!(b.cheapest_scroll(4.0).map(|s| s.item), Some(17626));
         assert!(b.bytes() > 0);
+    }
+
+    #[test]
+    fn ship_classes_sum_up_the_hulls() {
+        let b = load(&fixture());
+        let row = b.slave_template(15).unwrap().class();
+        assert_eq!(row.size, HullSize::Small);
+        assert!((row.top_speed - 3.2).abs() < 1e-5);
+        // 4.35 degrees a second: a 42 m radius at top speed
+        assert!(
+            (row.radius - 3.2 / 4.35f32.to_radians()).abs() < 0.1,
+            "{}",
+            row.radius
+        );
+        assert!((row.draft - 0.6).abs() < 1e-6 && row.cannons == 0 && row.racks == 0);
+        assert_eq!(
+            (row.spawn_ahead, row.portal_ms, row.passengers),
+            (1.5, 0, 1)
+        );
+        assert_eq!(row.route_clear(), 2);
+        assert_eq!(row.sea_floor_m(), crate::water::NAV_FLOOR_M);
+
+        let cutter = b.slave_template(21).unwrap();
+        let c = cutter.class();
+        assert_eq!(c.size, HullSize::Large);
+        // msm 2.0: half of the 12.6 of the data, and a 139 m turn at the 2.6 degree cap
+        assert!((c.top_speed - 6.3).abs() < 1e-5);
+        assert!(
+            (c.radius - 6.3 / 2.6f32.to_radians()).abs() < 0.5,
+            "{}",
+            c.radius
+        );
+        assert!((c.radius - 139.0).abs() < 1.0);
+        assert_eq!((c.beam, c.length, c.height), (6.5, 30.0, 14.5));
+        // below the waterline: 4 / 2 + the keel
+        assert!((c.draft - 2.2).abs() < 1e-6);
+        assert_eq!(
+            (c.spawn_ahead, c.spawn_side, c.portal_ms),
+            (30.0, 20.0, 7000)
+        );
+        // the cannon child at points 9 and 10, the harpoon at 12 is not a cannon; two racks
+        assert_eq!(cutter.cannon_points().collect::<Vec<_>>(), vec![9, 10]);
+        assert_eq!(cutter.children().len(), 3);
+        assert_eq!(cutter.rack_points(), &[60, 61]);
+        assert_eq!((c.cannons, c.racks, c.passengers), (2, 2, 0));
+        assert_eq!(c.sea_floor_m(), DEEP_FLOOR_M);
+        assert_eq!(c.route_clear(), 5);
+        assert_eq!(c.route_clears(), vec![5, 4, 3, 2, 1]);
+        // a stop from full speed takes some seventy metres with the brake at half
+        let stop = c.stopping_m(c.top_speed, 0.5);
+        assert!((50.0..160.0).contains(&stop), "{stop}");
+        assert!(c.stopping_m(c.top_speed, 1.0) < stop);
+        // the clipper keeps to the standard sea mask and a narrower margin
+        let clipper = b.slave_template(52).unwrap().class();
+        assert_eq!(clipper.size, HullSize::Medium);
+        assert_eq!(clipper.sea_floor_m(), crate::water::NAV_FLOOR_M);
+        assert!(
+            (3..=6).contains(&clipper.route_clear()),
+            "wider than the rowboat's"
+        );
+        assert_eq!(clipper.racks, 1);
+    }
+
+    #[test]
+    fn families_name_their_slaves() {
+        for f in ShipFamily::ALL {
+            assert_eq!(ShipFamily::parse(f.name()), Some(f));
+            assert!(!f.slaves().is_empty());
+        }
+        assert_eq!(ShipFamily::parse("galleon"), None);
+        assert_eq!(ShipFamily::Cutter.slaves(), &[21]);
+        let b = load(&fixture());
+        assert_eq!(
+            b.scroll_for(ShipFamily::Cutter, |_| 0).map(|s| s.item),
+            Some(5223)
+        );
+        assert_eq!(
+            b.scroll_for(ShipFamily::Clipper, |_| 0).map(|s| s.item),
+            Some(17626)
+        );
+        // what the bag holds comes first
+        assert_eq!(
+            b.scroll_for(ShipFamily::Rowboat, |i| i64::from(i == 15817))
+                .map(|s| s.item),
+            Some(15817)
+        );
+        assert_eq!(
+            b.scroll_for(ShipFamily::Rowboat, |_| 0).map(|s| s.item),
+            Some(17906)
+        );
+        assert!(b.scroll_for(ShipFamily::Schooner, |_| 0).is_none());
     }
 
     #[test]

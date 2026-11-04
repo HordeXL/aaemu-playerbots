@@ -673,47 +673,66 @@ skills 11215, 11216, 10594 and 16841); `apply_unit_state` tells it about gate NP
 
 A bot gets a boat summon scroll, summons a boat, sails it along a planned route and comes ashore.
 Only the sea is planned: lakes and rivers are out of scope (the sea mask knows nothing of them).
+The boat is the rowboat unless `[sail] ship` names another hull; the bigger hulls (clipper, cutter,
+junk, yawl, schooner) launch, steer, plan and berth differently, see [Bigger hulls](#bigger-hulls).
 
 ```text
 Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every failure, then Failed)
 ```
 
-- **Gear**: a scroll in the bag is used; otherwise, with `gm_bootstrap`, `/item add self 17906 1`
-  (the cheapest boat scroll of the data with a driver seat and a top speed of 4 m/s or more; the
-  rowboat). A boat left over from an earlier trip is despawned first. Without GM and without a
-  scroll the goal fails (`NoTarget`) and the brain's 60 s failure cooldown applies.
+- **Gear**: a scroll in the bag is used; otherwise, with `gm_bootstrap`, `/item add self <scroll> 1`
+  with the cheapest scroll of the hull family (`ShipFamily`, `Boats::scroll_for`): the default is
+  17906, the rowboat (the cheapest scroll of the data with a driver seat and a top speed of 2.5 m/s
+  or more). `[sail] ship = "auto"` takes the family of a scroll the bag holds, else a boat of the
+  bot's own (a roll seeded by the character id; merchants favour the schooner). A boat left over
+  from an earlier trip is despawned first. Without GM and without a scroll the goal fails
+  (`NoTarget`) and the brain's 60 s failure cooldown applies.
 - **Plan** (`goals/sail/trip.rs`): the nearest beach with open water in front of it is the launch
   (`find_shore`: land 3 m behind the stand point, water 12 to 28 m off the beach); the landing is a
-  beach near a random open-water point 1 to 3 km away whose sea route is at most 2.2 times the
-  straight line; otherwise a sightseeing loop out to a point at sea and back to the launch. Aggressive
-  monsters that live on the water (`danger_zones`: the spawns of NPC templates that attack on sight
-  and that the bot's faction is hostile to, e.g. 8563 / 13012 near (15344, 16346); at most 400)
-  close a 100 m disc each to the planner (140 m shuts the whole of Castaway Strait to a trip).
+  beach near a random open-water point 1 to 3 km away (twice as far for a hull that does 6 m/s)
+  whose sea route is at most 2.2 times the straight line; otherwise a sightseeing loop out to a
+  point at sea and back to the launch. Aggressive monsters that live on the water (`danger_zones`:
+  the spawns of NPC templates that attack on sight and that the bot's faction is hostile to, e.g.
+  8563 / 13012 near (15344, 16346); at most 400) close a 100 m disc each to the planner (140 m
+  shuts the whole of Castaway Strait to a trip). A failed plan says why in the bot's log.
 - **Sea map** (`aa-world::water`, `World::water()`): 16 m cells from the 4 m height grid, built on
   first use by up to four threads (about 1.4 s in a debug build, a tenth in release) and shared by
   all bots: a cell is sea when every height sample it touches is a real terrain sample under 98 m.
-  35 x 2431 cells of bits, **664 KiB**. The planner is an A* over open cells (a cell is open when
-  its square neighbourhood of `clear` cells is all sea) with hashed scratch, a node bound,
-  a shore penalty and line-of-sight smoothing; the route keeps two cells (32 m) off the beach, one
-  as a fallback.
+  35 x 2431 cells of bits, **664 KiB**. The large hulls use a second mask of the same size
+  (`World::water_deep()`, terrain under 95.5 m: 4.5 m of water), built at their first trip. The
+  planner is an A* over open cells (a cell is open when its square neighbourhood of `clear` cells
+  is all sea) with hashed scratch, a node bound, a shore penalty and line-of-sight smoothing; the
+  rowboat's route keeps two cells (32 m) off the beach, one as a fallback.
 - **Shore / Summon**: the bot walks to the stand point, faces the water, waits 0.8 s and casts the
   scroll's skill on itself (`start_skill_item`). Refusals of the place (`SkillResult` 0x23, error
   messages 100 / 583) pick another beach, at most two more times; an unexpected refusal is a
   `SkillRefused` finding; a boat that does not appear within the cast time plus 10 s is an issue.
 - **Board**: the bot swims to the hull (the server measures the bind reach to the hull's mass box,
-  under 4 m of surface gap) and sends `CSBindSlave` from 2.8 m, closer after a "too far" answer.
-- **Sail** (`bot/vehicle/{helm,follow}.rs`): pure-pursuit on the waypoints (lookahead 70 m, waypoint
-  reach 40 m, arrival 18 m) and a hull-aware rate-tracking heading controller. The server turns
-  slowly (a rowboat 4.35 degrees per second, angular acceleration 0.125 rad/s^2 at full helm; both
-  from `ship_models.turn_accel` and the kind's turn cap, `SlaveTemplate::turn`), so the controller
-  asks for the yaw rate that stops on the target heading (`sqrt(2 a err)`), converts the rate error
-  to a steering value and slows down for sharp turns. A steering probe at the start (80 steering
-  with 100 throttle for 2.5 s) measures which way the wheel turns (the documented direction is a
-  positive steering that lowers the yaw), and a divergence watch flips the sign once more if the
-  heading runs away. A `ShipRequest` is sent when the throttle changes, the steering moves by 6 or
-  more, or as a 1 s heartbeat (the server keeps a request until the next one).
-- **Stuck**: less than 3 m of progress in 8 s with the engine on, or the server's `stuck` flag, backs
-  the boat off astern for 4 s and plans the route again from where it is; the fourth episode aborts.
+  under 4 m of surface gap; for the bigger hulls the bot aims at a point 0.3 m outside the box and
+  binds from a gap of 1.4 m) and sends `CSBindSlave` from 2.8 m, closer after a "too far" answer.
+- **Sail** (`bot/vehicle/{helm,follow}.rs`): pure-pursuit on the waypoints (rowboat: lookahead 70 m,
+  waypoint reach 40 m, arrival 18 m) and a hull-aware rate-tracking heading controller. The server
+  turns slowly (a rowboat 4.35 degrees per second, angular acceleration 0.125 rad/s^2 at full helm;
+  both from `ship_models.turn_accel` and the kind's turn cap, `SlaveTemplate::turn`), so the
+  controller asks for the yaw rate that stops on the target heading (`sqrt(2 a err)`), converts the
+  rate error to a steering value and slows down for sharp turns. The turn factor of the server
+  (0.5 at a standstill, 1 from 2.5 internal units, which are twice the real speed) enters the rate
+  conversion. A steering probe at the start (80 steering with 100 throttle for 2.5 s) measures which
+  way the wheel turns (the documented direction is a positive steering that lowers the yaw), and a
+  divergence watch flips the sign once more if the heading runs away *and* the hull turns against
+  the helm (a hull that turns the right way but too slowly for the route keeps its sign). A
+  `ShipRequest` is sent when the throttle changes, the steering moves by 6 or more, or as a 1 s
+  heartbeat (the server keeps a request until the next one).
+- **Speed**: the throttle is an acceleration request, not a speed: the server accelerates the hull
+  for as long as the throttle is ahead, up to its cap, and brakes it with an astern throttle (2.4
+  times as hard as it accelerates). So `throttle(speed, wanted)` goes ahead in proportion to the
+  shortfall, to 0 within a small band and astern in proportion to the excess, and `wanted_speed`
+  is the top speed (1.1 times: the server caps the hull itself) unless the route asks for less
+  (`Guide.v_limit`) or the bow is far off the wanted heading.
+- **Stuck**: less than 3 m of progress in 8 s with the engine on, or the server's `stuck` flag
+  (which is never set), or an impact (a hull that ran at 1.5 m/s or more within the last 6 s and
+  now stands still with the engine on), backs the boat off astern (4 s and a tenth of a second per
+  metre of hull) and plans the route again from where it is; the fourth episode aborts.
 - **Land**: brake (astern while above 2.5 m/s), set the throttle to 0, `CSDiscardSlave`, then
   `CSDespawnSlave`, then walk (swim) to the landing stand point. Each request is repeated once
   after a timeout; a missing answer is an issue and the trip goes on.
@@ -733,28 +752,89 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
   no boat), `sail:bind_no_attach` (`SCSlaveBound` names the bot, no `SCUnitAttached`),
   `sail:bind_no_response`, `sail:no_ship_movement`, `sail:no_thrust` (engine on 5 s, deep water,
   not aground, speed 0), `sail:dead_wheel` (helm hard over at speed for 10 s, no turn),
+  `sail:slow_boat` (the top speed seen is under 75 percent of the data's, on a route over 600 m),
   `sail:despawn_ignored`, `sail:discard_ignored`, `sail:error_code:<id>` (an unexpected
   `SCErrorMsg` after a boat action).
 - **Memory**: `VehicleState` is one pointer (the `Sailor` is allocated by the first sail goal or
-  summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea map
-  is 664 KiB once. `size_of::<Bot>()` went from 3152 to 3160 bytes (limit 3200), `Goal` is 152
-  bytes (limit 160).
-- **Live behaviour** (QA server, rowboat scroll 17906, slave 15): the boat takes 10 to 20 s from the
-  cast to the bind, the helm probe finds the documented steering sign, the boat holds its heading
-  within a degree on the straights and its top speed is 3.2 m/s (`ship_models.velocity` 6.4 divided
-  by 2: the `MoveSpeedMul` of 2.0 the data estimate assumes is not in effect, so `sail:slow_boat`
-  files a low-severity report). A crossing of 1.6 to 3.4 km takes 9 to 18 minutes, landing, despawn
-  and the swim ashore about 20 seconds. The server keeps a despawned (or logged out with) boat in its
-  `slaves` table and puts it back on the water at login, at its old position: the Gear phase
-  despawns such a boat first. A scroll is not consumed by the cast.
+  summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea
+  map is 664 KiB once (and the deep one 664 KiB more once a large hull sails). `size_of::<Bot>()`
+  is 3192 bytes (limit 3200), `Goal` is 152 bytes (limit 160); the hull data and the route live
+  in the boxed machine.
+- **Live behaviour of the rowboat** (QA server, scroll 17906, slave 15): the boat takes 10 to 20 s
+  from the cast to the bind, the helm probe finds the documented steering sign, the boat holds its
+  heading within a degree on the straights and its top speed is 3.2 m/s: `ship_models.velocity`
+  6.4 times `MoveSpeedMul` squared (2.0) over 8. (This document used to say velocity times
+  `MoveSpeedMul` over 2, which is twice the speed; the server moves the body at the internal
+  speed times `MoveSpeedMul / 4` and caps the internal speed at `velocity * MoveSpeedMul / 2`.) A
+  crossing of 1.6 to 3.4 km takes 9 to 18 minutes, landing, despawn and the swim ashore about 20
+  seconds. The server keeps a despawned (or logged out with) boat in its `slaves` table and puts it
+  back on the water at login, at its old position: the Gear phase despawns such a boat first. A
+  scroll is not consumed by the cast.
 - **Limits**: sea only; the bot that is made to leave the goal at sea (a forced goal, a rest) is left
-  swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done.
-- **Tests**: the water mask, the planner (detour, no route, discs), the shore finder, the heading
-  controller (also with an inverted wheel and other hulls), the route follower, and the whole
-  machine against a scripted server (`goals/sail/tests.rs`: a rowboat with the server's turn
-  physics, GM scroll, refused places, no boat, no seat, ignored bind / discard / despawn, a dead
-  engine, a boat aground, an interruption at every point of the trip, a late boat of an interrupted
-  cast). Real-data check: `AA_BAKED=... cargo test -p aa-world --test water_real -- --ignored`.
+  swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done;
+  the bigger hulls sail with their driver only (no crew, no cannons, no cargo yet).
+- **Tests**: the water mask, the planner (detour, no route, discs), the shore and launch finders,
+  the heading controller (also with an inverted wheel and other hulls), the route follower, and the
+  whole machine against a scripted server (`goals/sail/tests.rs`: a rowboat, a clipper and a
+  cutter with the server's turn and speed physics (`vehicle/sim.rs`), GM scroll, refused places, no
+  boat, no seat, ignored bind / discard / despawn, a dead engine, a boat aground, a hull that hits
+  a wall without the server saying so, rounding the end of a wall, an interruption at every point of
+  the trip, a late boat of an interrupted cast). Real-data checks: `AA_BAKED=... cargo test -p
+  aa-world --test water_real -- --ignored` and `--test travel_real_data` (hull classes).
+
+### Bigger hulls
+
+`[sail] ship` picks the scroll family: `rowboat` (default, today's behaviour), `clipper`, `cutter`,
+`junk`, `yawl`, `schooner` or `auto`. The hull's numbers come from the server data
+(`aa_world::travel::ShipClass::of`, the constants `ROWBOAT`, `CLIPPER` and `CUTTER` are checked
+against the data by `ship_classes` in `travel_real_data.rs`):
+
+| Hull (scroll) | Kind | Top speed | Turn rate / radius at top speed | Box (beam x length x height) | Summon (ahead / side) | Portal | Guns / racks |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Rowboat (17906) | boat | 3.2 m/s | 4.35 deg/s, 42 m | 1 x 3 x 0.5 | 2 / 2 m | none | 0 / 0 |
+| Clipper (17626; the harpoon and adventurer's clippers 27266 / 23618 spawn 25 / 15) | speedboat | 6.5 m/s | 5.85 deg/s, 64 m | 4 x 8 x 7 | 5 / 5 m | 7 s | 0 / 0 |
+| Eznan cutter (5223), Lutesong junk (25739) | small sailing ship | 6.3 m/s | 2.6 deg/s, 139 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 8 / 4 |
+| Growling yawl (13711) | small sailing ship | 9.8 m/s | 2.6 deg/s, 216 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 8 / 4 |
+| Merchant schooner (23398) | small sailing ship | 6.5 m/s | 2.6 deg/s, 143 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 2 / 20 |
+
+The top speed is `velocity * MoveSpeedMul^2 / 8` (see the rowboat note above) and the sailing ships
+add the wind: with the server's default (official) wind model a small or big sailing ship or a
+fishing boat goes 15 percent faster while its bow is within 15 degrees of north or south, which the
+bots see as a cutter at 7.2 m/s or a schooner at 7.0 on a northward leg (the table is the speed
+without it). The radius is the top speed over the turn rate cap, so a cutter needs a circle of 280
+m across; the helm is ignored for the portal time (7 s) after the summon.
+
+- **Launch**: the server places the hull in `summon_candidate_1_2` (40 steps ahead of the caster,
+  starting at the "ahead" offset, on the line and to both sides by the "side" offset, the hull laid
+  across the caster's view with its bow to the caster's left) and refuses the first place where
+  the hull box touches the terrain or the line of sight is blocked. `find_launch` /
+  `launch_ok` (`aa-world::water::shore`) run the same search on the sea mask and the height grid
+  (footprint sampled in 15 points, `LAUNCH_DEPTH_MEDIUM_M` 2.5 m and `LAUNCH_DEPTH_LARGE_M` 6 m of
+  water under it, a 2 m margin) so a beach is only chosen when the server will have room. The planner
+  tries up to six beaches (a beach without open sea within 260 m of it is skipped). The Large depth
+  is a guess until the server's mass box test is known (the cutter's mass box reaches 13.5 m down,
+  its model less): the live runs below saw no refusal at 6 m.
+- **Berth**: the hull ends the trip at `moor_point`: the first point, going straight out to sea
+  from the landing beach (or the launch, for a loop) in 8 m steps up to 260 m, with `plan_clear`
+  cells of sea around it. The bot leaves the hull there, despawns it and swims the rest.
+- **Route**: a wider margin to the shore (`ShipClass::route_clear`: half the hull, a third of the
+  radius and half a cell, 2 to 6 cells; the wider margin falls back cell by cell, and a route more
+  than 1.35 times the planned one plus 300 m, as when the wide margin closes a passage, is not
+  taken while a narrower margin has a shorter one), the deep mask for the large hulls, then
+  `round_corners`: every corner becomes an arc of 1.15 times the radius (smaller where the legs
+  are short; kept sharp where the arc would leave the water) and a hairpin, as the far end of a loop
+  trip, becomes a half circle with the way back `2 * radius` beside the way out. The route is
+  resampled every 20 m so that the follower sees the curvature.
+- **Follower** (`Params::for_hull`): lookahead 0.9 radius (70 m at least), waypoint reach 10 m,
+  arrival 0.6 hull length (18 m at least), and a speed plan: `Guide.v_limit` is the lowest of the
+  end braking (0.4 of the astern deceleration, to 0.8 m/s at the end) and the corner limits (the
+  route's discrete curvature against 0.85 of the turn cap, 1.2 m/s at least for steerage).
+- **Helm**: the angular response uses the hull's own acceleration and cap (`Hull`), the probe lasts
+  2.5 to 7 s depending on the acceleration, the first sample is waited for `6 s + portal time`.
+  The trip limit is `max(40 min, 8 min + 2.5 * route / top speed)`.
+- **Aground**: the server never sets `stuck`, so the machine infers an impact from the speed (see
+  Stuck) and backs off at once; a hull stopped at the beach for 8 s is the old stuck window plus 4 s
+  for the big hulls.
 
 ## Population: census, economy board and director
 
@@ -849,7 +929,11 @@ Static data for the portal, instance-dungeon and boat abilities, loaded once wit
   carries is matched to a world by `zones.name` (the client's `world.xml` is not server data).
 - **Boats** (`boat.rs`): items whose use skill has the `SpawnSlave` effect and summon a boat-kind
   slave, with seats (`model_bindings`), `ship_models.velocity` and the slave's `MoveSpeedMul`
-  (top speed = velocity x MoveSpeedMul / 2) and an estimated hit point pool.
+  (top speed = velocity x MoveSpeedMul^2 / 8, `SlaveTemplate::top_speed`), the model's box,
+  turn data, spawn offsets, portal time, cannon and rack attach points and an estimated hit point
+  pool. `ShipClass::of(&template)` condenses a template into what driving it needs (top speed,
+  turn rate and radius, hull box, draft, sizes `Small` / `Medium` / `Large`, route margins, the
+  launch request); `ShipFamily` groups the scrolls of one hull (`Boats::scroll_for`).
 
 Fixed ids (Teleport Book 4045, skills 11215 / 11216 / 10594 / 14602 / 16841 / 15802, ...) are
 checked against `compact.sqlite3` at load and only warn when missing. Real-data checks:

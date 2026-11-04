@@ -10,13 +10,14 @@
 //! leaves a boat behind: every end of the goal passes through [`Machine::stop`].
 
 use aa_proto::sc_travel::error_message as emsg;
-use aa_world::water::{Disc, ShoreSpot};
+use aa_world::travel::{HullSize, ShipClass};
+use aa_world::water::{yaw_of, Disc, ShoreSpot};
 
 use super::trip::{Plan, PlanError};
 use crate::bot::motion::MotionStatus;
 use crate::bot::state::StateError;
 use crate::bot::vehicle::follow::{guide, Params};
-use crate::bot::vehicle::helm::{self, throttle, Cmd, Helm, Hull};
+use crate::bot::vehicle::helm::{self, throttle, wanted_speed, Cmd, Helm, Hull};
 use crate::bot::vehicle::{wrap_pi, Sailor, Track};
 use crate::bot::watch::classify::{refusal, skill_result, Refusal};
 use crate::bot::watch::Finding;
@@ -26,9 +27,10 @@ use super::super::{FailReason, GoalStatus};
 
 /// The server code the issue reports point at.
 const AREA: &str = "rust/crates/aaemu-game/src/systems/vehicles/";
-/// A boat must be at least this fast (m/s) to be worth the trip.
-pub const MIN_SPEED: f32 = 4.0;
-/// A trip (all phases) ends after this long.
+/// A boat must be at least this fast (m/s) to be worth the trip (the rowboat does 3.2).
+pub const MIN_SPEED: f32 = 2.5;
+/// A trip (all phases) ends after this long, or after eight minutes and two and a half times the
+/// time the planned route takes at top speed, if that is longer.
 const TRIP_LIMIT_MS: u64 = 40 * 60_000;
 /// A boat that was already there at the start must be gone within this long.
 const STALE_BOAT_MS: u64 = 15_000;
@@ -48,6 +50,10 @@ const MAX_RELAUNCH: u8 = 2;
 const BIND_REACH_M: f32 = 2.8;
 /// A closer reach after the server said the bot was too far.
 const BIND_REACH_CLOSE_M: f32 = 1.6;
+/// The same for a hull bigger than a rowboat, as the gap to the hull box (the server measures the
+/// reach to the box, less the bot's own radius).
+const HULL_REACH_M: f32 = 1.4;
+const HULL_REACH_CLOSE_M: f32 = 0.4;
 /// Pause between two binds.
 const BIND_RETRY_MS: u64 = 2500;
 /// Binds tried.
@@ -56,7 +62,8 @@ const MAX_BINDS: u8 = 3;
 const BOARD_LIMIT_MS: u64 = 60_000;
 /// `SCSlaveBound` seen, but no seat after this long: report it.
 const NO_ATTACH_MS: u64 = 3000;
-/// Wait for the first ship movement after the bind.
+/// Wait for the first ship movement after the bind (and the hull's portal time, during which the
+/// server ignores the helm).
 const FIRST_SAMPLE_MS: u64 = 6000;
 /// The log line about a sailing trip comes this often.
 const STATUS_MS: u64 = 60_000;
@@ -65,8 +72,12 @@ const STUCK_WINDOW_MS: u64 = 8000;
 const STUCK_MOVE_M: f32 = 3.0;
 /// Stuck episodes after which the trip is abandoned.
 const MAX_STUCK: u8 = 3;
-/// How long to back off after getting stuck.
+/// How long to back off after getting stuck (and a tenth of a second per metre of hull).
 const REVERSE_MS: u64 = 4000;
+/// The hull ran at this speed (m/s) a moment ago and now stands still with the engine on: it hit
+/// the ground or a wall (the server's `stuck` flag is never set).
+const IMPACT_SPEED: f32 = 1.5;
+const IMPACT_WINDOW_MS: u64 = 6000;
 /// The engine has run this long without any movement (and the server says nothing is wrong).
 const NO_THRUST_MS: u64 = 5000;
 /// Applied steering of at least this much with no turn at all for this long: the wheel is dead.
@@ -82,12 +93,8 @@ const DESPAWN_WAIT_MS: u64 = 8000;
 /// The way out of a failure: wait this long for the boat to be gone, and for the bot to be home.
 const ABORT_BOAT_MS: u64 = 12_000;
 const ABORT_HOME_MS: u64 = 120_000;
-/// The route following parameters (a rowboat needs 84 m to turn round at full speed).
-pub const PARAMS: Params = Params {
-    lookahead: 70.0,
-    reach: 40.0,
-    arrive: 18.0,
-};
+/// The route following parameters of the rowboat, which needs 84 m to turn round at full speed.
+pub const PARAMS: Params = Params::basic(70.0, 40.0, 18.0);
 
 /// The phases of a trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,10 +137,28 @@ pub struct Pick {
     pub skill: u32,
     /// The skill's cast time.
     pub cast_ms: u32,
-    /// The hull of the boat it summons.
-    pub hull: Hull,
-    /// That boat's top speed in m/s.
-    pub top_speed: f32,
+    /// The boat it summons.
+    pub class: ShipClass,
+}
+
+impl Pick {
+    /// The boat's hull, for the helm.
+    pub fn hull(&self) -> Hull {
+        Hull::of_class(&self.class)
+    }
+
+    /// The route following parameters of the boat: the rowboat's own, the hull's for the others.
+    pub fn params(&self) -> Params {
+        let hull = self.hull();
+        if self.class.size == HullSize::Small {
+            Params {
+                arrive: PARAMS.arrive.max(0.6 * self.class.length),
+                ..Params::for_hull(&hull, self.class.length, false)
+            }
+        } else {
+            Params::for_hull(&hull, self.class.length, true)
+        }
+    }
 }
 
 /// What the bot knows this tick.
@@ -239,7 +264,11 @@ pub struct Machine {
     cast_ms: u64,
     next_cast_ms: u64,
     casts: u8,
+    // trip
+    limit_ms: u64,
+    params: Params,
     // board
+    face_yaw: f32,
     approach_ms: u64,
     bind_ms: u64,
     binds: u8,
@@ -262,6 +291,7 @@ pub struct Machine {
     reverse_until_ms: u64,
     thrust_ms: u64,
     dead_wheel_ms: u64,
+    fast_ms: u64,
     sample_wait_ms: u64,
     // land
     brake_ms: u64,
@@ -328,6 +358,9 @@ impl Machine {
             danger: Vec::new(),
             tried: Vec::new(),
             relaunch: 0,
+            limit_ms: TRIP_LIMIT_MS,
+            params: PARAMS,
+            face_yaw: 0.0,
             gm_asked_ms: 0,
             stale_ms: 0,
             shore_tries: 0,
@@ -355,6 +388,7 @@ impl Machine {
             reverse_until_ms: 0,
             thrust_ms: 0,
             dead_wheel_ms: 0,
+            fast_ms: 0,
             sample_wait_ms: 0,
             brake_ms: 0,
             discard_ms: 0,
@@ -400,7 +434,7 @@ impl Machine {
     /// One tick.
     pub fn step(&mut self, io: &Input<'_>, acts: &mut Vec<Act>) -> Step {
         let now = io.now_ms;
-        if self.phase != Phase::Abort && now.saturating_sub(self.started_ms) > TRIP_LIMIT_MS {
+        if self.phase != Phase::Abort && now.saturating_sub(self.started_ms) > self.limit_ms {
             return self.abort(io, acts, FailReason::Timeout);
         }
         if self.phase.at_sea() {
@@ -484,13 +518,23 @@ impl Machine {
                     plan.launch.stand.0,
                     plan.launch.stand.1
                 )));
+                let sail_ms = (plan.route_m / io.pick.class.top_speed.max(0.5) * 2500.0) as u64;
+                self.limit_ms = TRIP_LIMIT_MS.max(8 * 60_000 + sail_ms);
                 self.plan = Some(plan);
                 self.shore_tries = 0;
                 self.enter(Phase::Shore, io.now_ms);
                 GoalStatus::Running
             }
-            Err(PlanError::NoCoast) => GoalStatus::Failed(FailReason::Other("no coast near")),
-            Err(PlanError::NoTrip) => GoalStatus::Failed(FailReason::Other("no trip from here")),
+            Err(PlanError::NoCoast) => {
+                acts.push(Act::Say(
+                    "sail: no launch beach with room for the boat near".into(),
+                ));
+                GoalStatus::Failed(FailReason::Other("no coast near"))
+            }
+            Err(PlanError::NoTrip) => {
+                acts.push(Act::Say("sail: no trip from here".into()));
+                GoalStatus::Failed(FailReason::Other("no trip from here"))
+            }
         }
     }
 
@@ -558,6 +602,8 @@ impl Machine {
                 // the scroll is gone (used by a cast the bot lost track of)
                 return GoalStatus::Failed(FailReason::Other("the scroll is gone"));
             };
+            // (the server lays the hull across the caster's view, bow to the caster's left)
+            self.face_yaw = yaw_of(water.0 - io.pos[0], water.1 - io.pos[1]);
             acts.push(Act::Pin);
             acts.push(Act::Summon {
                 skill: io.pick.skill,
@@ -624,7 +670,7 @@ impl Machine {
         self.tried.push(Disc {
             x: plan.launch.stand.0,
             y: plan.launch.stand.1,
-            r: 60.0,
+            r: 60.0 + io.pick.class.length,
         });
         self.relaunch += 1;
         if self.relaunch > MAX_RELAUNCH {
@@ -670,6 +716,8 @@ impl Machine {
             self.enter(Phase::Sail, now);
             self.sail_ms = now;
             self.sample_wait_ms = 0;
+            self.helm = Helm::new(io.pick.hull());
+            self.params = io.pick.params();
             acts.push(Act::StopMotion);
             acts.push(Act::Say(format!("sail: at the helm of boat {}", boat.obj)));
             return GoalStatus::Running;
@@ -743,13 +791,25 @@ impl Machine {
             // (the boat's place is not known yet: the summoner's record has not come)
             return GoalStatus::Running;
         };
-        let d = dist2(xy(io.pos), bpos);
-        if d > self.reach {
+        // a rowboat is reached at its middle; a bigger hull is boarded from its side: the
+        // server measures the bind reach to the hull box
+        let (d, aim, reach) = if io.pick.class.size == HullSize::Small {
+            (dist2(xy(io.pos), bpos), bpos, self.reach)
+        } else {
+            let (gap, near) = hull_gap(&io.pick.class, bpos, self.face_yaw, xy(io.pos));
+            let reach = if self.reach == BIND_REACH_CLOSE_M {
+                HULL_REACH_CLOSE_M
+            } else {
+                HULL_REACH_M
+            };
+            (gap, near, reach)
+        };
+        if d > reach {
             if now.saturating_sub(self.approach_ms) >= 1200 || self.approach_ms == 0 {
                 acts.push(Act::Travel {
-                    x: bpos.0,
-                    y: bpos.1,
-                    radius: 1.0,
+                    x: aim.0,
+                    y: aim.1,
+                    radius: 0.5,
                 });
                 self.approach_ms = now.max(1);
             }
@@ -810,7 +870,9 @@ impl Machine {
                     },
                     now,
                 );
-            } else if now - self.sample_wait_ms > FIRST_SAMPLE_MS {
+            } else if now - self.sample_wait_ms
+                > FIRST_SAMPLE_MS + u64::from(io.pick.class.portal_ms)
+            {
                 if self.once(once::NO_SAMPLE) {
                     acts.push(Act::Report(Box::new(issue(
                         IssueKind::NoResponse,
@@ -867,12 +929,15 @@ impl Machine {
             ));
         }
 
-        let g = guide(&self.route, &mut self.leg, here, &PARAMS);
+        let g = guide(&self.route, &mut self.leg, here, &self.params);
         self.dist_end = g.dist_end;
         if g.arrived {
             self.brake_ms = 0;
             self.enter(Phase::Land, now);
-            if self.top_seen < 0.75 * io.pick.top_speed && self.once(once::SLOW) {
+            if self.top_seen < 0.75 * io.pick.class.top_speed
+                && route_len(&self.route) > 600.0
+                && self.once(once::SLOW)
+            {
                 let template = io
                     .sailor
                     .and_then(|s| s.boat.as_ref())
@@ -882,12 +947,12 @@ impl Machine {
                         IssueKind::Other,
                         format!("sail:slow_boat:{}", io.pick.item),
                         "A boat is slower than its data says",
-                        "a top speed near ship_models.velocity * MoveSpeedMul / 2",
+                        "a top speed near ship_models.velocity * MoveSpeedMul^2 / 8",
                         format!(
                             "top speed seen {:.1} m/s over a trip of {:.0} m, the data says {:.1} m/s",
                             self.top_seen,
                             route_len(&self.route),
-                            io.pick.top_speed
+                            io.pick.class.top_speed
                         ),
                         Suspect::Unknown,
                     )
@@ -908,11 +973,12 @@ impl Machine {
         self.top_seen = self.top_seen.max(fwd);
         let err = wrap_pi(g.target_yaw - tr.cur.yaw);
         let rate = tr.yaw_rate();
+        let hull = io.pick.hull();
         let mut cmd = Cmd {
-            throttle: throttle(err, g.last_leg.then_some(g.dist_end), fwd),
+            throttle: throttle(fwd, wanted_speed(&hull, err, g.v_limit)),
             steering: self.helm.steer(err, rate, fwd),
         };
-        if self.helm.watch(now, err, cmd.steering) {
+        if self.helm.watch(now, err, cmd.steering, rate) {
             acts.push(Act::Say(format!(
                 "sail: the wheel turned the other way; steering sign {}",
                 self.helm.sign()
@@ -957,6 +1023,16 @@ impl Machine {
             return None;
         }
         let engine_on = tr.cur.throttle >= 40;
+        // the server never says the hull is aground: it ran, now it stands, with the engine on
+        let fwd = tr.cur.forward_speed();
+        if fwd >= IMPACT_SPEED {
+            self.fast_ms = now.max(1);
+        }
+        let impact = engine_on
+            && fwd < 0.25
+            && self.fast_ms != 0
+            && now - self.fast_ms <= IMPACT_WINDOW_MS
+            && now - self.fast_ms >= 500;
         // the engine runs and nothing moves, and the server does not say the hull is aground
         if engine_on && tr.cur.speed < 0.3 && !tr.cur.stuck {
             if self.thrust_ms == 0 {
@@ -986,8 +1062,13 @@ impl Machine {
         } else {
             self.thrust_ms = 0;
         }
-        let windowed = now.saturating_sub(self.win.1) >= STUCK_WINDOW_MS;
-        let aground = tr.cur.stuck;
+        let window_ms = if io.pick.class.size == HullSize::Small {
+            STUCK_WINDOW_MS
+        } else {
+            STUCK_WINDOW_MS + 4000
+        };
+        let windowed = now.saturating_sub(self.win.1) >= window_ms;
+        let aground = tr.cur.stuck || impact;
         if windowed || aground {
             let moved = dist2(here, self.win.0);
             self.win = (here, now);
@@ -1000,7 +1081,8 @@ impl Machine {
                     "sail: stuck at {:.0}, {:.0} (episode {}); backing off",
                     here.0, here.1, self.stuck
                 )));
-                self.reverse_until_ms = now + REVERSE_MS;
+                self.reverse_until_ms = now + REVERSE_MS + (io.pick.class.length * 100.0) as u64;
+                self.fast_ms = 0;
                 // the way may be blocked for good: plan again from here after the back-off
                 self.route.clear();
                 *cmd = Cmd {
@@ -1320,6 +1402,36 @@ fn boat_xy(io: &Input<'_>, s: &Sailor) -> Option<(f32, f32)> {
         .as_ref()
         .filter(|b| b.pos != [0.0; 3])
         .map(|b| xy(b.pos))
+}
+
+/// The gap in metres between a point and the box of a hull (`class`) whose origin is at
+/// `boat` and whose bow points along the heading `yaw + 90 degrees` of a caster facing `yaw`, and
+/// the point to swim to (the box's nearest point, a little outside it).
+pub(super) fn hull_gap(
+    class: &ShipClass,
+    boat: (f32, f32),
+    face_yaw: f32,
+    p: (f32, f32),
+) -> (f32, (f32, f32)) {
+    let yaw = face_yaw + std::f32::consts::FRAC_PI_2;
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let (rx, ry) = (yaw.cos(), yaw.sin());
+    let centre = (boat.0 + fx * class.center_y, boat.1 + fy * class.center_y);
+    let (ox, oy) = (p.0 - centre.0, p.1 - centre.1);
+    let (lx, ly) = (ox * rx + oy * ry, ox * fx + oy * fy);
+    let (hx, hy) = (class.beam / 2.0, class.length / 2.0);
+    let (cx, cy) = (lx.clamp(-hx, hx), ly.clamp(-hy, hy));
+    let gap = (lx - cx).hypot(ly - cy);
+    let near = (centre.0 + rx * cx + fx * cy, centre.1 + ry * cx + fy * cy);
+    if gap < 1e-3 {
+        return (0.0, near);
+    }
+    // a step outside the box along the line from the box to the bot
+    let k = 0.3 / gap;
+    (
+        gap,
+        (near.0 + (p.0 - near.0) * k, near.1 + (p.1 - near.1) * k),
+    )
 }
 
 fn route_len(r: &[(f32, f32)]) -> f32 {

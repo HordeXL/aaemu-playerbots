@@ -169,6 +169,8 @@ pub struct World {
     events: Events,
     /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
     water: OnceLock<Option<WaterMap>>,
+    /// The same for the large hulls (4.5 m of water), built at the first [`World::water_deep`].
+    water_deep: OnceLock<Option<WaterMap>>,
     /// Where the quests are, built at the first [`World::quest_atlas`].
     quest_atlas: OnceLock<QuestAtlas>,
     /// Spots inside each conflict zone group, built at the first [`World::zone_group_spots`].
@@ -297,6 +299,7 @@ impl World {
             travel,
             events,
             water: OnceLock::new(),
+            water_deep: OnceLock::new(),
             quest_atlas: OnceLock::new(),
             group_spots: OnceLock::new(),
         };
@@ -382,7 +385,12 @@ impl World {
             self.water
                 .get()
                 .and_then(Option::as_ref)
-                .map_or(0, WaterMap::bytes),
+                .map_or(0, WaterMap::bytes)
+                + self
+                    .water_deep
+                    .get()
+                    .and_then(Option::as_ref)
+                    .map_or(0, WaterMap::bytes),
         ));
         v.push((
             "quest atlas",
@@ -425,6 +433,37 @@ impl World {
                 Some(map)
             })
             .as_ref()
+    }
+
+    /// The sea mask for the large hulls ([`crate::travel::boat::DEEP_FLOOR_M`]: cells with 4.5 m of
+    /// water), built at the first call like [`World::water`].
+    pub fn water_deep(&self) -> Option<&WaterMap> {
+        self.water_deep
+            .get_or_init(|| {
+                let started = Instant::now();
+                let map = WaterMap::from_terrain(
+                    self.baked.terrain.as_ref()?,
+                    crate::travel::boat::DEEP_FLOOR_M,
+                );
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    sea_cells = map.sea_count(),
+                    kib = map.bytes() / 1024,
+                    "deep water map built"
+                );
+                Some(map)
+            })
+            .as_ref()
+    }
+
+    /// The sea mask a hull of `class` is planned on: [`World::water`] for the small and medium
+    /// hulls, [`World::water_deep`] for the large.
+    pub fn water_for(&self, class: &crate::travel::ShipClass) -> Option<&WaterMap> {
+        if class.sea_floor_m() < NAV_FLOOR_M {
+            self.water_deep()
+        } else {
+            self.water()
+        }
     }
 
     /// Terrain height at (x, y) from the baked grid; `None` without baked terrain or outside it.

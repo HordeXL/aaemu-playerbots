@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use aa_world::travel::boat::slave_kind;
+use aa_world::travel::ShipClass;
 use aa_world::{Vec3, World, WorldPaths};
 
 fn paths() -> Option<WorldPaths> {
@@ -509,7 +510,8 @@ fn boat_facts() {
         rowboat.move_speed_mul, 2.0,
         "+1000 flat MoveSpeedMul on a base of 1000"
     );
-    assert!((rowboat.top_speed() - 6.4).abs() < 1e-4);
+    // the body moves at speed * msm / 4 with the speed capped at velocity * msm / 2
+    assert!((rowboat.top_speed() - 3.2).abs() < 1e-4);
     assert_eq!(rowboat.max_hp, 6216);
     assert_eq!(rowboat.summon_range, 50);
 
@@ -517,7 +519,7 @@ fn boat_facts() {
     assert_eq!(&*clipper.name, "Clipper");
     assert_eq!((clipper.model, clipper.kind), (128, slave_kind::SPEEDBOAT));
     assert!(clipper.has_driver_seat() && clipper.passenger_seats() == 0);
-    assert!((clipper.top_speed() - 13.0).abs() < 1e-4);
+    assert!((clipper.top_speed() - 6.5).abs() < 1e-4);
 
     // only boats, and every scroll resolves
     for s in scrolls {
@@ -529,15 +531,164 @@ fn boat_facts() {
     let b = &w.travel().boats;
     assert_eq!(b.cheapest_scroll(0.0).map(|s| s.item), Some(17906));
     assert_eq!(
-        b.cheapest_scroll(7.0).map(|s| s.item),
+        b.cheapest_scroll(5.0).map(|s| s.item),
         Some(27266),
-        "the free clipper, 13 m/s"
+        "the free harpoon clipper, 6.5 m/s"
     );
     assert_eq!(
-        b.cheapest_scroll(14.0).map(|s| s.item),
+        b.cheapest_scroll(9.0).map(|s| s.item),
         Some(13711),
-        "the 19.6 m/s yawl"
+        "the 9.8 m/s yawl"
     );
+}
+
+/// The ship classes of the hulls the bots sail: the figures of `ship_models` and the kind's
+/// turn caps (`systems/ai/physics/ship.rs`) summed up.
+#[test]
+#[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+fn ship_classes() {
+    let Some(w) = load() else {
+        eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+        return;
+    };
+    let b = &w.travel().boats;
+    for t in b.slave_templates() {
+        let c = t.class();
+        println!(
+            "{:>4} {:<28} kind {:>2} {:?} top {:.1} m/s radius {:>4.0} m box {:.1} x {:.1} x {:.1}              draft {:.1} spawn {:.0}/{:.0} portal {} ms cannons {} racks {} seats {} clear {}",
+            t.id,
+            t.name,
+            t.kind,
+            c.size,
+            c.top_speed,
+            c.radius,
+            c.beam,
+            c.length,
+            c.height,
+            c.draft,
+            c.spawn_ahead,
+            c.spawn_side,
+            c.portal_ms,
+            c.cannons,
+            c.racks,
+            c.passengers,
+            c.route_clear()
+        );
+    }
+    let class = |id: u32| {
+        b.slave_template(id)
+            .unwrap_or_else(|| panic!("slave {id}"))
+            .class()
+    };
+    let near = |a: f32, b: f32, tol: f32| (a - b).abs() <= tol;
+    // rowboat 15: 3.2 m/s, 4.35 degrees a second
+    let r = class(15);
+    assert_eq!(r.size, aa_world::travel::HullSize::Small);
+    assert!(
+        near(r.top_speed, 3.2, 1e-3) && near(r.radius, 42.0, 1.0),
+        "{r:?}"
+    );
+    assert_eq!((r.spawn_ahead, r.portal_ms, r.passengers), (1.5, 0, 1));
+    // clipper 52 and the Adventurer's 76 (one cannon at point 10), harpoon clipper 14
+    let c = class(52);
+    assert!(
+        near(c.top_speed, 6.5, 1e-3) && near(c.radius, 64.0, 1.0),
+        "{c:?}"
+    );
+    assert_eq!((c.beam, c.length, c.height), (4.0, 8.0, 7.0));
+    assert_eq!((c.spawn_ahead, c.spawn_side, c.portal_ms), (5.0, 5.0, 7000));
+    assert_eq!(class(76).cannons, 1);
+    assert_eq!(class(76).spawn_ahead, 25.0);
+    assert_eq!(
+        b.slave_template(76)
+            .unwrap()
+            .cannon_points()
+            .collect::<Vec<_>>(),
+        vec![10]
+    );
+    assert_eq!(class(14).cannons, 0, "the harpoon gun is not a cannon");
+    // cutter 21 and junk 92: 8 cannons (points 9..=16), 4 pack racks (60..=63)
+    for id in [21, 92] {
+        let c = class(id);
+        assert_eq!(c.size, aa_world::travel::HullSize::Large, "{id}");
+        assert!(
+            near(c.top_speed, 6.3, 1e-3) && near(c.radius, 139.0, 1.0),
+            "{c:?}"
+        );
+        assert_eq!((c.beam, c.length, c.height), (6.5, 30.0, 14.5));
+        assert_eq!(
+            (c.spawn_ahead, c.spawn_side, c.portal_ms),
+            (30.0, 20.0, 7000)
+        );
+        assert_eq!((c.cannons, c.racks, c.passengers), (8, 4, 0), "{id}");
+        assert_eq!(c.route_clear(), 5);
+    }
+    assert_eq!(
+        b.slave_template(21)
+            .unwrap()
+            .cannon_points()
+            .collect::<Vec<_>>(),
+        (9..=16).collect::<Vec<u8>>()
+    );
+    assert_eq!(
+        b.slave_template(21).unwrap().rack_points(),
+        &[60, 61, 62, 63]
+    );
+    // yawl 24 and the Merchant Schooner 75: 2 cannons (points 9 and 10), 20 racks (60..=79)
+    let y = class(24);
+    assert!(
+        near(y.top_speed, 9.8, 1e-3) && near(y.radius, 216.0, 1.0),
+        "{y:?}"
+    );
+    let s = class(75);
+    assert!(
+        near(s.top_speed, 6.5, 1e-3) && near(s.radius, 143.0, 1.5),
+        "{s:?}"
+    );
+    assert_eq!((s.cannons, s.racks), (2, 20));
+    assert_eq!(
+        b.slave_template(75).unwrap().rack_points(),
+        (60..=79).collect::<Vec<u8>>()
+    );
+    // the constants the bots' tests use are these hulls
+    for (id, k) in [
+        (15, ShipClass::ROWBOAT),
+        (52, ShipClass::CLIPPER),
+        (21, ShipClass::CUTTER),
+    ] {
+        let c = class(id);
+        let same = |a: f32, b: f32| (a - b).abs() <= 0.01 * b.abs().max(1.0);
+        assert_eq!((c.slave, c.kind, c.size), (k.slave, k.kind, k.size), "{id}");
+        for (name, a, b) in [
+            ("top", c.top_speed, k.top_speed),
+            ("rate", c.turn_rate, k.turn_rate),
+            ("accel", c.turn_accel, k.turn_accel),
+            ("radius", c.radius, k.radius),
+            ("beam", c.beam, k.beam),
+            ("length", c.length, k.length),
+            ("height", c.height, k.height),
+            ("draft", c.draft, k.draft),
+            ("ahead", c.spawn_ahead, k.spawn_ahead),
+            ("side", c.spawn_side, k.spawn_side),
+            ("brake", c.brake, k.brake),
+            ("accel", c.accel, k.accel),
+            ("depth", c.box_depth, k.box_depth),
+        ] {
+            assert!(same(a, b), "{id} {name}: {a} vs {b}");
+        }
+        assert_eq!(
+            (c.portal_ms, c.cannons, c.racks, c.passengers),
+            (k.portal_ms, k.cannons, k.racks, k.passengers),
+            "{id}"
+        );
+    }
+    // the families resolve to a scroll each
+    for f in aa_world::travel::ShipFamily::ALL {
+        let s = b
+            .scroll_for(f, |_| 0)
+            .unwrap_or_else(|| panic!("no scroll for {}", f.name()));
+        println!("{:<9} -> item {} ({})", f.name(), s.item, s.name);
+    }
 }
 
 #[test]
