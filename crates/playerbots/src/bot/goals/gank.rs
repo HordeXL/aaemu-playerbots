@@ -958,6 +958,9 @@ impl Machine {
         let until = ctx.now_ms + crate::bot::goals::jitter_ms(ctx.rng, lo, hi);
         let mem = ctx.state.pvp_mut();
         mem.gank_next_ms = mem.gank_next_ms.max(until);
+        if let Some(line) = mem.standing() {
+            ctx.log.say(line);
+        }
     }
 }
 

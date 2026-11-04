@@ -54,6 +54,11 @@ const LEAVE_LEFT_S: i64 = 15;
 const UNKNOWN_LEFT_S: i64 = 600;
 /// Zone groups with a spot within this many metres are reachable on foot.
 const WALK_REACH_M: f32 = 3_500.0;
+/// A zone group has to have at least this many spots, and ...
+const MIN_LAND_SPOTS: usize = 8;
+/// ... at least this share (percent) of them has to be land the bot can stand on: the sea
+/// groups of the zone conflicts are for ships.
+const MIN_LAND_PCT: usize = 40;
 /// The goal gives up after this long (ms).
 const GOAL_MAX_MS: u64 = 45 * 60_000;
 /// A spot counts as reached this close (metres).
@@ -259,6 +264,12 @@ pub fn floor_pct(retreat_pct: u8) -> u8 {
     retreat_pct.saturating_add(20).clamp(20, 90)
 }
 
+/// Whether a zone group with these `spots` is land the bot can fight on.
+pub fn land_group(spots: &[[f32; 2]], ok: impl Fn([f32; 2]) -> bool) -> bool {
+    spots.len() >= MIN_LAND_SPOTS
+        && spots.iter().filter(|&&s| ok(s)).count() * 100 >= spots.len() * MIN_LAND_PCT
+}
+
 /// The `n` spots nearest to `from` that pass `ok`, nearest first, with their distances.
 pub fn nearest_spots<const N: usize>(
     spots: &[[f32; 2]],
@@ -344,6 +355,9 @@ fn wars(ctx: &Ctx<'_>) -> SmallVec<[War; 8]> {
             continue;
         }
         let spots = ctx.world.zone_group_spots(e.zone_group);
+        if !land_group(spots, standable(ctx.world)) {
+            continue;
+        }
         let Some(&(_, dist_m)) =
             nearest_spots::<1>(spots, [me[0], me[1]], standable(ctx.world)).first()
         else {
@@ -773,6 +787,9 @@ impl Machine {
         let until = ctx.now_ms + super::jitter_ms(ctx.rng, lo, hi);
         let mem = ctx.state.pvp_mut();
         mem.war_next_ms = mem.war_next_ms.max(until);
+        if let Some(line) = mem.standing() {
+            ctx.log.say(line);
+        }
     }
 }
 
@@ -876,6 +893,19 @@ mod tests {
         assert_eq!(d, [30.0, 50.0]);
         let n: SmallVec<[([f32; 2], f32); 2]> = nearest_spots(&[], [0.0, 0.0], |_| true);
         assert!(n.is_empty());
+    }
+
+    #[test]
+    fn only_land_groups_are_wars_for_a_bot_on_foot() {
+        let land: Vec<[f32; 2]> = (0..20).map(|i| [i as f32 * 256.0, 0.0]).collect();
+        assert!(land_group(&land, |_| true));
+        // a coast: 8 of 20 spots on land is still a land group, 7 is not
+        assert!(land_group(&land, |s| s[0] < 8.0 * 256.0));
+        assert!(!land_group(&land, |s| s[0] < 7.0 * 256.0));
+        // the open sea, and a group too small to patrol
+        assert!(!land_group(&land, |_| false));
+        assert!(!land_group(&land[..7], |_| true));
+        assert!(!land_group(&[], |_| true));
     }
 
     #[test]

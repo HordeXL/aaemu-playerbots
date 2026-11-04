@@ -175,6 +175,19 @@ impl PvpMem {
         })
     }
 
+    /// A line for the log with what the server last said about the bot's pvp standing, `None`
+    /// while it said nothing.
+    pub fn standing(&self) -> Option<String> {
+        (self.honor != 0 || self.hostile_kills != 0 || self.kills != 0 || self.deaths != 0).then(
+            || {
+                format!(
+                    "pvp: honor {}, hostile faction kills {}; killed {} and died {} times to characters",
+                    self.honor, self.hostile_kills, self.kills, self.deaths
+                )
+            },
+        )
+    }
+
     /// Kills made in the war of `zone_group` that ends at `end_unix_s`.
     pub fn war_kills(&self, zone_group: u16, end_unix_s: i64) -> u8 {
         self.wars
