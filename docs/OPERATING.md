@@ -374,7 +374,7 @@ max_per_player = 4           # ... and at most this many in one player's party
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `join_player_parties` | `false` | A bot accepts the invitation of a real player when it is idle enough. Off: the invitation is declined like any other stray one. |
-| `chat_commands` | `false` | The commands below, from the members of the bot's party, and a whisper "inv" from anyone. |
+| `chat_commands` | `false` | The commands below, from the members of the bot's party, and a whisper "inv" from anyone (the invitation it sends also needs `join_player_parties`). |
 | `follow_into_dungeons` | `false` | A bot in a player's party follows the leader through the doors of instance dungeons. |
 | `max_level_gap` | `10` | An invitation from a player whose level (when the bot can see it) is more than this far from the bot's own is declined; a bot also leaves when the leader is more than this plus five levels away. At least 1. |
 | `max_companions` | `8` | This process has at most this many bots in the parties of real players; more are declined. At most the number of bots. |
@@ -442,7 +442,9 @@ casts the entrance skill (the server puts a team member into the instance the te
 refusal is answered with `/level` when the bot may, `dungeon_level_up` and GM rights), follows and
 assists inside, and walks to the exit and casts it when the leader is out again. A dungeon it cannot
 enter (level, the three entries per four hours, refusals) is left alone and the leader is told
-once. A bot that leaves the party inside is moved out by the server after 15 seconds.
+once. The same happens when four entrance casts in a row load nothing (seen once, after a death and
+a respawn: the server took the cast and did nothing); the bot stands by and follows again when the
+leader is back. A bot that leaves the party inside is moved out by the server after 15 seconds.
 
 **Leaving.** A bot leaves when the leader tells it to, when no real player is left in the team, when
 the real players have been offline for three minutes, or when the levels drifted more than
