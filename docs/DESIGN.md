@@ -250,11 +250,24 @@ facts, the provenance ledger and the chat forwarding.
 | --- | --- | --- |
 | `Auction` goal, `goals::auction::{base_weight, score}`, `AuctionMemory` (`BotState::market`, `Inner::auction`) | `bot/goals/auction.rs`, `bot/market/auction.rs` | auction house |
 | `Market` goal, `goals::market::{base_weight, score}`, `AdState` (`Inner::ads`) fed by `AdState::on_chat` | `bot/goals/market.rs`, `bot/market/ads.rs`, `bot/goals/trade*` | trade-chat sales |
-| `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` | `aa-world` `items.rs` | shared (done) |
+| `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories and the quest-item flag of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` (sellable, unbound, not a quest item) | `aa-world` `items.rs` | shared (done) |
 | `Ledger` (`MarketState::clean_count`, `sellable_surplus`): the quantity of each item the bot may sell, fed by `BotState::apply` from the item task reasons | `bot/market/ledger.rs`, `bot/state.rs` | shared (done) |
+| `QuestNeeds::of(world, &state.quests)`: what the active quests still ask of each item (gather and use objectives), the part of the bag the sale paths keep back | `bot/market/needs.rs` | shared (done) |
 | `MarketState::on_chat(kind, sender, text, now_ms)`: shouts, trade chat, group-finding chat and whispers, forwarded by the social duty before it files the inbox (`market::forward_chat`; which kinds: `ads::hears`) | `bot/market/`, `bot/goals/social.rs` | shared (done), kinds are the market feature's |
 | `[behavior] lifelike`, `jump_rate`, `emotes` | `config.rs` | life-like movement (done, see below) |
 | `[market]` | `config.rs`, `Config::may_sell_to_players` | shared (done) |
+
+**What may change hands.** Every path that sells, asks for, buys or gives an item away goes through
+`ItemFacts::tradable()`, and the paths that part with the bot's own goods also keep back
+`QuestNeeds`: the sellable surplus (`Ledger::sellable_surplus`, behind the chat ads, the chat deals
+and the auction listings), the trade-chat name index (`ads::names::global`), the WTB goods
+(`goals::market::duty::wanted_goods`), the stand-in offers of random trades
+(`goals::trade::choose_offer`, rule `keep_of`: unknown items are not offered) and the auction
+buys (`auction::Env::tradable`). A quest item is detected from the compact database when the
+item table loads (the quest item category, quest-only loot, and the items the quest tables hand
+out except in the reward step); quest gather and use targets are ordinary materials and only
+count in `QuestNeeds`. A chat deal re-checks `QuestNeeds` when the meeting starts, since a quest
+taken since may need the goods.
 
 `MarketState` is one pointer per bot (`Option<Box<Inner>>`, allocated by the first gain the ledger
 counts), because the per-bot budget is tight (`size_of::<Bot>() < 3200`). The brain scores
