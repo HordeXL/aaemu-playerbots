@@ -599,6 +599,13 @@ goal and nudge its weight; the goal itself is another feature. The economy treat
 line as a quarter of a player's so that the bots' stand-in advertisements do not drive the
 scarcity they then react to.
 
+**Tests.** The census, economy, director, selector, view and server-API parser have unit tests next to
+the code; the web crate's `tests/api.rs` drives the new endpoints against a mocked hub; the
+supervisor tests cover filtered spawn, despawn and roster growth. `tests/population_real_data.rs`
+(ignored, needs `AA_COMPACT` and `AA_SERVER_DATA` like the other real-data tests) checks the sides
+and continents of real factions and zones, the census through a real hub, the filtered commands and
+the policy.
+
 ## Data directory
 
 `playerbots bake` writes (see `docs/DATA-FORMATS.md`):

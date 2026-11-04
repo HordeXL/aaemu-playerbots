@@ -570,7 +570,8 @@ impl Hub {
         let every_race: Vec<u8> = (1..=8).collect();
         if sel.races(&every_race).is_empty() {
             return Err(
-                "no race matches that filter: Nuian and Elf (Nuia) start on the west continent,                  Hariharan and Ferre (Haranya) on the east continent"
+                "no race matches that filter: the Nuia races start on the west continent, \
+                 the Haranya races on the east continent"
                     .to_string(),
             );
         }

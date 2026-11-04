@@ -557,7 +557,8 @@ pub struct HealthView {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct ActionRecord {
     pub at_ms: u64,
-    /// `spawn`, `despawn`, `hold`, `policy`, `wish`.
+    /// `spawn`, `despawn`, `hold`, `policy`, `wish`, `result` (what the supervisor did with the
+    /// order of the line before).
     pub kind: String,
     pub alliance: Alliance,
     pub count: u32,
