@@ -156,6 +156,33 @@ fn a_created_guild_is_read() {
 }
 
 #[test]
+fn the_list_of_guilds_is_read() {
+    // SCFactionListPacket: u8 n, n x faction
+    let mut body = vec![2u8];
+    body.extend(faction(5, 101, "Silent Wardens", 33, "Anna", 1_700_000_001));
+    body.extend(faction(6, 115, "Iron Pilgrims", 40, "Dov", 1_700_000_002));
+    match event(op::SCFactionListPacket, &body) {
+        GuildEvent::Factions(list) => {
+            assert_eq!(list.len(), 2);
+            assert_eq!((list[0].id, &*list[0].name), (5, "Silent Wardens"));
+            assert_eq!(
+                (list[1].id, list[1].mother_id, &*list[1].name),
+                (6, 115, "Iron Pilgrims")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // the empty list the server sends to a character that has none to show
+    match event(op::SCFactionListPacket, &[0]) {
+        GuildEvent::Factions(list) => assert!(list.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    // a count that does not fit the bytes is an error
+    assert!(parse(LEVEL_GAME, op::SCFactionListPacket, &[200, 1, 2]).is_err());
+    assert_eq!(op::SCFactionListPacket, 0x008);
+}
+
+#[test]
 fn a_member_list_chunk_is_read() {
     // SCExpeditionMemberListPacket: u32 total, u8 n, u32 id, members
     let mut body = cat(&[&le32(21), &[2], &le32(5)]);

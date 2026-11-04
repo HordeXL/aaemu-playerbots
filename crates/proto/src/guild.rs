@@ -228,6 +228,10 @@ pub struct MemberBrief {
 /// A packet about guilds. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuildEvent {
+    /// `SCFactionList` (0x008): guilds that exist, `u8 n` and `n` factions, at most 20 a packet
+    /// (`X/expedition.rs:491`). Sent at enter-world (all guilds, in chunks) and to everybody
+    /// when a guild is founded (that one).
+    Factions(Box<[FactionBrief]>),
     /// `SCFactionCreated` (0x013): the guild the sender founded exists. `faction`, `bc owner
     /// object`, `u8 n`, `n x (bc object, u32 character, str name)` (`X/expedition.rs:708`,
     /// `X/packets/expedition.rs:73`). Sent to the founder only.
@@ -317,6 +321,9 @@ pub enum GuildEvent {
 /// The smallest `ExpeditionMember.Write`: empty strings.
 const MIN_MEMBER_LEN: usize = 4 + 4 + 1 + 1 + 8 + 2 + 1 + 4 + 4 + 3 + 1 + 8 + 8 + 4 + 2 + 8;
 
+/// The smallest `write_system_faction`: empty strings.
+const MIN_FACTION_LEN: usize = 4 + 1 + 4 + 2 + 4 + 2 + 1 + 1 + 8 + 1 + 1;
+
 fn read_member(s: &mut PacketStream) -> Result<MemberBrief, MarshalError> {
     let guild = s.read_u32()?;
     let char_id = s.read_u32()?;
@@ -376,6 +383,21 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<GuildEvent>, 
         return Ok(None);
     }
     let read: Reader = match opcode {
+        sc::SCFactionListPacket => |s| {
+            let n = usize::from(s.read_u8()?);
+            if n.saturating_mul(MIN_FACTION_LEN) > s.remaining() {
+                return Err(MarshalError::EndOfStream {
+                    pos: s.pos(),
+                    wanted: n.saturating_mul(MIN_FACTION_LEN),
+                    len: s.len(),
+                });
+            }
+            let mut list = Vec::with_capacity(n);
+            for _ in 0..n {
+                list.push(read_faction(s)?);
+            }
+            Ok(GuildEvent::Factions(list.into_boxed_slice()))
+        },
         sc::SCFactionCreatedPacket => |s| {
             let faction = Box::new(read_faction(s)?);
             Ok(GuildEvent::Created {
