@@ -91,6 +91,33 @@ pub struct BotSnapshot {
     pub has_house: bool,
     pub online_secs: u32,
     pub paused: bool,
+    /// The guild (expedition) the bot belongs to, with its members; none for a bot in no guild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guild: Option<Box<GuildInfo>>,
+}
+
+/// The guild of a bot as its web snapshot shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GuildInfo {
+    /// The guild id.
+    pub id: u32,
+    pub name: String,
+    /// The bot's own rank: "General" (the owner), "Commander", "Officer", "Member", "Apprentice".
+    pub role: String,
+    /// The members the bot knows, the owner first.
+    pub members: Vec<GuildMember>,
+}
+
+/// A member of a guild.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GuildMember {
+    pub name: String,
+    /// Rank, as in [`GuildInfo::role`].
+    pub role: String,
+    pub level: u8,
+    pub online: bool,
+    /// One of our bots (else a real player).
+    pub bot: bool,
 }
 
 /// One line of a bot's event log.
