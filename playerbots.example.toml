@@ -97,6 +97,13 @@ jump_rate = 1.0
 # Emotes (a wave, a bow, a sit) in life-like moments.
 emotes = true
 
+[sail]
+# The boat the sailing goal uses: "rowboat" (default), "clipper", "cutter", "junk", "yawl",
+# "schooner" or "auto" (the boat whose scroll the bot holds, else a boat of its own). Needs
+# gm_bootstrap or the scroll in the bag. The bigger boats need more room: a cutter is launched
+# from a beach with deep water, sails wide of the coast and berths out at sea.
+ship = "rowboat"
+
 [market]
 # Selling what the bots gather: auction listings, trade-chat advertisements and sales to players.
 # Only goods the bots came by honestly are sold (looted, gathered, crafted, quest rewards, bought

@@ -7,13 +7,14 @@ use std::cell::RefCell;
 
 use aa_proto::sc_travel::{error_message as emsg, MySlaveInfo};
 use aa_proto::sc_world::WorldEvent;
+use aa_world::travel::ShipClass;
 use aa_world::water::{find_shore, yaw_of, Disc, ShoreSpot, WaterMap};
 
-use super::machine::{Act, Input, Machine, Ops, Phase, Pick};
+use super::machine::{hull_gap, Act, Input, Machine, Ops, Phase, Pick};
 use super::trip::{plan_trip, sail_route, Plan, PlanError, TripCfg};
 use crate::bot::motion::MotionStatus;
 use crate::bot::state::StateError;
-use crate::bot::vehicle::helm::{Cmd, Hull};
+use crate::bot::vehicle::helm::Cmd;
 use crate::bot::vehicle::sim::Plant;
 use crate::bot::vehicle::VehicleState;
 use crate::bot::watch::classify::skill_result;
@@ -41,29 +42,73 @@ fn is_land(c: i32, _r: i32) -> bool {
 }
 
 fn ground(x: f32, y: f32) -> Option<f32> {
+    ground_in(&NARROW, x, y)
+}
+
+/// A synthetic sea: `cols` x `rows` cells of 16 m, land where `land` says, the bot starts at `start`.
+#[derive(Clone, Copy)]
+struct Sea {
+    cols: i32,
+    rows: i32,
+    land: fn(i32, i32) -> bool,
+    start: [f32; 3],
+}
+
+/// The sea of most tests: 1600 x 960 m between two coasts.
+const NARROW: Sea = Sea {
+    cols: 100,
+    rows: 60,
+    land: is_land,
+    start: [60.0, 480.0, 110.0],
+};
+
+/// A wide sea of 3520 x 3200 m between two coasts (cols 0..=7 and 212..) with a wall of land from
+/// row 50 to the north edge in the middle: a trip from the west coast north of the wall's end to
+/// the east coast has to round its southern end.
+const WIDE: Sea = Sea {
+    cols: 220,
+    rows: 200,
+    land: wide_land,
+    start: [60.0, 1300.0, 110.0],
+};
+
+fn wide_land(c: i32, r: i32) -> bool {
+    c <= 7 || c >= 212 || ((100..=108).contains(&c) && r >= 50)
+}
+
+fn ground_in(sea: &Sea, x: f32, y: f32) -> Option<f32> {
     let (c, r) = ((x / 16.0).floor() as i32, (y / 16.0).floor() as i32);
-    if !(0..100).contains(&c) || !(0..60).contains(&r) {
+    if !(0..sea.cols).contains(&c) || !(0..sea.rows).contains(&r) {
         return None;
     }
-    Some(if is_land(c, r) { 110.0 } else { 50.0 })
+    Some(if (sea.land)(c, r) { 110.0 } else { 50.0 })
 }
 
 const SHORT: TripCfg = TripCfg {
     launch_m: 900.0,
     min_m: 700.0,
     max_m: 1300.0,
+    ship: ShipClass::ROWBOAT,
 };
 
 struct TestOps {
     map: WaterMap,
+    sea: Sea,
     rng: RefCell<fastrand::Rng>,
     cfg: TripCfg,
 }
 
 impl TestOps {
     fn new(seed: u64) -> TestOps {
+        TestOps::on(NARROW, seed)
+    }
+
+    fn on(sea: Sea, seed: u64) -> TestOps {
         TestOps {
-            map: WaterMap::from_cells((0.0, 0.0), 100, 60, |c, r| !is_land(c as i32, r as i32)),
+            map: WaterMap::from_cells((0.0, 0.0), sea.cols as u32, sea.rows as u32, |c, r| {
+                !(sea.land)(c as i32, r as i32)
+            }),
+            sea,
             rng: RefCell::new(fastrand::Rng::with_seed(seed)),
             cfg: SHORT,
         }
@@ -78,7 +123,7 @@ impl Ops for TestOps {
     fn plan(&self, from: (f32, f32), avoid: &[Disc]) -> Result<Plan, PlanError> {
         plan_trip(
             &self.map,
-            &ground,
+            &|x, y| ground_in(&self.sea, x, y),
             &mut self.rng.borrow_mut(),
             from,
             &self.cfg,
@@ -87,15 +132,21 @@ impl Ops for TestOps {
     }
 
     fn route(&self, start: (f32, f32), plan: &Plan, avoid: &[Disc]) -> Option<Vec<(f32, f32)>> {
-        sail_route(&self.map, start, plan, avoid)
+        sail_route(&self.map, start, plan, avoid, &self.cfg.ship)
     }
 
     fn shore_near(&self, from: (f32, f32), max_r: f32) -> Option<ShoreSpot> {
-        find_shore(&self.map, &ground, from, max_r, &[])
+        find_shore(
+            &self.map,
+            &|x, y| ground_in(&self.sea, x, y),
+            from,
+            max_r,
+            &[],
+        )
     }
 
     fn ground(&self, x: f32, y: f32) -> Option<f32> {
-        ground(x, y)
+        ground_in(&self.sea, x, y)
     }
 }
 
@@ -128,6 +179,8 @@ struct Script {
     dead_engine: bool,
     /// The hull cannot get past this x (it is aground there).
     wall_x: Option<f32>,
+    /// The server does not say the hull is aground (it never does).
+    silent_wall: bool,
 }
 
 enum Later {
@@ -149,6 +202,14 @@ struct Rig {
     /// Metres the boat sailed and the farthest it was from where it started.
     travelled: f32,
     farthest: f32,
+    /// Ticks the hull's box was not over the sea, the top speed reached, and the speed at the
+    /// last tick before the helm was left.
+    aground: u32,
+    top_seen: f32,
+    last_speed: f32,
+    /// When the hull first ran into the wall, and when the machine said it was stuck.
+    hit_ms: u64,
+    stuck_ms: u64,
     script: Script,
     ops: TestOps,
     pick: Pick,
@@ -165,7 +226,11 @@ struct Rig {
 
 impl Rig {
     fn new(script: Script, seed: u64) -> Rig {
-        let start = [60.0, 480.0, 110.0];
+        Rig::on(NARROW, script, seed)
+    }
+
+    fn on(sea: Sea, script: Script, seed: u64) -> Rig {
+        let start = sea.start;
         Rig {
             now: 1000,
             m: Machine::new(1000, start),
@@ -179,13 +244,17 @@ impl Rig {
             plant: None,
             travelled: 0.0,
             farthest: 0.0,
-            ops: TestOps::new(seed),
+            aground: 0,
+            top_seen: 0.0,
+            last_speed: 0.0,
+            hit_ms: 0,
+            stuck_ms: 0,
+            ops: TestOps::on(sea, seed),
             pick: Pick {
                 item: SCROLL,
                 skill: SKILL,
                 cast_ms: CAST_MS,
-                hull: Hull::ROWBOAT,
-                top_speed: 6.4,
+                class: ShipClass::ROWBOAT,
             },
             later: Vec::new(),
             casts: 0,
@@ -197,6 +266,17 @@ impl Rig {
             says: Vec::new(),
             script,
         }
+    }
+
+    /// A rig that sails a boat of `class` (a bigger hull than the rowboat).
+    fn with_class(script: Script, seed: u64, class: ShipClass) -> Rig {
+        let mut rig = Rig::new(script, seed);
+        rig.pick.class = class;
+        rig.ops.cfg = TripCfg {
+            ship: class,
+            ..SHORT
+        };
+        rig
     }
 
     fn seated(&self) -> bool {
@@ -333,8 +413,16 @@ impl Rig {
                             p.speed = 0.0;
                         }
                     }
+                    self.top_seen = self.top_seen.max(p.speed);
+                    self.last_speed = p.speed;
+                    if !hull_over_sea(&self.ops.map, &self.pick.class, p.pos, p.yaw) {
+                        self.aground += 1;
+                    }
                     let mut m = p.motion(BOAT);
-                    m.stuck = wall.is_some_and(|w| p.pos.0 >= w);
+                    m.stuck = !self.script.silent_wall && wall.is_some_and(|w| p.pos.0 >= w);
+                    if wall.is_some_and(|w| p.pos.0 >= w) && self.hit_ms == 0 {
+                        self.hit_ms = self.now;
+                    }
                     self.veh.on_event(&WorldEvent::ShipMoved(Box::new(m)), ME);
                 }
                 self.pos = [p.pos.0, p.pos.1, 100.5];
@@ -353,6 +441,26 @@ impl Rig {
             self.script.sign
         };
         let mut plant = Plant::new(self.yaw, sign).at(at.0, at.1);
+        let class = self.pick.class;
+        if class.size != aa_world::travel::HullSize::Small {
+            // the hull is laid across the caster's view, bow to the caster's left, on the first
+            // spot of the server's search that has room for it
+            let depth = if class.size == aa_world::travel::HullSize::Medium {
+                super::trip::LAUNCH_DEPTH_MEDIUM_M
+            } else {
+                super::trip::LAUNCH_DEPTH_LARGE_M
+            };
+            let sea = self.ops.sea;
+            let at = aa_world::water::launch_ok(
+                &self.ops.map,
+                &|x, y| ground_in(&sea, x, y),
+                &plan.launch,
+                &class.launch_req(depth),
+            )
+            .expect("the planner launched from a spot with room for the hull");
+            plant = Plant::of_class(&class, wrap(self.yaw + std::f32::consts::FRAC_PI_2), sign)
+                .at(at.0, at.1);
+        }
         if self.script.dead_engine {
             plant = plant.top(0.0);
         }
@@ -376,7 +484,11 @@ impl Rig {
                 template: 3,
                 hp: 100,
                 max_hp: 100,
-                pos: (at.0, at.1, 100.5),
+                pos: (
+                    self.plant.as_ref().map_or(at.0, |p| p.pos.0),
+                    self.plant.as_ref().map_or(at.1, |p| p.pos.1),
+                    100.5,
+                ),
             })),
             ME,
         );
@@ -394,7 +506,12 @@ impl Rig {
     fn apply(&mut self, acts: Vec<Act>) {
         for act in acts {
             match act {
-                Act::Say(s) => self.says.push(s),
+                Act::Say(s) => {
+                    if s.contains("stuck at") && self.stuck_ms == 0 {
+                        self.stuck_ms = self.now;
+                    }
+                    self.says.push(s);
+                }
                 Act::Gm(line) => {
                     self.gm_lines += 1;
                     if self.script.gm
@@ -436,8 +553,14 @@ impl Rig {
                             .push((self.now + 100, StateError::Msg(emsg::TOO_FAR_AWAY)));
                         continue;
                     }
+                    let class = self.pick.class;
                     let near = self.plant.as_ref().is_some_and(|p| {
-                        (p.pos.0 - self.pos[0]).hypot(p.pos.1 - self.pos[1]) <= 4.0
+                        if class.size == aa_world::travel::HullSize::Small {
+                            (p.pos.0 - self.pos[0]).hypot(p.pos.1 - self.pos[1]) <= 4.0
+                        } else {
+                            // (the server measures to the hull box)
+                            hull_gap(&class, p.pos, self.yaw, (self.pos[0], self.pos[1])).0 <= 3.0
+                        }
                     });
                     if !near {
                         self.errors
@@ -485,6 +608,26 @@ impl Rig {
             }
         }
     }
+}
+
+/// An angle wrapped to `(-pi, pi]`.
+fn wrap(a: f32) -> f32 {
+    crate::bot::vehicle::wrap_pi(a)
+}
+
+/// Whether the hull box of `class` at `pos` heading `yaw` lies over sea cells (nine points).
+fn hull_over_sea(map: &WaterMap, class: &ShipClass, pos: (f32, f32), yaw: f32) -> bool {
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let (rx, ry) = (yaw.cos(), yaw.sin());
+    [-1.0f32, 0.0, 1.0].iter().all(|a| {
+        [-1.0f32, 0.0, 1.0].iter().all(|b| {
+            let (l, w) = (a * class.length / 2.0, b * class.beam / 2.0);
+            map.sea_at(
+                pos.0 + fx * (l + class.center_y) + rx * w,
+                pos.1 + fy * (l + class.center_y) + ry * w,
+            )
+        })
+    })
 }
 
 fn working() -> Script {
@@ -573,8 +716,8 @@ fn a_loop_goes_out_to_sea_and_comes_back_to_the_beach() {
 #[test]
 fn a_boat_slower_than_its_data_is_reported_once() {
     let mut rig = Rig::new(working(), 5);
-    // the data says 12.8 m/s; the hull does 6.4
-    rig.pick.top_speed = 12.8;
+    // the data says 6.4 m/s; the hull does 3.2
+    rig.pick.class.top_speed = 6.4;
     assert_eq!(rig.run(TRIP_MS), GoalStatus::Done);
     assert_eq!(rig.keys, [format!("sail:slow_boat:{SCROLL}")]);
 }
@@ -1019,4 +1162,131 @@ fn a_trip_that_runs_too_long_is_given_up() {
     );
     let st = rig.run(300_000);
     assert!(matches!(st, GoalStatus::Failed(_)), "{st:?}");
+}
+
+// ---- bigger hulls ------------------------------------------------------------------------------------
+
+/// The hulls of the real data (see `ShipClass`), by name.
+fn hulls() -> [(&'static str, ShipClass); 2] {
+    [
+        ("clipper", ShipClass::CLIPPER),
+        ("cutter", ShipClass::CUTTER),
+    ]
+}
+
+#[test]
+fn a_clipper_and_a_cutter_sail_a_trip_without_touching_the_shore() {
+    for (name, class) in hulls() {
+        for (seed, sign) in [(1, 1), (2, -1), (3, 1)] {
+            let mut rig = Rig::with_class(Script { sign, ..working() }, seed, class);
+            let st = rig.run(TRIP_MS);
+            assert_eq!(st, GoalStatus::Done, "{name} seed {seed}: {:?}", rig.says);
+            assert!(rig.gone(), "{name} seed {seed}: boat or seat left behind");
+            assert_eq!(rig.aground, 0, "{name} seed {seed}: hull over land");
+            assert!(rig.keys.is_empty(), "{name} seed {seed}: {:?}", rig.keys);
+            assert!(rig.finds.is_empty());
+            assert!(
+                !rig.says.iter().any(|s| s.contains("stuck")),
+                "{name} seed {seed}: {:?}",
+                rig.says
+            );
+            // the hull reached its real top speed and was almost stopped at the berth
+            assert!(
+                rig.top_seen > 0.85 * class.top_speed && rig.top_seen < 1.05 * class.top_speed,
+                "{name} seed {seed}: top speed {} of {}",
+                rig.top_seen,
+                class.top_speed
+            );
+            assert!(
+                rig.last_speed < 1.5,
+                "{name} seed {seed}: {}",
+                rig.last_speed
+            );
+            // the bot swam to the landing's stand point
+            let plan = rig.m.plan().unwrap().clone();
+            let d = (rig.pos[0] - plan.landing.stand.0).hypot(rig.pos[1] - plan.landing.stand.1);
+            assert!(d < 6.0, "{name} seed {seed}: {d:.1} m from the landing");
+            // the hull berthed out at sea, clear of the beach by the planner's margin
+            let berth = plan.moor;
+            assert!(rig
+                .ops
+                .map
+                .open_at(berth.0, berth.1, rig.ops.cfg.plan_clear()));
+            assert_eq!(rig.m.helm().sign(), sign, "{name} seed {seed}");
+        }
+    }
+}
+
+#[test]
+fn a_big_hull_is_launched_where_the_server_has_room_for_it() {
+    let mut rig = Rig::with_class(working(), 3, ShipClass::CUTTER);
+    assert_eq!(rig.run(TRIP_MS), GoalStatus::Done, "{:?}", rig.says);
+    let plan = rig.m.plan().unwrap().clone();
+    // the launch is a beach whose water runs on for the hull: the planner's own finder agrees
+    let req = ShipClass::CUTTER.launch_req(super::trip::LAUNCH_DEPTH_LARGE_M);
+    assert!(
+        aa_world::water::launch_ok(&rig.ops.map, &ground, &plan.launch, &req).is_some(),
+        "{:?}",
+        plan.launch
+    );
+    // the boat was summoned and boarded from its side: the bot bound within the box's reach
+    assert!(rig.says.iter().any(|s| s.contains("at the helm")));
+}
+
+#[test]
+fn a_big_hull_stops_dead_and_backs_off_at_once_without_the_servers_stuck_flag() {
+    // the server never says a hull is aground; a hull that ran and now stands with its engine on is
+    for (name, class) in hulls() {
+        let mut rig = Rig::with_class(
+            Script {
+                wall_x: Some(700.0),
+                silent_wall: true,
+                ..working()
+            },
+            4,
+            class,
+        );
+        let st = rig.run(TRIP_MS);
+        assert_eq!(
+            st,
+            GoalStatus::Failed(FailReason::Stuck),
+            "{name}: {:?}",
+            rig.says
+        );
+        assert!(rig.hit_ms > 0 && rig.stuck_ms > rig.hit_ms, "{name}");
+        let reaction = rig.stuck_ms - rig.hit_ms;
+        assert!(
+            reaction < 4000,
+            "{name}: {reaction} ms from the impact to backing off"
+        );
+        assert!(rig.gone());
+    }
+}
+
+#[test]
+fn a_cutter_rounds_the_end_of_a_wall_inside_the_water() {
+    // the route from the west coast to the east coast goes round the southern end of the wall
+    let mut rounded = 0;
+    for seed in 0..6 {
+        let mut rig = Rig::on(WIDE, working(), seed);
+        rig.pick.class = ShipClass::CUTTER;
+        rig.ops.cfg = TripCfg {
+            min_m: 2200.0,
+            max_m: 4200.0,
+            ship: ShipClass::CUTTER,
+            ..SHORT
+        };
+        let st = rig.run(60 * 60_000);
+        assert_eq!(st, GoalStatus::Done, "seed {seed}: {:?}", rig.says);
+        assert_eq!(rig.aground, 0, "seed {seed}: hull over land");
+        assert!(rig.keys.is_empty(), "seed {seed}: {:?}", rig.keys);
+        assert!(rig.gone());
+        let plan = rig.m.plan().unwrap().clone();
+        if plan.landing.stand.0 > 3000.0 {
+            rounded += 1;
+            // it went down to the passage below the wall and back up on the other side
+            assert!(rig.travelled > 1.05 * (plan.landing.stand.0 - plan.launch.stand.0));
+        }
+    }
+    assert!(rounded > 0, "no seed crossed the wall's end");
 }

@@ -30,6 +30,8 @@ pub struct Config {
     pub bots: BotsCfg,
     /// Goal weights.
     pub behavior: BehaviorCfg,
+    /// Sailing: which boat the bots sail.
+    pub sail: SailCfg,
     /// Selling: the auction house, trade-chat advertisements, buyers.
     pub market: MarketCfg,
     /// Guilds (expeditions): bots found, join and run them.
@@ -255,6 +257,54 @@ impl Default for BehaviorCfg {
             emotes: true,
         }
     }
+}
+
+/// Which boat a bot sails (`[sail] ship`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShipChoice {
+    /// The rowboat (3.2 m/s, one passenger).
+    #[default]
+    Rowboat,
+    /// The clipper (6.5 m/s, driver only).
+    Clipper,
+    /// The Eznan cutter (6.3 m/s, 8 cannons, 4 pack racks).
+    Cutter,
+    /// The Lutesong junk (the cutter's hull).
+    Junk,
+    /// The Growling yawl (9.8 m/s).
+    Yawl,
+    /// The Merchant Schooner (6.5 m/s, 2 cannons, 20 pack racks).
+    Schooner,
+    /// A bot sails the boat whose scroll it holds, else each bot has a boat of its own: mostly
+    /// rowboats and clippers, some cutters, junks and schooners (merchants like the schooner).
+    Auto,
+}
+
+impl ShipChoice {
+    /// The hull family of a fixed choice; `None` for `auto`.
+    pub fn family(self) -> Option<aa_world::travel::ShipFamily> {
+        use aa_world::travel::ShipFamily as F;
+        match self {
+            ShipChoice::Rowboat => Some(F::Rowboat),
+            ShipChoice::Clipper => Some(F::Clipper),
+            ShipChoice::Cutter => Some(F::Cutter),
+            ShipChoice::Junk => Some(F::Junk),
+            ShipChoice::Yawl => Some(F::Yawl),
+            ShipChoice::Schooner => Some(F::Schooner),
+            ShipChoice::Auto => None,
+        }
+    }
+}
+
+/// `[sail]`: the boats of the sailing goal (switched on and off by `[behavior] sailing`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SailCfg {
+    /// The boat the bots sail: `rowboat` (default), `clipper`, `cutter`, `junk`, `yawl`,
+    /// `schooner` or `auto`. With `bots.gm_bootstrap` a bot gets the scroll with the GM
+    /// `/item add` command; without, it needs the scroll in its bag.
+    pub ship: ShipChoice,
 }
 
 /// Where a bot meets the buyer of something it advertised.
