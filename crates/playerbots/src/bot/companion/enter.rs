@@ -157,7 +157,8 @@ pub struct Facts {
     pub door_in_view: bool,
     /// The walk of the bot failed (stuck or timed out).
     pub trip_failed: bool,
-    /// The refusal the server sent since the last cast.
+    /// The refusal the server sent since the last cast or level raise (the glue forgets the
+    /// older ones, else a raise would be ordered again at every tick).
     pub refused: Option<EntryError>,
     /// The last cast of the entrance skill was refused.
     pub cast_refused: bool,

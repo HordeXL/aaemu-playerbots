@@ -737,6 +737,8 @@ impl Run {
     }
 
     fn raise_level(&mut self, ctx: &mut Ctx<'_>) {
+        // (the refusal that sent us here is answered: only later ones count)
+        self.err_mark = ctx.now_ms;
         let Some(d) = self.dungeon.and_then(|i| ctx.world.dungeons().get(i)) else {
             return;
         };
