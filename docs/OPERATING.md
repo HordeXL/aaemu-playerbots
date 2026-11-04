@@ -220,7 +220,7 @@ attacker and runs to the recall point of its alliance's home zone (or straight a
 that lasts longer than 90 s or a target more than 70 m away is dropped.
 
 **Gank.** The post comes from the trade routes (`bot/pvp/post.rs`), the squads from the coordinator
-(`bot/pvp/squad.rs`; a bot that waits offers itself every 25 s, bots of one alliance within 140 m
+(`bot/pvp/squad.rs`; a bot that waits offers itself every 25 s, bots of one alliance within 500 m
 and 12 levels of each other are ordered together through the party plumbing). The odds
 (`bot/pvp/fight.rs`: level and hit points of the bot and its friends within 40 m against the
 target and its allies within 30 m) say attack (a ratio up to 1.25), wait for a squad (up to 3) or

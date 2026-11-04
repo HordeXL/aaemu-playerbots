@@ -67,8 +67,10 @@ const PLAN_WALK_TRIP_M: f32 = 3_500.0;
 const PLAN_TELEPORT_RADIUS_M: f32 = 12_000.0;
 /// The bot counts as at its post this close (metres).
 const POST_STOP_M: f32 = 6.0;
-/// How far the bot looks out for carriers (metres).
-const SEE_M: f32 = 110.0;
+/// How far the bot looks out for carriers (metres): well inside the distance at which the combat
+/// controller gives a fight with a character up.
+const SEE_M: f32 = 60.0;
+const _: () = assert!(SEE_M < fight::LOST_DISTANCE);
 /// A solo bot walks this far either way along the route while it waits (metres) ...
 const PATROL_SPAN_M: f32 = 70.0;
 /// ... every so often (ms, low and high).
@@ -607,7 +609,7 @@ impl Machine {
         if order.is_some() && self.target != 0 {
             let me = ctx.state.me.pos;
             match ctx.state.units.get(&self.target) {
-                Some(u) if u.dead() && u.dist2d(me) <= SEE_M => {
+                Some(u) if u.dead() && u.dist2d(me) <= 2.0 * SEE_M => {
                     self.victim = u.pos;
                     return self.begin_collect(ctx, order, "a squad mate killed the carrier");
                 }

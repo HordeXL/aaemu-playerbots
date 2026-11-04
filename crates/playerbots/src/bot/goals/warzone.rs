@@ -67,8 +67,10 @@ const SPOT_STOP_M: f32 = 12.0;
 const PATROL_MIN_M: f32 = 120.0;
 /// ... and at most this far.
 const PATROL_MAX_M: f32 = 500.0;
-/// How far the bot looks for characters to fight (metres).
-const HUNT_M: f32 = 90.0;
+/// How far the bot looks for characters to fight (metres): well inside the distance at which the
+/// combat controller gives a fight with a character up.
+const HUNT_M: f32 = 60.0;
+const _: () = assert!(HUNT_M < fight::LOST_DISTANCE);
 /// The odds of a running fight are looked at this often (ms) ...
 const EVAL_MS: u64 = 2_000;
 /// ... and not before the fight is this old (ms).

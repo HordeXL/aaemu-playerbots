@@ -21,7 +21,7 @@ pub const STANDBY_TTL: Duration = Duration::from_secs(75);
 /// A waiting bot repeats its offer this often (bot clock, ms).
 pub const REPEAT_MS: u64 = 25_000;
 /// Bots farther apart than this do not form a squad (metres).
-pub const NEAR_M: f32 = 140.0;
+pub const NEAR_M: f32 = 500.0;
 /// Levels may differ by this much in a squad.
 pub const LEVEL_DIFF: u8 = 12;
 /// The most members of a squad (`PartyOrder` holds [`MAX_PARTY`]).
