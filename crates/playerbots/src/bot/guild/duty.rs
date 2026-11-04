@@ -177,6 +177,7 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         return;
     }
     let _ = ctx.state.guild.mem();
+    note_left(ctx);
     publish(ctx, running);
     answer_invitation(ctx);
     check_join(ctx);
@@ -869,13 +870,28 @@ fn step_leave(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// Called when the bot is out of its guild: it rests a moment before another invitation (checked
-/// by the duty when it sees the guild gone after a leave).
-pub fn note_left(ctx: &mut Ctx<'_>) {
+/// Takes note of a guild the bot lost (it left, was expelled or the guild was dismissed): the
+/// bot rests a moment before another invitation, and a hand-over or leave under way is over.
+fn note_left(ctx: &mut Ctx<'_>) {
     let now = ctx.now_ms;
-    let mem = ctx.state.guild.mem();
-    mem.t.rejoin_after_ms = now + REJOIN_PAUSE_MS;
+    let Some(mem) = ctx.state.guild.get_mut() else {
+        return;
+    };
+    let Some(left) = mem.log.left else {
+        return;
+    };
+    if left.at_ms == mem.t.left_seen_ms {
+        return;
+    }
+    mem.t.left_seen_ms = left.at_ms;
     mem.t.leave = None;
+    mem.t.rejoin_after_ms = now + REJOIN_PAUSE_MS;
+    let how = match left.how {
+        super::log::LeftHow::Left => "left",
+        super::log::LeftHow::Expelled => "was expelled from",
+        super::log::LeftHow::Dismissed => "lost (dismissed)",
+    };
+    ctx.log.say(format!("guild: {how} guild {}", left.guild));
 }
 
 // ---- the web snapshot ------------------------------------------------------------------------------

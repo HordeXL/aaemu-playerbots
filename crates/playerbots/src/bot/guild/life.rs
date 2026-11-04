@@ -145,6 +145,8 @@ pub struct Timers {
     pub found_block_until_ms: u64,
     /// The bot may be invited again after this bot clock (it left a guild).
     pub rejoin_after_ms: u64,
+    /// The loss of a guild the duty has taken note of (the bot clock of [`log::Left`]).
+    pub left_seen_ms: u64,
     /// Anti-repeat memory of the guild lines.
     pub recent: super::chat::Recent,
     /// Anti-repeat memory of the answers to real players.

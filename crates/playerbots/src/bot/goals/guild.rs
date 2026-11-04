@@ -180,6 +180,15 @@ impl Guild {
         if !duty::can_found(&facts) {
             return GoalStatus::Failed(FailReason::Other("guild: cannot sign a charter now"));
         }
+        // (a wish is good for a long while; asking again would only move the bot back in line)
+        let ttl = WISH_TTL.as_millis() as u64;
+        let wished =
+            ctx.state.guild.get().is_some_and(|m| {
+                m.t.wished_ms != 0 && ctx.now_ms.saturating_sub(m.t.wished_ms) < ttl
+            });
+        if wished {
+            return GoalStatus::Done;
+        }
         let wish = GuildWish {
             bot: ctx.persona.id,
             mother: duty::mother_of(ctx),
