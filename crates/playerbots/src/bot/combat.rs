@@ -595,6 +595,13 @@ impl Combat {
         self.watch = Watch::default();
     }
 
+    /// Like [`Combat::engage`] for a target taken up to help the party (the kill is the bot's to
+    /// loot, as with the controller's own assists).
+    pub fn engage_assist(&mut self, target_obj: u32) {
+        self.engage(target_obj);
+        self.assisting = target_obj;
+    }
+
     /// A fresh start against the current target: forgets what the fight so far taught the
     /// controller (skill back-offs, range corrections, the stall watch) and keeps the target.
     pub fn restart_fight(&mut self) {
@@ -1599,6 +1606,8 @@ const FIGHT_LIMITS: ThreatLimits = ThreatLimits {
 /// How far a bot in a team goes to help a team member (standing, and travelling).
 const ASSIST_M: f32 = 45.0;
 const TRAVEL_ASSIST_M: f32 = TRAVEL_FIGHT_M;
+/// A bot a player told to stay only helps a team member this close.
+const HOLD_ASSIST_M: f32 = 12.0;
 
 /// A bot on its way somewhere only turns on units that attack it right now and are close.
 const TRAVEL_LIMITS: ThreatLimits = ThreatLimits {
@@ -1668,7 +1677,9 @@ fn pick_assist(ctx: &Ctx<'_>, travelling: bool) -> Option<u32> {
         &state.units,
         state.me.pos,
         now,
-        if travelling {
+        if super::companion::holding(state) {
+            HOLD_ASSIST_M
+        } else if travelling {
             TRAVEL_ASSIST_M
         } else {
             ASSIST_M

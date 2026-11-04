@@ -430,7 +430,7 @@ fn pair_of_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u64; 2], D::E
 }
 
 /// `[party]`: bots and the parties of real players. Everything is off by default.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PartyCfg {
     /// Bots join the parties of real players when invited (goal `companion`).
@@ -439,6 +439,27 @@ pub struct PartyCfg {
     pub chat_commands: bool,
     /// A bot in a player's party follows it into instance dungeons.
     pub follow_into_dungeons: bool,
+    /// A bot declines the invitation of a player whose level (when it is known) differs from its
+    /// own by more than this.
+    pub max_level_gap: u8,
+    /// This process has at most this many bots in the parties of real players at once; more
+    /// invitations are declined.
+    pub max_companions: u32,
+    /// At most this many of our bots join one player's party (a party holds five).
+    pub max_per_player: u8,
+}
+
+impl Default for PartyCfg {
+    fn default() -> Self {
+        Self {
+            join_player_parties: false,
+            chat_commands: false,
+            follow_into_dungeons: false,
+            max_level_gap: 10,
+            max_companions: 8,
+            max_per_player: 4,
+        }
+    }
 }
 
 /// `[population]`: the population director of the web UI, which starts and stops bots to follow
@@ -877,6 +898,20 @@ impl Config {
         ensure!(
             g.churn_per_hour.is_finite() && (0.0..=60.0).contains(&g.churn_per_hour),
             "guild.churn_per_hour must be a number in 0..=60"
+        );
+        let pt = &self.party;
+        ensure!(
+            pt.max_level_gap >= 1,
+            "party.max_level_gap must be at least 1"
+        );
+        ensure!(
+            (1..=4).contains(&pt.max_per_player),
+            "party.max_per_player must be in 1..=4"
+        );
+        ensure!(
+            pt.max_companions <= MAX_BOTS,
+            "party.max_companions {} is above the limit of {MAX_BOTS}",
+            pt.max_companions
         );
         let pv = &self.pvp;
         ensure!(
@@ -1700,23 +1735,37 @@ emote = true
     fn the_party_keys_are_all_off() {
         let p = Config::default().party;
         assert!(!p.join_player_parties && !p.chat_commands && !p.follow_into_dungeons);
+        assert_eq!(
+            (p.max_level_gap, p.max_companions, p.max_per_player),
+            (10, 8, 4)
+        );
         assert_documented(
             "party",
             &[
                 "join_player_parties = false",
                 "chat_commands = false",
                 "follow_into_dungeons = false",
+                "max_level_gap = 10",
+                "max_companions = 8",
+                "max_per_player = 4",
             ],
         );
         let cfg = Config::parse(
-            "[party]\njoin_player_parties = true\nchat_commands = true\nfollow_into_dungeons = true\n",
+            "[party]\njoin_player_parties = true\nchat_commands = true\nfollow_into_dungeons = true\nmax_level_gap = 5\nmax_companions = 2\nmax_per_player = 3\n",
         )
         .unwrap();
         let p = cfg.party;
         assert!(p.join_player_parties && p.chat_commands && p.follow_into_dungeons);
+        assert_eq!(
+            (p.max_level_gap, p.max_companions, p.max_per_player),
+            (5, 2, 3)
+        );
         for bad in [
             "[party]\njoin_parties = true\n",
             "[party]\nchat_commands = 1\n",
+            "[party]\nmax_level_gap = 0\n",
+            "[party]\nmax_per_player = 0\n",
+            "[party]\nmax_per_player = 5\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

@@ -23,6 +23,7 @@ pub mod avoid;
 pub mod brain;
 pub mod cmd;
 pub mod combat;
+pub mod companion;
 pub mod coordinator;
 pub mod ctx;
 pub mod director;
@@ -1127,6 +1128,9 @@ impl Bot {
         let hub = &self.shared.hub;
         let guild_info =
             guild::snapshot_if_changed(&mut self.state.guild, |c| hub.is_bot_char(c), char_id);
+        // (and so is the party part)
+        let party_info =
+            companion::snapshot_if_changed(&mut self.state.party, |c| hub.is_bot_char(c), char_id);
         let mother = if me.faction != 0 {
             world.mother_faction(me.faction)
         } else {
@@ -1135,6 +1139,9 @@ impl Bot {
         self.slot.with(|g| {
             if let Some(info) = guild_info {
                 g.snap.guild = info;
+            }
+            if let Some(info) = party_info {
+                g.snap.party = info;
             }
             g.path.clear();
             self.motion.route_points(&mut g.path, PATH_POINTS_MAX);

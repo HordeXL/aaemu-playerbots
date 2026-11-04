@@ -26,6 +26,10 @@ use smallvec::SmallVec;
 
 use super::state::{BotState, Unit, UnitKind};
 
+mod remote;
+
+pub use remote::{LootRule, Remote};
+
 /// The most members of one party (the server's team size for dungeons is 5).
 pub const MAX_PARTY: usize = 5;
 /// The size the coordinator aims at (capped by the dungeon's player limit).
@@ -170,6 +174,11 @@ pub struct TeamLog {
     pub member_targets: SmallVec<[(u32, u32, u64); MAX_PARTY]>,
     /// Monsters that target a member `(monster, member object, bot clock)`.
     pub attackers: SmallVec<[(u32, u32, u64); 6]>,
+    /// What the bot knows of each member: role, online, zone, instance, position, hit points
+    /// (see [`Remote`]).
+    pub remote: SmallVec<[Remote; MAX_PARTY]>,
+    /// The loot rule of the team, once the server told it.
+    pub loot: Option<LootRule>,
 }
 
 /// A target noted longer ago than this is forgotten.
@@ -218,6 +227,7 @@ impl TeamLog {
                 self.team_id = *team_id;
                 self.owner = *owner_id;
                 self.members = members.iter().map(member_of).collect();
+                self.remote = members.iter().map(Remote::from_brief).collect();
                 self.invite = None;
                 self.left = None;
                 self.joined_ms = now_ms.max(1);
@@ -235,6 +245,7 @@ impl TeamLog {
                 } else if self.members.len() < 50 {
                     self.members.push(m);
                 }
+                self.note_joined(member);
                 self.changes += 1;
                 true
             }
@@ -242,6 +253,7 @@ impl TeamLog {
                 team_id, char_id, ..
             } if *team_id == self.team_id => {
                 self.members.retain(|m| m.char_id != *char_id);
+                self.remote.retain(|r| r.char_id != *char_id);
                 self.changes += 1;
                 true
             }
@@ -266,6 +278,12 @@ impl TeamLog {
                 self.owner = *owner_id;
                 true
             }
+            // (where the members are, their role, their object ids: see `remote.rs`)
+            ActivityEvent::TeamRemoteMembers { .. }
+            | ActivityEvent::TeamMemberDisconnected { .. }
+            | ActivityEvent::TeamMemberRoleChanged { .. }
+            | ActivityEvent::TeamRefreshMember { .. }
+            | ActivityEvent::TeamLootingRuleChanged { .. } => self.apply_vitals(ev, now_ms),
             _ => false,
         }
     }
@@ -280,9 +298,20 @@ impl TeamLog {
         self.team_id = 0;
         self.owner = 0;
         self.members.clear();
+        self.remote.clear();
+        self.loot = None;
         self.member_targets.clear();
         self.attackers.clear();
         self.changes += 1;
+    }
+
+    /// The last target member `member_obj` announced `(target, bot clock)`, however long ago (the
+    /// server tells a change only, so a member that fights for minutes announces nothing).
+    pub fn target_of(&self, member_obj: u32) -> Option<(u32, u64)> {
+        self.member_targets
+            .iter()
+            .find(|t| t.0 == member_obj && t.1 != 0)
+            .map(|t| (t.1, t.2))
     }
 
     /// Whether unit `obj` is a member of the team other than the bot.
@@ -389,6 +418,9 @@ pub struct PartyMem {
     pub runs: u16,
     /// Dungeon goals that gave up (this connection).
     pub failed_runs: u16,
+    /// The companion memory (the party of real players, see [`super::companion`]); made on first
+    /// use.
+    pub companion: Option<Box<super::companion::Mem>>,
 }
 
 impl PartyMem {
@@ -458,6 +490,11 @@ pub fn observe(mem: &mut Option<Box<PartyMem>>, ev: &ActivityEvent, now_ms: u64)
             | ActivityEvent::TeamDismissed { .. }
             | ActivityEvent::RejectedTeam { .. }
             | ActivityEvent::TeamOwnerChanged { .. }
+            | ActivityEvent::TeamRemoteMembers { .. }
+            | ActivityEvent::TeamMemberDisconnected { .. }
+            | ActivityEvent::TeamMemberRoleChanged { .. }
+            | ActivityEvent::TeamRefreshMember { .. }
+            | ActivityEvent::TeamLootingRuleChanged { .. }
     );
     if !is_team_event {
         return;
@@ -743,7 +780,7 @@ impl PartyBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aa_proto::sc_activity::TeamMemberBrief;
+    use aa_proto::sc_activity::{TeamMemberBrief, TeamPerson};
 
     fn mbr(id: u32, obj: u32) -> TeamMemberBrief {
         TeamMemberBrief {
@@ -860,6 +897,178 @@ mod tests {
             600,
         );
         assert_eq!((t.rejected, t.rejected_ms), (1, 600));
+    }
+
+    fn person(char_id: u32, zone: u32, instance: u32, pos: [f32; 3], obj: u32) -> TeamPerson {
+        TeamPerson {
+            char_id,
+            zone_id: zone,
+            instance_id: instance,
+            level: 22,
+            hp: 600,
+            hp_max: 1200,
+            mp: 10,
+            mp_max: 20,
+            pos,
+            obj_id: obj,
+        }
+    }
+
+    #[test]
+    fn the_team_log_knows_where_the_members_are() {
+        let mut t = TeamLog::default();
+        t.apply(&joined(9, 5, &[(5, 50), (6, 60)]), 200);
+        // a join packet knows names, roles and levels, nothing about position
+        let r = t.remote_of(5).unwrap();
+        assert_eq!(
+            (&*r.name, r.level, r.online, r.located()),
+            ("C5", 20, true, false)
+        );
+        assert_eq!(r.hp_pct(), None);
+        assert_eq!(t.owner_remote().map(|r| r.char_id), Some(5));
+        // the owner is somewhere else: a position packet tells zone, instance, hit points
+        assert!(t.apply(
+            &ActivityEvent::TeamRemoteMembers {
+                members: vec![person(5, 301, 7, [10.0, 20.0, 30.0], 51)].into(),
+            },
+            1_000
+        ));
+        let r = t.remote_of(5).unwrap();
+        assert_eq!(
+            (r.zone_id, r.instance_id, r.pos),
+            (301, 7, [10.0, 20.0, 30.0])
+        );
+        assert_eq!((r.hp_pct(), r.seen_ms, r.obj_id), (Some(50), 1_000, 51));
+        // the object id reaches the member list too (the assist looks members up by it)
+        assert_eq!(
+            t.members.iter().find(|m| m.char_id == 5).unwrap().obj_id,
+            51
+        );
+        // a character that is not in the team is ignored
+        assert!(!t.apply(
+            &ActivityEvent::TeamRemoteMembers {
+                members: vec![person(99, 1, 0, [0.0; 3], 9)].into(),
+            },
+            1_100
+        ));
+        // a role is chosen, an object id refreshed, the loot rule changed
+        t.apply(
+            &ActivityEvent::TeamMemberRoleChanged {
+                team_id: 9,
+                char_id: 6,
+                role: 2,
+            },
+            1_200,
+        );
+        assert_eq!(t.remote_of(6).unwrap().role, 2);
+        t.apply(
+            &ActivityEvent::TeamRefreshMember {
+                team_id: 9,
+                char_id: 6,
+                obj_id: 66,
+            },
+            1_300,
+        );
+        assert_eq!(t.remote_of(6).unwrap().obj_id, 66);
+        assert_eq!(
+            t.members.iter().find(|m| m.char_id == 6).unwrap().obj_id,
+            66
+        );
+        t.apply(
+            &ActivityEvent::TeamLootingRuleChanged {
+                team_id: 9,
+                method: 2,
+                min_grade: 3,
+                master: 5,
+                roll_bop: true,
+                flags: 1,
+            },
+            1_400,
+        );
+        assert_eq!(t.loot.map(|l| (l.method, l.master)), Some((2, 5)));
+        // packets of another team change nothing
+        assert!(!t.apply(
+            &ActivityEvent::TeamMemberRoleChanged {
+                team_id: 77,
+                char_id: 6,
+                role: 3
+            },
+            1_500
+        ));
+        assert_eq!(t.remote_of(6).unwrap().role, 2);
+        // the owner goes offline: no object id, no longer online, the last place is kept
+        t.apply(
+            &ActivityEvent::TeamMemberDisconnected {
+                team_id: 9,
+                char_id: 5,
+                person: Box::new(person(5, 301, 7, [11.0, 21.0, 31.0], 0)),
+            },
+            2_000,
+        );
+        let r = t.remote_of(5).unwrap();
+        assert!(!r.online && r.obj_id == 0);
+        assert_eq!(r.pos, [11.0, 21.0, 31.0]);
+        assert_eq!(t.members.iter().find(|m| m.char_id == 5).unwrap().obj_id, 0);
+        // a member that comes back is online again, with an object id
+        t.apply(
+            &ActivityEvent::TeamRemoteMembers {
+                members: vec![person(5, 301, 7, [12.0, 22.0, 32.0], 52)].into(),
+            },
+            3_000,
+        );
+        assert!(t.remote_of(5).unwrap().online);
+        // members leave and the team ends: the records go with them
+        t.apply(
+            &ActivityEvent::TeamMemberLeft {
+                team_id: 9,
+                char_id: 6,
+                kicked: false,
+            },
+            3_100,
+        );
+        assert!(t.remote_of(6).is_none());
+        t.apply(&ActivityEvent::TeamDismissed { team_id: 9 }, 3_200);
+        assert!(t.remote.is_empty() && t.loot.is_none());
+        // (nothing is applied while the bot is in no team)
+        assert!(!t.apply(
+            &ActivityEvent::TeamRemoteMembers {
+                members: vec![person(5, 1, 0, [0.0; 3], 1)].into(),
+            },
+            3_300
+        ));
+    }
+
+    #[test]
+    fn a_member_that_joins_later_gets_a_record_and_keeps_it_across_a_return() {
+        let mut t = TeamLog::default();
+        t.apply(&joined(9, 5, &[(5, 50)]), 100);
+        t.apply(
+            &ActivityEvent::TeamMemberJoined {
+                team_id: 9,
+                member: mbr(7, 70),
+                party: 0,
+            },
+            200,
+        );
+        assert_eq!(t.remote_of(7).map(|r| r.obj_id), Some(70));
+        t.apply(
+            &ActivityEvent::TeamRemoteMembers {
+                members: vec![person(7, 100, 0, [1.0, 2.0, 3.0], 70)].into(),
+            },
+            300,
+        );
+        // the same member joins again (a re-login sends SCTeamMemberJoined): the place is kept
+        t.apply(
+            &ActivityEvent::TeamMemberJoined {
+                team_id: 9,
+                member: mbr(7, 71),
+                party: 0,
+            },
+            400,
+        );
+        let r = t.remote_of(7).unwrap();
+        assert_eq!((r.obj_id, r.pos, r.online), (71, [1.0, 2.0, 3.0], true));
+        assert_eq!(t.remote.len(), 2);
     }
 
     #[test]

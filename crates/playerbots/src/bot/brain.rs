@@ -409,6 +409,16 @@ impl Brain {
             self.start_goal(ctx, GoalKind::Trade, None);
         }
         super::goals::dungeon::unsolicited(ctx, self.goal.as_ref().map(Goal::kind));
+        // Party duty: answers the invitations of real players, keeps a companion's membership in
+        // order and reads the chat commands whatever the bot does; a bot that is in a real player's
+        // party and runs nothing it must not drop turns to the companion goal.
+        if super::companion::duty(ctx, self.goal.as_ref().map(Goal::kind))
+            && !matches!(self.choice, GoalChoice::Forced(_))
+            && !self.is_disabled(GoalKind::Companion)
+            && !self.cooldown_until.active(GoalKind::Companion, now)
+        {
+            self.start_goal(ctx, GoalKind::Companion, None);
+        }
         // Guild duty: answers invitations, recruits, promotes and talks whatever the bot does.
         super::guild::duty(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
@@ -451,10 +461,12 @@ impl Brain {
         ctx.state.me.hp_pct() < HURT_PCT
             && !ctx.combat.busy()
             && !matches!(self.choice, GoalChoice::Forced(_))
-            && self
-                .goal
-                .as_ref()
-                .is_some_and(|g| !matches!(g.kind(), GoalKind::Rest | GoalKind::Dungeon))
+            && self.goal.as_ref().is_some_and(|g| {
+                !matches!(
+                    g.kind(),
+                    GoalKind::Rest | GoalKind::Dungeon | GoalKind::Companion
+                )
+            })
     }
 
     fn start_goal(&mut self, ctx: &mut Ctx<'_>, kind: GoalKind, order: Option<PairOrder>) {

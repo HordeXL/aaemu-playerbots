@@ -66,10 +66,10 @@ const T_MONSTER_Z: u16 = 1 << 10;
 
 /// A doodad the run uses: the entrance or an exit.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Door {
-    template: u32,
-    skill: u32,
-    pos: [f32; 3],
+pub(crate) struct Door {
+    pub(crate) template: u32,
+    pub(crate) skill: u32,
+    pub(crate) pos: [f32; 3],
 }
 
 /// A party member as the hub shows it.
@@ -485,41 +485,9 @@ impl Run {
         }
     }
 
-    /// The exit to use: the doodad in view nearest to the bot, else the nearest the data lists.
+    /// The exit to use, see [`exit_door_of`].
     fn exit_door(&self, ctx: &Ctx<'_>, d: &Dungeon) -> Option<(Door, bool)> {
-        let iw = ctx.world.dungeon_world(d)?;
-        let me = ctx.state.me.pos;
-        let mut best: Option<(Door, f32)> = None;
-        for x in iw.exits() {
-            if let Some((_, pos)) = find_doodad(ctx, x.template, [x.pos.x, x.pos.y, x.pos.z]) {
-                let dist = floor_dist(me, pos);
-                if best.is_none_or(|b| dist < b.1) {
-                    best = Some((
-                        Door {
-                            template: x.template,
-                            skill: x.skill,
-                            pos,
-                        },
-                        dist,
-                    ));
-                }
-            }
-        }
-        if let Some((door, _)) = best {
-            return Some((door, true));
-        }
-        let x = iw.exits().iter().min_by(|a, b| {
-            floor_dist(me, [a.pos.x, a.pos.y, a.pos.z])
-                .total_cmp(&floor_dist(me, [b.pos.x, b.pos.y, b.pos.z]))
-        })?;
-        Some((
-            Door {
-                template: x.template,
-                skill: x.skill,
-                pos: [x.pos.x, x.pos.y, x.pos.z],
-            },
-            false,
-        ))
+        exit_door_of(ctx, d)
     }
 
     // ---- one tick --------------------------------------------------------------------------
@@ -1323,8 +1291,46 @@ fn phase_note(from: Phase, to: Phase) -> &'static str {
     }
 }
 
+/// The exit to use: the doodad in view nearest to the bot, else the nearest the data lists. The
+/// flag says whether the doodad is in view.
+pub(crate) fn exit_door_of(ctx: &Ctx<'_>, d: &Dungeon) -> Option<(Door, bool)> {
+    let iw = ctx.world.dungeon_world(d)?;
+    let me = ctx.state.me.pos;
+    let mut best: Option<(Door, f32)> = None;
+    for x in iw.exits() {
+        if let Some((_, pos)) = find_doodad(ctx, x.template, [x.pos.x, x.pos.y, x.pos.z]) {
+            let dist = floor_dist(me, pos);
+            if best.is_none_or(|b| dist < b.1) {
+                best = Some((
+                    Door {
+                        template: x.template,
+                        skill: x.skill,
+                        pos,
+                    },
+                    dist,
+                ));
+            }
+        }
+    }
+    if let Some((door, _)) = best {
+        return Some((door, true));
+    }
+    let x = iw.exits().iter().min_by(|a, b| {
+        floor_dist(me, [a.pos.x, a.pos.y, a.pos.z])
+            .total_cmp(&floor_dist(me, [b.pos.x, b.pos.y, b.pos.z]))
+    })?;
+    Some((
+        Door {
+            template: x.template,
+            skill: x.skill,
+            pos: [x.pos.x, x.pos.y, x.pos.z],
+        },
+        false,
+    ))
+}
+
 /// The entrance the party uses: the first one the data lists.
-fn door_of(d: &Dungeon) -> Option<Door> {
+pub(crate) fn door_of(d: &Dungeon) -> Option<Door> {
     let e = d.entrances.first()?;
     let p = e.spawns.first()?;
     Some(Door {
@@ -1335,7 +1341,7 @@ fn door_of(d: &Dungeon) -> Option<Door> {
 }
 
 /// The doodad of `template` in view nearest to `near`: object id and position.
-fn find_doodad(ctx: &Ctx<'_>, template: u32, near: [f32; 3]) -> Option<(u32, [f32; 3])> {
+pub(crate) fn find_doodad(ctx: &Ctx<'_>, template: u32, near: [f32; 3]) -> Option<(u32, [f32; 3])> {
     ctx.state
         .doodads
         .iter()
@@ -1370,7 +1376,7 @@ fn drop_stale_load(ctx: &mut Ctx<'_>) {
 
 /// The height the bot takes to fight a monster at `target` from `me`: the monster's, when that is
 /// more than [`FLOOR_REACH_M`] above or below and the monster is within [`FOLLOW_XY_M`] on the map.
-fn floor_to_follow(me: [f32; 3], target: [f32; 3]) -> Option<f32> {
+pub(crate) fn floor_to_follow(me: [f32; 3], target: [f32; 3]) -> Option<f32> {
     let off_floor = (target[2] - me[2]).abs() > FLOOR_REACH_M;
     (off_floor && target[2].is_finite() && flat(me, target) <= FOLLOW_XY_M).then_some(target[2])
 }
@@ -1378,7 +1384,7 @@ fn floor_to_follow(me: [f32; 3], target: [f32; 3]) -> Option<f32> {
 /// Inside an instance the bot has no ground under it: it keeps the height it arrived at, so the
 /// mobs of another floor stay out of reach. A leg to another floor therefore starts at the height
 /// of its end (the server takes the position the client reports).
-fn match_floor(ctx: &mut Ctx<'_>, dest: [f32; 3]) {
+pub(crate) fn match_floor(ctx: &mut Ctx<'_>, dest: [f32; 3]) {
     let me = ctx.state.me.pos;
     let z = dest[2];
     if (z - me[2]).abs() <= FLOOR_FIX_M || routed_on_mesh(ctx, me, dest) {

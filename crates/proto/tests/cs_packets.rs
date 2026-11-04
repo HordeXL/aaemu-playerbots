@@ -537,6 +537,24 @@ fn team() {
         &[5, 0, 0, 0, 0x0D, 0x0C, 0x0B, 0x0A, 1],
     );
     assert_eq!((cs::RISKY_LEAVE, cs::RISKY_DISMISS), (0, 2));
+    game(
+        cs::make_team_owner(5, 0x0A0B_0C0D),
+        op::CSMakeTeamOwnerPacket,
+        &[5, 0, 0, 0, 0x0D, 0x0C, 0x0B, 0x0A],
+    );
+    game(
+        cs::set_team_member_role(5, 0x0A0B_0C0D, cs::team_role::HEALER),
+        op::CSSetTeamMemberRolePacket,
+        &[5, 0, 0, 0, 0x0D, 0x0C, 0x0B, 0x0A, 2],
+    );
+    assert_eq!(
+        (
+            cs::team_role::TANK,
+            cs::team_role::HEALER,
+            cs::team_role::ATTACKER
+        ),
+        (1, 2, 3)
+    );
 }
 
 // ---- housing --------------------------------------------------------------------------------

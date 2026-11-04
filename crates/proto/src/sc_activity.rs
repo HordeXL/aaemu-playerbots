@@ -130,6 +130,35 @@ pub struct TeamMemberBrief {
     pub obj_id: u32,
 }
 
+/// A team member as written by `TeamMember.WritePerson` (G/systems/social/packets/team.rs:46-66,
+/// 50 bytes): where the member is and how it fares. The server sends it for members out of the
+/// render distance of each other and whenever a member moves (`SCTeamRemoteMembersEx`), and when a
+/// member goes offline (`SCTeamMemberDisconnected`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TeamPerson {
+    /// Character id.
+    pub char_id: u32,
+    /// Zone key of the member's transform (the zone it stands in in the main world, the
+    /// dungeon's zone key in an instance: what `SCLoadInstance` carries).
+    pub zone_id: u32,
+    /// Instance id of the member's world (`0` in the main world).
+    pub instance_id: u32,
+    /// Level.
+    pub level: u8,
+    /// Hit points.
+    pub hp: i32,
+    /// Maximum hit points.
+    pub hp_max: i32,
+    /// Mana.
+    pub mp: i32,
+    /// Maximum mana.
+    pub mp_max: i32,
+    /// Position in the member's own world (instance-local inside an instance).
+    pub pos: [f32; 3],
+    /// Object id; `0` when the member is offline.
+    pub obj_id: u32,
+}
+
 /// A house as written by `House.Write` (G/models/house.rs:95-131): the body of `SCMyHouse`,
 /// `SCHouseState` and (after the owner id) `SCLoginCharInfoHouse`.
 #[derive(Debug, Clone, PartialEq)]
@@ -539,6 +568,61 @@ pub enum ActivityEvent {
         team_id: u32,
         /// Character id of the new owner.
         owner_id: u32,
+    },
+    /// `SCTeamRemoteMembersEx` (0xe4): `i32 count` and one `TeamMember.WritePerson` each. Sent
+    /// to the others whenever a member moves, and for members out of each other's render distance
+    /// on change (500 ms) and at least every 5 s. G/systems/social/packets/team.rs:282-288,
+    /// G/systems/social/team.rs:1241-1253 and :1310-1366.
+    TeamRemoteMembers {
+        /// The members the packet describes.
+        members: Box<[TeamPerson]>,
+    },
+    /// `SCTeamMemberDisconnected` (0xdc): `u32 team`, `u32 character`, `WritePerson`. A member went
+    /// offline (an offline owner is replaced first). G/systems/social/packets/team.rs:218-224.
+    TeamMemberDisconnected {
+        /// Team id.
+        team_id: u32,
+        /// Character id of the member that went offline.
+        char_id: u32,
+        /// The member's last state (object id `0`).
+        person: Box<TeamPerson>,
+    },
+    /// `SCTeamMemberRoleChanged` (0xde): `u32 team`, `u32 character`, `u8 role` (1 tank,
+    /// 2 healer, 3 attacker). G/systems/social/packets/team.rs:255-262.
+    TeamMemberRoleChanged {
+        /// Team id.
+        team_id: u32,
+        /// Character id.
+        char_id: u32,
+        /// The new role.
+        role: u8,
+    },
+    /// `SCRefreshTeamMember` (0xe3): `u32 team`, `u32 character`, `bc object id`: the object id of
+    /// a member that logged in or joined. G/systems/social/packets/team.rs:161-168.
+    TeamRefreshMember {
+        /// Team id.
+        team_id: u32,
+        /// Character id.
+        char_id: u32,
+        /// The member's object id.
+        obj_id: u32,
+    },
+    /// `SCTeamLootingRuleChanged` (0xe2): `u32 team`, `LootingRule.Write` (`u8 method`,
+    /// `u8 minimum grade`, `u32 loot master`, `bool roll for bind-on-pickup`), `u8 change flags`.
+    /// G/systems/social/packets/team.rs:209-216.
+    TeamLootingRuleChanged {
+        /// Team id.
+        team_id: u32,
+        /// Loot method.
+        method: u8,
+        /// Minimum grade that is rolled for.
+        min_grade: u8,
+        /// Character id of the loot master.
+        master: u32,
+        /// Bind-on-pickup items are rolled for.
+        roll_bop: bool,
+        /// What the change touched.
+        flags: u8,
     },
 
     // ---- housing ------------------------------------------------------------------------
@@ -979,6 +1063,38 @@ pub fn parse(level: u8, opcode: u16, body: &[u8]) -> Result<Option<ActivityEvent
                 owner_id: s.read_u32()?,
             })
         },
+        sc::SCTeamRemoteMembersExPacket => team_remote_members,
+        sc::SCTeamMemberDisconnectedPacket => |s| {
+            Ok(E::TeamMemberDisconnected {
+                team_id: s.read_u32()?,
+                char_id: s.read_u32()?,
+                person: Box::new(read_team_person(s)?),
+            })
+        },
+        sc::SCTeamMemberRoleChangedPacket => |s| {
+            Ok(E::TeamMemberRoleChanged {
+                team_id: s.read_u32()?,
+                char_id: s.read_u32()?,
+                role: s.read_u8()?,
+            })
+        },
+        sc::SCRefreshTeamMemberPacket => |s| {
+            Ok(E::TeamRefreshMember {
+                team_id: s.read_u32()?,
+                char_id: s.read_u32()?,
+                obj_id: s.read_bc()?,
+            })
+        },
+        sc::SCTeamLootingRuleChangedPacket => |s| {
+            Ok(E::TeamLootingRuleChanged {
+                team_id: s.read_u32()?,
+                method: s.read_u8()?,
+                min_grade: s.read_u8()?,
+                master: s.read_u32()?,
+                roll_bop: s.read_bool()?,
+                flags: s.read_u8()?,
+            })
+        },
         // housing
         sc::SCMyHousePacket => |s| Ok(E::MyHouse(Box::new(HouseInfo::read(s)?))),
         sc::SCLoginCharInfoHousePacket => |s| {
@@ -1288,6 +1404,58 @@ fn joined_team(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
         team_id,
         owner_id,
         is_party,
+        members: members.into_boxed_slice(),
+    })
+}
+
+/// Bytes of one `TeamMember.WritePerson` (G/systems/social/packets/team.rs:46-66).
+const TEAM_PERSON_BYTES: usize = 50;
+
+/// `TeamMember.WritePerson`: character id, zone, instance, level, hit points and mana (current and
+/// maximum), the 9-byte position, the object id (`0` offline), then a flag byte, the three
+/// abilities and five reserved bytes that bots do not use.
+fn read_team_person(s: &mut PacketStream) -> Result<TeamPerson, MarshalError> {
+    let char_id = s.read_u32()?;
+    let zone_id = s.read_u32()?;
+    let instance_id = s.read_u32()?;
+    let level = s.read_u8()?;
+    let hp = s.read_i32()?;
+    let hp_max = s.read_i32()?;
+    let mp = s.read_i32()?;
+    let mp_max = s.read_i32()?;
+    let (x, y, z) = s.read_position()?;
+    let obj_id = s.read_bc()?;
+    skip(s, 9)?;
+    Ok(TeamPerson {
+        char_id,
+        zone_id,
+        instance_id,
+        level,
+        hp,
+        hp_max,
+        mp,
+        mp_max,
+        pos: [x, y, z],
+        obj_id,
+    })
+}
+
+/// `SCTeamRemoteMembersEx`: `i32 count` and the members (the count is checked against the bytes
+/// left before anything is allocated).
+fn team_remote_members(s: &mut PacketStream) -> Result<ActivityEvent, MarshalError> {
+    let count = usize::try_from(s.read_i32()?).unwrap_or(0);
+    if count > s.remaining() / TEAM_PERSON_BYTES {
+        return Err(MarshalError::EndOfStream {
+            pos: s.pos(),
+            wanted: count.saturating_mul(TEAM_PERSON_BYTES),
+            len: s.len(),
+        });
+    }
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        members.push(read_team_person(s)?);
+    }
+    Ok(ActivityEvent::TeamRemoteMembers {
         members: members.into_boxed_slice(),
     })
 }

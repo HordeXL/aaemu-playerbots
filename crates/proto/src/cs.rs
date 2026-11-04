@@ -1234,6 +1234,43 @@ pub fn ask_risky_team_action(team_id: u32, target_character_id: u32, action: u8)
     })
 }
 
+/// Roles of [`set_team_member_role`] (the server's `member_role`: 1 tank, 2 healer, 3 attacker;
+/// anything above 3 is stored as undecided).
+pub mod team_role {
+    /// No role chosen.
+    pub const UNDECIDED: u8 = 0;
+    /// Tank.
+    pub const TANK: u8 = 1;
+    /// Healer.
+    pub const HEALER: u8 = 2;
+    /// Attacker (damage dealer).
+    pub const ATTACKER: u8 = 3;
+}
+
+/// `CSMakeTeamOwnerPacket`: the owner hands the team to member `member_character_id`. Server
+/// read: `systems/social/packets/team.rs:381`; only the owner may, and the member must be in the
+/// team (`systems/social/team.rs:934`).
+///
+/// Body: `u32 team_id, u32 member_character_id`.
+pub fn make_team_owner(team_id: u32, member_character_id: u32) -> Out {
+    game(cs::CSMakeTeamOwnerPacket, |s| {
+        s.write_u32(team_id).write_u32(member_character_id);
+    })
+}
+
+/// `CSSetTeamMemberRolePacket`: sets the own role (a member may only change its own,
+/// `systems/social/team.rs:973`; values in [`team_role`]). Server read:
+/// `systems/social/packets/team.rs:446`.
+///
+/// Body: `u32 team_id, u32 member_character_id, u8 role`.
+pub fn set_team_member_role(team_id: u32, member_character_id: u32, role: u8) -> Out {
+    game(cs::CSSetTeamMemberRolePacket, |s| {
+        s.write_u32(team_id)
+            .write_u32(member_character_id)
+            .write_u8(role);
+    })
+}
+
 // ---- housing --------------------------------------------------------------------------------
 
 /// `CSConstructHouseTaxPacket`: quotes the tax of building `design_id` at a position.
