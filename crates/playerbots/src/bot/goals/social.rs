@@ -707,7 +707,9 @@ fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
         hub.pop.hear(hub, world, kind, sender, text);
     });
     // (the guild feature hears the guild chat and the whispers that ask for an invitation)
-    let claimed = crate::bot::guild::forward_chat(ctx, &lines);
+    let mut claimed = crate::bot::guild::forward_chat(ctx, &lines);
+    // (and the party feature hears the commands of the members of the bot's party and the "inv" whispers)
+    claimed.extend(crate::bot::companion::forward_chat(ctx, &lines));
     let t = unix_ms();
     ctx.log
         .with_slot(|g| route_lines(lines, &mut g.social, t, heard));

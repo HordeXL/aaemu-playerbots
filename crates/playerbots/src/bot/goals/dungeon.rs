@@ -260,6 +260,10 @@ pub fn unsolicited(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
     if matches!(running, Some(GoalKind::Dungeon | GoalKind::Guild)) {
         return;
     }
+    // (a real player's invitation is the party feature's: it answers within seconds)
+    if crate::bot::companion::claims(ctx) {
+        return;
+    }
     let Some(inv) = ctx.state.team().and_then(|t| t.invite.as_ref()) else {
         return;
     };

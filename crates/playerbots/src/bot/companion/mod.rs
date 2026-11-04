@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-pub use duty::{claims, duty, forward_chat, in_player_party, leader_char, snapshot_if_changed};
+pub use duty::{
+    claims, duty, forward_chat, holding, in_player_party, leader_char, snapshot_if_changed,
+};
 
 /// How the companion behaves when nothing special is going on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

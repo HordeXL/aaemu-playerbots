@@ -485,41 +485,9 @@ impl Run {
         }
     }
 
-    /// The exit to use: the doodad in view nearest to the bot, else the nearest the data lists.
+    /// The exit to use, see [`exit_door_of`].
     fn exit_door(&self, ctx: &Ctx<'_>, d: &Dungeon) -> Option<(Door, bool)> {
-        let iw = ctx.world.dungeon_world(d)?;
-        let me = ctx.state.me.pos;
-        let mut best: Option<(Door, f32)> = None;
-        for x in iw.exits() {
-            if let Some((_, pos)) = find_doodad(ctx, x.template, [x.pos.x, x.pos.y, x.pos.z]) {
-                let dist = floor_dist(me, pos);
-                if best.is_none_or(|b| dist < b.1) {
-                    best = Some((
-                        Door {
-                            template: x.template,
-                            skill: x.skill,
-                            pos,
-                        },
-                        dist,
-                    ));
-                }
-            }
-        }
-        if let Some((door, _)) = best {
-            return Some((door, true));
-        }
-        let x = iw.exits().iter().min_by(|a, b| {
-            floor_dist(me, [a.pos.x, a.pos.y, a.pos.z])
-                .total_cmp(&floor_dist(me, [b.pos.x, b.pos.y, b.pos.z]))
-        })?;
-        Some((
-            Door {
-                template: x.template,
-                skill: x.skill,
-                pos: [x.pos.x, x.pos.y, x.pos.z],
-            },
-            false,
-        ))
+        exit_door_of(ctx, d)
     }
 
     // ---- one tick --------------------------------------------------------------------------
@@ -1321,6 +1289,44 @@ fn phase_note(from: Phase, to: Phase) -> &'static str {
         (_, Phase::Out) => "back outside",
         _ => "",
     }
+}
+
+/// The exit to use: the doodad in view nearest to the bot, else the nearest the data lists. The
+/// flag says whether the doodad is in view.
+pub(crate) fn exit_door_of(ctx: &Ctx<'_>, d: &Dungeon) -> Option<(Door, bool)> {
+    let iw = ctx.world.dungeon_world(d)?;
+    let me = ctx.state.me.pos;
+    let mut best: Option<(Door, f32)> = None;
+    for x in iw.exits() {
+        if let Some((_, pos)) = find_doodad(ctx, x.template, [x.pos.x, x.pos.y, x.pos.z]) {
+            let dist = floor_dist(me, pos);
+            if best.is_none_or(|b| dist < b.1) {
+                best = Some((
+                    Door {
+                        template: x.template,
+                        skill: x.skill,
+                        pos,
+                    },
+                    dist,
+                ));
+            }
+        }
+    }
+    if let Some((door, _)) = best {
+        return Some((door, true));
+    }
+    let x = iw.exits().iter().min_by(|a, b| {
+        floor_dist(me, [a.pos.x, a.pos.y, a.pos.z])
+            .total_cmp(&floor_dist(me, [b.pos.x, b.pos.y, b.pos.z]))
+    })?;
+    Some((
+        Door {
+            template: x.template,
+            skill: x.skill,
+            pos: [x.pos.x, x.pos.y, x.pos.z],
+        },
+        false,
+    ))
 }
 
 /// The entrance the party uses: the first one the data lists.

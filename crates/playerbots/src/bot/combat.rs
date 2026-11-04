@@ -1599,6 +1599,8 @@ const FIGHT_LIMITS: ThreatLimits = ThreatLimits {
 /// How far a bot in a team goes to help a team member (standing, and travelling).
 const ASSIST_M: f32 = 45.0;
 const TRAVEL_ASSIST_M: f32 = TRAVEL_FIGHT_M;
+/// A bot a player told to stay only helps a team member this close.
+const HOLD_ASSIST_M: f32 = 12.0;
 
 /// A bot on its way somewhere only turns on units that attack it right now and are close.
 const TRAVEL_LIMITS: ThreatLimits = ThreatLimits {
@@ -1668,7 +1670,9 @@ fn pick_assist(ctx: &Ctx<'_>, travelling: bool) -> Option<u32> {
         &state.units,
         state.me.pos,
         now,
-        if travelling {
+        if super::companion::holding(state) {
+            HOLD_ASSIST_M
+        } else if travelling {
             TRAVEL_ASSIST_M
         } else {
             ASSIST_M

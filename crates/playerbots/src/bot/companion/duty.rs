@@ -27,7 +27,7 @@ use super::{Mem, Mode, Pending};
 use crate::bot::cmd::GoalKind;
 use crate::bot::ctx::Ctx;
 use crate::bot::goals::social::{strip_gm, whisper_packet};
-use crate::bot::party::TeamLog;
+use crate::bot::party::{PartyMem, TeamLog};
 use crate::bot::state::{BotState, ChatIn, UnitKind};
 use crate::hub::unix_ms;
 
@@ -65,8 +65,24 @@ fn mem_of(state: &mut BotState) -> &mut Mem {
         .get_or_insert_with(Default::default)
 }
 
+/// The companion memory of the bot when it has one (reading it makes none).
+fn peek(state: &BotState) -> Option<&Mem> {
+    state.party.as_deref()?.companion.as_deref()
+}
+
+/// Like [`peek`], to change.
+fn peek_mut(state: &mut BotState) -> Option<&mut Mem> {
+    state.party.as_deref_mut()?.companion.as_deref_mut()
+}
+
 fn team_of<'a>(ctx: &'a Ctx<'_>) -> Option<&'a TeamLog> {
     ctx.state.team().filter(|t| t.in_team())
+}
+
+/// Whether a player told the bot to stay: it then helps the party only close by (see the combat
+/// controller) and does not follow.
+pub fn holding(state: &BotState) -> bool {
+    peek(state).is_some_and(|m| m.mode == Mode::Stay)
 }
 
 /// Whether the bot is in a team with a real player (a character that is not one of ours).
@@ -149,12 +165,15 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     if !cfg.join_player_parties {
         return false;
     }
-    // a dungeon run, a founding or a squad answers its own invitations and owns its team
+    // a dungeon run or a founding answers its own invitations; a squad that is out to gank is
+    // busy (a real player's invitation gets its no at once) and owns the team it made
+    if !matches!(running, Some(GoalKind::Dungeon | GoalKind::Guild)) {
+        answer_invitation(ctx, running);
+    }
     if !matches!(
         running,
         Some(GoalKind::Dungeon | GoalKind::Guild | GoalKind::Gank)
     ) {
-        answer_invitation(ctx, running);
         upkeep(ctx, running);
     }
     running.is_none_or(policy::preemptible) && in_player_party(ctx) && !leaving(ctx)
@@ -172,7 +191,7 @@ fn answer_invitation(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
     let inv = ctx.state.team().and_then(|t| t.invite.clone());
     let Some(inv) = inv else {
         // nothing to answer; a yes that never became a team gives its place back
-        let wait = mem_of(ctx.state).joining;
+        let wait = peek(ctx.state).and_then(|m| m.joining);
         if let Some((_, at)) = wait {
             if team_of(ctx).is_none() && now.saturating_sub(at) > JOIN_WAIT_MS {
                 mem_of(ctx.state).joining = None;
@@ -180,15 +199,17 @@ fn answer_invitation(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
                 ctx.log.say("party: the team never came; place given back");
             }
         }
-        mem_of(ctx.state).pending = None;
+        if let Some(m) = peek_mut(ctx.state) {
+            m.pending = None;
+        }
         return;
     };
     // the invitations of our own bots belong to the dungeon and guild goals
     if ctx.hub.is_bot_char(inv.from_char) {
         return;
     }
-    let pending = mem_of(ctx.state)
-        .pending
+    let pending = peek(ctx.state)
+        .and_then(|m| m.pending)
         .filter(|p| p.invite_ms == inv.at_ms);
     let Some(pending) = pending else {
         // first sight of this invitation: a no goes out at once, a yes after a pause
@@ -294,8 +315,7 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
         Some(t) => (t.team_id, t.owner, upkeep_members(ctx, t)),
         None => {
             // not in a team (any more): the place on the board goes back
-            let was = {
-                let m = mem_of(ctx.state);
+            let was = peek_mut(ctx.state).is_some_and(|m| {
                 let was = m.registered != 0;
                 m.registered = 0;
                 m.hand = (0, 0);
@@ -303,7 +323,7 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
                 m.leave = false;
                 m.leave_sent_ms = 0;
                 was
-            };
+            });
             if was {
                 ctx.hub.companions.release(bot);
                 ctx.log.say("party: out of the party");
@@ -711,11 +731,11 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
 /// The party of the bot as the web snapshot shows it, rebuilt when the team changed. `None` when
 /// nothing changed since the last call, `Some(None)` when the bot left its party.
 pub fn snapshot_if_changed(
-    st: &mut BotState,
+    party: &mut Option<Box<PartyMem>>,
     is_bot: impl Fn(u32) -> bool,
+    me: u32,
 ) -> Option<Option<Box<pb_web::PartyInfo>>> {
-    let me = st.me.char_id;
-    let pm = st.party.as_deref()?;
+    let pm = party.as_deref_mut()?;
     let own_mode = pm.companion.as_deref().map_or(Mode::Follow, |m| m.mode);
     let team = &pm.team;
     let key = if team.in_team() {
@@ -769,6 +789,6 @@ pub fn snapshot_if_changed(
             members,
         })
     });
-    mem_of(st).web_key = key;
+    pm.companion.get_or_insert_with(Default::default).web_key = key;
     Some(info)
 }
