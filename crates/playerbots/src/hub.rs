@@ -1029,6 +1029,12 @@ mod tests {
             ("sail", crate::bot::cmd::GoalKind::Sail),
             ("auction", crate::bot::cmd::GoalKind::Auction),
             ("market", crate::bot::cmd::GoalKind::Market),
+            ("guild", crate::bot::cmd::GoalKind::Guild),
+            ("gank", crate::bot::cmd::GoalKind::Gank),
+            ("warzone", crate::bot::cmd::GoalKind::Warzone),
+            ("event", crate::bot::cmd::GoalKind::Event),
+            ("companion", crate::bot::cmd::GoalKind::Companion),
+            ("farm", crate::bot::cmd::GoalKind::Farm),
         ] {
             assert_eq!(
                 to_bot_cmd(Command::Goal { goal: name.into() }),

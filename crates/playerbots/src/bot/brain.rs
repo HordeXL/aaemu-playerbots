@@ -7,9 +7,10 @@
 //! [`FailReason::NotImplemented`] are switched off for good, goals that fail otherwise rest for a
 //! while ([`FAIL_COOLDOWN_MS`]).
 //!
-//! The dungeon, sail, auction and market goals are the exception: the features that own them score
-//! them from the whole tick context (`own_scores`), with none of the factors above (the auction
-//! and market goals score 0 until their features exist).
+//! The dungeon, sail, auction, market, guild, gank, warzone, event, companion and farm goals are the
+//! exception: the features that own them score them from the whole tick context (`own_scores`),
+//! with none of the factors above (the guild, gank, warzone, event, companion and farm goals are
+//! stubs and score 0 until their features exist).
 //!
 //! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
 //! pack recipe, housing without GM help or a design item) are left out of the draw up front
@@ -24,7 +25,7 @@ use std::cell::Cell;
 
 use smallvec::SmallVec;
 
-use super::cmd::{BotCmd, GoalChoice, GoalKind, PairKind, PairOrder};
+use super::cmd::{BotCmd, GoalChoice, GoalKind, GoalMask, PairKind, PairOrder};
 use super::combat::Combat;
 use super::ctx::Ctx;
 use super::director::{self, Director, Pick, Situation};
@@ -49,7 +50,7 @@ pub const GATE_TTL_MS: u64 = 30_000;
 
 /// The goals the bot cannot make anything of right now, as a bit per [`GoalKind::index`]. Every
 /// entry is a cheap predicate the goal's module exports; a goal without one is never gated.
-pub fn gate(ctx: &Ctx<'_>) -> u16 {
+pub fn gate(ctx: &Ctx<'_>) -> GoalMask {
     let mut mask = 0;
     if super::goals::trade_run::unavailable(ctx).is_some() {
         mask |= 1 << GoalKind::TradeRun.index();
@@ -72,7 +73,7 @@ pub struct ScoreInput {
     /// The goal that ended last.
     pub last: Option<GoalKind>,
     /// Goals that must not be picked (stubs, cooling down), as a bit per [`GoalKind::index`].
-    pub blocked: u16,
+    pub blocked: GoalMask,
 }
 
 /// The configured weight of every goal scaled by the temperament, in [`GoalKind::index`] order.
@@ -86,23 +87,34 @@ pub fn base_weights(b: &BehaviorCfg, t: &Temperament) -> [f32; GoalKind::COUNT] 
     w[GoalKind::Housing.index()] = b.housing * (0.4 + 1.2 * t.homebody);
     w[GoalKind::Rest.index()] = b.rest * (0.5 + t.homebody);
     w[GoalKind::Wander.index()] = b.wander * (0.6 + 0.8 * t.homebody);
-    // (the travel and market goals own their weights, see `own_scores`)
+    // (the travel, market, guild, pvp, event, party and farming goals own their weights, see
+    // `own_scores`)
     w[GoalKind::Dungeon.index()] = super::goals::dungeon::base_weight(b, t);
     w[GoalKind::Sail.index()] = super::goals::sail::base_weight(b, t);
     w[GoalKind::Auction.index()] = super::goals::auction::base_weight(b, t);
     w[GoalKind::Market.index()] = super::goals::market::base_weight(b, t);
+    w[GoalKind::Guild.index()] = super::goals::guild::base_weight(b, t);
+    w[GoalKind::Gank.index()] = super::goals::gank::base_weight(b, t);
+    w[GoalKind::Warzone.index()] = super::goals::warzone::base_weight(b, t);
+    w[GoalKind::Event.index()] = super::goals::event::base_weight(b, t);
+    w[GoalKind::Companion.index()] = super::goals::companion::base_weight(b, t);
+    w[GoalKind::Farm.index()] = super::goals::farm::base_weight(b, t);
     w
 }
 
-/// Goals that score themselves from the whole tick context: the dungeons, sailing, auction and
-/// market features own their eligibility (a party, a boat scroll, goods to sell, the
-/// `behavior.dungeons`, `behavior.sailing` and `[market]` switches), so the brain applies none of
-/// its factors to them. A goal that is blocked (switched off, cooling down, gated) is not asked;
-/// a score that is not a positive number is 0.
+/// A goal's own `score` function (`goals::<name>::score`).
+type OwnScore = fn(&Ctx<'_>, f32) -> f32;
+
+/// Goals that score themselves from the whole tick context: the dungeons, sailing, auction,
+/// market, guild, pvp, event, party and farming features own their eligibility (a party, a boat
+/// scroll, goods to sell, the `behavior.dungeons`, `behavior.sailing`, `[market]`, `[guild]`,
+/// `[pvp]`, `[events]`, `[party]` and `[farm]` switches), so the brain applies none of its factors
+/// to them. A goal that is blocked (switched off, cooling down, gated) is not asked; a score that
+/// is not a positive number is 0.
 fn own_scores(
     ctx: &Ctx<'_>,
     base: &[f32; GoalKind::COUNT],
-    blocked: u16,
+    blocked: GoalMask,
     s: &mut [f32; GoalKind::COUNT],
 ) {
     let dungeon = GoalKind::Dungeon.index();
@@ -119,10 +131,23 @@ fn own_scores(
     s[market] = own_score(blocked, market, || {
         super::goals::market::score(ctx, base[market])
     });
+    // (the wave-one goals are stubs: 0 until their features exist)
+    let wave_one: [(GoalKind, OwnScore); 6] = [
+        (GoalKind::Guild, super::goals::guild::score),
+        (GoalKind::Gank, super::goals::gank::score),
+        (GoalKind::Warzone, super::goals::warzone::score),
+        (GoalKind::Event, super::goals::event::score),
+        (GoalKind::Companion, super::goals::companion::score),
+        (GoalKind::Farm, super::goals::farm::score),
+    ];
+    for (kind, score) in wave_one {
+        let i = kind.index();
+        s[i] = own_score(blocked, i, || score(ctx, base[i]));
+    }
 }
 
 /// `raw()` unless goal `index` is in `blocked` or the value is not a positive number.
-fn own_score(blocked: u16, index: usize, raw: impl FnOnce() -> f32) -> f32 {
+fn own_score(blocked: GoalMask, index: usize, raw: impl FnOnce() -> f32) -> f32 {
     if blocked & (1 << index) != 0 {
         return 0.0;
     }
@@ -184,20 +209,24 @@ pub fn choose(scores: &[f32; GoalKind::COUNT], rng: &mut fastrand::Rng) -> Optio
 }
 
 /// Until when each goal rests after a failure, on the bot clock. Whole seconds in a `u32` (136
-/// years): half the size of milliseconds in a `u64`, which the per-bot budget needs now that
-/// there are twelve goals (`size_of::<Bot>() < 3200` is asserted).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Cooldowns([u32; GoalKind::COUNT]);
+/// years): half the size of milliseconds in a `u64`. The table is allocated by the first failure
+/// (one pointer until then), which the per-bot budget needs now that there are eighteen goals
+/// (`size_of::<Bot>() < 3200` is asserted).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Cooldowns(Option<Box<[u32; GoalKind::COUNT]>>);
 
 impl Cooldowns {
     /// `kind` rests until `until_ms` (rounded up to the next second).
     fn set(&mut self, kind: GoalKind, until_ms: u64) {
-        self.0[kind.index()] = u32::try_from(until_ms.div_ceil(1000)).unwrap_or(u32::MAX);
+        let table = self.0.get_or_insert_with(|| Box::new([0; GoalKind::COUNT]));
+        table[kind.index()] = u32::try_from(until_ms.div_ceil(1000)).unwrap_or(u32::MAX);
     }
 
     /// Whether `kind` is still resting at the bot clock `now_ms`.
     fn active(&self, kind: GoalKind, now_ms: u64) -> bool {
-        now_ms < u64::from(self.0[kind.index()]) * 1000
+        self.0
+            .as_ref()
+            .is_some_and(|t| now_ms < u64::from(t[kind.index()]) * 1000)
     }
 }
 
@@ -217,7 +246,7 @@ pub struct Brain {
     choice: GoalChoice,
     last: Option<GoalKind>,
     /// Goals that reported `NotImplemented`.
-    disabled: u16,
+    disabled: GoalMask,
     /// Until when a failed goal is not picked.
     cooldown_until: Cooldowns,
     next_think_ms: u64,
@@ -229,7 +258,7 @@ pub struct Brain {
     forced_fails: u8,
     /// The last answer of [`gate`]: the bot clock it is good until, the level it was asked at and
     /// the goals it blocks.
-    gated: Cell<(u64, u8, u16)>,
+    gated: Cell<(u64, u8, GoalMask)>,
     /// Chat and director state, see [`Chat`].
     ext: Option<Box<Chat>>,
 }
@@ -526,7 +555,7 @@ impl Brain {
     }
 
     /// The goals [`gate`] blocks, asked again when the last answer is old or the level changed.
-    fn gated_goals(&self, ctx: &Ctx<'_>) -> u16 {
+    fn gated_goals(&self, ctx: &Ctx<'_>) -> GoalMask {
         let (until, level, mask) = self.gated.get();
         let now = ctx.now_ms;
         if now < until && level == ctx.state.me.level {
@@ -789,7 +818,7 @@ mod tests {
 
     #[test]
     fn gated_goals_are_never_drawn_and_their_bits_fit_the_mask() {
-        const _: () = assert!(GoalKind::COUNT <= 16);
+        const _: () = assert!(GoalKind::COUNT <= GoalMask::BITS as usize);
         let b = base();
         let mut i = input(100);
         i.blocked = (1 << GoalKind::TradeRun.index()) | (1 << GoalKind::Housing.index());
@@ -905,6 +934,57 @@ mod tests {
         let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
         brain.command(&BotCmd::Goal(GoalChoice::Forced(GoalKind::Market)));
         assert!(matches!(brain.queued, Some((GoalKind::Market, None))));
+    }
+
+    #[test]
+    fn the_wave_one_goals_are_never_drawn_by_weight_until_their_features_exist() {
+        let wave_one = [
+            GoalKind::Guild,
+            GoalKind::Gank,
+            GoalKind::Warzone,
+            GoalKind::Event,
+            GoalKind::Companion,
+            GoalKind::Farm,
+        ];
+        let w = base();
+        let s = scores(&w, &input(100));
+        for g in wave_one {
+            assert_eq!(w[g.index()], 0.0, "{g:?}");
+            assert_eq!(s[g.index()], 0.0, "{g:?}");
+        }
+        let mut rng = fastrand::Rng::with_seed(13);
+        for _ in 0..5000 {
+            let g = choose(&s, &mut rng).unwrap();
+            assert!(!wave_one.contains(&g), "{g:?}");
+        }
+        // forcing one from the web UI queues it, and its stub switches it off for the bot
+        for g in wave_one {
+            let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
+            brain.command(&BotCmd::Goal(GoalChoice::Forced(g)));
+            assert!(matches!(brain.queued, Some((k, None)) if k == g), "{g:?}");
+            assert!(!brain.is_disabled(g));
+        }
+    }
+
+    #[test]
+    fn the_goal_masks_hold_every_goal() {
+        // every goal has its own bit, including the last one
+        let mut all: GoalMask = 0;
+        for g in GoalKind::ALL {
+            all |= 1 << g.index();
+        }
+        assert_eq!(all.count_ones() as usize, GoalKind::COUNT);
+        let last = GoalKind::ALL[GoalKind::COUNT - 1];
+        assert_eq!(own_score(1 << last.index(), last.index(), || 1.0), 0.0);
+        assert_eq!(
+            own_score(all & !(1 << last.index()), last.index(), || 1.0),
+            1.0
+        );
+        let mut i = input(100);
+        i.blocked = 1 << last.index();
+        let b = [1.0; GoalKind::COUNT];
+        assert_eq!(scores(&b, &i)[last.index()], 0.0);
+        assert!(scores(&b, &i)[GoalKind::Quest.index()] > 0.0);
     }
 
     #[test]

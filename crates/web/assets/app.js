@@ -34,7 +34,8 @@ const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 
 const GOALS = [['auto', 'Auto'], ['quest', 'Quest'], ['grind', 'Grind'], ['duel', 'Duel'], ['trade', 'Trade'],
   ['trade_run', 'Trade run'], ['housing', 'Housing'], ['dungeon', 'Dungeon'], ['sail', 'Sail'],
-  ['auction', 'Auction'], ['market', 'Market'], ['rest', 'Rest'], ['wander', 'Wander']];
+  ['auction', 'Auction'], ['market', 'Market'], ['guild', 'Guild'], ['gank', 'Gank'], ['warzone', 'Warzone'],
+  ['event', 'Event'], ['companion', 'Companion'], ['farm', 'Farm'], ['rest', 'Rest'], ['wander', 'Wander']];
 
 const MARKER = {
   house:        { label: 'House',        color: '#a0693a', minScale: 0 },
