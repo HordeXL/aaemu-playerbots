@@ -343,13 +343,38 @@ fn the_produce_on_its_way_leaves_out_the_seeds() {
 }
 
 #[test]
+fn a_harvested_crop_that_leaves_is_no_loss() {
+    let b = book();
+    let w = watcher(&b, &field, [6.0, 5.0, 10.0], 1_000);
+    let mut m = FarmMem::default();
+    m.observe(&w, &created(&[doodad(1, 2259, ME, 4457, 5.0, 5.0)]));
+    m.expect_removal(1);
+    m.observe(&w, &WorldEvent::DoodadsRemoved(smallvec![1]));
+    assert!(m.plots.is_empty());
+    assert_eq!(m.lost, 0, "the bot harvested it");
+    // the expectation is used up
+    m.observe(&w, &created(&[doodad(1, 2259, ME, 4457, 5.0, 5.0)]));
+    m.observe(&w, &WorldEvent::DoodadsRemoved(smallvec![1]));
+    assert_eq!(m.lost, 1);
+    // and bounded
+    for obj in 0..20 {
+        m.expect_removal(obj);
+    }
+    assert!(m.reaped.len() <= 4);
+}
+
+#[test]
 fn plots_are_found_by_object_and_by_place() {
     let b = book();
     let w = watcher(&b, &field, [0.0; 3], 1);
     let mut m = FarmMem::default();
     m.observe(&w, &created(&[doodad(1, 2259, ME, 4456, 5.0, 5.0)]));
     assert!(m.by_obj(1).is_some() && m.by_obj(2).is_none() && m.by_obj(0).is_none());
-    assert!(m.at(5.5, 5.5).is_some() && m.at(9.0, 5.0).is_none());
+    assert!(m.at(5.3, 5.3).is_some() && m.at(9.0, 5.0).is_none());
+    assert!(
+        m.at(6.7, 5.0).is_none(),
+        "a neighbour one spacing away is another plot"
+    );
     assert_eq!(m.count_on(FarmKind::Farm as u8), 1);
     assert_eq!(m.count_on(OWN_LAND), 0);
     m.drop_plot(0);

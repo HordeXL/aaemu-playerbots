@@ -911,3 +911,26 @@ fn the_goal_scores_itself_and_a_homebody_merchant_likes_it_most() {
     assert!(super::weight(&keen) > neutral && neutral > super::weight(&wild));
     assert!(super::weight(&wild) > 0.0);
 }
+
+#[test]
+fn neighbouring_plots_a_spacing_apart_are_harvested_and_replanted_one_by_one() {
+    let mut rig = Rig::new(Machine::harvest(false, 10_000));
+    // three crops 1.7 m apart, as close as the planner puts them
+    for (i, x) in [100.0f32, 101.7, 103.4].into_iter().enumerate() {
+        let mut p = ripe_plot(3_001 + i as u32, x, true);
+        p.pos[1] = 102.0;
+        rig.mem.plots.push(p);
+    }
+    assert_eq!(rig.run(600_000), GoalStatus::Done);
+    assert_eq!(rig.machine.harvested, 3);
+    assert_eq!(
+        rig.planted_at.len(),
+        3,
+        "every harvested place is planted again"
+    );
+    assert_eq!(rig.mem.plots.len(), 3);
+    let mut xs: Vec<f32> = rig.planted_at.iter().map(|p| p[0]).collect();
+    xs.sort_by(f32::total_cmp);
+    assert_eq!(xs, vec![100.0, 101.7, 103.4]);
+    assert_eq!(rig.mem.lost, 0);
+}

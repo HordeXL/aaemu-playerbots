@@ -43,8 +43,9 @@ pub const RECHECK_MS: u64 = 5 * 60_000;
 pub const VANISH_M: f32 = 12.0;
 /// A plot the bot planted this recently is not dropped by an older list of the public farms.
 pub const FRESH_MS: u64 = 30_000;
-/// Two plots this close are the same plot.
-pub const SAME_SPOT_M: f32 = 2.0;
+/// Two plots this close are the same plot (crops keep at least `site::spacing_m` of 1.6 m
+/// between them, so neighbours are never this close).
+pub const SAME_SPOT_M: f32 = 0.75;
 /// Land type of a plot on the land of one of the bot's houses; the public farms use their
 /// [`FarmKind`] as `u8`.
 pub const OWN_LAND: u8 = 0;
@@ -134,6 +135,8 @@ pub struct FarmMem {
     pub harvested: u32,
     /// Crops that vanished near the bot without a harvest.
     pub lost: u32,
+    /// Crops the bot just harvested, whose removal is expected (not a loss).
+    reaped: SmallVec<[u32; 4]>,
 }
 
 impl FarmMem {
@@ -177,6 +180,14 @@ impl FarmMem {
         if i < self.plots.len() {
             self.plots.remove(i);
         }
+    }
+
+    /// The bot harvested crop `obj`: its removal from the world is no loss.
+    pub fn expect_removal(&mut self, obj: u32) {
+        if self.reaped.len() >= 4 {
+            self.reaped.remove(0);
+        }
+        self.reaped.push(obj);
     }
 
     /// Whether (x, y) is a spot the server refused lately.
@@ -311,7 +322,12 @@ impl FarmMem {
         };
         if dist2d(self.plots[i].pos, w.pos) <= VANISH_M {
             self.plots.remove(i);
-            self.lost = self.lost.saturating_add(1);
+            match self.reaped.iter().position(|&o| o == obj) {
+                Some(k) => {
+                    self.reaped.remove(k);
+                }
+                None => self.lost = self.lost.saturating_add(1),
+            }
         } else {
             self.plots[i].obj = 0;
         }
@@ -422,6 +438,38 @@ pub fn publish(hub: &Hub, bot: u32, state: &BotState, world: &World) {
         .map(|m| m.growing(world.farm()))
         .unwrap_or_default();
     hub.farms.publish(bot, &growing);
+}
+
+/// The bot's plots as lines for the web UI (nothing for a bot that never farmed).
+pub fn plot_lines(state: &BotState, world: &World, now_ms: u64, out: &mut Vec<pb_web::PlotLine>) {
+    let Some(mem) = state.market.farm() else {
+        return;
+    };
+    for p in mem.plots.iter().take(MAX_PLOTS) {
+        let crop = world.doodad(p.doodad).map_or("a crop", |d| &*d.name);
+        let state = if p.ripe {
+            "ripe".to_owned()
+        } else if p.obj == 0 {
+            "out of view".to_owned()
+        } else if p.check_ms > now_ms {
+            let left = (p.check_ms - now_ms) / 60_000;
+            if left == 0 {
+                "growing, less than a minute left".to_owned()
+            } else {
+                format!("growing, about {left} min left")
+            }
+        } else {
+            "due".to_owned()
+        };
+        out.push(pb_web::PlotLine {
+            x: p.pos[0],
+            y: p.pos[1],
+            crop: crop.to_owned(),
+            state,
+            honest: p.honest,
+            land: p.kind().map_or("own land", |k| k.name()).to_owned(),
+        });
+    }
 }
 
 /// The server's refusals of a planting (the `ErrorMessageType` ids the doodad placement sends).

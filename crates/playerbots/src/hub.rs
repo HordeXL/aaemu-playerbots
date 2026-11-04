@@ -70,6 +70,9 @@ pub struct SlotInner {
     /// The route the bot is walking, map-plane `[x, y]` points (empty when none). Written by the
     /// bot task (owned by the motion feature), shown as `BotDetail::path`.
     pub path: Vec<[f32; 2]>,
+    /// The bot's crops, refreshed with the extra rows (the farming goal), shown as
+    /// `BotDetail::plots`.
+    pub plots: Vec<pb_web::PlotLine>,
     /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
     pub social: SlotSocial,
 }
@@ -146,6 +149,7 @@ impl BotSlot {
         g.snap.partner = None;
         g.snap.online_secs = 0;
         g.path.clear();
+        g.plots.clear();
         self.obj_id.store(0, Ordering::Relaxed);
     }
 }
@@ -772,6 +776,7 @@ impl BotHub for Hub {
             extra: g.extra.clone(),
             chat: g.social.chat_lines(),
             path: g.path.clone(),
+            plots: g.plots.clone(),
         }))
     }
 
@@ -860,7 +865,14 @@ impl BotHub for Hub {
     }
 
     fn economy(&self) -> EconomyView {
-        self.pop.economy_view()
+        let mut view = self.pop.economy_view();
+        let growing: FxHashMap<u32, f32> = self.farms.totals().into_iter().collect();
+        if !growing.is_empty() {
+            for row in &mut view.items {
+                row.growing = growing.get(&row.template).copied().unwrap_or(0.0);
+            }
+        }
+        view
     }
 
     fn director(&self) -> DirectorView {

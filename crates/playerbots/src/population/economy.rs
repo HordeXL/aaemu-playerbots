@@ -451,6 +451,7 @@ impl Economy {
                 wts: ev.wts.round() as u32,
                 reasons: sc.reasons,
                 boosted: boosted.contains(&template),
+                growing: 0.0,
             }
         };
         for (t, s) in &g.items {

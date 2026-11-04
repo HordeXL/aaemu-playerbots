@@ -85,6 +85,7 @@ impl BotHub for TestHub {
                 text: "Bob: hi there".into(),
             }],
             path: Vec::new(),
+            plots: Vec::new(),
         })
     }
 

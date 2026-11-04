@@ -1199,6 +1199,8 @@ impl Bot {
                 g.extra.push(("sessions".into(), self.sessions.to_string()));
                 g.extra
                     .push(("quests".into(), goals::quest::summary(world, &self.state)));
+                g.plots.clear();
+                farm::plot_lines(&self.state, world, self.state.now_ms, &mut g.plots);
             }
         });
         self.slot.obj_id.store(self.state.me.obj, Ordering::Relaxed);

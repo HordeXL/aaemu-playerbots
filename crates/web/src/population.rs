@@ -320,6 +320,9 @@ pub struct ItemRow {
     pub reasons: Vec<String>,
     /// The director was told to grow this item.
     pub boosted: bool,
+    /// How many of the item the bots' plots will give (the farming goal); 0 when none grows.
+    #[serde(default)]
+    pub growing: f32,
 }
 
 /// Where the economy numbers come from.

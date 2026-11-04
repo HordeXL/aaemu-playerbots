@@ -21,8 +21,8 @@ use pb_web::{
     ActionRecord, Activity, Alliance, BotDetail, BotHub, BotSnapshot, Command, Continent,
     DirectorView, EconomySources, EconomyView, HealthView, HeatCell, HubStats, IssueAction,
     IssueDetail, IssueSample, IssueSummary, ItemRow, LlmStats, LogLine, MapInfo, Marker,
-    MarkerKind, PlayerSeen, Policy, PolicyPatch, QuestLine, RegionCell, ServerView, SideRow,
-    WebConfig, WorldRect, WorldTotals, WorldView, ZoneRow,
+    MarkerKind, PlayerSeen, PlotLine, Policy, PolicyPatch, QuestLine, RegionCell, ServerView,
+    SideRow, WebConfig, WorldRect, WorldTotals, WorldView, ZoneRow,
 };
 
 const AREA: (f32, f32, f32, f32) = (15000.0, 14800.0, 16200.0, 15800.0);
@@ -598,6 +598,28 @@ impl BotHub for MockHub {
                 .cloned()
                 .collect(),
             path: Vec::new(),
+            plots: if id.is_multiple_of(3) {
+                vec![
+                    PlotLine {
+                        x: 14_210.0,
+                        y: 9_020.5,
+                        crop: "Potato".into(),
+                        state: "ripe".into(),
+                        honest: true,
+                        land: "farm".into(),
+                    },
+                    PlotLine {
+                        x: 14_214.5,
+                        y: 9_020.5,
+                        crop: "Potato".into(),
+                        state: "growing, about 6 min left".into(),
+                        honest: false,
+                        land: "own land".into(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1409,6 +1431,7 @@ fn mock_economy(policy: &Policy) -> EconomyView {
                 wts,
                 reasons,
                 boosted: policy.boosts.iter().any(|b| b.template == template),
+                growing: if template.is_multiple_of(5) { 12.0 } else { 0.0 },
             }
         })
         .collect();

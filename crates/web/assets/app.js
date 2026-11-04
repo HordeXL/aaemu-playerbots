@@ -424,6 +424,7 @@ function buildDetail() {
   D.name = $('d-name'); D.sub = $('d-sub'); D.hp = $('d-hp'); D.hpText = $('d-hp-text');
   D.quests = $('d-quests'); D.extra = $('d-extra'); D.extraWrap = $('d-extra-wrap'); D.log = $('d-log');
   D.chat = $('d-chat'); D.chatWrap = $('d-chat-wrap');
+  D.plots = $('d-plots'); D.plotsWrap = $('d-plots-wrap');
   D.status = $('c-status'); D.pause = $('c-pause'); D.goal = $('c-goal'); D.duel = $('c-duel');
   D.trade = $('c-trade'); D.say = $('c-say'); D.whisper = $('c-whisper'); D.whisperTo = $('c-whisper-to');
   D.f = {};
@@ -588,6 +589,20 @@ function renderDetail() {
   const ef = document.createDocumentFragment();
   for (const kv of ex) ef.append(h('dt', null, String(kv[0])), h('dd', null, String(kv[1])));
   D.extra.replaceChildren(ef);
+  // the bot's crops (the farming goal)
+  const plots = d.plots || [];
+  D.plotsWrap.hidden = plots.length === 0;
+  const pf = document.createDocumentFragment();
+  for (const p of plots) {
+    const li = h('li');
+    li.append(
+      h('span', null, (p.crop || 'crop') + ' on ' + (p.land || 'land')),
+      h('span', null, p.state + (p.honest ? '' : ' (minted seed)')),
+    );
+    li.title = Math.round(p.x) + ', ' + Math.round(p.y);
+    pf.append(li);
+  }
+  D.plots.replaceChildren(pf);
   // chat the bot heard and said, newest first
   const chat = (d.chat || []).slice().sort((a, b) => b.t - a.t).slice(0, 8);
   D.chatWrap.hidden = chat.length === 0;

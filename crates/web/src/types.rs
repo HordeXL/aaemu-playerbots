@@ -153,6 +153,22 @@ pub struct QuestLine {
     pub status: String,
 }
 
+/// One crop of a bot (the farming goal).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlotLine {
+    /// Where it stands.
+    pub x: f32,
+    pub y: f32,
+    /// What grows there (the crop's name).
+    pub crop: String,
+    /// `growing`, `ripe`, `due` (worth a look) or `out of view`, with the time left when known.
+    pub state: String,
+    /// The seeds were bought: the harvest may be sold.
+    pub honest: bool,
+    /// Where it is: `own land` or the kind of public farm.
+    pub land: String,
+}
+
 /// Everything the detail panel shows about one bot.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BotDetail {
@@ -170,6 +186,9 @@ pub struct BotDetail {
     /// the motion controller; the UI draws it for the selected bot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<[f32; 2]>,
+    /// The bot's crops (the farming goal), empty when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plots: Vec<PlotLine>,
 }
 
 /// Token-budget numbers of the optional LLM.
@@ -849,13 +868,44 @@ mod tests {
             extra: Vec::new(),
             chat: Vec::new(),
             path: Vec::new(),
+            plots: Vec::new(),
         };
         let v = serde_json::to_value(&d).unwrap();
         assert!(v.get("path").is_none(), "{v}");
+        assert!(v.get("plots").is_none(), "{v}");
         d.path = vec![[1.5, 2.0], [3.0, -4.25]];
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains(r#""path":[[1.5,2.0],[3.0,-4.25]]"#), "{json}");
         let back: BotDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn the_plots_of_a_detail_are_left_out_when_empty_and_round_trip_otherwise() {
+        let mut d = BotDetail {
+            snapshot: BotSnapshot::default(),
+            log: Vec::new(),
+            quests: Vec::new(),
+            extra: Vec::new(),
+            chat: Vec::new(),
+            path: Vec::new(),
+            plots: Vec::new(),
+        };
+        d.plots.push(PlotLine {
+            x: 10.5,
+            y: -3.0,
+            crop: "Potato".into(),
+            state: "ripe".into(),
+            honest: true,
+            land: "farm".into(),
+        });
+        let json = serde_json::to_string(&d).unwrap();
+        let back: BotDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+        // a detail from before the field existed still reads
+        let mut v = serde_json::to_value(&d).unwrap();
+        v.as_object_mut().unwrap().remove("plots");
+        let old: BotDetail = serde_json::from_value(v).unwrap();
+        assert!(old.plots.is_empty());
     }
 }

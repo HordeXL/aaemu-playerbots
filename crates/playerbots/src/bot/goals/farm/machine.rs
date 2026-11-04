@@ -1058,6 +1058,7 @@ impl Machine {
                 Some(i) => !mem.plots[i].ripe,
             };
             if worked {
+                mem.expect_removal(self.reap.obj);
                 self.reap.gone_ms = io.now_ms;
                 self.harvested += 1;
                 mem.harvested += 1;
