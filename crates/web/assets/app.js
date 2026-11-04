@@ -17,30 +17,30 @@ const ACT = {
   offline:    { label: 'Offline',    color: '#9aa0a6' },
   connecting: { label: 'Connecting', color: '#c9ccd2' },
   idle:       { label: 'Idle',       color: '#4f8ef7' },
-  traveling:  { label: 'Traveling',  color: '#17b3c4' },
-  questing:   { label: 'Questing',   color: '#f2b01e' },
-  grinding:   { label: 'Grinding',   color: '#f2711c' },
-  fighting:   { label: 'Fighting',   color: '#e5383b' },
-  dueling:    { label: 'Dueling',    color: '#d62f8a' },
-  trading:    { label: 'Trading',    color: '#2fb344' },
-  trade_run:  { label: 'Trade run',  color: '#8bc34a' },
-  housing:    { label: 'Housing',    color: '#a0693a' },
-  resting:    { label: 'Resting',    color: '#9b6bdf' },
-  dead:       { label: 'Dead',       color: '#111111' },
+  traveling:  { label: '赶路',  color: '#17b3c4' },
+  questing:   { label: '做任务',   color: '#f2b01e' },
+  grinding:   { label: '刷怪',   color: '#f2711c' },
+  fighting:   { label: '战斗',   color: '#e5383b' },
+  dueling:    { label: '决斗',    color: '#d62f8a' },
+  trading:    { label: '交易',    color: '#2fb344' },
+  trade_run:  { label: '跑商',  color: '#8bc34a' },
+  housing:    { label: '房产',    color: '#a0693a' },
+  resting:    { label: '休息',    color: '#9b6bdf' },
+  dead:       { label: '死亡',       color: '#111111' },
 };
 const ACT_INDEX = {};
 ACTIVITIES.forEach((a, i) => { ACT_INDEX[a] = i; });
 const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 
-const GOALS = [['auto', 'Auto'], ['quest', 'Quest'], ['grind', 'Grind'], ['duel', 'Duel'], ['trade', 'Trade'],
-  ['trade_run', 'Trade run'], ['housing', 'Housing'], ['dungeon', 'Dungeon'], ['sail', 'Sail'],
-  ['auction', 'Auction'], ['market', 'Market'], ['rest', 'Rest'], ['wander', 'Wander']];
+const GOALS = [['auto', '自动'], ['quest', '任务'], ['grind', '刷怪'], ['duel', '决斗'], ['trade', '交易'],
+  ['trade_run', '跑商'], ['housing', '房产'], ['dungeon', '副本'], ['sail', '帆船'],
+  ['auction', '拍卖'], ['market', '市场'], ['rest', '休息'], ['wander', '闲逛']];
 
 const MARKER = {
-  house:        { label: 'House',        color: '#a0693a', minScale: 0 },
-  duel_flag:    { label: 'Duel flag',    color: '#d62f8a', minScale: 0 },
-  quest_giver:  { label: 'Quest giver',  color: '#f2b01e', minScale: 0.12 },
-  trade_outlet: { label: 'Trade outlet', color: '#2fb344', minScale: 0 },
+  house:        { label: '房屋',        color: '#a0693a', minScale: 0 },
+  duel_flag:    { label: '决斗旗',    color: '#d62f8a', minScale: 0 },
+  quest_giver:  { label: '任务发布者',  color: '#f2b01e', minScale: 0.12 },
+  trade_outlet: { label: '交易点', color: '#2fb344', minScale: 0 },
 };
 const MARKER_KINDS = Object.keys(MARKER);
 
@@ -198,8 +198,8 @@ function refreshView() {
   renderChips();
   renderList();
   setText($('list-foot'), out.length === S.list.length
-    ? nf.format(S.list.length) + ' bots'
-    : nf.format(out.length) + ' of ' + nf.format(S.list.length) + ' bots');
+    ? nf.format(S.list.length) + ' 个机器人'
+    : nf.format(out.length) + ' / ' + nf.format(S.list.length) + ' 个机器人');
   $('empty').hidden = S.list.length > 0;
   requestDraw();
 }
@@ -212,7 +212,7 @@ function buildChips() {
   const wrap = $('chips');
   chipAll = h('button', 'chip');
   chipAll.type = 'button';
-  chipAll.append(h('span', null, 'All'), h('b', null, '0'));
+  chipAll.append(h('span', null, '全部'), h('b', null, '0'));
   chipAll.addEventListener('click', () => { S.filter.clear(); refreshView(); });
   wrap.append(chipAll);
   for (const a of ACTIVITIES) {
@@ -277,7 +277,7 @@ function renderStats() {
   const s = S.stats;
   if (!s) return;
   setTile('st-online', nf.format(s.bots_online) + ' / ' + nf.format(s.bots_total), null);
-  setTile('st-mem', fmtBytes(s.rss_bytes), fmtBytes(s.bytes_per_bot) + '/bot');
+  setTile('st-mem', fmtBytes(s.rss_bytes), fmtBytes(s.bytes_per_bot) + '/机器人');
   setTile('st-pkt', fmtRate(s.packets_in_per_sec) + ' in', fmtRate(s.packets_out_per_sec) + ' out');
   setTile('st-bw', fmtBytes(s.bytes_in_per_sec) + '/s in', fmtBytes(s.bytes_out_per_sec) + '/s out');
   setTile('st-up', fmtDur(s.uptime_secs), null);
@@ -286,14 +286,14 @@ function renderStats() {
   if (l) {
     const unlimited = !(num(l.budget_left) < 1e15);
     const extra = [];
-    if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' throttled');
-    if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' chat replies');
-    if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' director picks');
-    setTile('st-llm', nf.format(l.requests) + ' requests, ' + nf.format(l.failures) + ' failed',
-      fmtCount(l.tokens_today) + ' tokens today, ' + (unlimited ? 'no budget limit' : fmtCount(l.budget_left) + ' left') +
+    if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' 次限流');
+    if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' 次聊天回复');
+    if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' 次导演决策');
+    setTile('st-llm', nf.format(l.requests) + ' 次请求, ' + nf.format(l.failures) + ' 次失败',
+      fmtCount(l.tokens_today) + ' token 今日, ' + (unlimited ? '无预算上限' : '剩余 ' + fmtCount(l.budget_left)) +
       (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));
   }
-  document.title = 'Playerbots (' + s.bots_online + '/' + s.bots_total + ')';
+  document.title = '玩家机器人 (' + s.bots_online + '/' + s.bots_total + ')';
   renderIssueBadge(s);
 }
 
@@ -301,9 +301,9 @@ function renderConn() {
   const c = $('conn');
   const age = S.lastOkAt ? (performance.now() - S.lastOkAt) / 1000 : Infinity;
   let cls = 'conn', text;
-  if (S.failures >= 2 || age > 6) { cls += ' down'; text = S.lastOkAt ? 'no data for ' + Math.floor(age) + ' s' : 'cannot reach the bot process'; }
-  else if (S.lastOkAt) { cls += ' live'; text = 'live'; }
-  else text = 'connecting';
+  if (S.failures >= 2 || age > 6) { cls += ' down'; text = S.lastOkAt ? '已 ' + Math.floor(age) + ' 秒无数据' : '无法连接机器人进程'; }
+  else if (S.lastOkAt) { cls += ' live'; text = '正常'; }
+  else text = '连接中';
   if (c.className !== cls) c.className = cls;
   setText($('conn-text'), text);
 }
@@ -411,9 +411,9 @@ function markSort() {
 
 // ------------------------------------------------------------------ selection and detail panel
 const D = {};
-const FIELD_DEFS = [['goal', 'Goal'], ['detail', 'Detail'], ['activity', 'Activity'], ['zone', 'Zone'],
-  ['pos', 'Position'], ['gold', 'Gold'], ['house', 'House'], ['online', 'Online for'],
-  ['partner', 'Partner'], ['state', 'State'], ['id', 'Bot id']];
+const FIELD_DEFS = [['goal', '目标'], ['detail', '详情'], ['activity', '状态'], ['zone', '区域'],
+  ['pos', '坐标'], ['gold', '金币'], ['house', '房屋'], ['online', '在线时长'],
+  ['partner', '搭档'], ['state', '运行状态'], ['id', '机器人ID']];
 
 function buildDetail() {
   D.panel = $('detail');
@@ -444,17 +444,17 @@ function buildDetail() {
   });
   $('c-duel-go').addEventListener('click', () => {
     if (S.sel != null && D.duel.value) sendCommand(S.sel, { type: 'duel_with', other: Number(D.duel.value) }, D.status);
-    else setStatus(D.status, 'err', 'Pick another bot first.');
+    else setStatus(D.status, 'err', '请先选择另一个机器人。');
   });
   $('c-trade-go').addEventListener('click', () => {
     if (S.sel != null && D.trade.value) sendCommand(S.sel, { type: 'trade_with', other: Number(D.trade.value) }, D.status);
-    else setStatus(D.status, 'err', 'Pick another bot first.');
+    else setStatus(D.status, 'err', '请先选择另一个机器人。');
   });
   $('c-say-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = D.say.value.trim();
     if (S.sel == null) return;
-    if (!text) { setStatus(D.status, 'err', 'Type something to say.'); return; }
+    if (!text) { setStatus(D.status, 'err', '请输入要说的话。'); return; }
     if (await sendCommand(S.sel, { type: 'say', text }, D.status)) D.say.value = '';
   });
   $('c-whisper-form').addEventListener('submit', async (e) => {
@@ -462,7 +462,7 @@ function buildDetail() {
     const to = D.whisperTo.value.trim();
     const text = D.whisper.value.trim();
     if (S.sel == null) return;
-    if (!to || !text) { setStatus(D.status, 'err', 'Give a character name and a line to whisper.'); return; }
+    if (!to || !text) { setStatus(D.status, 'err', '请填写角色名和悄悄话内容。'); return; }
     if (await sendCommand(S.sel, { type: 'whisper', to, text }, D.status)) D.whisper.value = '';
   });
 }
@@ -518,7 +518,7 @@ function fillPartnerSelects() {
   if (document.activeElement === D.duel || document.activeElement === D.trade) return;
   S.partnerSig = sig;
   const others = S.list.filter((b) => b.id !== S.sel && b.ai > 1).sort((a, b) => coll.compare(a.name, b.name));
-  for (const [sel, label] of [[D.duel, 'Duel with…'], [D.trade, 'Trade with…']]) {
+  for (const [sel, label] of [[D.duel, '与…决斗'], [D.trade, '与…交易']]) {
     const keep = sel.value;
     const frag = document.createDocumentFragment();
     const first = h('option', null, label);
@@ -534,6 +534,125 @@ function fillPartnerSelects() {
   }
 }
 
+// The server sends goals and details as English words; show them in Chinese.
+const GOAL_LABEL = {
+  quest: '做任务', grind: '刷怪', duel: '决斗', trade: '交易', trade_run: '跑商', housing: '房产',
+  dungeon: '副本', sail: '帆船', auction: '拍卖', market: '市场', rest: '休息', wander: '闲逛',
+  travel: '赶路', auto: '自动', none: '空闲', idle: '空闲', portal: '传送', gather: '采集',
+  loot: '拾取', talk: '交谈', craft: '制作', sell: '出售', buy: '购买', house: '房屋',
+};
+// The server describes what a bot is doing in English sentences; translate the common ones.
+// Replaces $1..$9 in a template with the regex groups. String.replace() with a function
+// would leave them literal, so the substitution is done here.
+function interp(tpl, m) {
+  return tpl.replace(/\$(\d)/g, (_, i) => {
+    const v = m[Number(i)];
+    return v === undefined ? '' : v;
+  });
+}
+
+const PHRASE = [
+  [/^dead, can respawn in (\d+)s$/, '死亡，$1 秒后复活'],
+  [/^paused$/, '已暂停'],
+  [/^fighting (.+)$/, '战斗中：$1'],
+  [/^dead$/, '死亡'],
+  [/^looking around$/, '四处张望'],
+  [/^strolling to ([-\d.]+), ([-\d.]+)$/, '闲逛到 $1, $2'],
+  [/^looking for someone to duel$/, '寻找决斗对手'],
+  [/^meeting (.+) for a duel$/, '与 $1 会面决斗'],
+  [/^challenged (.+)$/, '已挑战 $1'],
+  [/^duel with (.+) starts$/, '与 $1 的决斗开始'],
+  [/^dueling (.+)$/, '正在与 $1 决斗'],
+  [/^(.+) against (.+), recovering$/, '$1 对战 $2，休整中'],
+  [/^recovering from a duel$/, '决斗后恢复中'],
+  [/^planning a house$/, '规划房屋'],
+  [/^looking for a place to build$/, '寻找可建造地块'],
+  [/^walking to a building plot$/, '走向建造地块'],
+  [/^asking for the building tax$/, '询问建造税'],
+  [/^getting the design and tax certificates$/, '获取图纸和税务凭证'],
+  [/^placing a house \(try (.+)\)$/, '放置房屋（尝试 $1）'],
+  [/^building the house \((\d+) steps left\)$/, '建造房屋（还剩 $1 步）'],
+  [/^going home$/, '回家'],
+  [/^resting at home$/, '在家休息'],
+  [/^hunting, (\d+) kills$/, '狩猎中，击杀 $1'],
+  [/^looking for monsters, (\d+) kills$/, '寻找怪物，击杀 $1'],
+  [/^scanning, (\d+) kills$/, '搜索中，击杀 $1'],
+  [/^getting something to trade$/, '准备交易物资'],
+  [/^looking for someone to trade with$/, '寻找交易对象'],
+  [/^walking to (.+) to trade$/, '走向 $1 进行交易'],
+  [/^asking (.+) to trade$/, '请求与 $1 交易'],
+  [/^accepted the trade with (.+)$/, '已接受与 $1 的交易'],
+  [/^waiting for (.+)'s trade request$/, '等待 $1 的交易请求'],
+  [/^trading with (.+): offering (.+)$/, '与 $1 交易中，报价 $2'],
+  [/^market: advertising, listening for buyers$/, '市场：发布广告，等待买家'],
+  [/^market: (.+), (.+) (.+)$/, '市场：$1 $2，$3'],
+  [/^auction house$/, '拍卖行'],
+  [/^market$/, '市场'],
+  [/^dungeon$/, '副本'],
+  [/^sail$/, '帆船'],
+  [/^resting$/, '休息中'],
+  [/^quest$/, '任务'],
+  [/^craft$/, '制作'],
+  [/^an item$/, '使用物品'],
+  [/^go to the marked area$/, '前往标记区域'],
+  [/^gather (.+)$/, '采集 $1'],
+  [/^kill (.+)$/, '击杀 $1'],
+  [/^talk to (.+)$/, '与 $1 对话'],
+  [/^use (.+)$/, '使用 $1'],
+  [/^reach level (\d+)$/, '达到 $1 级'],
+  [/^getting it from (.+)$/, '正在从 $1 接取'],
+  [/^collect (.+)$/, '收集 $1'],
+  [/^destroy (.+)$/, '摧毁 $1'],
+  [/^craft (.+)$/, '制作 $1'],
+  [/^deliver (.+)$/, ' delivering $1'],
+
+  [/^talk to (.+)$/, '与 $1 对话'],
+  [/^use (.+)$/, '使用 $1'],
+  [/^reach level (\d+)$/, '达到 $1 级'],
+  [/^do something unsupported$/, '执行不支持的动作'],
+  [/^getting a boat scroll$/, '获取船只卷轴'],
+  [/^planning a trip$/, '规划航程'],
+  [/^walking to the launch beach$/, '走向下水海滩'],
+  [/^summoning a boat$/, '召唤船只'],
+  [/^boarding the boat$/, '登船'],
+  [/^sailing, ([\d.]+) m to go$/, '航行中，还剩 $1 米'],
+  [/^coming ashore$/, '上岸'],
+  [/^leaving the boat$/, '离开船只'],
+];
+
+function zhPhrase(s) {
+  const k = String(s || '').trim();
+  if (!k) return '-';
+  // "Quest 123 <title>: <objective> (<have>/<need>)" - the quest name stays as it is,
+  // the objective is translated by the phrase table.
+  const q = k.match(/^Quest (\d+) (.+?): (.+?)(?: \((\d+)\/(\d+)\))?$/);
+  if (q) {
+    const obj = zhPhrase(q[3]);
+    const prog = q[4] !== undefined ? '（' + q[4] + '/' + q[5] + '）' : '';
+    return '任务 ' + q[1] + ' ' + q[2] + '：' + obj + prog;
+  }
+  // The quest list row: "3508 好奇害死猫 (0/1)" or "3508 好奇害死猫 (ready)".
+  const qr = k.match(/^(?:Quest )?(\d+) (.+?)(?: \((\d+)\/(\d+)\))?(?: \(ready\))?$/);
+  if (qr) {
+    const prog = qr[3] !== undefined ? '（' + qr[3] + '/' + qr[4] + '）' : (k.includes('(ready)') ? '（可提交）' : '');
+    return '任务 ' + qr[1] + ' ' + qr[2] + prog;
+  }
+  for (const [re, tpl] of PHRASE) {
+    const m = k.match(re);
+    if (m) return interp(tpl, m);
+  }
+  return k;
+}
+
+function zhGoal(s) {
+  const k = String(s || '').trim();
+  if (!k) return '-';
+  if (GOAL_LABEL[k]) return GOAL_LABEL[k];
+  const parts = k.split(/\s+/);
+  if (parts.length === 1 && GOAL_LABEL[parts[0].toLowerCase()]) return GOAL_LABEL[parts[0].toLowerCase()];
+  return zhPhrase(k);
+}
+
 function renderDetail() {
   if (S.sel == null) return;
   const live = S.bots.get(S.sel);
@@ -542,8 +661,8 @@ function renderDetail() {
   // does not have the bot (yet).
   const b = live || (d && snapshotToView(d.snapshot));
   if (!b) {
-    setText(D.name, 'Bot #' + S.sel);
-    setText(D.sub, 'waiting for data…');
+    setText(D.name, '机器人 #' + S.sel);
+    setText(D.sub, '等待数据…');
     return;
   }
   setText(D.name, b.name);
@@ -553,17 +672,17 @@ function renderDetail() {
   if (D.hp.className !== hpCls) D.hp.className = hpCls;
   setText(D.hpText, b.hp + '%');
   const f = D.f;
-  setText(f.goal, b.goal || '-');
-  setText(f.detail, b.detail || '-');
+  setText(f.goal, zhGoal(b.goal));
+  setText(f.detail, zhGoal(b.detail));
   setText(f.activity, ACT[b.activity].label);
   setText(f.zone, b.zone || '-');
   setText(f.pos, b.x.toFixed(1) + ', ' + b.y.toFixed(1) + ', ' + b.z.toFixed(1));
   setText(f.gold, nf.format(b.gold));
-  setText(f.house, b.house ? 'owns a house' : 'none');
+  setText(f.house, b.house ? '拥有房屋' : '无');
   setText(f.online, fmtDur(b.online));
-  setText(f.state, b.paused ? 'paused' : 'running');
+  setText(f.state, b.paused ? '已暂停' : '运行中');
   setText(f.id, String(b.id));
-  setText(D.pause, b.paused ? 'Resume' : 'Pause');
+  setText(D.pause, b.paused ? '继续' : '暂停');
   renderPartner(b);
   fillPartnerSelects();
 
@@ -571,10 +690,10 @@ function renderDetail() {
   // quests
   const qs = d.quests || [];
   const qf = document.createDocumentFragment();
-  if (!qs.length) qf.append(h('li', 'empty', 'No quests.'));
+  if (!qs.length) qf.append(h('li', 'empty', '暂无任务。'));
   for (const q of qs) {
     const li = h('li');
-    li.append(h('span', null, (q.name || 'Quest') + ' #' + q.id), h('span', null, q.status || ''));
+    li.append(h('span', null, (q.name || '任务') + ' #' + q.id), h('span', null, q.status || ''));
     qf.append(li);
   }
   D.quests.replaceChildren(qf);
@@ -597,7 +716,7 @@ function renderDetail() {
   // log, newest first
   const log = (d.log || []).slice().sort((a, b) => b.t - a.t).slice(0, 80);
   const lf = document.createDocumentFragment();
-  if (!log.length) lf.append(h('li', 'empty', 'Nothing logged yet.'));
+  if (!log.length) lf.append(h('li', 'empty', '暂无日志。'));
   for (const ln of log) {
     const li = h('li');
     const t = h('time', null, fmtClock(ln.t));
@@ -656,22 +775,22 @@ async function postJson(url, payload) {
     if (r.ok) return { ok: true };
     let msg = (body && body.error) || ('HTTP ' + r.status);
     if (r.status === 401) {
-      msg = 'Not authorised: enter the API token under Global controls. (' + msg + ')';
+      msg = '未授权：请在"全局控制"中输入 API 令牌。(' + msg + ')';
       $('global').open = true;
       $('g-token').focus();
     }
     return { ok: false, error: msg };
   } catch (e) {
-    return { ok: false, error: 'Request failed: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || e) };
+    return { ok: false, error: '请求失败：' + (e && e.name === 'AbortError' ? '超时' : (e && e.message) || e) };
   }
 }
 
 async function sendCommand(bot, cmd, statusEl) {
   const url = bot == null ? '/api/command' : '/api/bots/' + bot + '/command';
-  setStatus(statusEl, '', 'Sending ' + cmd.type + '…');
+  setStatus(statusEl, '', '正在发送 ' + cmd.type + '…');
   const r = await postJson(url, cmd);
   if (r.ok) {
-    setStatus(statusEl, 'ok', 'Sent: ' + describe(cmd));
+    setStatus(statusEl, 'ok', '已发送：' + describe(cmd));
     last.bots = -Infinity; last.detail = -Infinity; tick();
     return true;
   }
@@ -681,11 +800,11 @@ async function sendCommand(bot, cmd, statusEl) {
 
 function describe(cmd) {
   switch (cmd.type) {
-    case 'goal': return 'goal ' + cmd.goal;
-    case 'duel_with': case 'trade_with': return cmd.type.replace('_with', '') + ' with #' + cmd.other;
-    case 'say': return 'say';
-    case 'whisper': return 'whisper to ' + cmd.to;
-    case 'spawn': case 'despawn': return cmd.type + ' ' + cmd.count;
+    case 'goal': return '目标 ' + cmd.goal;
+    case 'duel_with': case 'trade_with': return (cmd.type === 'duel_with' ? '决斗' : '交易') + ' 对象 #' + cmd.other;
+    case 'say': return '喊话';
+    case 'whisper': return '对 ' + cmd.to + ' 悄悄话';
+    case 'spawn': return '生成 ' + cmd.count + ' 个'; case 'despawn': return '移除 ' + cmd.count + ' 个';
     default: return cmd.type;
   }
 }
@@ -702,7 +821,7 @@ function buildGlobal() {
   for (const [id, type] of [['g-spawn', 'spawn'], ['g-despawn', 'despawn']]) {
     $(id).addEventListener('click', () => {
       const n = count();
-      if (!n) { setStatus(st, 'err', 'Enter a count between 1 and 1000.'); return; }
+      if (!n) { setStatus(st, 'err', '请输入 1 到 1000 之间的数量。'); return; }
       sendCommand(null, { type, count: n }, st);
     });
   }
@@ -713,7 +832,7 @@ function buildGlobal() {
 // ------------------------------------------------------------------ issues
 // Problems of the game server that the bots ran into, deduplicated by the bot process.
 const ISSUE_STATES = ['open', 'queued', 'ignored', 'resolved'];
-const STATE_LABEL = { open: 'Open', queued: 'Queued', ignored: 'Ignored', resolved: 'Resolved' };
+const STATE_LABEL = { open: '待处理', queued: '已入队', ignored: '已忽略', resolved: '已修复' };
 const STATE_CLS = { open: 'st-open', queued: 'st-queued', ignored: 'st-ignored', resolved: 'st-resolved' };
 const SEV_CLS = { high: 'sev-high', medium: 'sev-medium', low: 'sev-low' };
 // What the operator can do in each state (the server refuses the rest, e.g. queueing twice).
@@ -722,10 +841,10 @@ const ISSUE_ACTIONS = {
   ignored: ['reopen', 'resolve'], resolved: ['reopen', 'ignore'],
 };
 const ACTION_INFO = {
-  queue: ['Queue', 'Write the entry to the team issue queue now'],
-  ignore: ['Ignore', 'Never queue this one by itself'],
-  resolve: ['Resolve', 'Mark it as fixed'],
-  reopen: ['Reopen', 'Back to open'],
+  queue: ['加入队列', '立即写入团队问题队列'],
+  ignore: ['忽略', '不单独加入队列'],
+  resolve: ['标记已修复', '标记为已解决'],
+  reopen: ['重新打开', '回到待处理状态'],
 };
 const ISSUE_MAX_ROWS = 300;
 const POS_RE = /\bat \((-?\d+(?:\.\d+)?), (-?\d+(?:\.\d+)?), (-?\d+(?:\.\d+)?)\)/g;
@@ -736,15 +855,29 @@ const I = {
 };
 const IE = { rows: new Map(), chipEls: {} }; // elements
 
-function words(s) { return String(s || '').replace(/_/g, ' '); }
+const KIND_LABEL = {
+  quest_no_credit: '任务无奖励', npc_missing: 'NPC 缺失', doodad_missing: '场景物件缺失',
+  kick: '被踢下线', stall: '服务器卡死', death_without_packet: '死亡无提示',
+  trade_paid_wrong: '交易金额错误', server_error: '服务器错误', malformed_packet: '数据包格式错误',
+  level_up_failed: '升级失败', item_missing: '物品缺失', stuck: '无法移动',
+};
+function words(s) {
+  const k = String(s || '');
+  if (KIND_LABEL[k]) return KIND_LABEL[k];
+  return k.replace(/_/g, ' ');
+}
 function fmtAgo(ms) {
   if (!num(ms)) return '-';
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  return s < 5 ? 'just now' : fmtDur(s) + ' ago';
+  return s < 5 ? '刚刚' : fmtDur(s) + '前';
 }
 function fmtStamp(ms) { return num(ms) ? new Date(ms).toLocaleString() : '-'; }
 
-function pill(text, classes) { return h('span', 'pill ' + (classes[text] || 'other'), text || '-'); }
+const SEV_LABEL = { high: '严重', medium: '中等', low: '轻微' };
+function pill(text, classes) {
+  const label = STATE_LABEL[text] || SEV_LABEL[text] || text || '-';
+  return h('span', 'pill ' + (classes[text] || 'other'), label);
+}
 
 function cleanSummary(s) {
   return {
@@ -783,9 +916,9 @@ function renderIssueBadge(s) {
   b.hidden = queued === 0;
   setText(a, String(open));
   setText(b, String(queued));
-  a.title = open + ' open';
-  b.title = queued + ' queued';
-  $('tab-issues').setAttribute('aria-label', 'Server issues: ' + open + ' open, ' + queued + ' queued');
+  a.title = open + ' 个待处理';
+  b.title = queued + ' 个已入队';
+  $('tab-issues').setAttribute('aria-label', '服务器问题：' + open + ' 个待处理, ' + queued + ' 个已入队');
 }
 
 function issuesVisible() { return I.tab && !document.body.classList.contains('panel-hidden'); }
@@ -825,7 +958,7 @@ function buildIssues() {
 
   IE.chipAll = h('button', 'chip');
   IE.chipAll.type = 'button';
-  IE.chipAll.append(h('span', null, 'All'), h('b', null, '0'));
+  IE.chipAll.append(h('span', null, '全部'), h('b', null, '0'));
   IE.chipAll.addEventListener('click', () => toggleIssueState(null));
   IE.chips.append(IE.chipAll);
   for (const st of ISSUE_STATES) {
@@ -867,31 +1000,91 @@ function renderIssueList() {
     const b = h('button', 'issue-row');
     b.type = 'button';
     b._fp = it.fingerprint;
-    b.title = it.fingerprint + ' · last seen ' + fmtStamp(it.last_seen);
+    b.title = it.fingerprint + ' · 最后出现 ' + fmtStamp(it.last_seen);
     const top = h('span', 'i-top');
     top.append(pill(it.state, STATE_CLS), pill(it.severity, SEV_CLS), h('span', 'i-ago', fmtAgo(it.last_seen)));
-    const meta = [words(it.kind), nf.format(it.count) + '×', nf.format(it.bots) + (it.bots === 1 ? ' bot' : ' bots'),
-      'suspect ' + (it.suspect || 'unknown')];
-    b.append(top, h('span', 'i-title', it.title || words(it.kind) || it.fingerprint), h('span', 'i-meta', meta.join(' · ')));
+    const meta = [words(it.kind), nf.format(it.count) + '×', nf.format(it.bots) + (it.bots === 1 ? ' 个机器人' : ' 个机器人'),
+      '怀疑 ' + (it.suspect || '未知')];
+    b.append(top, h('span', 'i-title', zhIssueTitle(it.title || words(it.kind) || it.fingerprint)), h('span', 'i-meta', meta.join(' · ')));
     b.addEventListener('click', () => openIssue(it.fingerprint));
     li.append(b);
     f.append(li);
     IE.rows.set(it.fingerprint, b);
   }
   if (!shown.length) {
-    f.append(h('li', 'empty', !I.loaded ? 'Loading…' : I.list.length ? 'No issues in the selected states.' : 'No server issues reported.'));
+    f.append(h('li', 'empty', !I.loaded ? '加载中…' : I.list.length ? '所选状态下没有问题。' : '尚未报告任何服务器问题。'));
   }
   IE.list.replaceChildren(f);
   if (focused && IE.rows.has(focused)) IE.rows.get(focused).focus({ preventScroll: true });
   setText(IE.foot, shown.length === I.list.length
-    ? nf.format(I.list.length) + (I.list.length === 1 ? ' issue' : ' issues')
-    : nf.format(shown.length) + ' of ' + nf.format(I.list.length) + ' issues' + (shown.length > ISSUE_MAX_ROWS ? ' (first ' + ISSUE_MAX_ROWS + ' shown)' : ''));
+    ? nf.format(I.list.length) + (I.list.length === 1 ? ' 个问题' : ' 个问题')
+    : nf.format(shown.length) + ' / ' + nf.format(I.list.length) + ' 个问题' + (shown.length > ISSUE_MAX_ROWS ? ' (仅显示前 ' + ISSUE_MAX_ROWS + ' 条)' : ''));
 }
 
 function showIssueView() {
   IE.listview.hidden = I.sel != null;
   IE.detailview.hidden = I.sel == null;
   IE.issues.classList.toggle('has-issue', I.sel != null);
+}
+
+// The server builds the issue title in English; translate the shapes it uses.
+const VERB_ZH = {
+  start: '开始', turn: '提交', in: '提交', accept: '接受', give: '放弃',
+  giveup: '放弃', pick: '拾取', complete: '完成', finish: '完成', use: '使用',
+};
+const ISSUE_TITLE = [
+  [/^The server refused to (\w+)(?: (\w+))? quest (\d+) \((.+)\)$/, '服务器拒绝$3 号任务（$4）'],
+  [/^The server refused skill (\d+) \((.+)\)$/, '服务器拒绝了技能 $1（$2）'],
+  [/^The server refused skill (\d+) "(.+)" \((.+)\)$/, '服务器拒绝了技能 $1「$2」（$3）'],
+  [/^The server kicked a bot$/, '服务器踢掉了一个机器人'],
+  [/^The server kicked the bot \((.+), reason (.+)\)$/, '服务器踢掉了机器人（$1，原因 $2）'],
+  [/^The server did not answer (.+)$/, '服务器没有响应$1'], // see NOUN_ZH below
+  [/^The server did not answer: (.+) \((.+)\)$/, '服务器没有响应：$1（$2）'],
+  [/^The server never resurrected a dead character that asked for it$/, '服务器没有复活请求复活的角色'],
+  [/^The server broke the protocol \((.+)\)$/, '服务器破坏了协议（$1）'],
+  [/^The server stalled: it stopped answering for several seconds$/, '服务器卡死：连续数秒没有响应'],
+  [/^The server stalled$/, '服务器卡死'],
+  [/^The server refused to start a Teleport Book cast$/, '服务器拒绝启动传送书施法'],
+  [/^The server refused to start the Teleport Book record cast$/, '服务器拒绝启动传送书记录施法'],
+  [/^The server refused CSUsePortal for the bot's own gate$/, '服务器拒绝机器人对自己传送门的 CSUsePortal'],
+  [/^The server refused to start the recall skill$/, '服务器拒绝启动召回技能'],
+  [/^The server refused (.+) \(error (\d+)\)$/, '服务器拒绝了$1（错误码 $2）'],
+  [/^The server says the bot is too far from a boat it stands next to$/, '服务器称机器人离身边的船只太远'],
+  [/^The character died without a death packet$/, '角色死亡但没有收到死亡数据包'],
+  [/^The quest gave no credit$/, '任务没有发放奖励'],
+  [/^The NPC is not where the data says$/, 'NPC 不在数据指定的位置'],
+  [/^The trade did not pay what it should$/, '交易支付的金额不正确'],
+];
+
+
+// A few english words that show up inside the issue texts.
+const NOUN_ZH = {
+  'the packet': '数据包', 'the heartbeat': '心跳包', 'the request': '请求',
+  'the quest': '任务', 'the skill': '技能', 'the login': '登录', 'the character': '角色',
+  'the trade': '交易', 'the portal': '传送门', 'the boat': '船只', 'the game': '游戏',
+};
+function zhWords(s) {
+  let out = String(s || '');
+  for (const [en, zh] of Object.entries(NOUN_ZH)) {
+    if (out.includes(en)) out = out.split(en).join(zh);
+  }
+  return out;
+}
+
+function zhIssueTitle(s) {
+  const k = String(s || '').trim();
+  if (!k) return '-';
+  for (const [re, tpl] of ISSUE_TITLE) {
+    const m = k.match(re);
+    if (m) {
+      let out = interp(tpl, m);
+      // translate the verb inside the substituted text
+      out = out.replace(/拒绝(start|turn|accept|give|giveup|pick|complete|finish|use)( (\w+))?/,
+        (_, v, v2) => '拒绝' + (VERB_ZH[v] || v) + (v2 ? VERB_ZH[v2] || '' : ''));
+      return zhWords(out);
+    }
+  }
+  return k;
 }
 
 function openIssue(fp) {
@@ -924,40 +1117,40 @@ function renderIssueDetail(d) {
   const fp = s.fingerprint;
   I.detail = d;
   setText(IE.fp, fp);
-  setText(IE.title, s.title || words(s.kind) || fp);
+  setText(IE.title, zhIssueTitle(s.title || words(s.kind) || fp));
   IE.pills.replaceChildren(pill(s.state, STATE_CLS), pill(s.severity, SEV_CLS));
   renderIssueActions();
 
   const newest = (d.samples || []).reduce((a, x) => (!a || x.at > a.at ? x : a), null);
   let queue;
   if (s.state === 'queued') {
-    queue = (d.queued_at ? 'queued ' + fmtAgo(d.queued_at) + ' (' + fmtStamp(d.queued_at) + ')' : 'queued') + '; marker ' + fp;
+    queue = (d.queued_at ? '入队于 ' + fmtAgo(d.queued_at) + ' (' + fmtStamp(d.queued_at) + ')' : '已入队') + '; 标记 ' + fp;
   } else if (s.state === 'open') {
-    queue = s.reportable ? 'not queued yet; the policy queues it when its rules allow'
-      : 'not queued; the policy never queues it by itself (Queue does it anyway)';
+    queue = s.reportable ? '尚未入队；策略在满足条件时会自动入队'
+      : '未入队；策略不会自动入队（可手动点击"加入队列"）';
   } else {
-    queue = 'not queued';
+    queue = '未入队';
   }
   fillKv(IE.fields, [
-    ['Expected', newest ? newest.expected || '-' : '-'],
-    ['Actual', newest ? newest.actual || '-' : '-'],
-    ['Kind', words(s.kind) || '-'],
-    ['Suspect', s.suspect || 'unknown'],
-    ['Seen', nf.format(s.count) + (s.count === 1 ? ' time by ' : ' times by ') + nf.format(s.bots) + (s.bots === 1 ? ' bot' : ' bots')],
-    ['First seen', fmtAgo(s.first_seen) + ' (' + fmtStamp(s.first_seen) + ')'],
-    ['Last seen', fmtAgo(s.last_seen) + ' (' + fmtStamp(s.last_seen) + ')'],
-    ['Queue', queue],
-    ['Evidence', d.evidence || (d.partial ? '-' : 'not written yet'), d.evidence ? 'mono' : null],
-    ['Area', d.area ? d.area + ' (hint, not verified)' : '-'],
+    ['预期', newest ? newest.expected || '-' : '-'],
+    ['实际', newest ? newest.actual || '-' : '-'],
+    ['类型', words(s.kind) || '-'],
+    ['怀疑对象', s.suspect || '未知'],
+    ['出现次数', nf.format(s.count) + (s.count === 1 ? ' 次，来自 ' : ' 次，来自 ') + nf.format(s.bots) + ' 个机器人'],
+    ['首次出现', fmtAgo(s.first_seen) + ' (' + fmtStamp(s.first_seen) + ')'],
+    ['最后出现', fmtAgo(s.last_seen) + ' (' + fmtStamp(s.last_seen) + ')'],
+    ['队列', queue],
+    ['证据', d.evidence || (d.partial ? '-' : '尚未写入'), d.evidence ? 'mono' : null],
+    ['区域', d.area ? d.area + '（提示，未经核实）' : '-'],
   ]);
 
   if (d.partial) {
-    IE.samples.replaceChildren(h('p', 'muted', 'Loading samples…'));
+    IE.samples.replaceChildren(h('p', 'muted', '加载样本中…'));
     setText(IE.entry, '');
     return;
   }
   const entry = String(d.entry || '').replace(/\r\n/g, '\n');
-  setText(IE.entry, entry || '(no entry yet)');
+  setText(IE.entry, entry || '（尚无条目）');
   renderSamples(d);
 }
 
@@ -997,7 +1190,7 @@ function renderSamples(d) {
     if (samples.length) I.open.add(sampleKey(fp, samples[0]));
   }
   const f = document.createDocumentFragment();
-  if (!samples.length) f.append(h('p', 'muted', 'No samples kept.'));
+  if (!samples.length) f.append(h('p', 'muted', '未保留样本。'));
   for (const s of samples) f.append(sampleEl(d.summary, s));
   IE.samples.replaceChildren(f);
 }
@@ -1008,24 +1201,24 @@ function sampleEl(sum, s) {
   const key = sampleKey(sum.fingerprint, s);
   const det = h('details', 'sample');
   trackOpen(det, key);
-  det.append(h('summary', null, (s.bot || 'unknown bot') + ' · ' + fmtStamp(s.at)));
+  det.append(h('summary', null, (s.bot || '未知机器人') + ' · ' + fmtStamp(s.at)));
   const body = h('div', 's-body');
   if (s.context) body.append(h('p', 's-ctx', s.context));
-  const rows = [['Expected', s.expected || '-'], ['Actual', s.actual || '-']];
+  const rows = [['预期', s.expected || '-'], ['实际', s.actual || '-']];
   const pos = samplePos(s);
   if (pos) {
     const cell = h('span');
-    const go = h('button', 'link', 'Show on map');
+    const go = h('button', 'link', '在地图上显示');
     go.type = 'button';
     go.addEventListener('click', () => showOnMap(pos, words(sum.kind) + ' · ' + (s.bot || sum.fingerprint)));
     cell.append(document.createTextNode(pos.x + ', ' + pos.y + ', ' + pos.z + '  '), go);
-    rows.push(['Position', cell]);
+    rows.push(['坐标', cell]);
   }
   for (const kv of s.facts || []) rows.push([String(kv[0]), String(kv[1])]);
   const dl = h('dl', 'kv');
   fillKv(dl, rows);
   body.append(dl);
-  for (const [title, lines, tag] of [['Packet trail', s.trail, 'trail'], ['Server log', s.server_log, 'server'], ['Bot log', s.bot_log, 'bot']]) {
+  for (const [title, lines, tag] of [['数据包记录', s.trail, 'trail'], ['服务器日志', s.server_log, 'server'], ['机器人日志', s.bot_log, 'bot']]) {
     if (!lines || !lines.length) continue;
     const blk = h('details', 'blk-wrap');
     trackOpen(blk, key + '#' + tag);
@@ -1080,12 +1273,12 @@ async function pollIssues() {
   } catch (e) {
     if (fp && I.sel === fp && e && e.status === 404) {
       closeIssue();
-      setStatus(IE.status, 'err', 'That issue is gone.');
+      setStatus(IE.status, 'err', '该问题已不存在。');
       last.issues = performance.now(); // keep the message for a poll
     } else if (fp) {
-      if (I.sel === fp) setText(IE.derr, 'Could not refresh: ' + ((e && e.message) || e));
+      if (I.sel === fp) setText(IE.derr, '刷新失败：' + ((e && e.message) || e));
     } else {
-      setStatus(IE.status, 'err', 'Could not load the issues: ' + ((e && e.message) || e));
+      setStatus(IE.status, 'err', '加载问题列表失败：' + ((e && e.message) || e));
     }
   } finally { busy.issues = false; }
 }
@@ -1533,7 +1726,7 @@ function updateHover() {
     const b = hit.bot;
     setText(tip.name, b.name);
     setText(tip.sub, 'Lv ' + b.level + ' ' + b.cls + ' · ' + ACT[b.activity].label);
-    setText(tip.goal, b.detail || b.goal);
+    setText(tip.goal, zhGoal(b.detail || b.goal));
   } else {
     setText(tip.name, hit.marker.label || MARKER[hit.marker.kind].label);
     setText(tip.sub, MARKER[hit.marker.kind].label);

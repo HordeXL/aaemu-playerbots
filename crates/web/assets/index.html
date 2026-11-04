@@ -1,131 +1,131 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<title>Playerbots</title>
+<title>玩家机器人</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div id="app">
   <header id="topbar">
-    <h1>Playerbots</h1>
-    <span id="conn" class="conn" title="Connection to the bot process"><i></i><span id="conn-text">connecting</span></span>
+    <h1>玩家机器人</h1>
+    <span id="conn" class="conn" title="与机器人进程的连接状态"><i></i><span id="conn-text">连接中</span></span>
     <span class="spacer"></span>
-    <button id="btn-panel" type="button" aria-controls="sidebar" aria-expanded="true" title="Show or hide the side panel">Panel</button>
+    <button id="btn-panel" type="button" aria-controls="sidebar" aria-expanded="true" title="显示或隐藏侧边面板">面板</button>
   </header>
 
   <main id="mapwrap">
-    <canvas id="map" tabindex="0" aria-label="World map of all bots"></canvas>
-    <div id="tools" role="toolbar" aria-label="Map tools">
-      <button id="z-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
-      <button id="z-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>
-      <button id="z-fit" type="button" aria-label="Fit all bots" title="Fit all bots (F)">Fit</button>
-      <label title="Keep the selected bot in the centre"><input id="o-follow" type="checkbox"> Follow</label>
-      <label title="Show houses, duel flags and trade outlets"><input id="o-markers" type="checkbox" checked> Markers</label>
-      <label title="Draw lines between duel and trade partners"><input id="o-lines" type="checkbox" checked> Pairs</label>
-      <label title="Show bot names when zoomed in"><input id="o-names" type="checkbox" checked> Names</label>
+    <canvas id="map" tabindex="0" aria-label="所有机器人的世界地图"></canvas>
+    <div id="tools" role="toolbar" aria-label="地图工具">
+      <button id="z-in" type="button" aria-label="放大" title="放大 (+)">+</button>
+      <button id="z-out" type="button" aria-label="缩小" title="缩小 (-)">&minus;</button>
+      <button id="z-fit" type="button" aria-label="显示所有机器人" title="显示所有机器人 (F)">全览</button>
+      <label title="让选中的机器人保持在地图中央"><input id="o-follow" type="checkbox"> 跟随</label>
+      <label title="显示房屋、决斗旗和交易点"><input id="o-markers" type="checkbox" checked> 标记</label>
+      <label title="在决斗和交易搭档之间画线"><input id="o-lines" type="checkbox" checked> 配对</label>
+      <label title="放大时显示机器人名字"><input id="o-names" type="checkbox" checked> 名称</label>
     </div>
-    <div id="legend" aria-label="Legend"></div>
+    <div id="legend" aria-label="图例"></div>
     <div id="coords" aria-hidden="true" hidden></div>
     <div id="tip" role="tooltip" hidden><b id="tip-name"></b><span id="tip-sub"></span><span id="tip-goal"></span></div>
-    <div id="empty" hidden>No bots reported yet.</div>
+    <div id="empty" hidden>尚未有机器人上报数据。</div>
   </main>
 
-  <aside id="sidebar" aria-label="Bots">
-    <section id="stats" aria-label="Statistics">
-      <div class="tile"><span class="k">Online</span><b id="st-online">-</b></div>
-      <div class="tile"><span class="k">Memory</span><b id="st-mem">-</b></div>
-      <div class="tile"><span class="k">Packets/s</span><b id="st-pkt">-</b></div>
-      <div class="tile half"><span class="k">Traffic</span><b id="st-bw">-</b></div>
-      <div class="tile half"><span class="k">Uptime</span><b id="st-up">-</b></div>
-      <div class="tile wide" id="st-llm-tile" hidden><span class="k">LLM</span><b id="st-llm">-</b></div>
+  <aside id="sidebar" aria-label="机器人">
+    <section id="stats" aria-label="统计">
+      <div class="tile"><span class="k">在线</span><b id="st-online">-</b></div>
+      <div class="tile"><span class="k">内存</span><b id="st-mem">-</b></div>
+      <div class="tile"><span class="k">包/秒</span><b id="st-pkt">-</b></div>
+      <div class="tile half"><span class="k">流量</span><b id="st-bw">-</b></div>
+      <div class="tile half"><span class="k">运行时长</span><b id="st-up">-</b></div>
+      <div class="tile wide" id="st-llm-tile" hidden><span class="k">大模型</span><b id="st-llm">-</b></div>
     </section>
 
-    <div id="tabs" role="group" aria-label="Side panel view">
-      <button id="tab-bots" type="button" aria-pressed="true">Bots</button>
-      <button id="tab-issues" type="button" aria-pressed="false" aria-label="Server issues">Issues<b id="tab-open" class="badge open" hidden></b><b id="tab-queued" class="badge queued" hidden></b></button>
+    <div id="tabs" role="group" aria-label="侧边面板视图">
+      <button id="tab-bots" type="button" aria-pressed="true">机器人</button>
+      <button id="tab-issues" type="button" aria-pressed="false" aria-label="服务器问题">问题<b id="tab-open" class="badge open" hidden></b><b id="tab-queued" class="badge queued" hidden></b></button>
     </div>
 
     <section id="filters">
-      <div id="chips" role="group" aria-label="Filter by activity"></div>
-      <input id="search" type="search" placeholder="Search name, class, zone, goal&hellip;" autocomplete="off" spellcheck="false" aria-label="Search bots">
+      <div id="chips" role="group" aria-label="按状态筛选"></div>
+      <input id="search" type="search" placeholder="搜索名字、职业、区域、目标&hellip;" autocomplete="off" spellcheck="false" aria-label="搜索机器人">
     </section>
 
     <section id="listbox">
       <div id="list-head" role="row">
-        <button type="button" data-sort="name">Name</button>
-        <button type="button" data-sort="level" class="num">Lv</button>
-        <button type="button" data-sort="class">Class</button>
-        <button type="button" data-sort="activity">Activity</button>
-        <button type="button" data-sort="zone">Zone</button>
+        <button type="button" data-sort="name">名字</button>
+        <button type="button" data-sort="level" class="num">等级</button>
+        <button type="button" data-sort="class">职业</button>
+        <button type="button" data-sort="activity">状态</button>
+        <button type="button" data-sort="zone">区域</button>
       </div>
-      <div id="list" role="listbox" aria-label="Bot list" tabindex="0"><div id="list-spacer"></div></div>
+      <div id="list" role="listbox" aria-label="机器人列表" tabindex="0"><div id="list-spacer"></div></div>
       <div id="list-foot"></div>
     </section>
 
-    <section id="detail" hidden aria-label="Selected bot">
+    <section id="detail" hidden aria-label="选中的机器人">
       <div class="d-head">
         <div>
           <h2 id="d-name"></h2>
           <div id="d-sub" class="muted"></div>
         </div>
-        <button id="d-close" type="button" aria-label="Deselect bot" title="Deselect (Esc)">&times;</button>
+        <button id="d-close" type="button" aria-label="取消选择" title="取消选择 (Esc)">&times;</button>
       </div>
-      <div class="hp" title="Health"><div class="hp-bar"><div id="d-hp"></div></div><span id="d-hp-text"></span></div>
+      <div class="hp" title="生命值"><div class="hp-bar"><div id="d-hp"></div></div><span id="d-hp-text"></span></div>
       <dl id="d-fields" class="kv"></dl>
 
-      <h3>Commands</h3>
+      <h3>命令</h3>
       <div class="cmd-row">
-        <button id="c-pause" type="button">Pause</button>
-        <select id="c-goal" aria-label="Goal"></select>
-        <button id="c-goal-set" type="button">Set goal</button>
+        <button id="c-pause" type="button">暂停</button>
+        <select id="c-goal" aria-label="目标"></select>
+        <button id="c-goal-set" type="button">设定目标</button>
       </div>
       <div class="cmd-row">
-        <select id="c-duel" aria-label="Duel partner"></select>
-        <button id="c-duel-go" type="button">Duel</button>
+        <select id="c-duel" aria-label="决斗对象"></select>
+        <button id="c-duel-go" type="button">决斗</button>
       </div>
       <div class="cmd-row">
-        <select id="c-trade" aria-label="Trade partner"></select>
-        <button id="c-trade-go" type="button">Trade</button>
+        <select id="c-trade" aria-label="交易对象"></select>
+        <button id="c-trade-go" type="button">交易</button>
       </div>
       <form id="c-say-form" class="cmd-row" autocomplete="off">
-        <input id="c-say" type="text" maxlength="200" placeholder="Say in local chat&hellip;" aria-label="Chat line">
-        <button type="submit">Say</button>
+        <input id="c-say" type="text" maxlength="200" placeholder="在附近频道发言&hellip;" aria-label="发言内容">
+        <button type="submit">发言</button>
       </form>
       <form id="c-whisper-form" class="cmd-row" autocomplete="off">
-        <input id="c-whisper-to" class="who" type="text" maxlength="32" placeholder="Name" aria-label="Whisper to character">
-        <input id="c-whisper" type="text" maxlength="200" placeholder="Whisper&hellip;" aria-label="Whisper line">
-        <button type="submit">Whisper</button>
+        <input id="c-whisper-to" class="who" type="text" maxlength="32" placeholder="角色名" aria-label="悄悄话对象">
+        <input id="c-whisper" type="text" maxlength="200" placeholder="悄悄话内容&hellip;" aria-label="悄悄话内容">
+        <button type="submit">悄悄话</button>
       </form>
       <div id="c-status" class="status" role="status"></div>
 
-      <h3>Quests</h3>
+      <h3>任务</h3>
       <ul id="d-quests" class="plain"></ul>
       <div id="d-extra-wrap" hidden>
-        <h3>Details</h3>
+        <h3>详细信息</h3>
         <dl id="d-extra" class="kv"></dl>
       </div>
       <div id="d-chat-wrap" hidden>
-        <h3>Chat <span class="muted">(newest first)</span></h3>
+        <h3>聊天 <span class="muted">（最新在前）</span></h3>
         <ol id="d-chat" class="log"></ol>
       </div>
-      <h3>Log <span class="muted">(newest first)</span></h3>
+      <h3>日志 <span class="muted">（最新在前）</span></h3>
       <ol id="d-log" class="log"></ol>
     </section>
 
-    <section id="issues" aria-label="Server issues">
+    <section id="issues" aria-label="服务器问题">
       <div id="i-listview">
-        <div id="i-chips" role="group" aria-label="Filter by state"></div>
+        <div id="i-chips" role="group" aria-label="按状态筛选"></div>
         <div id="i-status" class="status" role="status"></div>
-        <ul id="i-list" class="issue-list" aria-label="Issue list"></ul>
+        <ul id="i-list" class="issue-list" aria-label="问题列表"></ul>
         <div id="i-foot"></div>
       </div>
       <div id="i-detailview" hidden>
         <div class="d-head">
-          <button id="i-back" type="button" title="Back to the list (Esc)">&lsaquo; Issues</button>
+          <button id="i-back" type="button" title="返回列表 (Esc)">&lsaquo; 问题</button>
           <span id="i-fp" class="mono muted"></span>
         </div>
         <h2 id="i-title"></h2>
@@ -134,28 +134,28 @@
         <div id="i-astatus" class="status" role="status"></div>
         <div id="i-derr" class="status err" role="status"></div>
         <dl id="i-fields" class="kv"></dl>
-        <h3>Samples <span class="muted">(newest first)</span></h3>
+        <h3>样本 <span class="muted">（最新在前）</span></h3>
         <div id="i-samples"></div>
         <details id="i-entry-wrap">
-          <summary>Queue entry <span class="muted">(as written to the team's issue queue)</span></summary>
+          <summary>队列条目 <span class="muted">（写入团队问题队列的内容）</span></summary>
           <pre id="i-entry" class="blk" tabindex="0"></pre>
         </details>
       </div>
     </section>
 
     <details id="global">
-      <summary>Global controls</summary>
+      <summary>全局控制</summary>
       <div class="cmd-row">
-        <input id="g-count" type="number" min="1" max="1000" value="5" aria-label="Number of bots">
-        <button id="g-spawn" type="button">Spawn</button>
-        <button id="g-despawn" type="button">Despawn</button>
+        <input id="g-count" type="number" min="1" max="1000" value="5" aria-label="机器人数量">
+        <button id="g-spawn" type="button">生成</button>
+        <button id="g-despawn" type="button">移除</button>
       </div>
       <div class="cmd-row">
-        <button id="g-pause" type="button">Pause all</button>
-        <button id="g-resume" type="button">Resume all</button>
+        <button id="g-pause" type="button">全部暂停</button>
+        <button id="g-resume" type="button">全部继续</button>
       </div>
       <form class="cmd-row" id="token-row" autocomplete="off">
-        <input id="g-token" type="password" placeholder="API token (if the server needs one)" autocomplete="off" aria-label="API token">
+        <input id="g-token" type="password" placeholder="API 令牌（服务器需要时填写）" autocomplete="off" aria-label="API 令牌">
       </form>
       <div id="g-status" class="status" role="status"></div>
     </details>
