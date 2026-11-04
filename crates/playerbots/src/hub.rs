@@ -330,6 +330,9 @@ pub struct Hub {
     pub chat: ChatHub,
     /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
     pub contest: Contest,
+    /// The world events (rifts) that are running and the bots that take part, see
+    /// [`crate::events`].
+    pub events: crate::events::EventBoard,
     /// Navigation: the planner pool and the counters, see [`crate::bot::nav`].
     pub nav: NavService,
     /// What the leaders of dungeon parties tell their members (owned by the dungeons feature).
@@ -364,6 +367,7 @@ impl Hub {
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
             contest: Contest::new(),
+            events: Default::default(),
             nav: NavService::default(),
             board: Default::default(),
             issue_svc: Arc::new(Issues::disabled()),
@@ -447,6 +451,25 @@ impl Hub {
         );
         self.rss.lock().refresh(false);
         self.nav.tick();
+        self.tick_events();
+    }
+
+    /// While an event runs: tells the board how many bots are online and how high they are, and
+    /// files the issues its detectors found.
+    fn tick_events(&self) {
+        if !self.events.any() {
+            return;
+        }
+        let levels = self.slots().into_iter().filter_map(|s| {
+            s.with(|g| {
+                (!matches!(g.snap.activity, Activity::Offline | Activity::Connecting))
+                    .then_some(g.snap.level)
+            })
+        });
+        let pop = crate::events::Population::from_levels(levels);
+        for report in self.events.sweep(Some(pop)) {
+            self.report_issue(report);
+        }
     }
 
     /// Records (or replaces) the house marker of a bot.

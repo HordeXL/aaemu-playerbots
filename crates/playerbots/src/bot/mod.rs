@@ -330,6 +330,7 @@ impl Bot {
     fn go_offline(&mut self) {
         self.online_since = None;
         self.shared.hub.contest.release_bot(self.entry.id);
+        self.shared.hub.events.release_bot(self.entry.id);
         self.motion.leave_world();
         self.slot.set_offline();
     }
@@ -677,6 +678,12 @@ impl Bot {
             }
         }
         self.state.apply(&ev);
+        crate::events::on_server_event(
+            &self.shared.hub.events,
+            &self.shared.world,
+            &ev,
+            &self.state,
+        );
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);

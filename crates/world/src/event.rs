@@ -189,6 +189,8 @@ pub struct Events {
     defs: Vec<EventDef>,
     /// The templates of every controller of every event.
     controllers: FxHashSet<u32>,
+    /// The templates any wave of any event waits for.
+    wave_npcs: FxHashSet<u32>,
 }
 
 impl Events {
@@ -302,11 +304,26 @@ impl Events {
                 });
             },
         )?;
+        Ok(Events::from_defs(defs))
+    }
+
+    /// The events of these definitions (sorted here), for tests and tools that have no database.
+    pub fn from_defs(mut defs: Vec<EventDef>) -> Events {
+        defs.sort_by_key(|d| d.id);
         let controllers = defs
             .iter()
             .flat_map(|d| d.controllers.iter().map(|c| c.template))
             .collect();
-        Ok(Events { defs, controllers })
+        let wave_npcs = defs
+            .iter()
+            .flat_map(|d| d.steps.iter())
+            .flat_map(|s| s.kills.iter().map(|k| k.template))
+            .collect();
+        Events {
+            defs,
+            controllers,
+            wave_npcs,
+        }
     }
 
     /// Definition `id`.
@@ -327,6 +344,11 @@ impl Events {
         self.controllers.contains(&template)
     }
 
+    /// Whether some wave of some event waits for `template` (a cheap test before a closer look).
+    pub fn is_wave_npc(&self, template: u32) -> bool {
+        self.wave_npcs.contains(&template)
+    }
+
     /// Approximate heap bytes held.
     pub fn bytes(&self) -> usize {
         self.defs
@@ -345,7 +367,7 @@ impl Events {
                     + d.controllers.len() * std::mem::size_of::<Controller>()
             })
             .sum::<usize>()
-            + self.controllers.capacity() * 8
+            + (self.controllers.capacity() + self.wave_npcs.capacity()) * 8
     }
 }
 
@@ -541,6 +563,7 @@ mod tests {
         assert!(!d.is_controller(500));
         assert!(ev.is_controller(903));
         assert!(!ev.is_controller(500));
+        assert!(ev.is_wave_npc(500) && ev.is_wave_npc(502) && !ev.is_wave_npc(900));
     }
 
     #[test]
