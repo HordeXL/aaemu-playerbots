@@ -110,6 +110,10 @@ pub struct BotSnapshot {
     /// The guild (expedition) the bot belongs to, with its members; none for a bot in no guild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guild: Option<Box<GuildInfo>>,
+    /// The party of real players the bot is in (a companion), with its members; none for a bot
+    /// in no party or in a party of bots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub party: Option<Box<PartyInfo>>,
 }
 
 /// The guild of a bot as its web snapshot shows it.
@@ -131,6 +135,32 @@ pub struct GuildMember {
     /// Rank, as in [`GuildInfo::role`].
     pub role: String,
     pub level: u8,
+    pub online: bool,
+    /// One of our bots (else a real player).
+    pub bot: bool,
+}
+
+/// The party of a bot as its web snapshot shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PartyInfo {
+    /// The server's team id.
+    pub id: u32,
+    /// Name of the leader (the owner of the team).
+    pub leader: String,
+    /// What the bot does when nothing special is going on: `follow` or `stay`.
+    pub mode: String,
+    /// The members the bot knows, the bot itself included.
+    pub members: Vec<PartyMember>,
+}
+
+/// A member of a party.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PartyMember {
+    pub name: String,
+    /// `tank`, `healer`, `attacker` or empty (no role chosen).
+    pub role: String,
+    pub level: u8,
+    pub leader: bool,
     pub online: bool,
     /// One of our bots (else a real player).
     pub bot: bool,
