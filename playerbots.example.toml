@@ -185,6 +185,12 @@ join_player_parties = false
 chat_commands = false
 # A bot in a player's party follows it into instance dungeons.
 follow_into_dungeons = false
+# A bot declines the invitation of a player whose level (when known) is more than this far from its own.
+max_level_gap = 10
+# This process has at most this many bots in the parties of real players (more are declined) ...
+max_companions = 8
+# ... and at most this many of them in one player's party (a party holds five).
+max_per_player = 4
 
 [population]
 # The population director of the web UI: starts and stops bots to follow the players. Off until
