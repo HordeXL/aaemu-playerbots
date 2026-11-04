@@ -78,7 +78,8 @@ for a minute. The bot defends itself whatever it is doing.
 | **Gank** | Off until `[pvp] enabled` and `gank`, and someone may be attacked (`attack_bots`, or `attack_players` without `gm_bootstrap`). Plans an ambush post on the route between a specialty workbench and the NPC that buys its pack (outside the victims' home zones, where the server protects them; conflict zones and wars score higher), waits there and attacks a carrier of the hostile alliance when the odds are fair. Bots that wait close together form a squad of up to `max_squad` through the coordinator, so a stronger carrier can be taken. When the carrier dies the dropped pack is picked up (within 3 m, skill 11361) and a trade run sells it. It gives up on stronger groups, at the retreat line, on a protected target and after a death. See [Player versus player](#player-versus-player-pvp). |
 | **Warzone** | Off until `[pvp] enabled` and `warzone`. Scored while a reachable land zone group is at war (conflict or war) with enough time left and the bot has not yet killed `war_kill_cap` characters in it: goes there, patrols from spot to spot, fights allowed characters when the odds are fair, regroups when hurt and leaves at peace. See [Player versus player](#player-versus-player-pvp). |
 | **Event** | Joins a rift (a tower defence event) while one runs, walks to the defended target, kills the monsters of the current wave next to other bots and leaves when it ends. Needs `[events] enabled`; see [World events](#world-events-events). |
-| **Companion, Farm** | Reserved: follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
+| **Companion** | A bot in the party of a real player follows the leader, helps in its fights, obeys a closed set of chat commands and, with `follow_into_dungeons`, goes through a dungeon door behind the leader. Needs `[party] join_player_parties`; see [Parties of real players](#parties-of-real-players-party). |
+| **Farm** | Reserved: plant and harvest crops. The goal exists (the web UI can name it) but is not implemented yet: a bot that is told to do it switches it off. Its settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -160,8 +161,9 @@ Safety of the GM lines:
 These sections are all off by default; `enabled = false` (or the `false` default of the switch named
 below) keeps the bots exactly as they were without them. The goals they belong to are reserved and
 not implemented yet (see [Goals and behaviour](#goals-and-behaviour)), except the event goal, which
-is described in [World events](#world-events-events); the settings are read and checked now so the
-features can be added without changing the file.
+is described in [World events](#world-events-events), and the companion goal ([Parties of real
+players](#parties-of-real-players-party)); the settings are read and checked now so the features can
+be added without changing the file.
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
@@ -181,9 +183,12 @@ features can be added without changing the file.
 | | `max_share` | `0.25` | At most this share (0 to 1) of the online bots that are high enough for the event takes part in events at once. |
 | | `join_delay_secs` | `[10, 120]` | A bot waits a random number of seconds in `[low, high]` before it joins. |
 | | `avoid_war_zones` | `true` | With `enabled`: the quest, grind and wander goals choose no destination in a zone group at war, and bots do not join an event there. |
-| `[party]` | `join_player_parties` | `false` | Bots join the parties of real players when invited (goal `companion`). |
-| | `chat_commands` | `false` | Bots obey party chat commands of the player who leads the party. |
-| | `follow_into_dungeons` | `false` | A bot in a player's party follows it into instance dungeons. |
+| `[party]` | `join_player_parties` | `false` | Bots join the parties of real players when invited (goal `companion`; see [Parties of real players](#parties-of-real-players-party)). |
+| | `chat_commands` | `false` | Bots obey the chat commands of their party (`follow`, `stay`, `come`, `assist`, `leave`, `dungeon <name>`) and invite a player who whispers `inv`. |
+| | `follow_into_dungeons` | `false` | A bot in a player's party follows it through the doors of instance dungeons. |
+| | `max_level_gap` | `10` | A bot declines a player more than this many levels away (and leaves when the gap grows to this plus five). |
+| | `max_companions` | `8` | This process has at most this many bots in the parties of real players. |
+| | `max_per_player` | `4` | At most this many of them in one player's party (1 to 4). |
 | `[population]` | `enabled` | `false` | Master switch of the population director (see [World metrics and the population director](#world-metrics-and-the-population-director), which lists every key). |
 | `[farm]` | `enabled` | `false` | Master switch of the farming features (goal `farm`). |
 | | `max_plots` | `5` | One bot tends at most this many plots. |
@@ -348,6 +353,100 @@ Seen while building the feature against the Rust server; the bots cope with all 
   a fighter, so most bots in the live run left hurt and died. Real kills need real characters.
 * An event nobody fights stays in its wave until its time cap (3600 s for the two rifts), when the
   server ends it; that is how a rift without players behaves, not a fault.
+
+## Parties of real players (`[party]`)
+
+Off by default. With it on, a bot that is invited by a real player (a character that is not one of the
+bots of this process) joins the party, follows the leader, helps in the fights and, if you let it, goes
+through a dungeon door behind the leader. Bot-only parties (dungeon runs, guild foundings, gank
+squads) work as before; the party feature never touches the invitations of the bots of this process.
+
+```toml
+[party]
+join_player_parties = true   # accept the invitations of real players (goal "companion")
+chat_commands = true         # obey the chat commands of the party, answer "inv"
+follow_into_dungeons = true  # follow the leader through dungeon doors
+max_level_gap = 10           # decline a player more than this many levels away
+max_companions = 8           # at most this many bots of this process in parties of real players
+max_per_player = 4           # ... and at most this many in one player's party
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `join_player_parties` | `false` | A bot accepts the invitation of a real player when it is idle enough. Off: the invitation is declined like any other stray one. |
+| `chat_commands` | `false` | The commands below, from the members of the bot's party, and a whisper "inv" from anyone. |
+| `follow_into_dungeons` | `false` | A bot in a player's party follows the leader through the doors of instance dungeons. |
+| `max_level_gap` | `10` | An invitation from a player whose level (when the bot can see it) is more than this far from the bot's own is declined; a bot also leaves when the leader is more than this plus five levels away. At least 1. |
+| `max_companions` | `8` | This process has at most this many bots in the parties of real players; more are declined. At most the number of bots. |
+| `max_per_player` | `4` | At most this many of them in one player's party (1 to 4; a party holds five). |
+
+**Invitations.** The server never expires a team invitation, and a pending one blocks every later
+invitation to the same character, so a bot answers each invitation within seconds. It says **no at
+once** when it is in a team already (a second membership would corrupt the server's team), in a
+dungeon or loading, dead, trading, dueling, on a portal journey, a boat or a seat, or busy with a
+goal it does not drop (a dungeon run, a duel or trade, a meeting with a buyer, the auction house, a
+guild founding, a gank squad, a war, a rift, a trade run's trip or a boat trip); when the level gap
+is too wide; or when a cap is reached. Otherwise it says **yes after a human pause** (1.5 to 3.5
+seconds) and the companion goal replaces whatever small thing it did (quests, grinding, resting,
+wandering, housing). A declined player gets one short whisper that says why (at most every two
+minutes). The caps are kept by the hub (one short mutex); a place on the board that is not renewed
+for 45 seconds, because the bot lost its connection, is given back.
+
+**Following.** The leader is the owner of the team when that is a real player, else the first real
+player online (a bot that invited a player owns the team until the player has joined; it hands the
+lead over, four tries eight seconds apart). The bot walks to the leader's unit in view, else to the
+position the server sends with every move of a team member (`SCTeamRemoteMembersEx`), and stops two
+and a half to six metres short, a different distance for each bot of the party, so they do not stack.
+It starts walking when the leader is more than eight metres away; beyond 120 m the way is a trip
+(portals, GM `/move` when `long_travel_teleport_m` is set). While catching up (leader more than 20 m
+away) the combat controller only turns on monsters that attack it. Below 40 % hit points a bot rests
+next to the leader until 70 %.
+
+**Fights.** The combat controller already helps any team member: the monsters that attack a member
+first, then the member's target, within 45 m. `assist` points the bot at the leader's target for 20
+seconds. The goal does not own the controller: a fight pauses it, and the bot follows again when the
+fight is over. A bot told to `stay` only helps members within 12 m.
+
+**Chat commands** (`chat_commands`). A closed set, no GM path, read from whispers, local chat and
+party chat of the members of the bot's party (never from the bots of this process):
+
+| Say | The bot |
+| --- | --- |
+| `follow` | follows the leader again (ends `stay`, `come` and `dungeon`) |
+| `stay` | stands where it is |
+| `come` | walks to the speaker |
+| `assist` | attacks the speaker's target for 20 seconds |
+| `leave` | leaves the party (the leader only) |
+| `dungeon <name>` | walks to the entrance of the dungeon and waits there; the leader only; the name is matched by the beginning of its words ("which one?" when it names several) |
+| `inv`, `invite me` (whisper, from anyone) | invites the speaker to its party, if the policy above allows it and the bot owns its party or has none |
+
+Filler words are ignored ("follow me", "come here pls"); a line of more than six words is
+conversation, not a command. The bot answers by whisper with a short natural line (a late joiner of a
+team gets no party chat from the server, so nothing is said there).
+
+**Roles.** A bot announces its party role on joining (`CSSetTeamMemberRole`): tank for tanks, healer
+for healers, attacker for the rest. Healing allies is **not** done: the rotation heals are
+self-only (`Aim::SelfOnly`), a healer fights like a damage dealer and heals itself.
+
+**Dungeons** (`follow_into_dungeons`). The bot reads the leader's world from the position records of
+the team: when the instance id is not 0 the leader is inside a dungeon (the record carries the
+instance's zone key, which names the dungeon); a leader that was in view next to an entrance and
+vanished counts as inside until a record says more. After a moment the bot walks to the entrance,
+casts the entrance skill (the server puts a team member into the instance the team opened; a level
+refusal is answered with `/level` when the bot may, `dungeon_level_up` and GM rights), follows and
+assists inside, and walks to the exit and casts it when the leader is out again. A dungeon it cannot
+enter (level, the three entries per four hours, refusals) is left alone and the leader is told
+once. A bot that leaves the party inside is moved out by the server after 15 seconds.
+
+**Leaving.** A bot leaves when the leader tells it to, when no real player is left in the team, when
+the real players have been offline for three minutes, or when the levels drifted more than
+`max_level_gap` plus five apart.
+
+**Limits.** A bot that dies loses the goal and starts it again after the respawn (it walks to the
+entrance again; the entry limit applies). Mounts, boats and carts of the leader are not followed.
+The bots of other `playerbots` processes on the same server count as real players, so two
+processes with `[party]` on and the same server invite each other into the symmetric hand-over of
+the lead; run the feature in one process, or keep the other's bots away from each other's invites.
 
 ## Selling (`[market]`)
 

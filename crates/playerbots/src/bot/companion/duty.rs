@@ -394,7 +394,7 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
     mem_of(ctx.state).gone_since_ms = plan.gone_since_ms;
     if plan.role {
         mem_of(ctx.state).role_sent = team_id;
-        let role = role_of(&ctx.persona.archetype);
+        let role = role_of(ctx.persona.archetype.role);
         ctx.send(cs::set_team_member_role(team_id, me, role));
         ctx.log.debug(format!("party: role {role}"));
     }
@@ -410,9 +410,9 @@ fn upkeep(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
 }
 
 /// The party role of a class: tank, healer, or attacker.
-pub fn role_of(arch: &crate::archetype::Archetype) -> u8 {
+pub fn role_of(role: crate::archetype::Role) -> u8 {
     use crate::archetype::Role;
-    match arch.role {
+    match role {
         Role::Tank => cs::team_role::TANK,
         Role::Healer => cs::team_role::HEALER,
         Role::Melee | Role::Ranged | Role::Caster => cs::team_role::ATTACKER,
@@ -707,6 +707,8 @@ fn invite_request(ctx: &mut Ctx<'_>, who: &str) -> bool {
         .filter(|&l| l > 0);
     // (the bot judges itself as the invitee would: only a bot in no team passes)
     f.in_team = false;
+    // (a bot inside a dungeon may invite: that is how a player joins the run it leads)
+    f.away = false;
     match policy::judge(&f) {
         Ok(()) => {
             let team_id = team_of(ctx).map_or(0, |t| t.team_id);
@@ -794,4 +796,153 @@ pub fn snapshot_if_changed(
     });
     pm.companion.get_or_insert_with(Default::default).web_key = key;
     Some(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aa_proto::sc_activity::{ActivityEvent, TeamMemberBrief};
+
+    fn brief(char_id: u32, name: &str, level: u8, obj_id: u32) -> TeamMemberBrief {
+        TeamMemberBrief {
+            char_id,
+            name: name.into(),
+            level,
+            role: 0,
+            obj_id,
+        }
+    }
+
+    fn join(party: &mut Option<Box<PartyMem>>, owner: u32, members: Vec<TeamMemberBrief>) {
+        crate::bot::party::observe(
+            party,
+            &ActivityEvent::JoinedTeam {
+                team_id: 9,
+                owner_id: owner,
+                is_party: true,
+                members: members.into(),
+            },
+            1_000,
+        );
+    }
+
+    const ME: u32 = 10;
+    const PLAYER: u32 = 20;
+    const BOT: u32 = 30;
+
+    fn party() -> Option<Box<PartyMem>> {
+        let mut p = None;
+        join(
+            &mut p,
+            PLAYER,
+            vec![
+                brief(PLAYER, "Lead", 30, 200),
+                brief(ME, "Me", 28, 100),
+                brief(BOT, "Other", 29, 300),
+            ],
+        );
+        p
+    }
+
+    #[test]
+    fn the_web_party_is_rebuilt_only_when_the_team_changed() {
+        let is_bot = |c: u32| c == BOT;
+        let mut p = party();
+        let first = snapshot_if_changed(&mut p, is_bot, ME)
+            .expect("a new party")
+            .expect("in a party");
+        assert_eq!(
+            (first.id, first.leader.as_str(), first.mode.as_str()),
+            (9, "Lead", "follow")
+        );
+        let names: Vec<(&str, bool, bool)> = first
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.leader, m.bot))
+            .collect();
+        // (the bot itself and the other bot of this process are bots, the player is not)
+        assert_eq!(
+            names,
+            [
+                ("Lead", true, false),
+                ("Me", false, true),
+                ("Other", false, true)
+            ]
+        );
+        assert!(
+            snapshot_if_changed(&mut p, is_bot, ME).is_none(),
+            "nothing changed"
+        );
+        // a role announcement changes the key, so does the follow mode
+        crate::bot::party::observe(
+            &mut p,
+            &ActivityEvent::TeamMemberRoleChanged {
+                team_id: 9,
+                char_id: ME,
+                role: 2,
+            },
+            2_000,
+        );
+        let again = snapshot_if_changed(&mut p, is_bot, ME).unwrap().unwrap();
+        assert_eq!(again.members[1].role, "healer");
+        p.as_deref_mut()
+            .unwrap()
+            .companion
+            .get_or_insert_with(Default::default)
+            .mode = Mode::Stay;
+        let stay = snapshot_if_changed(&mut p, is_bot, ME).unwrap().unwrap();
+        assert_eq!(stay.mode, "stay");
+        // leaving the party clears it, once
+        crate::bot::party::observe(
+            &mut p,
+            &ActivityEvent::LeftTeam {
+                team_id: 9,
+                kicked: false,
+                dismissed: true,
+            },
+            3_000,
+        );
+        assert_eq!(snapshot_if_changed(&mut p, is_bot, ME), Some(None));
+        assert!(snapshot_if_changed(&mut p, is_bot, ME).is_none());
+        // a bot that never met a team has nothing to show
+        assert!(snapshot_if_changed(&mut None, is_bot, ME).is_none());
+    }
+
+    #[test]
+    fn a_companion_memory_is_made_only_when_something_needs_it() {
+        let mut p = party();
+        assert!(p.as_deref().unwrap().companion.is_none());
+        let mut st = BotState::default();
+        assert!(peek(&st).is_none());
+        assert!(!holding(&st));
+        mem_of(&mut st).mode = Mode::Stay;
+        assert!(holding(&st));
+        assert!(peek(&st).is_some());
+        // the snapshot reads the mode without making a memory
+        let _ = snapshot_if_changed(&mut p, |_| false, ME);
+        assert!(
+            p.as_deref().unwrap().companion.is_some(),
+            "it keeps its key there"
+        );
+    }
+
+    #[test]
+    fn a_name_is_remembered_by_its_hash_whatever_the_case() {
+        assert_eq!(name_key("Wezukleix"), name_key("  wezukleix "));
+        assert_ne!(name_key("Wezukleix"), name_key("Deitroth"));
+    }
+
+    #[test]
+    fn a_bot_is_a_tank_a_healer_or_an_attacker() {
+        use crate::archetype::Role;
+        for (role, want) in [
+            (Role::Tank, cs::team_role::TANK),
+            (Role::Healer, cs::team_role::HEALER),
+            (Role::Melee, cs::team_role::ATTACKER),
+            (Role::Ranged, cs::team_role::ATTACKER),
+            (Role::Caster, cs::team_role::ATTACKER),
+        ] {
+            assert_eq!(role_of(role), want, "{role:?}");
+        }
+    }
 }

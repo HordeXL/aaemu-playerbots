@@ -289,7 +289,7 @@ already name its goal.
 | `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` (done, see [PvP](#pvp-botpvp-goals-gank-and-warzone)) | `bot/goals/gank.rs`, `config.rs` | pvp |
 | `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table (done) | `bot/goals/warzone.rs`, `config.rs` | pvp |
 | `Event` goal (`goals::event`, built: see [Events](#events-goal-event)), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
-| `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
+| `Companion` goal (`goals::companion`, built: see [Parties of real players](#parties-of-real-players-botcompanion-goal-companion)), `[party]` | `bot/goals/companion.rs`, `bot/companion/`, `config.rs` | party with real players (done) |
 | `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
 | `[population]` (the web UI's population director and the server API poll, see [Population](#population-census-economy-board-and-director)) | `config.rs`, `population/` | web director (done) |
 | `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`, `war_kill_cap`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
@@ -314,6 +314,55 @@ conflict and war only, and false for a zone group the server has not announced.
 failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
 pays one pointer for it. With eighteen goals, the zone table, the guild state and the pvp memory, `size_of::<Bot>()` is 3192 bytes
 (limit 3200) and `Goal` stays 152: a new per-bot structure belongs behind a pointer.
+
+## Parties of real players (`bot/companion/`, goal `companion`)
+
+A bot in the party of a real player: it joins when invited, follows the leader, helps in the fights,
+obeys a closed set of chat commands and goes through a dungeon door behind the leader. The pieces
+are pure decision code, tested without a connection, and thin glue that turns them into packets.
+
+| File | What it is |
+| --- | --- |
+| `aa-proto` `sc_activity.rs`, `cs.rs` | The team packets a companion needs besides the join ones: `SCTeamRemoteMembersEx` (0xe4: zone key, instance id, level, hit points, mana and position of every member), `SCTeamMemberDisconnected`, `SCTeamMemberRoleChanged`, `SCRefreshTeamMember`, `SCTeamLootingRuleChanged`; the requests `make_team_owner` and `set_team_member_role`. Byte-exact tests were written from the server's encoders; counts are bounded by the bytes left. |
+| `bot/party/remote.rs` | `Remote` per team member (role, online, level, object id, zone key, instance id, vitals, position, when it was seen) next to the `TeamLog`; a pure function of the packets, boxed with the rest of `PartyMem`. |
+| `policy.rs` | `judge(&Facts)`: may the bot join (or invite) now? In a team, away, dead, trading, dueling, on a journey, busy with a goal it does not drop, the level gap, the caps. |
+| `command.rs` | `parse(text)` into the closed set (`follow`, `stay`, `come`, `assist`, `leave`, `dungeon <name>`, `inv`), the dungeon name search (word prefixes), the short lines the bot answers with. |
+| `follow.rs` | `decide(&Inputs)`: hold, rest, keep the trip or walk (to the leader, a different stop distance per bot, catching up beyond 20 m, a trip beyond 120 m, rest below 40 % until 70 % with hysteresis); `should_assist(&AssistIn)`: the leader's last target. |
+| `upkeep.rs` | `plan(&Facts)`: announce the role once, hand the lead to the first real player online (four tries), leave (asked, no real player, offline for three minutes, level gap plus five). |
+| `lead.rs` | `leader_state(&In)`: main world, a dungeon (instance id) or *vanished at an entrance* from the unit in view and the position records; `position` says where to walk. |
+| `enter.rs` | `Machine`: the dungeon follow (outside, door, cast, load, inside, exit, away) with its deadlines, typed reasons (`Why`) and the refusals answered by kind through the dungeon goal's `entry::reaction`. `step(&Facts) -> Intent` is pure. |
+| `duty.rs` | The glue the brain calls every tick: answer invitations, upkeep, queued whispers, the chat commands, the web snapshot. |
+| `mod.rs` | `Mem` (the per-bot state, one box inside `PartyMem`) and `Board` (the hub's count of companions per process and per player, places expire after 45 s). |
+| `bot/goals/companion.rs` | The goal: facts for the machine from the tick context, the intents carried out (walk, cast the entrance and exit skills, `/level`, leave the team), the follow step, the assist. |
+
+**Size.** `size_of::<Bot>()` did not grow: the companion memory is an `Option<Box<Mem>>` inside the
+existing `PartyMem` box (allocated by the first invitation or command), the caps are on the hub, and
+the goal is one pointer.
+
+**Hooks in shared files** (all additive): `Brain::tick` calls `companion::duty` (and starts the goal
+when the bot is in a real player's party and runs nothing it must not drop), `route_inbox` hands the
+chat lines to `companion::forward_chat`, `dungeon::unsolicited` leaves a real player's invitation to
+the party feature, `pick_assist` in the combat controller shrinks the help radius to 12 m for a bot
+told to `stay`, `publish` fills `BotSnapshot.party`.
+
+**What the server does that the design works around** (live-verified, see OPERATING.md):
+
+* An invitation never expires and a pending one blocks every later invitation to the same
+  character: every invitation is answered within seconds, a no at once.
+* Accepting does not check the membership of another team, so a bot never accepts while it is in one.
+* A late joiner of an existing team receives no party chat: replies are whispers.
+* A character that logs in again is still a member of its team (the server keeps the offline
+  member), and gets the join packet again: a restarted bot follows its party at once.
+* A team member that casts the entrance of a dungeon its team has opened joins the team's
+  instance; the entry limit (`enter_count` per four hours and character) still counts.
+* The `0xe4` record carries the zone *key* (the instance's key inside a dungeon), not `zones.id`.
+* The server announces a target change only: a fight that began before a bot joined, or that goes
+  on for minutes, is invisible to an event-driven assist, so the goal looks at the leader's last
+  announced target itself.
+* Whispers between the factions are refused by the server (`CHAT_CANNOT_WHISPER_TO_HOSTILE`).
+
+**Not done.** Healing allies: the rotation's heals are `Aim::SelfOnly` and `rotation::Inputs` knows
+only the bot's own hit points; a healer fights like a damage dealer and heals itself.
 
 ## Guilds (`bot/guild/`, goal `guild`)
 
