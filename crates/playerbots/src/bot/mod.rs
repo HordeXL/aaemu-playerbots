@@ -33,6 +33,7 @@ pub mod motion;
 pub mod nav;
 pub mod party;
 pub mod place;
+pub mod pvp;
 pub mod rotation;
 pub mod session;
 pub mod state;

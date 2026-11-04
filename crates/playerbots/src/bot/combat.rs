@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 use super::ctx::Ctx;
 use super::goals::duel::{Answer, DuelPhase, DuelWatch};
 use super::motion::{MotionStatus, Pace};
+use super::pvp;
 use super::rotation::{
     self, CastKind, Decision, Inputs, LearnCtx, Learner, RotState, Rotation, SkillBook, TargetView,
 };
@@ -161,6 +162,11 @@ pub enum LostReason {
     Blocked,
     /// A defence against an attacker was dropped because the bot is on its way somewhere.
     Travel,
+    /// The bot is too hurt to fight a character on (`[pvp] retreat_hp_pct`); it runs.
+    Retreat,
+    /// The server accepts cast after cast at a character and nothing happens to it: the zone
+    /// protects it. The bot gives up and leaves it alone for a while.
+    Protected,
 }
 
 /// How the last [`CombatStatus::Lost`] came about.
@@ -178,9 +184,9 @@ impl Loss {
     /// alone for a long time. (A target that left the view or ran away is just gone.)
     pub fn unreachable(self) -> bool {
         match self.reason {
-            LostReason::Stalled | LostReason::Blocked => true,
+            LostReason::Stalled | LostReason::Blocked | LostReason::Protected => true,
             LostReason::Timeout => !self.dealt,
-            LostReason::Gone | LostReason::Far | LostReason::Travel => false,
+            LostReason::Gone | LostReason::Far | LostReason::Travel | LostReason::Retreat => false,
         }
     }
 }
@@ -503,6 +509,8 @@ pub struct Combat {
     obstructed: u32,
     /// Object id of a target the server called immune to a skill, until [`Combat::tick`] reports it.
     immune_refused: u32,
+    /// The bot is running from a fight with a character (see [`pvp::fight::start_flee`]).
+    fleeing: bool,
 }
 
 impl Default for Combat {
@@ -549,6 +557,7 @@ impl Combat {
             loss: None,
             obstructed: 0,
             immune_refused: 0,
+            fleeing: false,
         }
     }
 
@@ -629,8 +638,20 @@ impl Combat {
     /// has taken it, so that no other goal (resting after the fight) pushes the goal aside first.
     pub fn busy(&self) -> bool {
         self.target.is_some()
+            || self.fleeing
             || self.loot.is_some()
             || (self.duel.attended() && self.duel.peek_end().is_some())
+    }
+
+    /// Marks the bot as running from a fight (the run itself is [`pvp::fight::flee_step`]); goals
+    /// that do not drive the controller wait while it lasts.
+    pub fn set_fleeing(&mut self, on: bool) {
+        self.fleeing = on;
+    }
+
+    /// Whether the bot is running from a fight with a character.
+    pub fn fleeing(&self) -> bool {
+        self.fleeing
     }
 
     /// The result of the last [`Combat::tick`].
@@ -914,6 +935,12 @@ impl Combat {
     fn step(ctx: &mut Ctx<'_>) -> CombatStatus {
         let now = ctx.now_ms;
         let travelling = ctx.combat.travelling(now);
+        if ctx.combat.fleeing {
+            // running from a character: no new fight until the run is over
+            if pvp::fight::flee_step(ctx) {
+                return CombatStatus::Idle;
+            }
+        }
         if ctx.combat.target.is_none() {
             let limits = if travelling {
                 TRAVEL_LIMITS
@@ -922,6 +949,12 @@ impl Combat {
             };
             if let Some(obj) = pick_threat(ctx, &limits) {
                 ctx.log.debug(format!("defending against unit {obj}"));
+                ctx.combat.engage(obj);
+                ctx.combat.defending = obj;
+            } else if let Some(obj) = pvp::defence::pick(ctx, travelling) {
+                // (a hostile character that attacks the bot: `[pvp] defend`)
+                ctx.log
+                    .say(format!("pvp: defending against {}", char_name_of(ctx, obj)));
                 ctx.combat.engage(obj);
                 ctx.combat.defending = obj;
             } else if let Some(obj) = pick_assist(ctx, travelling) {
@@ -961,7 +994,11 @@ impl Combat {
 
         let me = ctx.state.me.pos;
         let dist = dist2d(me, upos);
-        let (lost_at, timeout) = if is_char {
+        // a fight with a character outside a duel is a pvp fight (`bot/pvp`): it has limits
+        let pvp_fight = is_char && !ctx.combat.duel.in_duel();
+        let (lost_at, timeout) = if pvp_fight {
+            (pvp::fight::LOST_DISTANCE, pvp::fight::FIGHT_TIMEOUT_MS)
+        } else if is_char {
             (DUEL_LOST_DISTANCE, u64::MAX)
         } else {
             (LOST_DISTANCE, FIGHT_TIMEOUT_MS)
@@ -983,8 +1020,24 @@ impl Combat {
                 refused: false,
             });
         }
+        let pvp_break = if pvp_fight {
+            let w = &ctx.combat.watch;
+            pvp::fight::judge(&pvp::fight::Facts {
+                hp_pct: ctx.state.me.hp_pct(),
+                retreat_pct: ctx.cfg.pvp.retreat_hp_pct,
+                accepted: w.accepted,
+                dealt: w.dealt,
+                since_first_ms: now.saturating_sub(w.first_accept_ms),
+            })
+        } else {
+            None
+        };
         let reason = if dist > lost_at {
             Some(LostReason::Far)
+        } else if pvp_break == Some(pvp::fight::Break::Protected) {
+            Some(LostReason::Protected)
+        } else if pvp_break == Some(pvp::fight::Break::Retreat) {
+            Some(LostReason::Retreat)
         } else if now.saturating_sub(engaged_at) > timeout {
             Some(LostReason::Timeout)
         } else if travelling && ctx.combat.defending == obj && dist > TRAVEL_LOSE_M {
@@ -1120,9 +1173,51 @@ impl Combat {
         ctx.combat.loss = Some(loss);
         if let Some(obj) = ctx.combat.target {
             Self::shun(ctx, obj, loss);
+            Self::pvp_aftermath(ctx, obj, reason);
         }
         ctx.combat.disengage();
         CombatStatus::Lost
+    }
+
+    /// What a pvp fight that ended without a winner leaves behind: the character is shunned for a
+    /// while and a bot that is too hurt runs.
+    fn pvp_aftermath(ctx: &mut Ctx<'_>, obj: u32, reason: LostReason) {
+        let Some((pos, is_char)) = ctx
+            .state
+            .units
+            .get(&obj)
+            .map(|u| (u.pos, u.kind == UnitKind::Character))
+        else {
+            return;
+        };
+        if !is_char || ctx.combat.duel.in_duel() {
+            return;
+        }
+        let now = ctx.now_ms;
+        let name = char_name_of(ctx, obj);
+        match reason {
+            LostReason::Protected => {
+                ctx.log.say(format!(
+                    "pvp: {name} takes no damage here (protected); leaving it alone"
+                ));
+                ctx.state.pvp_mut().shun(obj, now + pvp::fight::SHUN_MS);
+                ctx.state.pvp_mut().gave_up += 1;
+            }
+            LostReason::Retreat => {
+                ctx.log.say(format!(
+                    "pvp: {} percent of hit points left, retreating from {name}",
+                    ctx.state.me.hp_pct()
+                ));
+                ctx.state.pvp_mut().shun(obj, now + pvp::fight::SHUN_MS / 3);
+                ctx.state.pvp_mut().gave_up += 1;
+                pvp::fight::start_flee(ctx, obj, pos);
+            }
+            LostReason::Timeout | LostReason::Far => {
+                ctx.state.pvp_mut().shun(obj, now + pvp::fight::SHUN_MS / 3);
+                ctx.state.pvp_mut().gave_up += 1;
+            }
+            _ => {}
+        }
     }
 
     /// Leaves `obj` alone after the controller gave it up. A goal that picked the fight does the
@@ -1467,6 +1562,15 @@ fn char_name(ctx: &Ctx<'_>, char_id: u32) -> String {
         .find(|u| u.kind == UnitKind::Character && u.id == char_id)
         .and_then(|u| u.name.as_deref())
         .map_or_else(|| format!("character {char_id}"), str::to_owned)
+}
+
+/// The name of the unit with object id `obj` if it is a character in view.
+fn char_name_of(ctx: &Ctx<'_>, obj: u32) -> String {
+    ctx.state
+        .units
+        .get(&obj)
+        .and_then(|u| u.name.as_deref())
+        .map_or_else(|| format!("unit {obj}"), str::to_owned)
 }
 
 /// How far the controller goes to defend the bot.
