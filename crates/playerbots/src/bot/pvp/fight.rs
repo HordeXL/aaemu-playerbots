@@ -18,7 +18,7 @@ use crate::bot::state::{dist2d, UnitKind};
 use super::Flee;
 
 /// A fight against a character that does not end otherwise ends after this long.
-pub const FIGHT_TIMEOUT_MS: u64 = 90_000;
+pub const FIGHT_TIMEOUT_MS: u64 = 240_000;
 /// A character that runs farther than this from the bot is let go.
 pub const LOST_DISTANCE: f32 = 70.0;
 /// Casts the server accepted at a target that lost nothing, after which it counts as protected.

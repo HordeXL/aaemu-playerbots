@@ -204,9 +204,10 @@ may attack, for the defence, the `gank` goal and the `warzone` goal alike:
 - Only a character of the hostile alliance (Nuian against Haranyan). A friendly or neutral
   character is never a target, and the bots never use the force attack to change that.
 - Never a character in the home zone of its alliance: the server accepts the casts there and drops
-  the damage without a word. A bot does not start such a fight, and when casts are accepted for
-  five seconds and nothing is hurt it gives the fight up, leaves that character alone for three
-  minutes and logs `protected`.
+  the damage without a word. A bot does not start such a fight (the zone owner comes from the
+  baked zone grid, which is coarse at zone borders), and when casts are accepted for five seconds
+  and nothing is hurt it gives the fight up, leaves that character alone for three minutes and
+  logs `protected`.
 - Never a name in `never_names` (game masters, friends), also not in self-defence. `only_names`
   narrows the real players that may be attacked.
 - Our own bots only with `attack_bots`; real players only with `attack_players`, and never while
@@ -217,7 +218,7 @@ may attack, for the defence, the `gank` goal and the `warzone` goal alike:
 **Self-defence** (`defend`): a hostile character that hits the bot is fought back, whatever
 `attack_bots` and `attack_players` say. Below `retreat_hp_pct` the bot breaks off, shuns the
 attacker and runs to the recall point of its alliance's home zone (or straight away); a fight
-that lasts longer than 90 s or a target more than 70 m away is dropped.
+that lasts longer than four minutes or a target more than 70 m away is dropped.
 
 **Gank.** The post comes from the trade routes (`bot/pvp/post.rs`), the squads from the coordinator
 (`bot/pvp/squad.rs`; a bot that waits offers itself every 25 s, bots of one alliance within 500 m
