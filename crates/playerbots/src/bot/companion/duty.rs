@@ -165,11 +165,9 @@ pub fn duty(ctx: &mut Ctx<'_>, running: Option<GoalKind>) -> bool {
     if !cfg.join_player_parties {
         return false;
     }
-    // a dungeon run or a founding answers its own invitations; a squad that is out to gank is
-    // busy (a real player's invitation gets its no at once) and owns the team it made
-    if !matches!(running, Some(GoalKind::Dungeon | GoalKind::Guild)) {
-        answer_invitation(ctx, running);
-    }
+    // (a dungeon run, a founding or a squad answers the invitations of its own bots; the invitation
+    // of a real player gets its no at once: those goals are busy)
+    answer_invitation(ctx, running);
     if !matches!(
         running,
         Some(GoalKind::Dungeon | GoalKind::Guild | GoalKind::Gank)
