@@ -392,6 +392,7 @@ async fn serves_the_embedded_ui() {
         ("/", "text/html", "<canvas id=\"map\""),
         ("/index.html", "text/html", "<canvas id=\"map\""),
         ("/app.js", "text/javascript", "requestAnimationFrame"),
+        ("/population.js", "text/javascript", "api/director/policy"),
         ("/style.css", "text/css", "prefers-color-scheme"),
     ] {
         let r = s.get(path).await;
@@ -761,6 +762,7 @@ async fn rebound_host_names_are_refused_on_loopback_without_a_token() {
         "/",
         "/index.html",
         "/app.js",
+        "/population.js",
         "/style.css",
         "/map.png",
         "/api/bots",
@@ -770,6 +772,9 @@ async fn rebound_host_names_are_refused_on_loopback_without_a_token() {
         "/api/map",
         "/api/issues",
         "/api/issues/pb:6f3b2e1c",
+        "/api/world",
+        "/api/economy",
+        "/api/director",
     ] {
         let r = s
             .request("GET", path, &[("Host", "evil.example")], None)

@@ -5,6 +5,8 @@
  * polls; the canvas only redraws when something changed (requestAnimationFrame on demand).
  * The Issues view polls /api/issues (or /api/issues/:fp in the detail view) every 5 s, only while
  * it is on screen; the open/queued badge follows the 1 s /api/stats poll.
+ * The World, Economy and Director views live in population.js, which borrows from this file through
+ * window.pbHost (helpers, the tab switch and the map overlay hook).
  * Every string that comes from the bot process is inserted with textContent, never innerHTML.
  */
 (() => {
@@ -111,9 +113,10 @@ const S = {
   W: 0, H: 0, dpr: 1, cx: 0, cy: 0, scale: 0.02, userMoved: false, fitted: false, vanim: null,
   mouse: { x: 0, y: 0, in: false, touch: false }, hover: null, hoverMarker: null, dragging: false,
   sx: new Float32Array(0), sy: new Float32Array(0), on: new Uint8Array(0),
-  failures: 0, lastOkAt: 0, token: '', partnerSig: '', restoredHash: false, flash: null,
+  failures: 0, lastOkAt: 0, token: '', partnerSig: '', restoredHash: false, flash: null, tab: 'bots',
 };
 const C = {}; // theme colours read from CSS variables
+const host = {}; // what population.js borrows, see init()
 
 function readTheme() {
   const cs = getComputedStyle(document.documentElement);
@@ -797,13 +800,22 @@ function selecting(el) {
   return !!sel && !sel.isCollapsed && el.contains(sel.anchorNode);
 }
 
-function setTab(issues) {
-  I.tab = issues;
-  $('sidebar').classList.toggle('view-issues', issues);
-  $('tab-bots').setAttribute('aria-pressed', issues ? 'false' : 'true');
-  $('tab-issues').setAttribute('aria-pressed', issues ? 'true' : 'false');
-  lsSet('pb_tab', issues ? 'issues' : 'bots');
+const TABS = ['bots', 'world', 'economy', 'director', 'issues'];
+
+// Shows one of the side panel views; `true` means Issues and `false` Bots (the old call style).
+function setTab(tab) {
+  if (tab === true) tab = 'issues';
+  if (!TABS.includes(tab)) tab = 'bots';
+  S.tab = tab;
+  I.tab = tab === 'issues';
+  const sb = $('sidebar');
+  for (const t of TABS) {
+    sb.classList.toggle('view-' + t, t === tab);
+    $('tab-' + t).setAttribute('aria-pressed', t === tab ? 'true' : 'false');
+  }
+  lsSet('pb_tab', tab);
   last.issues = -Infinity; // the 200 ms tick picks it up
+  if (host.tabChanged) host.tabChanged(tab);
 }
 
 function toggleIssueState(st) {
@@ -839,10 +851,9 @@ function buildIssues() {
     IE.chipEls[st] = { b, cnt };
   }
 
-  $('tab-bots').addEventListener('click', () => setTab(false));
-  $('tab-issues').addEventListener('click', () => setTab(true));
+  for (const t of TABS) $('tab-' + t).addEventListener('click', () => setTab(t));
   IE.back.addEventListener('click', closeIssue);
-  setTab(lsGet('pb_tab') === 'issues');
+  setTab(lsGet('pb_tab') || 'bots');
 }
 
 function renderIssueList() {
@@ -1489,6 +1500,7 @@ function draw(now) {
   ctx.fillStyle = C['map-bg'];
   ctx.fillRect(0, 0, S.W, S.H);
   drawBackdrop();
+  if (host.drawHeat) host.drawHeat(ctx, { W: S.W, H: S.H, scale: S.scale, cx: S.cx, cy: S.cy, colors: C });
   if (S.showMarkers) drawMarkers();
   if (S.showLines) drawLines();
   drawPath();
@@ -1764,6 +1776,8 @@ function tick() {
 
 function restoreHash() {
   S.restoredHash = true;
+  const t = /^#tab=([a-z]+)$/.exec(location.hash);
+  if (t && TABS.includes(t[1])) { setTab(t[1]); return; }
   const m = /^#bot=(\d+)$/.exec(location.hash);
   if (!m) return;
   const id = Number(m[1]);
@@ -1779,6 +1793,11 @@ function setPanel(open) {
 }
 
 function init() {
+  Object.assign(host, {
+    h, setText, num, clamp, fmtBytes, fmtCount, fmtDur, fmtClock, fmtRate, lsGet, lsSet, fetchJson, postJson,
+    setStatus, requestDraw, setTab, bots: () => S.list, currentTab: () => S.tab,
+  });
+  window.pbHost = host;
   readTheme();
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readTheme(); requestDraw(); });
   try {

@@ -24,6 +24,7 @@ pub const TOKEN_HEADER: &str = "x-playerbots-token";
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
+const POPULATION_JS: &str = include_str!("../assets/population.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
 /// Path the hub's map image is served at (and the `image_url` a hub reports for it).
@@ -161,6 +162,7 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/population.js", get(population_js))
         .route("/style.css", get(style_css))
         .route(MAP_PATH, get(map_png))
         .route("/api/bots", get(api_bots))
@@ -344,6 +346,10 @@ async fn index() -> Response {
 
 async fn app_js() -> Response {
     static_page("text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn population_js() -> Response {
+    static_page("text/javascript; charset=utf-8", POPULATION_JS)
 }
 
 async fn style_css() -> Response {

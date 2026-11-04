@@ -495,6 +495,65 @@ pre.blk {
 }
 pre.blk:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* ---------------------------------------------------------------- world, economy, director */
+#tabs button { min-width: 0; padding: 4px 6px; }
+#tab-mode { min-width: 0; width: 10px; height: 10px; padding: 0; border-radius: 50%; font-size: 0; line-height: 0; }
+#tab-mode.mode-dry_run, #tab-mode.mode-holding { background: var(--warn); border: 1px solid var(--warn); }
+#tab-mode.mode-live { background: var(--ok); border: 1px solid var(--ok); }
+
+.pop-view { display: none; flex: none; flex-direction: column; gap: 6px; }
+#sidebar.view-world #world, #sidebar.view-economy #economy, #sidebar.view-director #director { display: flex; }
+#sidebar.view-world #filters, #sidebar.view-world #listbox, #sidebar.view-world #detail,
+#sidebar.view-economy #filters, #sidebar.view-economy #listbox, #sidebar.view-economy #detail,
+#sidebar.view-director #filters, #sidebar.view-director #listbox, #sidebar.view-director #detail { display: none; }
+.pop-view h3 { margin: 8px 0 0; }
+.pop-block { min-width: 0; overflow-x: auto; }
+.pop-note { font-size: 12px; margin-top: 2px; }
+.pop-empty { padding: 4px 0; }
+.pop-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.pop-tiles .tile { grid-column: auto; }
+
+.pop-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pop-form input[type="number"] { width: 5em; }
+.pop-form input#e-template { width: 7.5em; }
+.pop-form select { flex: 1 1 8.5em; min-width: 0; }
+
+table.pop { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.pop th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border); padding: 2px 6px 2px 0; white-space: nowrap; }
+table.pop td { padding: 2px 6px 2px 0; border-bottom: 1px solid var(--panel-2); vertical-align: top; overflow-wrap: anywhere; }
+table.pop th.num, table.pop td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.pop tr.dim td { color: var(--muted); }
+table.pop .pcell { display: inline-flex; align-items: center; gap: 2px; }
+table.pop .pl { color: var(--danger); font-weight: 600; }
+table.pop .bt { color: var(--accent); font-weight: 600; }
+table.pop span.boosted { font-weight: 700; }
+button.tiny { min-height: 0; padding: 0 5px; margin-left: 3px; line-height: 16px; font-size: 12px; }
+button.danger { border-color: var(--danger); color: var(--danger); font-weight: 600; }
+
+.side { font-weight: 600; }
+.side.nuia { color: #3b82f6; }
+.side.haranya { color: #e5683b; }
+.side.other, .side.unknown { color: var(--muted); }
+
+.pbar { display: inline-block; width: 100%; min-width: 40px; height: 8px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--border); vertical-align: middle; overflow: hidden; }
+.pbar i { display: block; height: 100%; background: var(--accent); }
+.pbar.warm i { background: var(--warn); }
+.pbar.hot i { background: var(--danger); }
+
+.dir-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.dir-head label.dry { display: inline-flex; gap: 4px; align-items: center; margin-left: auto; }
+.pill.mode-off { color: var(--muted); }
+.pill.mode-dry_run, .pill.mode-holding { background: var(--warn); border-color: var(--warn); color: var(--accent-text); }
+.pill.mode-live { background: var(--ok); border-color: var(--ok); color: var(--accent-text); }
+
+.pop-policy { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; }
+.pop-policy label { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
+.pop-policy label > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pop-policy input[type="number"] { width: 6em; flex: none; }
+.pop-policy label.check { grid-column: 1 / -1; justify-content: flex-start; }
+.pop-policy.bias { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pop-policy.bias input[type="number"] { width: 4.5em; }
+
 /* ---------------------------------------------------------------- small screens */
 body.panel-hidden #sidebar { display: none; }
 body.panel-hidden #app { grid-template-columns: minmax(0, 1fr); }

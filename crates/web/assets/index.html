@@ -27,6 +27,7 @@
       <label title="Show houses, duel flags and trade outlets"><input id="o-markers" type="checkbox" checked> Markers</label>
       <label title="Draw lines between duel and trade partners"><input id="o-lines" type="checkbox" checked> Pairs</label>
       <label title="Show bot names when zoomed in"><input id="o-names" type="checkbox" checked> Names</label>
+      <label title="Show where players (red) and bots (blue) are, in 512 m squares"><input id="o-heat" type="checkbox"> Heat</label>
     </div>
     <div id="legend" aria-label="Legend"></div>
     <div id="coords" aria-hidden="true" hidden></div>
@@ -46,6 +47,9 @@
 
     <div id="tabs" role="group" aria-label="Side panel view">
       <button id="tab-bots" type="button" aria-pressed="true">Bots</button>
+      <button id="tab-world" type="button" aria-pressed="false" title="Players and bots by continent and side">World</button>
+      <button id="tab-economy" type="button" aria-pressed="false" title="Scarce items, prices and supply">Economy</button>
+      <button id="tab-director" type="button" aria-pressed="false" title="The population director">Director<b id="tab-mode" class="badge" hidden></b></button>
       <button id="tab-issues" type="button" aria-pressed="false" aria-label="Server issues">Issues<b id="tab-open" class="badge open" hidden></b><b id="tab-queued" class="badge queued" hidden></b></button>
     </div>
 
@@ -143,6 +147,10 @@
       </div>
     </section>
 
+    <section id="world" class="pop-view" aria-label="World"></section>
+    <section id="economy" class="pop-view" aria-label="Economy"></section>
+    <section id="director" class="pop-view" aria-label="Director"></section>
+
     <details id="global">
       <summary>Global controls</summary>
       <div class="cmd-row">
@@ -162,5 +170,6 @@
   </aside>
 </div>
 <script src="/app.js"></script>
+<script src="/population.js"></script>
 </body>
 </html>
