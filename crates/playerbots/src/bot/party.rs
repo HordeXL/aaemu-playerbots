@@ -409,6 +409,9 @@ pub struct PartyMem {
     pub runs: u16,
     /// Dungeon goals that gave up (this connection).
     pub failed_runs: u16,
+    /// The companion memory (the party of real players, see [`super::companion`]); made on first
+    /// use.
+    pub companion: Option<Box<super::companion::Mem>>,
 }
 
 impl PartyMem {

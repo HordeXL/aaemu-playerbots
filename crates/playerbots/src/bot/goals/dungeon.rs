@@ -34,11 +34,11 @@
 //! (the glue to the tick context). This file is the goal itself and its scoring.
 
 mod clear;
-mod entry;
+pub(crate) mod entry;
 mod machine;
 mod report;
 mod route;
-mod run;
+pub(crate) mod run;
 #[cfg(test)]
 mod sim;
 

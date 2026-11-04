@@ -23,6 +23,7 @@ pub mod avoid;
 pub mod brain;
 pub mod cmd;
 pub mod combat;
+pub mod companion;
 pub mod coordinator;
 pub mod ctx;
 pub mod director;
