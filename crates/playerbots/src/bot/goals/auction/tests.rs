@@ -226,6 +226,8 @@ struct Fake {
     facts: HashMap<u32, Facts>,
     names: HashMap<u32, String>,
     useful: HashSet<u32>,
+    /// Templates the bot must not trade (quest items, bound or unsellable ones).
+    untradable: HashSet<u32>,
     spot: Option<Spot>,
     stacks: SmallVec<[Stack; MAX_LISTINGS]>,
     budget: Option<i64>,
@@ -274,6 +276,7 @@ impl Fake {
             facts: HashMap::from([(ORE, facts(40, 20))]),
             names: HashMap::from([(ORE, "Copper Ore".to_owned())]),
             useful: HashSet::new(),
+            untradable: HashSet::new(),
             spot: Some(Spot {
                 template: NPC_TEMPLATE,
                 pos: [1000.0, 2000.0, 10.0],
@@ -562,6 +565,9 @@ impl Env for Fake {
     }
     fn facts(&self, template: u32) -> Option<Facts> {
         self.facts.get(&template).copied()
+    }
+    fn tradable(&self, template: u32) -> bool {
+        !self.untradable.contains(&template)
     }
     fn item_name(&self, template: u32) -> Option<String> {
         self.names.get(&template).cloned()
@@ -1012,6 +1018,51 @@ fn a_bargain_seen_while_pricing_my_own_goods_is_bought() {
     assert_eq!(f.packets(op::CSBidAuctionPacket).len(), 1);
     // and the bot's own ore is not listed under that price: the market (5 each) is below the
     // vendor's 20
+    assert!(f.packets(op::CSAuctionPostPacket).is_empty());
+}
+
+#[test]
+fn a_lot_of_an_item_the_bot_may_not_trade_is_never_bought() {
+    // a quest item (or a bound, or an unsellable one) priced at 60 % of what a vendor would
+    // pay, and a potion the bot could use at the price of a shop: neither is bought
+    let mut f = buyer();
+    f.facts.insert(98, facts(500, 300));
+    f.names.insert(98, "Dark Shadow Talisman".to_owned());
+    f.facts.insert(60, facts(100, 30));
+    f.names.insert(60, "Healing Potion".to_owned());
+    f.useful.insert(60);
+    f.untradable.extend([98, 60]);
+    let cheap = f.lot(98, 5, 900, 77);
+    f.market.push(cheap);
+    let potion = f.lot(60, 2, 190, 77);
+    f.market.push(potion);
+    let (_, status) = run_visit(&mut f, 3_000);
+    assert_eq!(status, GoalStatus::Done, "{:?}", f.reports);
+    assert!(f.packets(op::CSBidAuctionPacket).is_empty());
+    assert_eq!(f.st.me.money, 50_000);
+    assert_eq!(f.mem.stats.bought, 0);
+    // a tradable lot beside them is still found
+    let ok = f.lot(98, 5, 900, 78);
+    f.untradable.remove(&98);
+    f.market.push(ok);
+    let (_, status) = run_visit(&mut f, 3_000);
+    assert_eq!(status, GoalStatus::Done, "{:?}", f.reports);
+    assert_eq!(f.packets(op::CSBidAuctionPacket).len(), 1);
+}
+
+#[test]
+fn a_bargain_among_my_own_goods_is_not_bought_when_the_item_may_not_be_traded() {
+    let mut f = Fake::new().with_ore();
+    f.st.me.money = 50_000;
+    f.budget = Some(10_000);
+    // 20 ore at 5 each, a vendor pays 400: a bargain, but the ore is not tradable here (and so
+    // it is not listed either, whatever the stack list says)
+    f.untradable.insert(ORE);
+    let cheap = f.lot(ORE, 20, 100, 77);
+    f.market.push(cheap);
+    let (_, status) = run_visit(&mut f, 3_000);
+    assert_eq!(status, GoalStatus::Done);
+    assert!(f.packets(op::CSBidAuctionPacket).is_empty());
     assert!(f.packets(op::CSAuctionPostPacket).is_empty());
 }
 

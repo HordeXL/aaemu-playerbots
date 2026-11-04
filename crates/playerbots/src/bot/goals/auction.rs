@@ -25,7 +25,9 @@
 //!   what beats the vendor after the 10% tax and the up-front fee), 48 hours. The server answers
 //!   `SCAuctionPosted`, error 241 (cannot pay) or, for a refusal it does not report, nothing.
 //! * **Browse / Buy**: lots priced far under the vendor price, or items the bot can use at no more
-//!   than a shop asks, within a small budget, are bought out.
+//!   than a shop asks, within a small budget, are bought out. Never a lot of an item that is not
+//!   tradable (a quest item, a bound or an unsellable one): no vendor would take it back, so no
+//!   price makes it a bargain.
 //! * **Linger**: the bot stays a little, like a player reading the list.
 //!
 //! Results come by mail (types 13 to 16); collecting them is a background duty ([`duty`]) that runs
@@ -127,6 +129,10 @@ pub trait Env {
     fn report(&mut self, report: IssueReport);
     /// The price facts of an item.
     fn facts(&self, template: u32) -> Option<Facts>;
+    /// Whether the bot may trade the item at all ([`aa_world::ItemFacts::tradable`]: sellable,
+    /// not bound and not a quest item). The bot neither lists nor buys an item that is not, however
+    /// cheap the lot is.
+    fn tradable(&self, template: u32) -> bool;
     /// The English name of an item.
     fn item_name(&self, template: u32) -> Option<String>;
     /// Whether the bot can use the item itself.
@@ -207,6 +213,13 @@ impl Env for Live<'_, '_> {
 
     fn facts(&self, template: u32) -> Option<Facts> {
         facts_of(self.0.world, template)
+    }
+
+    fn tradable(&self, template: u32) -> bool {
+        self.0
+            .world
+            .item_facts(template)
+            .is_some_and(aa_world::ItemFacts::tradable)
     }
 
     fn item_name(&self, template: u32) -> Option<String> {
