@@ -220,8 +220,10 @@ impl Event {
             run.idle_since_ms = now;
         }
         run.step = view.step;
-        if let Some(rally) = rally_of(def, &view, ctx.state.me.pos) {
-            if dist2d(rally, run.rally) > 10.0 {
+        if let Some(rally) = live_rally(ctx, def, &view) {
+            // (the target may walk: the own spot follows once it is out of the ring)
+            let off = ((run.spot[0] - rally[0]).powi(2) + (run.spot[1] - rally[1]).powi(2)).sqrt();
+            if off > plan::SPOT_M.1 + 4.0 {
                 run.spot = plan::spot(rally, bot, run.id.def);
             }
             run.rally = rally;
@@ -505,6 +507,15 @@ fn rally_of(def: &EventDef, view: &View, from: [f32; 3]) -> Option<[f32; 3]> {
         .map(|p| [p.x, p.y, p.z])
 }
 
+/// [`rally_of`], but the defended unit's own position when the bot sees it: the target of a rift
+/// walks a path, and the server's list only gives where it stood when the list was sent.
+fn live_rally(ctx: &Ctx<'_>, def: &EventDef, view: &View) -> Option<[f32; 3]> {
+    if let Some(u) = view.target.and_then(|(obj, _)| ctx.state.unit(obj)) {
+        return Some(u.pos);
+    }
+    rally_of(def, view, ctx.state.me.pos)
+}
+
 fn caps_of(ctx: &Ctx<'_>, def: &EventDef) -> Caps {
     let cfg = &ctx.cfg.events;
     Caps {
@@ -533,7 +544,7 @@ fn offer(ctx: &Ctx<'_>, ask: bool) -> Option<Offer> {
         let Some(def) = ctx.world.events().get(view.id.def) else {
             continue;
         };
-        let Some(rally) = rally_of(def, &view, me.pos) else {
+        let Some(rally) = live_rally(ctx, def, &view) else {
             continue;
         };
         let dist_m = dist2d(me.pos, rally);

@@ -356,6 +356,22 @@ fn a_bot_joins_the_rift_fights_its_wave_and_leaves_when_it_ends() {
         assert_ne!(rig.combat.target(), Some(0x6003), "attacked a controller");
     }
 
+    // the defended unit walks a path: the bot, which sees it, follows (the list says where it
+    // stood when it was sent)
+    let moved = [TARGET[0] + 90.0, TARGET[1], TARGET[2]];
+    rig.add_unit(0x5000, 8828, moved);
+    for _ in 0..600 {
+        rig.tick(250);
+        if dist2d(rig.state.me.pos, moved) <= 40.0 {
+            break;
+        }
+    }
+    assert!(
+        dist2d(rig.state.me.pos, moved) <= 40.0,
+        "{:.0} m from the walking target",
+        dist2d(rig.state.me.pos, moved)
+    );
+
     // the event ends
     rig.feed(WorldEvent::TowerDefEnd {
         id: RIFT,

@@ -357,9 +357,13 @@ impl EventBoard {
             if e.set_step(info.step, now) {
                 self.log_wave(e);
             }
-            e.target = info
+            let target = info
                 .has_target()
                 .then_some((info.target_obj, [info.pos.0, info.pos.1, info.pos.2]));
+            if target != e.target {
+                self.log_target(e, target);
+            }
+            e.target = target;
         }
         // an event the list leaves out is over
         let gone: SmallVec<[EventId; 2]> = g
@@ -433,6 +437,26 @@ impl EventBoard {
             e.zone_key,
             if e.saw_start { "" } else { " (found in progress)" },
         );
+    }
+
+    fn log_target(&self, e: &Running, target: Option<(u32, [f32; 3])>) {
+        match target {
+            Some((obj, p)) => tracing::info!(
+                target: "pb_events",
+                "event target: {} (def {}) defends unit {obj} at {:.0}, {:.0}, {:.0}",
+                self.name(e.id.def),
+                e.id.def,
+                p[0],
+                p[1],
+                p[2],
+            ),
+            None => tracing::info!(
+                target: "pb_events",
+                "event target: {} (def {}) has no target unit in the server's list",
+                self.name(e.id.def),
+                e.id.def,
+            ),
+        }
     }
 
     fn log_wave(&self, e: &Running) {
