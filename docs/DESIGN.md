@@ -312,7 +312,7 @@ conflict and war only, and false for a zone group the server has not announced.
 **Masks and the per-bot budget.** The brain's goal masks (`disabled`, `blocked`, the gate) are a
 `GoalMask` (`u32`, 32 goals; a compile-time check fails the build when the goals outgrow it). The
 failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
-pays one pointer for it. With eighteen goals, the zone table and the guild state, `size_of::<Bot>()` is 3184 bytes
+pays one pointer for it. With eighteen goals, the zone table, the guild state and the pvp memory, `size_of::<Bot>()` is 3192 bytes
 (limit 3200) and `Goal` stays 152: a new per-bot structure belongs behind a pointer.
 
 ## Guilds (`bot/guild/`, goal `guild`)
@@ -334,7 +334,7 @@ into packets.
 | `goals/guild.rs` | The goal: with a `PartyPurpose::Guild` order the founding (without one, when an operator forces it, a wish). Its score is 0: the wish itself (`CoordHandle::request_guild`) is posted by the duty. |
 
 **Per-bot cost.** `BotState::guild` is `GuildState(Option<Box<Mem>>)`: one pointer until the first
-guild packet or duty tick with the feature on. `size_of::<Bot>()` is 3184 with it (limit 3200).
+guild packet or duty tick with the feature on. `size_of::<Bot>()` is 3192 with it and the other features (limit 3200).
 
 **Founding through the coordinator.** The duty posts a `GuildWish` when the bot can sign a charter; the
 bot goes on with its day and the coordinator keeps the wish for 20 minutes. `Coordinator::form_guilds` runs on
@@ -386,7 +386,7 @@ Everything is behind `[pvp] enabled`. The pieces:
 **State.** `BotState::pvp` is one pointer (`Option<Box<PvpMem>>`, allocated by the first use): the
 backpack templates of the characters in view, the shun table, blocked posts, the flee in progress,
 war kill counts and the last honor the server said. The one cheap per-unit fact is the `U_PACK`
-flag in `Unit::flags` (the backpack slot is occupied). `size_of::<Bot>()` is 3184 bytes (limit
+flag in `Unit::flags` (the backpack slot is occupied). `size_of::<Bot>()` is 3192 bytes with the guild and the other features (limit
 3200).
 
 **Protocol.** The backpack is equipment slot 26 (`BACKPACK_SLOT`); a character's state packet carries
