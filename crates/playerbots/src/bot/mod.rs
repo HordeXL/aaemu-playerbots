@@ -39,6 +39,7 @@ pub mod state;
 pub mod travel;
 pub mod vehicle;
 pub mod watch;
+pub mod zones;
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;

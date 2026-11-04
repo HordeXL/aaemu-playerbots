@@ -613,6 +613,17 @@ pub enum WorldEvent {
         /// The change is temporary.
         temp: bool,
     },
+    /// `SCConflictZoneStatePacket` (packets/world.rs:334): the conflict state of a zone group,
+    /// sent once per zone group at world entry and again on every change. `state` is one of
+    /// [`conflict_state`].
+    ConflictZoneState {
+        /// Zone group id.
+        zone_group: u16,
+        /// Conflict state, see [`conflict_state`].
+        state: u8,
+        /// When the state ends, in Unix seconds (0 when it does not).
+        end_unix_s: i64,
+    },
 
     // ---- doodads -----------------------------------------------------------------------
     /// `SCDoodadCreatedPacket` (one doodad, `Doodad.Write` models/doodad.rs:247) or
@@ -1000,6 +1011,8 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCCombatEngagedPacket => |s| some(WorldEvent::CombatEngaged { obj: s.read_bc()? }),
         sc::SCCombatClearedPacket => |s| some(WorldEvent::CombatCleared { obj: s.read_bc()? }),
         sc::SCUnitFactionChangedPacket => read_faction_changed,
+        // zone conflicts
+        sc::SCConflictZoneStatePacket => read_conflict_zone_state,
         // portals
         sc::SCCharacterPortalsPacket => sc_travel::read_portal_book,
         sc::SCCharacterReturnDistrictsPacket => sc_travel::read_return_districts,
@@ -1759,6 +1772,61 @@ fn read_faction_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         old,
         faction,
         temp,
+    })
+}
+
+/// The values of the state byte of `SCConflictZoneStatePacket` (`ZoneConflictType`,
+/// data/world_data.rs:189). A zone starts at [`TENSION`](conflict_state::TENSION), climbs with
+/// the kills of the two factions through [`CONFLICT`](conflict_state::CONFLICT) to
+/// [`WAR`](conflict_state::WAR) and ends in [`PEACE`](conflict_state::PEACE).
+pub mod conflict_state {
+    /// Calm.
+    pub const TENSION: u8 = 0;
+    /// The first kills.
+    pub const DANGER: u8 = 1;
+    /// More kills.
+    pub const DISPUTE: u8 = 2;
+    /// More still.
+    pub const UNREST: u8 = 3;
+    /// The last step before the fighting.
+    pub const CRISIS: u8 = 4;
+    /// The factions fight in the zone.
+    pub const CONFLICT: u8 = 5;
+    /// The zone is at war (the tower is up).
+    pub const WAR: u8 = 6;
+    /// The loser of a war is protected for a while.
+    pub const PEACE: u8 = 7;
+
+    /// Whether the zone is fought over: [`CONFLICT`] or [`WAR`].
+    pub fn at_war(state: u8) -> bool {
+        state == CONFLICT || state == WAR
+    }
+
+    /// The name of `state` for logs; `"unknown"` for a value the server does not use.
+    pub fn name(state: u8) -> &'static str {
+        match state {
+            TENSION => "tension",
+            DANGER => "danger",
+            DISPUTE => "dispute",
+            UNREST => "unrest",
+            CRISIS => "crisis",
+            CONFLICT => "conflict",
+            WAR => "war",
+            PEACE => "peace",
+            _ => "unknown",
+        }
+    }
+}
+
+/// `SCConflictZoneStatePacket` (packets/world.rs:346): `u16 zone group, u8 state, i64 end time`.
+fn read_conflict_zone_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let zone_group = s.read_u16()?;
+    let state = s.read_u8()?;
+    let end_unix_s = s.read_i64()?;
+    some(WorldEvent::ConflictZoneState {
+        zone_group,
+        state,
+        end_unix_s,
     })
 }
 

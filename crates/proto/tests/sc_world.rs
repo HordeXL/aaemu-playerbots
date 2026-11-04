@@ -1109,6 +1109,76 @@ fn loot_took_and_failed() {
     );
 }
 
+// ---- zone conflicts ------------------------------------------------------------------------
+
+#[test]
+fn conflict_zone_state() {
+    use aa_proto::sc_world::conflict_state as cs;
+    // packets/world.rs:346: u16 zone group, u8 state, i64 end time
+    let mut s = PacketStream::new();
+    s.write_u16(7).write_u8(cs::WAR).write_i64(1_700_000_123);
+    assert_eq!(
+        s.as_bytes(),
+        [
+            7, 0, // zone group
+            6, // state
+            0x7B, 0xF1, 0x53, 0x65, 0, 0, 0, 0, // end time, little endian
+        ]
+    );
+    assert_eq!(
+        game(sc::SCConflictZoneStatePacket, &s),
+        WorldEvent::ConflictZoneState {
+            zone_group: 7,
+            state: cs::WAR,
+            end_unix_s: 1_700_000_123,
+        }
+    );
+    truncation_is_rejected(sc::SCConflictZoneStatePacket, s.as_bytes(), 11);
+
+    // a state the table does not know is passed on as it is, and so is no end time at all
+    let mut s = PacketStream::new();
+    s.write_u16(0xFFFF).write_u8(200).write_i64(0);
+    assert_eq!(
+        game(sc::SCConflictZoneStatePacket, &s),
+        WorldEvent::ConflictZoneState {
+            zone_group: 0xFFFF,
+            state: 200,
+            end_unix_s: 0,
+        }
+    );
+    // the packet is a game packet only
+    assert_eq!(
+        parse(2, sc::SCConflictZoneStatePacket, s.as_bytes()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn conflict_states_have_the_server_values() {
+    use aa_proto::sc_world::conflict_state as cs;
+    // data/world_data.rs:189 (`ZoneConflictType`)
+    assert_eq!(
+        [
+            cs::TENSION,
+            cs::DANGER,
+            cs::DISPUTE,
+            cs::UNREST,
+            cs::CRISIS,
+            cs::CONFLICT,
+            cs::WAR,
+            cs::PEACE
+        ],
+        [0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    for state in 0..=255u8 {
+        assert_eq!(cs::at_war(state), state == 5 || state == 6, "state {state}");
+    }
+    assert_eq!(cs::name(cs::TENSION), "tension");
+    assert_eq!(cs::name(cs::WAR), "war");
+    assert_eq!(cs::name(cs::PEACE), "peace");
+    assert_eq!(cs::name(8), "unknown");
+}
+
 // ---- dispatcher ----------------------------------------------------------------------------
 
 #[test]

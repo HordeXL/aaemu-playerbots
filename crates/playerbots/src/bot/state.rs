@@ -25,6 +25,7 @@ use super::travel::TravelState;
 use super::vehicle::VehicleState;
 use super::watch::classify;
 use super::watch::{Finding, Watch};
+use super::zones::ZoneStates;
 
 /// Most units kept in the view.
 pub const MAX_UNITS: usize = 1024;
@@ -417,6 +418,9 @@ pub struct BotState {
     /// What the bot may sell and what the market features remember (the provenance ledger, see
     /// [`super::market`]); allocated when the bot first gains something it may sell.
     pub market: super::market::MarketState,
+    /// The conflict state of the zone groups the server announced (one pointer until the first
+    /// announcement), see [`BotState::zone_state`] and [`BotState::at_war`].
+    pub zone_states: ZoneStates,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -480,6 +484,19 @@ impl BotState {
     }
 
     // ---- queries ------------------------------------------------------------------------
+
+    /// The conflict state of zone group `zone_group` (one of
+    /// [`conflict_state`](aa_proto::sc_world::conflict_state)) and the Unix second it ends;
+    /// `None` when the server has not announced the zone group.
+    pub fn zone_state(&self, zone_group: u16) -> Option<(u8, i64)> {
+        self.zone_states.get(zone_group)
+    }
+
+    /// Whether zone group `zone_group` is fought over (conflict or war). `false` when the server
+    /// has not announced it.
+    pub fn at_war(&self, zone_group: u16) -> bool {
+        self.zone_states.at_war(zone_group)
+    }
 
     /// The unit with object id `obj`.
     pub fn unit(&self, obj: u32) -> Option<&Unit> {
@@ -748,6 +765,15 @@ impl BotState {
                     self.me.faction = *faction;
                 } else if let Some(u) = self.units.get_mut(obj) {
                     u.faction = *faction;
+                }
+            }
+            WorldEvent::ConflictZoneState {
+                zone_group,
+                state,
+                end_unix_s,
+            } => {
+                if !self.zone_states.set(*zone_group, *state, *end_unix_s) {
+                    self.dropped = self.dropped.saturating_add(1);
                 }
             }
             WorldEvent::DoodadsCreated(list) => {
@@ -1383,6 +1409,46 @@ mod tests {
             500,
         )))));
         s
+    }
+
+    #[test]
+    fn zone_conflict_packets_fill_the_zone_table() {
+        use aa_proto::sc_world::conflict_state as cs;
+        let zone = |zone_group, state, end_unix_s| {
+            world(WorldEvent::ConflictZoneState {
+                zone_group,
+                state,
+                end_unix_s,
+            })
+        };
+        let mut s = BotState::new();
+        assert_eq!(s.zone_state(7), None);
+        assert!(!s.at_war(7));
+        // one packet per zone group at world entry ...
+        s.apply(&zone(7, cs::TENSION, 1_700_000_000));
+        s.apply(&zone(8, cs::CONFLICT, 1_700_000_500));
+        s.apply(&zone(9, cs::PEACE, 0));
+        assert_eq!(s.zone_state(7), Some((cs::TENSION, 1_700_000_000)));
+        assert_eq!(s.zone_state(9), Some((cs::PEACE, 0)));
+        assert!(!s.at_war(7) && s.at_war(8) && !s.at_war(9));
+        // ... and one on each change
+        s.apply(&zone(7, cs::WAR, 1_700_003_600));
+        s.apply(&zone(8, cs::PEACE, 1_700_007_200));
+        assert_eq!(s.zone_state(7), Some((cs::WAR, 1_700_003_600)));
+        assert!(s.at_war(7) && !s.at_war(8));
+        assert_eq!(s.zone_state(8), Some((cs::PEACE, 1_700_007_200)));
+        assert_eq!(s.zone_states.len(), 3);
+        assert_eq!(s.dropped, 0);
+        // the table is bounded; what does not fit is counted like any other dropped event
+        for g in 100..(100 + crate::bot::zones::MAX_ZONE_STATES as u16) {
+            s.apply(&zone(g, cs::TENSION, 0));
+        }
+        assert_eq!(s.zone_states.len(), crate::bot::zones::MAX_ZONE_STATES);
+        assert!(s.dropped > 0);
+        // a new connection starts from scratch
+        s.reset();
+        assert_eq!(s.zone_state(7), None);
+        assert!(s.zone_states.is_empty());
     }
 
     #[test]

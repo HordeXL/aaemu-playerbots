@@ -276,6 +276,45 @@ are stubs, so no bot picks them); forcing one from the web UI makes it fail with
 which switches it off for that bot. The brain's failure cooldowns are whole seconds in a `u32`
 for the same reason.
 
+## Wave-1 hooks (guilds, pvp, events, companion, farming, population)
+
+Six more features plug in the same way as the market ones. Shared and done: the goal stubs, the
+configuration, the goal mask and the zone conflict table. A feature fills in its own files and
+reads its own `[section]`; the brain, the goal enum, the web goal lists and the director text
+already name its goal.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `config.rs` | guilds |
+| `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` | `bot/goals/gank.rs`, `config.rs` | pvp |
+| `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table | `bot/goals/warzone.rs`, `config.rs` | pvp |
+| `Event` goal (`goals::event`), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
+| `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
+| `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
+| `[population]` (the web UI's population director: `enabled`, `dry_run`, `max_spawn_per_min`, `min_action_gap_secs`) | `config.rs` | web director |
+| `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
+| `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
+| `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
+
+Every stub goal fails with `NotImplemented` (the brain then switches it off for the bot) and its
+`score` is 0, so no bot picks it; forcing one from the web UI does no harm. A feature scores its goal
+through its own `score(ctx, base)` (gate on its `[section]`; the brain applies none of its factors to
+it) and turns the stub's methods into the real thing (`owns_combat` for the pvp goals).
+
+**The zone conflict table.** The server sends one `SCConflictZoneStatePacket` per zone group at world
+entry and one on every change: a `u16` zone group, a `u8` state (0 tension, 1 danger, 2 dispute,
+3 unrest, 4 crisis, 5 conflict, 6 war, 7 peace) and the `i64` Unix second the state ends. Each bot
+keeps the latest of each zone group in `BotState::zone_states`, a table behind one pointer
+(allocated by the first packet, bounded at 64 zone groups, cleared by a reconnect). The end time is
+the server's schedule; the state holds until a new packet replaces it. `at_war` is true for
+conflict and war only, and false for a zone group the server has not announced.
+
+**Masks and the per-bot budget.** The brain's goal masks (`disabled`, `blocked`, the gate) are a
+`GoalMask` (`u32`, 32 goals; a compile-time check fails the build when the goals outgrow it). The
+failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
+pays one pointer for it. With eighteen goals and the zone table, `size_of::<Bot>()` is 3176 bytes
+(limit 3200) and `Goal` stays 152: a new per-bot structure belongs behind a pointer.
+
 ## Navigation motion (`bot/nav/`)
 
 Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight lines;
