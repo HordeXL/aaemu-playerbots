@@ -52,17 +52,34 @@ struct Zones {
     names: Vec<(u16, Box<str>)>,
     /// `zones.id -> zone_key`.
     key_of_id: IdMap<u16>,
+    /// `(zone_key, zone group, faction)` sorted by key: the zone group (what the conflict state
+    /// packets name) and the faction that owns the zone (0 = nobody: a conflict zone, the sea).
+    info: Vec<(u16, u16, u32)>,
+    /// Sorted zone groups that take part in the zone conflicts (`conflict_zones`, not closed).
+    conflict_groups: Vec<u16>,
+}
+
+/// What the static data says about a zone (`zones` row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneInfo {
+    /// The zone group (the id of `SCConflictZoneStatePacket`).
+    pub group: u16,
+    /// The faction that owns the zone; 0 when nobody does. A character of the alliance whose
+    /// mother faction this is cannot be attacked in the zone (the server's home-zone rule).
+    pub faction: u32,
 }
 
 impl Zones {
     fn load(conn: &Connection, texts: &Texts) -> Result<Zones> {
         let mut names: Vec<(u16, Box<str>)> = Vec::new();
         let mut ids = Vec::new();
+        let mut info: Vec<(u16, u16, u32)> = Vec::new();
         each_row(
             conn,
-            "SELECT id, name, zone_key, group_id FROM zones",
+            "SELECT id, name, zone_key, group_id, faction_id FROM zones",
             |r| {
                 let (id, key) = (r.u32(0), r.u16(2));
+                info.push((key, r.u16(3), r.u32(4)));
                 let name: Box<str> = texts
                     .get(TextTable::Zone, id)
                     .or_else(|| texts.get(TextTable::ZoneGroup, r.u32(3)))
@@ -75,10 +92,29 @@ impl Zones {
             },
         )?;
         names.sort_by_key(|n| n.0);
+        info.sort_by_key(|i| i.0);
+        info.dedup_by_key(|i| i.0);
+        // (an old database without the table has no conflict zones)
+        let mut conflict_groups: Vec<u16> = Vec::new();
+        let _ = each_row(
+            conn,
+            "SELECT zone_group_id FROM conflict_zones WHERE closed IN ('f', '0') OR closed = 0",
+            |r| conflict_groups.push(r.u16(0)),
+        );
+        conflict_groups.sort_unstable();
+        conflict_groups.dedup();
         Ok(Zones {
             names,
             key_of_id: IdMap::build(ids),
+            info,
+            conflict_groups,
         })
+    }
+
+    fn info(&self, key: u16) -> Option<ZoneInfo> {
+        let i = self.info.binary_search_by_key(&key, |i| i.0).ok()?;
+        let (_, group, faction) = self.info[i];
+        Some(ZoneInfo { group, faction })
     }
 
     fn name(&self, key: u16) -> Option<&str> {
@@ -92,6 +128,8 @@ impl Zones {
         self.names.capacity() * std::mem::size_of::<(u16, Box<str>)>()
             + self.names.iter().map(|n| n.1.len()).sum::<usize>()
             + self.key_of_id.shallow_bytes()
+            + self.info.capacity() * std::mem::size_of::<(u16, u16, u32)>()
+            + self.conflict_groups.capacity() * 2
     }
 }
 
@@ -130,6 +168,8 @@ pub struct World {
     water: OnceLock<Option<WaterMap>>,
     /// Where the quests are, built at the first [`World::quest_atlas`].
     quest_atlas: OnceLock<QuestAtlas>,
+    /// Spots inside each conflict zone group, built at the first [`World::zone_group_spots`].
+    group_spots: OnceLock<FxHashMap<u16, Box<[[f32; 2]]>>>,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -243,6 +283,7 @@ impl World {
             travel,
             water: OnceLock::new(),
             quest_atlas: OnceLock::new(),
+            group_spots: OnceLock::new(),
         };
         let q = world.quests.stats();
         tracing::info!(
@@ -536,6 +577,12 @@ impl World {
         self.skills.get(id)
     }
 
+    /// Whether doodad template `template` is what a put-down or dropped backpack turns into (a
+    /// trade pack lying on the ground that anybody can pick up again).
+    pub fn is_pack_doodad(&self, template: u32) -> bool {
+        self.doodads.is_pack_doodad(template)
+    }
+
     /// The skill a client casts to use doodad template `doodad` (a quest prop, a lever, a bench);
     /// 0 when it has none and the client's default interaction applies.
     pub fn doodad_use_skill(&self, doodad: u32) -> u32 {
@@ -660,6 +707,62 @@ impl World {
     /// Zone key for a `zones.id` (quests use ids, the client and baked grid use keys).
     pub fn zone_key_for_id(&self, zone_id: u32) -> Option<u16> {
         self.zones.key_of_id.get(zone_id).copied()
+    }
+
+    /// The zone group and the owning faction of a zone key.
+    pub fn zone_info(&self, zone_key: u16) -> Option<ZoneInfo> {
+        self.zones.info(zone_key)
+    }
+
+    /// The zone info at (x, y) from the baked zone grid; `None` outside every zone (the open sea
+    /// is partly one) and without the baked grid.
+    pub fn zone_info_at(&self, x: f32, y: f32) -> Option<ZoneInfo> {
+        self.zones.info(self.zone_key_at(x, y)?)
+    }
+
+    /// Spots (x, y) inside the conflict zone group `group`: the centres of every fourth sector
+    /// (256 m apart) of the baked zone grid whose zone belongs to the group, in a stable order.
+    /// Empty for other groups and without the baked grid. Built for all conflict groups at the
+    /// first call (a scan of the grid, a few ms) and shared by all bots.
+    pub fn zone_group_spots(&self, group: u16) -> &[[f32; 2]] {
+        let all = self.group_spots.get_or_init(|| {
+            let mut out: FxHashMap<u16, Vec<[f32; 2]>> = FxHashMap::default();
+            let Some(grid) = self.baked.zones.as_ref() else {
+                return FxHashMap::default();
+            };
+            for row in (0..grid.height).step_by(4) {
+                for col in (0..grid.width).step_by(4) {
+                    let key = grid.keys[row as usize * grid.width as usize + col as usize];
+                    if key == 0 {
+                        continue;
+                    }
+                    let Some(info) = self.zones.info(key) else {
+                        continue;
+                    };
+                    if self.is_conflict_group(info.group) {
+                        out.entry(info.group).or_default().push([
+                            (col as f32 + 0.5) * grid.sector,
+                            (row as f32 + 0.5) * grid.sector,
+                        ]);
+                    }
+                }
+            }
+            out.into_iter()
+                .map(|(g, v)| (g, v.into_boxed_slice()))
+                .collect()
+        });
+        all.get(&group).map_or(&[], |v| &v[..])
+    }
+
+    /// Whether zone group `group` takes part in the zone conflicts (land conflict zones and the
+    /// sea groups; not the closed ones).
+    pub fn is_conflict_group(&self, group: u16) -> bool {
+        self.zones.conflict_groups.binary_search(&group).is_ok()
+    }
+
+    /// The zone groups of the zone conflicts, ascending.
+    pub fn conflict_groups(&self) -> &[u16] {
+        &self.zones.conflict_groups
     }
 }
 
