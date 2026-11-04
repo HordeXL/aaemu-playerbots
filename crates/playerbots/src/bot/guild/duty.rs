@@ -204,8 +204,14 @@ fn publish(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
     let (level, mother) = (ctx.state.me.level, mother_of(ctx));
     let name: Box<str> = ctx.state.me.name.clone();
     let mem = ctx.state.guild.mem();
-    if mem.t.wished_ms != 0 && now.saturating_sub(mem.t.wished_ms) < WISH_TTL.as_millis() as u64 {
-        flags |= WISHING;
+    // (a wish that cannot be filled now, because the limit of guilds is reached or the bot is
+    // busy, does not keep the guilds from recruiting the bot)
+    let wished =
+        mem.t.wished_ms != 0 && now.saturating_sub(mem.t.wished_ms) < WISH_TTL.as_millis() as u64;
+    if wished {
+        if flags & CAN_FOUND != 0 {
+            flags |= WISHING;
+        }
     } else if mem.t.wished_ms != 0 {
         mem.t.wished_ms = 0;
     }
