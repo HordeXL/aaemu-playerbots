@@ -5,8 +5,8 @@ mod sc_world_common;
 
 use aa_proto::opcodes::sc;
 use aa_proto::sc_world::{
-    movement_direction_radians, parse, unit_state_yaw_radians, unit_type, BuffInfo, DoodadInfo,
-    UnitInfo, WorldEvent,
+    movement_direction_radians, parse, unit_state_yaw_radians, unit_type, BuffInfo,
+    CommonFarmEntry, DoodadInfo, UnitInfo, WorldEvent,
 };
 use aa_proto::PacketStream;
 use sc_world_common::{game, no_panic_on_truncation, write_item, write_model_params};
@@ -1080,6 +1080,56 @@ fn doodad_phase_changed() {
             phase: 9
         }
     );
+}
+
+#[test]
+fn common_farm_list() {
+    // systems/npcs/public_farm.rs (SCResponseCommonFarmListPacket::write): i32 count twice, then
+    // per crop u32 farm type, u32 template, u32 time left, u32 func group, a position, i64 plant time
+    let mut s = PacketStream::new();
+    s.write_i32(2).write_i32(2);
+    for (kind, template, left, phase, x, plant) in [
+        (
+            1u32,
+            2259u32,
+            540_000u32,
+            4456u32,
+            12_543.5f32,
+            1_700_000_000i64,
+        ),
+        (2, 413, 0, 7, 12_600.25, 1_700_000_100),
+    ] {
+        s.write_u32(kind)
+            .write_u32(template)
+            .write_u32(left)
+            .write_u32(phase)
+            .write_position(x, 15_390.0, 120.5)
+            .write_i64(plant);
+    }
+    let WorldEvent::CommonFarmList(list) = game(sc::SCResponseCommonFarmListPacket, &s) else {
+        panic!("not a farm list");
+    };
+    assert_eq!(list.len(), 2);
+    let a: CommonFarmEntry = list[0];
+    assert_eq!(
+        (a.farm_type, a.template, a.time_left, a.phase),
+        (1, 2259, 540_000, 4456)
+    );
+    assert!((a.pos.0 - 12_543.5).abs() < 0.01 && (a.pos.1 - 15_390.0).abs() < 0.01);
+    assert!((a.pos.2 - 120.5).abs() < 0.01);
+    assert_eq!(a.plant_time, 1_700_000_000);
+    assert_eq!((list[1].template, list[1].phase), (413, 7));
+    no_panic_on_truncation(sc::SCResponseCommonFarmListPacket, s.as_bytes());
+    // an empty list, and a count the body cannot hold
+    let mut s = PacketStream::new();
+    s.write_i32(0).write_i32(0);
+    let WorldEvent::CommonFarmList(list) = game(sc::SCResponseCommonFarmListPacket, &s) else {
+        panic!("not a farm list");
+    };
+    assert!(list.is_empty());
+    let mut s = PacketStream::new();
+    s.write_i32(9).write_i32(9);
+    assert!(parse(1, sc::SCResponseCommonFarmListPacket, s.as_bytes()).is_err());
 }
 
 #[test]

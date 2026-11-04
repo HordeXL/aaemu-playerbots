@@ -245,6 +245,23 @@ pub struct DoodadInfo {
     pub has_loot: bool,
 }
 
+/// One crop of `SCResponseCommonFarmListPacket`: a plant of the character on a public farm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommonFarmEntry {
+    /// Farm kind (`FarmGroupKind`: 1 farm, 2 nursery, 3 ranch, 4 stable).
+    pub farm_type: u32,
+    /// Doodad template of the crop.
+    pub template: u32,
+    /// Milliseconds until its current phase ends.
+    pub time_left: u32,
+    /// Its current phase (`func_group_id`).
+    pub phase: u32,
+    /// Position.
+    pub pos: Pos,
+    /// When it was planted, Unix seconds.
+    pub plant_time: i64,
+}
+
 /// One item slot of `SCCharacterInvenContentsPacket`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvItem {
@@ -683,6 +700,10 @@ pub enum WorldEvent {
     DoodadsCreated(SmallVec<[DoodadInfo; 1]>),
     /// `SCDoodadRemovedPacket` (packets/world_objects.rs:44) or `SCDoodadsRemovedPacket` (:60).
     DoodadsRemoved(SmallVec<[u32; 4]>),
+    /// `SCResponseCommonFarmListPacket` (systems/npcs/public_farm.rs): the character's crops on
+    /// the public farms, the answer to `CSRequestCommonFarmList`. The doodad object ids are not
+    /// in it; a crop gets its object id when it comes into view.
+    CommonFarmList(Box<[CommonFarmEntry]>),
     /// `SCDoodadPhaseChangedPacket` (systems/npcs/doodad/packets.rs:53).
     DoodadPhase {
         /// Doodad object id.
@@ -1092,6 +1113,7 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCDoodadRemovedPacket => read_doodad_removed,
         sc::SCDoodadsRemovedPacket => read_doodads_removed,
         sc::SCDoodadPhaseChangedPacket => read_doodad_phase,
+        sc::SCResponseCommonFarmListPacket => read_common_farm_list,
         // own data
         sc::SCCharacterInvenInitPacket => read_inventory_init,
         sc::SCCharacterInvenContentsPacket => read_inventory,
@@ -2002,6 +2024,33 @@ fn read_doodad_phase(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let phase = s.read_u32()?;
     some(WorldEvent::DoodadPhase { obj, phase })
+}
+
+/// One entry of `SCResponseCommonFarmListPacket`: four `u32`, a position (9 bytes), an `i64`.
+const FARM_ENTRY: usize = 4 * 4 + 9 + 8;
+
+fn read_common_farm_list(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    skip(s, 4)?; // the count is written twice
+    let count = usize::try_from(s.read_i32()?).unwrap_or(0);
+    check_count(s, count, FARM_ENTRY, "common farm entry")?;
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let farm_type = s.read_u32()?;
+        let template = s.read_u32()?;
+        let time_left = s.read_u32()?;
+        let phase = s.read_u32()?;
+        let pos = s.read_position()?;
+        let plant_time = s.read_i64()?;
+        list.push(CommonFarmEntry {
+            farm_type,
+            template,
+            time_left,
+            phase,
+            pos,
+            plant_time,
+        });
+    }
+    some(WorldEvent::CommonFarmList(list.into_boxed_slice()))
 }
 
 // ---- own data readers ----------------------------------------------------------------------
