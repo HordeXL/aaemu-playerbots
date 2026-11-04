@@ -160,7 +160,7 @@ impl Goal {
             GoalKind::Sail => Goal::Sail(Sail::default()),
             GoalKind::Auction => Goal::Auction(Auction::default()),
             GoalKind::Market => Goal::Market(Market::default()),
-            GoalKind::Guild => Goal::Guild(Guild::new()),
+            GoalKind::Guild => Goal::Guild(Guild::new(party)),
             GoalKind::Gank => Goal::Gank(Gank::new()),
             GoalKind::Warzone => Goal::Warzone(Warzone::new()),
             GoalKind::Event => Goal::Event(Event::new()),

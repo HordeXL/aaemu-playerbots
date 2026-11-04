@@ -256,7 +256,8 @@ pub fn score(ctx: &Ctx<'_>, base: f32) -> f32 {
 /// arrived before the party order did and was not answered. (A pending invitation blocks every
 /// other one to the same character on the server.)
 pub fn unsolicited(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
-    if running == Some(GoalKind::Dungeon) {
+    // (a founding team answers its own invitations: the guild goal)
+    if matches!(running, Some(GoalKind::Dungeon | GoalKind::Guild)) {
         return;
     }
     let Some(inv) = ctx.state.team().and_then(|t| t.invite.as_ref()) else {

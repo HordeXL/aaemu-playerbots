@@ -138,6 +138,7 @@ impl MockBot {
                 has_house: fastrand::u8(0..10) == 0,
                 online_secs: fastrand::u32(0..40_000),
                 paused: false,
+                ..BotSnapshot::default()
             },
             target: random_point(),
             next_change: 3.0 + fastrand::f32() * 25.0,

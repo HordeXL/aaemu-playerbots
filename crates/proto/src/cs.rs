@@ -903,6 +903,9 @@ pub mod chat_type {
     pub const PARTY: i16 = 4;
     /// Region chat.
     pub const REGION: i16 = 6;
+    /// Guild (expedition) chat; the target is empty. A character that is in no guild gets the
+    /// error message 311.
+    pub const CLAN: i16 = 7;
     /// Chat with the allied faction.
     pub const ALLY: i16 = 14;
 }

@@ -285,7 +285,7 @@ already name its goal.
 
 | Hook | Where | Owner |
 | --- | --- | --- |
-| `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `config.rs` | guilds |
+| `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `bot/guild/`, `config.rs` | guilds (done, see [Guilds](#guilds-botguild-goal-guild)) |
 | `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` | `bot/goals/gank.rs`, `config.rs` | pvp |
 | `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table | `bot/goals/warzone.rs`, `config.rs` | pvp |
 | `Event` goal (`goals::event`), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
@@ -312,8 +312,63 @@ conflict and war only, and false for a zone group the server has not announced.
 **Masks and the per-bot budget.** The brain's goal masks (`disabled`, `blocked`, the gate) are a
 `GoalMask` (`u32`, 32 goals; a compile-time check fails the build when the goals outgrow it). The
 failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
-pays one pointer for it. With eighteen goals and the zone table, `size_of::<Bot>()` is 3176 bytes
+pays one pointer for it. With eighteen goals, the zone table and the guild state, `size_of::<Bot>()` is 3184 bytes
 (limit 3200) and `Goal` stays 152: a new per-bot structure belongs behind a pointer.
+
+## Guilds (`bot/guild/`, goal `guild`)
+
+A guild is what the server calls an expedition (`systems/social/expedition.rs`). The feature is
+split into pure decision code, tested without a connection, and thin glue that turns the decisions
+into packets.
+
+| File | What it is |
+| --- | --- |
+| `aa-proto` `guild.rs` | The requests (`create`, `invite`, `reply_invite`, `leave`, `kick`, `set_member_role`, `change_owner`, `dismiss`), the `GuildEvent` parser for the nine packets a bot needs (faction list, created, member list in chunks, member status, invitation, join/leave/expel, role, owner, dismissed), the role and error-code constants. Counts are bounded by the bytes left, byte-exact tests were written from the server's writers. `cs::chat_type::CLAN` is guild chat. |
+| `log.rs` | `GuildLog`: id, name, owner, members (`since_ms`, role, online), the pending invitation, how the bot last lost a guild, the newcomers to greet. A pure function of the packets (`apply`), idempotent where the server repeats itself (`SCUnitExpeditionChanged` may arrive twice on a leave). |
+| `book.rs` | `GuildBook` in the `Hub`: one mutex around plain data, the clock is an argument. A card per bot (character, mother faction, level, guild, can-join / can-found / wishing, refreshed every 5 s, stale after 20 s), the guilds the bots belong to, the foundings under way (`reserve` / `release`, so `max_guilds` counts them), the guild names that are taken, the claim on an invited bot, the pace of invitations and chat lines per guild. |
+| `plan.rs`, `forming.rs` | `plan` picks `party_size` wishes of one mother faction (longest wait first, the founder is the highest-level bot that can pay); `Wishes` is the coordinator's list (`CoordMsg::Guild`), which first drops the wishes of bots that left, joined a guild or changed faction (the book knows) and reserves the place in the book. |
+| `found.rs` | `Machine`: the founder (wait for the others, invite one after the other, name, create, dismiss the team) and the member (answer the leader's invitation, turn others down, wait for the guild, leave the team). `step(&Snap) -> (Status, Acts)` is pure; every wait has a deadline and a typed `Fail` with a back-off. |
+| `life.rs` | `View` over the log: who may recruit, whom the owner promotes, who succeeds a leaving owner, who may leave, whom to greet; the clocks and plans in `Timers`. |
+| `duty.rs` | The glue every brain tick (`guild::duty`): card and membership to the book, invitation answers (a human pause first), the join-ignored detector, life steps, requests of real players, the web snapshot (`snapshot_if_changed`). |
+| `chat.rs`, `names.rs`, `report.rs` | The lines (no repeat of a recent one, all pass the safety filter), the request detector for whispers ("ginv", "guild invite", "can i join"; not "party", "group", "dungeon", ...), the name generator (mirrors the server's `^[a-zA-Z ]{3,32}$`, five shapes, a Roman numeral from the third try), the issue reports. |
+| `goals/guild.rs` | The goal: with a `PartyPurpose::Guild` order the founding (without one, when an operator forces it, a wish). Its score is 0: the wish itself (`CoordHandle::request_guild`) is posted by the duty. |
+
+**Per-bot cost.** `BotState::guild` is `GuildState(Option<Box<Mem>>)`: one pointer until the first
+guild packet or duty tick with the feature on. `size_of::<Bot>()` is 3184 with it (limit 3200).
+
+**Founding through the coordinator.** The duty posts a `GuildWish` when the bot can sign a charter; the
+bot goes on with its day and the coordinator keeps the wish for 20 minutes. `Coordinator::form_guilds` runs on
+every wish and every sweep; it sends every member of a team the same `PartyOrder` (leader first,
+purpose `Guild`), which the brain turns into the goal with the order. Nobody walks anywhere: the
+team invitation and `CSInviteToExpedition` go by name and the server checks no distance. The founder
+releases the reservation in `stop`; one that is never released ends after ten minutes.
+
+**Server facts the bots keep to** (read from `expedition.rs`, `team.rs`):
+
+* A charter needs a team of `PartyMemberCount` (five), every member level 5 or more, unguilded and of
+  the founder's mother faction, and 10000 copper from the founder; the name is compared exactly
+  and must match the regex. Refusals are `SCErrorMsg` codes 293, 294, 295, 296, 297, 299, 321,
+  330 and 761; each has a back-off (`Fail::back_off_ms`).
+* An owner who leaves leaves the guild without a leader: the bots hand the guild over first
+  (`CSChangeExpeditionOwner`) and wait for `SCExpeditionOwnerChanged` before they leave.
+* By default only role 2 and up may invite, only the general (255) may promote and expel. Refused
+  invitations and replies are silent, so every request has a deadline and a detector.
+* An invitation lasts 60 s and a target has one pending; a team invitation never expires and
+  blocks later ones, so a founding member answers at once and turns down strays
+  (`dungeon::unsolicited` spares the goal `guild` for the same reason).
+
+**Detectors.** A "join" that did not become a membership within 15 s, a creation without an
+answer, a leave or hand-over or promotion that changed nothing, and a creation refused for a
+reason the bots' own checks exclude are reported with the keys `guild join-ignored`,
+`guild create-no-answer`, `guild create-refused code=N`, `guild leave-ignored`,
+`guild owner-change-ignored` and `guild promote-ignored` (area `systems/social/expedition.rs`).
+
+**Tests.** Unit tests cover every pure part (the parser with byte-exact packets, the log, the
+book, the planner, the coordinator's forming, the machine, the decisions, the lines, the names, the
+reports, the config). `tests/guild_real_data.rs` (ignored without the server data, see its header)
+drives the real brain against the real world: an owner promoting and recruiting its own faction
+only, the invitation policy, whispers for an invitation, a hand-over before a leave and the rest
+after it, a founder gathering a team, a wish reaching the coordinator.
 
 ## Navigation motion (`bot/nav/`)
 

@@ -27,6 +27,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod director;
 pub mod goals;
+pub mod guild;
 pub mod manner;
 pub mod market;
 pub mod motion;
@@ -677,6 +678,10 @@ impl Bot {
             }
         }
         self.state.apply(&ev);
+        // (the guild lists the server sends name the guilds that exist: those names are taken)
+        if let ServerEvent::Activity(aa_proto::sc_activity::ActivityEvent::Guild(g)) = &ev {
+            guild::observe(&self.shared.hub.guilds, g);
+        }
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
@@ -1079,7 +1084,15 @@ impl Bot {
         let paused = self.paused;
         let has_house = !self.state.houses.is_empty();
         let (level, hp, pos, money) = (me.level, me.hp_pct(), me.pos, me.money);
+        // (the guild part of the snapshot is rebuilt only when the guild changed)
+        let char_id = me.char_id;
+        let hub = &self.shared.hub;
+        let guild_info =
+            guild::snapshot_if_changed(&mut self.state.guild, |c| hub.is_bot_char(c), char_id);
         self.slot.with(|g| {
+            if let Some(info) = guild_info {
+                g.snap.guild = info;
+            }
             g.path.clear();
             self.motion.route_points(&mut g.path, PATH_POINTS_MAX);
             let s = &mut g.snap;

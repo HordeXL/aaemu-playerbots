@@ -703,9 +703,20 @@ fn route_inbox(ctx: &mut Ctx<'_>, heard: &mut SmallVec<[ChatIn; 2]>) {
     crate::bot::market::forward_chat(&lines, |kind, sender, text, at_ms| {
         market.on_chat(kind, sender, text, at_ms)
     });
+    // (the guild feature hears the guild chat and the whispers that ask for an invitation)
+    let claimed = crate::bot::guild::forward_chat(ctx, &lines);
     let t = unix_ms();
     ctx.log
         .with_slot(|g| route_lines(lines, &mut g.social, t, heard));
+    // a whisper the guild feature answers is not answered a second time
+    if !claimed.is_empty() {
+        heard.retain(|l| {
+            !(l.kind == cs::chat_type::WHISPER
+                && claimed
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(strip_gm(&l.name))))
+        });
+    }
     // a whisper that belongs to a negotiation of the market is the market's to answer
     if ctx.cfg.market.enabled && ctx.cfg.market.chat_ads {
         let market = &ctx.state.market;

@@ -340,6 +340,7 @@ impl Brain {
             BotCmd::Party(order) => {
                 let kind = match order.purpose {
                     PartyPurpose::Dungeon { .. } => GoalKind::Dungeon,
+                    PartyPurpose::Guild => GoalKind::Guild,
                 };
                 self.queue(kind, None);
                 self.party = Some(order.clone());
@@ -405,6 +406,8 @@ impl Brain {
             self.start_goal(ctx, GoalKind::Trade, None);
         }
         super::goals::dungeon::unsolicited(ctx, self.goal.as_ref().map(Goal::kind));
+        // Guild duty: answers invitations, recruits, promotes and talks whatever the bot does.
+        super::guild::duty(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
         if self.goal.is_none() && now >= self.next_think_ms {
             self.pick(ctx);
@@ -1024,6 +1027,24 @@ mod tests {
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(own_score(0, dungeon, || bad), 0.0, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_guild_order_queues_the_guild_goal_with_its_order() {
+        use crate::bot::party::PartyPurpose;
+        let order = PartyOrder {
+            party_id: 8,
+            leader: 1,
+            members: [1, 2, 3, 4, 5].into_iter().collect(),
+            purpose: PartyPurpose::Guild,
+        };
+        let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
+        brain.command(&BotCmd::Party(Box::new(order.clone())));
+        assert!(matches!(brain.queued, Some((GoalKind::Guild, None))));
+        assert_eq!(brain.party.as_deref(), Some(&order));
+        // the goal is made with the order
+        let goal = Goal::with_party(GoalKind::Guild, None, brain.party.take());
+        assert_eq!(goal.kind(), GoalKind::Guild);
     }
 
     #[test]

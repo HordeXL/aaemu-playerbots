@@ -131,6 +131,10 @@ party_size = 5
 max_guilds = 3
 # Bots accept the guild invitations of real players.
 accept_player_invites = false
+# How many times an hour a bot that has been in a bot guild for a quarter of an hour leaves it, on
+# average (0 = never). An owner hands the guild to another bot first; the bot can be invited again
+# after a while.
+churn_per_hour = 0.2
 
 [pvp]
 # Player versus player: defending, fights between bots, ganks and warzones. Off until enabled.

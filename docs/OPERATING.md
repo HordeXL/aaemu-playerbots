@@ -26,7 +26,7 @@ reads it (default `playerbots.toml`).
 | `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings, reconnect back-off. |
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
-| `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds` and `accept_player_invites` (see [Switched-off features](#switched-off-features)). |
+| `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds`, `accept_player_invites` and `churn_per_hour` (see [Guilds](#guilds-guild)). |
 | `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad` and `retreat_hp_pct`. |
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones`. |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
@@ -74,7 +74,8 @@ for a minute. The bot defends itself whatever it is doing.
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
-| **Guild, Gank, Warzone, Event, Companion, Farm** | Reserved: found or join a guild, ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
+| **Guild** | A bot with no guild that can pay the charter asks the coordinator for a founding team (a duty, whatever it is doing); five bots of one faction found a guild together. What a bot does in its guild afterwards (answer invitations, recruit, promote, talk, leave) is a duty that runs whatever the goal is. Needs `[guild] enabled`; see [Guilds](#guilds-guild). |
+| **Gank, Warzone, Event, Companion, Farm** | Reserved: ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -160,12 +161,6 @@ checked now so the features can be added without changing the file.
 
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
-| `[guild]` | `enabled` | `false` | Master switch of the guild features. |
-| | `found` | `true` | Bots may found guilds (otherwise they only join). |
-| | `min_level` | `5` | A bot founds or joins a guild from this level on. |
-| | `party_size` | `5` | Bots that found a guild together (1 to 50). |
-| | `max_guilds` | `3` | This process founds at most this many guilds (0 = none). |
-| | `accept_player_invites` | `false` | Bots accept the guild invitations of real players. |
 | `[pvp]` | `enabled` | `false` | Master switch of the pvp features. |
 | | `defend` | `true` | A bot fights back when a player attacks it. |
 | | `attack_bots` | `false` | Bots of hostile factions attack each other. |
@@ -192,6 +187,70 @@ checked now so the features can be added without changing the file.
 | | `max_plots` | `5` | One bot tends at most this many plots. |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
+
+## Guilds (`[guild]`)
+
+Off by default (`enabled = false`). With it on, bots found guilds (the server calls them
+expeditions), recruit each other, keep them running and, if you let them, take in real players.
+
+```toml
+[guild]
+enabled = true
+found = true                  # bots may found guilds (false: they only join)
+min_level = 5                 # a bot founds or joins a guild from this level on
+party_size = 5                # bots that sign a charter together
+max_guilds = 3                # this process founds at most this many guilds
+accept_player_invites = false # bots accept the invitations of real players
+churn_per_hour = 0.2          # how often a member leaves a bot guild (0 = never)
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch of the guild features (the goal `guild` and the guild duty). |
+| `found` | `true` | Bots may found guilds. Off: they only join existing ones. |
+| `min_level` | `5` | A bot founds or joins a guild from this level on. The server needs level 5 for a charter, so a lower value only lets bots join. |
+| `party_size` | `5` | Bots that found a guild together. The server needs a team of `Expedition.Create.PartyMemberCount` (five by default); more than five is five. |
+| `max_guilds` | `3` | This process runs at most this many guilds, counting the founding teams that are under way (0 = none). |
+| `accept_player_invites` | `false` | A bot that is in no guild accepts the invitation of a real player. Off: it declines. |
+| `churn_per_hour` | `0.2` | How many times an hour a bot that has been in a bot guild for a quarter of an hour leaves it, on average (0 to 60). |
+
+**Founding.** A bot with no guild, level 5 or more, 10000 copper (or `gm_bootstrap`, which mints the
+gold) and no other business posts a wish with the coordinator (the guild duty does that, whatever the
+bot is doing). When `party_size` such bots of one faction wish, the coordinator orders them to a founding
+team: the highest level founds. The founder invites the others into a team by name (the server
+checks no distance), creates the guild with a generated name (letters and spaces; a taken name is
+replaced, up to five tries), and dismisses the team. A failure rests the bot for a minute to half an
+hour, depending on the cause, and a refusal that the bots' own checks should have excluded (a team
+member that is guilded or of another faction, a level too low) is filed as a server issue. The bots
+wait about a minute and a half after the first one logs in before they found anything, so the bots
+that are still logging in can report the guilds they are in, and `max_guilds` counts those.
+
+**Life in a guild.** Whatever goal a bot runs, it answers guild invitations (a bot of a bot guild
+says yes, a bot that is in a guild or a founding team says no, a real player's is answered by
+`accept_player_invites`), and a member of a guild that bots own does the following:
+
+* An officer (or the owner) invites an unguilded bot of its own faction every half minute or so,
+  until the guild has twenty members. A bot that was invited is not invited by a second officer.
+* The owner makes the best one or two bots officers once they have been in the guild half a
+  minute (one officer from four members, two from eight).
+* The owner and now and then an officer welcome a newcomer in guild chat; a newcomer says thanks;
+  now and then a line of small talk. Guild chat is limited per guild and for all guilds together,
+  and follows the `[social]` switches (`enabled`, `bot_chatter`, `chatter_needs_player`).
+* A member leaves with the chance `churn_per_hour` gives. An owner never leaves a guild
+  leaderless: it hands the guild to another bot of the guild first (an officer, else the highest
+  level) and stays if there is none. A bot that left rests a minute and a half before it takes
+  another invitation.
+
+**Real players.** Bots never expel, promote or demote a real player, and they recruit only bots.
+A real player who sends a bot officer the whisper "ginv", "guild invite" or "can i join" gets an
+invitation (and a whisper that says so); a member that cannot invite names an officer who can. A
+real player's line in guild chat is answered by one bot with a canned line. With
+`accept_player_invites` a bot that is in no guild accepts a real player's invitation too.
+
+**See it.** The web UI's bot list carries each bot's guild with its members (`guild` in
+`/api/bots`); the bot's log has the `guild:` lines (invited, joined, handed over, left). Server
+behaviour that contradicts the protocol (an accepted invitation that never became a membership, a
+creation or leave the server ignored) is filed as an issue with keys `guild ...`.
 
 ## Selling (`[market]`)
 

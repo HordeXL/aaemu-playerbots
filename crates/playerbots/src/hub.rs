@@ -334,6 +334,9 @@ pub struct Hub {
     pub nav: NavService,
     /// What the leaders of dungeon parties tell their members (owned by the dungeons feature).
     pub board: crate::bot::party::PartyBoard,
+    /// What the bots share about guilds: who can be invited, the guilds, the foundings (owned by
+    /// the guild feature, see [`crate::bot::guild`]).
+    pub guilds: crate::bot::guild::GuildBook,
     /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
     issue_svc: Arc<Issues>,
     /// Server log lines handed to bots in the current second (second, lines).
@@ -366,6 +369,7 @@ impl Hub {
             contest: Contest::new(),
             nav: NavService::default(),
             board: Default::default(),
+            guilds: Default::default(),
             issue_svc: Arc::new(Issues::disabled()),
             log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),

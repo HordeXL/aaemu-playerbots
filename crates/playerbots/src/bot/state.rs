@@ -421,6 +421,9 @@ pub struct BotState {
     /// The conflict state of the zone groups the server announced (one pointer until the first
     /// announcement), see [`BotState::zone_state`] and [`BotState::at_war`].
     pub zone_states: ZoneStates,
+    /// What the bot knows about its guild (expedition) and what the guild duty plans (one pointer
+    /// until the first guild packet or duty tick), see [`super::guild`].
+    pub guild: super::guild::GuildState,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -646,6 +649,7 @@ impl BotState {
                 me.exp = own.exp;
                 me.labor = own.labor;
                 me.money = own.money;
+                self.guild.on_own_guild(own.expedition_id, self.now_ms);
                 self.equipment = own.equipment.to_vec();
                 // Saved with no hit points: the server sends no death event for it.
                 if own.hp <= 0 {
@@ -1223,6 +1227,9 @@ impl BotState {
         self.trade.apply(ev, self.now_ms);
         self.house_log.apply(ev, self.now_ms, self.me.char_id);
         super::party::observe(&mut self.party, ev, self.now_ms);
+        if let ActivityEvent::Guild(g) = ev {
+            self.guild.on_event(g, self.me.char_id, self.now_ms);
+        }
         match ev {
             ActivityEvent::Quests { list } => {
                 for row in list {

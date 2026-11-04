@@ -9,6 +9,7 @@
 //! - [`sc`]: server → client packet parsers ([`sc::ServerEvent`]): [`sc_world`] (world, units,
 //!   inventory, combat, chat, loot, plus the travel packets below), [`sc_activity`] (quests,
 //!   duels, trade, teams, houses, mail, crafting).
+//! - [`guild`]: the guild (expedition) requests and the packets that tell a bot about its guild.
 //! - [`sc_travel`]: the payload types and readers of the travel packets: the teleport book and
 //!   recall districts (`SCCharacterPortals`, `SCCharacterReturnDistricts`, `SCPortalInfoSaved`,
 //!   `SCPortalDeleted`, `SCUnitPortalUsed`), instance dungeons (`SCProcessingInstance`,
@@ -23,6 +24,7 @@ pub mod auction;
 pub mod codec;
 pub mod cs;
 pub mod game;
+pub mod guild;
 pub mod login;
 pub mod opcodes;
 pub mod pos;
