@@ -1,9 +1,10 @@
 //! Where an ambush waits: a pure planner over the trade routes.
 //!
 //! A carrier walks from a specialty workbench to the NPC that buys its pack, so an ambush belongs
-//! on such a route. The planner takes every workbench spawn near the bot, the best-paid pack it
-//! offers and the best buyer of it (the trade run's own [`best_buyer`]), walks along the straight
-//! line between them and keeps the points where a hostile carrier can be attacked at all:
+//! on such a route. The planner takes every workbench spawn near the bot, every pack it offers and
+//! the best buyer of each (the trade run's own [`best_buyer`]; a carrier may take any of them),
+//! walks along the straight line between workbench and buyer and keeps the points where a hostile
+//! carrier can be attacked at all:
 //!
 //! * the workbench stands in the victims' own zones or in no one's (that is where the carriers
 //!   come from), and the point is not in a zone the victims' alliance owns (the server protects a
@@ -12,7 +13,7 @@
 //!
 //! Points in a conflict zone (a war, if it is on, counts for more) and the first point outside
 //! the victims' zones (where every carrier of the route has to pass) score best, then the price
-//! of the pack, less the way for the bot.
+//! of the pack, less the way for the bot. The bot draws among the best few.
 
 use aa_world::{Vec3, ZoneInfo};
 use smallvec::SmallVec;
@@ -39,7 +40,7 @@ const MERGE_M: f32 = 150.0;
 /// Most posts kept.
 const MAX_POSTS: usize = 16;
 /// The bot draws among this many of the best posts.
-const PICK_AMONG: usize = 3;
+const PICK_AMONG: usize = 6;
 
 /// An ambush post.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,7 +106,8 @@ pub fn candidates<D: RouteData + ?Sized, G: PostGeo + ?Sized>(
         if owner != 0 && owner != q.victims {
             return;
         }
-        let mut best: Option<([f32; 2], u32)> = None;
+        // every pack the bench offers goes to its own buyer: a carrier may take any of them
+        let mut buyers: SmallVec<[([f32; 2], u32); 4]> = SmallVec::new();
         for &craft in data.pack_crafts_at(tpl) {
             let Some(c) = data.craft(craft) else { continue };
             if !c.is_pack || c.product.0 == 0 {
@@ -114,11 +116,12 @@ pub fn candidates<D: RouteData + ?Sized, G: PostGeo + ?Sized>(
             let Some((_, buyer, price)) = best_buyer(data, c.product.0, bench, &|_| true) else {
                 continue;
             };
-            if best.is_none_or(|b| price > b.1) {
-                best = Some((buyer, price));
+            match buyers.iter_mut().find(|b| d2(b.0, buyer) < 1.0) {
+                Some(b) => b.1 = b.1.max(price),
+                None => buyers.push((buyer, price)),
             }
         }
-        if let Some((buyer, price)) = best {
+        for (buyer, price) in buyers {
             if d2(bench, buyer) > 2.0 * END_MARGIN_M {
                 routes.push((bench, buyer, price));
             }
@@ -286,6 +289,20 @@ mod tests {
         // Nuian victims: nothing of theirs may stand in Nuian land
         let posts = candidates(&data, &Land, &query(148, &none));
         assert!(posts.iter().all(|p| p.pos[0] >= 500.0), "{posts:?}");
+    }
+
+    #[test]
+    fn every_pack_of_a_bench_has_its_own_route() {
+        let mut data = Fake::sample();
+        // bench 100 offers pack 11 (to the buyer at (1500, 0)) and pack 12 (to another one)
+        data.buyers.insert(12, vec![501]);
+        data.prices.insert((11, 500), 80_000);
+        data.prices.insert((12, 501), 40_000);
+        let none = |_: u16| false;
+        let posts = candidates(&data, &Land, &query(149, &none));
+        let east = posts.iter().any(|p| p.dir[0] > 0.9 && p.price == 80_000);
+        let north = posts.iter().any(|p| p.dir[1] > 0.5 && p.price == 40_000);
+        assert!(east && north, "{posts:?}");
     }
 
     #[test]
