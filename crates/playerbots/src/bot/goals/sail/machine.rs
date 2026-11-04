@@ -525,8 +525,16 @@ impl Machine {
                 self.enter(Phase::Shore, io.now_ms);
                 GoalStatus::Running
             }
-            Err(PlanError::NoCoast) => GoalStatus::Failed(FailReason::Other("no coast near")),
-            Err(PlanError::NoTrip) => GoalStatus::Failed(FailReason::Other("no trip from here")),
+            Err(PlanError::NoCoast) => {
+                acts.push(Act::Say(
+                    "sail: no launch beach with room for the boat near".into(),
+                ));
+                GoalStatus::Failed(FailReason::Other("no coast near"))
+            }
+            Err(PlanError::NoTrip) => {
+                acts.push(Act::Say("sail: no trip from here".into()));
+                GoalStatus::Failed(FailReason::Other("no trip from here"))
+            }
         }
     }
 
@@ -970,7 +978,7 @@ impl Machine {
             throttle: throttle(fwd, wanted_speed(&hull, err, g.v_limit)),
             steering: self.helm.steer(err, rate, fwd),
         };
-        if self.helm.watch(now, err, cmd.steering) {
+        if self.helm.watch(now, err, cmd.steering, rate) {
             acts.push(Act::Say(format!(
                 "sail: the wheel turned the other way; steering sign {}",
                 self.helm.sign()

@@ -55,6 +55,8 @@ const DIVERGE_MS: u64 = 4000;
 const DIVERGE_CAPS: f32 = 0.6;
 /// Sign flips a helm makes at most (the sign is a fact of the server, not a mood).
 const MAX_FLIPS: u8 = 2;
+/// The hull turns against the helm when its yaw rate is this many turn caps the wrong way.
+const AGAINST_CAPS: f32 = 0.15;
 
 /// How a hull turns and moves: the angular acceleration at full helm (rad/s^2, at full turn
 /// factor), the turn rate the helm settles at (rad/s) - both halved at standstill (see
@@ -250,10 +252,13 @@ impl Helm {
         s.round().clamp(-FULL, FULL) as i8
     }
 
-    /// The divergence watch: call once per control step with the heading error and the steering
-    /// that was sent. When the wheel has been hard over for a few seconds and the error only grew,
-    /// the sign was wrong: flip it (at most [`MAX_FLIPS`] times). Returns whether it flipped.
-    pub fn watch(&mut self, now_ms: u64, err: f32, steering: i8) -> bool {
+    /// The divergence watch: call once per control step with the heading error, the steering that
+    /// was sent and the measured yaw rate (rad/s, positive = the yaw grows). When the wheel has
+    /// been hard over for a few seconds, the error only grew and the hull turns *against* the
+    /// helm, the sign was wrong: flip it (at most [`MAX_FLIPS`] times). A hull that turns the way
+    /// it is steered but not fast enough for the route (the error grows on a tight curve) keeps its
+    /// sign. Returns whether it flipped.
+    pub fn watch(&mut self, now_ms: u64, err: f32, steering: i8, rate: f32) -> bool {
         if steering.unsigned_abs() < HARD_OVER {
             self.hard_since_ms = 0;
             return false;
@@ -265,8 +270,12 @@ impl Helm {
             return false;
         }
         let secs = DIVERGE_MS as f32 / 1000.0;
+        // the way the yaw changes when the wheel is right: a positive steering lowers it with
+        // sign +1
+        let expected = -f32::from(self.sign) * f32::from(steering.signum());
         if now_ms.saturating_sub(self.hard_since_ms) >= DIVERGE_MS
             && err.abs() >= self.hard_err + DIVERGE_CAPS * self.hull.cap * secs
+            && rate * expected < -AGAINST_CAPS * self.hull.cap
             && self.flips < MAX_FLIPS
         {
             self.sign = -self.sign;
@@ -360,7 +369,7 @@ mod tests {
         while now < end {
             let err = wrap_pi(target((now - t0) as f32 / 1000.0) - plant.yaw);
             let s = helm.steer(err, plant.yaw_rate_estimate(), plant.speed);
-            helm.watch(now, err, s);
+            helm.watch(now, err, s, plant.yaw_rate_estimate());
             plant.request(CRUISE, s);
             plant.advance(0.25);
             now += 250;
@@ -473,7 +482,7 @@ mod tests {
         for step in 0..1200 {
             let err = wrap_pi(1.5 - p.yaw);
             let s = helm.steer(err, p.yaw_rate_estimate(), p.speed);
-            if helm.watch(now, err, s) && flipped.is_none() {
+            if helm.watch(now, err, s, p.yaw_rate_estimate()) && flipped.is_none() {
                 flipped = Some(step);
             }
             p.request(CRUISE, s);
@@ -490,11 +499,27 @@ mod tests {
         let mut h = Helm::default();
         // hard over for ten seconds while the error shrinks
         for i in 0..40 {
-            assert!(!h.watch(i * 250, 2.0 - i as f32 * 0.04, 127));
+            assert!(!h.watch(i * 250, 2.0 - i as f32 * 0.04, 127, -0.05));
         }
         // a centred wheel resets it
-        assert!(!h.watch(10_000, 2.0, 0));
+        assert!(!h.watch(10_000, 2.0, 0, 0.0));
         assert_eq!(h.flips(), 0);
+    }
+
+    #[test]
+    fn a_hull_that_turns_the_way_it_is_steered_keeps_its_sign_while_the_error_grows() {
+        // hard over for ten seconds on a curve the hull cannot follow: the error grows, but the
+        // yaw falls as a positive steering should make it
+        let mut h = Helm::default();
+        for i in 0..40 {
+            assert!(!h.watch(i * 250, 0.1 + i as f32 * 0.05, 127, -0.07));
+        }
+        assert_eq!(h.flips(), 0);
+        // the same with a hull that turns against the helm: flipped after the four seconds
+        let mut h = Helm::default();
+        let flipped = (0..40).any(|i| h.watch(i * 250, 0.1 + i as f32 * 0.05, 127, 0.07));
+        assert!(flipped);
+        assert_eq!(h.sign(), -1);
     }
 
     #[test]

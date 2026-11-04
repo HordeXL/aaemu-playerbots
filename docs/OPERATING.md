@@ -25,6 +25,7 @@ reads it (default `playerbots.toml`).
 | `[data]` | Paths of the server's `compact.sqlite3` and `app/Data` directory, the baked data directory (`baked`) and the world name. |
 | `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings, reconnect back-off. |
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
+| `[sail]` | The boat the sailing goal uses: `ship` = `rowboat` (default), `clipper`, `cutter`, `junk`, `yawl`, `schooner` or `auto` (see [Sailing](#sailing)). |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
 | `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds`, `accept_player_invites` and `churn_per_hour` (see [Guilds](#guilds-guild)). |
 | `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct` and `war_kill_cap`. |
@@ -73,7 +74,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Auction** | Walks to the nearest auctioneer, lists surplus goods, buys a bargain and goes home (see [Auction house](#auction-house)). Needs `[market] enabled` and `auction`. |
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
-| **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
+| **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (twice as far in a 6 m/s hull; a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. A rowboat by default; `[sail] ship` picks a clipper, cutter, junk, yawl or schooner. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
 | **Guild** | A bot with no guild that can pay the charter asks the coordinator for a founding team (a duty, whatever it is doing); five bots of one faction found a guild together. What a bot does in its guild afterwards (answer invitations, recruit, promote, talk, leave) is a duty that runs whatever the goal is. Needs `[guild] enabled`; see [Guilds](#guilds-guild). |
 | **Gank** | Off until `[pvp] enabled` and `gank`, and someone may be attacked (`attack_bots`, or `attack_players` without `gm_bootstrap`). Plans an ambush post on the route between a specialty workbench and the NPC that buys its pack (outside the victims' home zones, where the server protects them; conflict zones and wars score higher), waits there and attacks a carrier of the hostile alliance when the odds are fair. Bots that wait close together form a squad of up to `max_squad` through the coordinator, so a stronger carrier can be taken. When the carrier dies the dropped pack is picked up (within 3 m, skill 11361) and a trade run sells it. It gives up on stronger groups, at the retreat line, on a protected target and after a death. See [Player versus player](#player-versus-player-pvp). |
 | **Warzone** | Off until `[pvp] enabled` and `warzone`. Scored while a reachable land zone group is at war (conflict or war) with enough time left and the bot has not yet killed `war_kill_cap` characters in it: goes there, patrols from spot to spot, fights allowed characters when the odds are fair, regroups when hurt and leaves at peace. See [Player versus player](#player-versus-player-pvp). |
@@ -133,7 +134,7 @@ Safety of the GM lines:
   dungeon's level range raise its level to the range's minimum with the GM `/level` command
   (logged); `false` keeps dungeons to the bots whose level fits.
 * `[behavior] sailing = true` (default): bots may summon boats and sail (goal `sail`); `false` keeps
-  them on land.
+  them on land. `[sail] ship` chooses the boat, see [Sailing](#sailing).
 * `[behavior] lifelike = true` (default): bots move like people (jumps, emotes, idle mannerisms);
   `false` keeps them walking and standing still. `jump_rate = 1.0` scales how often they jump (0 =
   never) and `emotes = true` lets them use emotes. It only shows when a real player (a character that
@@ -348,6 +349,44 @@ Seen while building the feature against the Rust server; the bots cope with all 
   a fighter, so most bots in the live run left hurt and died. Real kills need real characters.
 * An event nobody fights stays in its wave until its time cap (3600 s for the two rifts), when the
   server ends it; that is how a rift without players behaves, not a fault.
+
+## Sailing
+
+The `sail` goal summons a boat at a beach, sails 1 to 3 km over the sea (twice as far in a 6 m/s hull)
+and swims ashore after leaving the boat. `[behavior] sailing = false` switches it off. Which boat the
+bots use is `[sail] ship`:
+
+```toml
+[sail]
+ship = "cutter"    # rowboat (default) | clipper | cutter | junk | yawl | schooner | auto
+```
+
+* `rowboat` is the default and behaves as before. A scroll in the bag is used; without one a bot
+  needs `bots.gm_bootstrap` (it adds the scroll with `/item add self`).
+* `clipper` (6.5 m/s), `cutter` and `junk` (6.3 m/s), `yawl` (9.8 m/s) and `schooner` (6.5 m/s, the
+  merchant ship) sail with the driver only: no crew, cannons or cargo yet. `auto` uses the
+  family of a scroll the bag holds, else gives each bot a boat of its own (mostly rowboats and
+  clippers, some cutters and junks, merchants like the schooner).
+* A big hull needs room. The bot looks for a beach (within 1500 m of where it stands) where the
+  server will accept the summon, sails a route that keeps 3 to 6 cells (48 to 96 m) off the coast and
+  rounds its corners with the hull's own turn radius (a cutter turns on a circle of 280 m, a yawl 430
+  m), and parks the hull out at sea (up to 260 m from the beach) before it swims in. A bot that
+  stands on a shore with no such beach or sea within reach fails the goal and the brain tries
+  something else after a minute (the log line is `sail: no launch beach with room for the boat near` or
+  `sail: no trip from here`).
+* The server sometimes refuses a summon for lack of room even where the height grid shows
+  water (about one in ten of the live summons: rocks and piers are in its collision data, not
+  the grid). The bot logs `sail: no room for the boat here; trying another beach` and tries two more
+  beaches. If refusals are common on your server, raise `LAUNCH_DEPTH_MEDIUM_M` / `LAUNCH_DEPTH_LARGE_M`
+  in `crates/playerbots/src/bot/goals/sail/trip.rs` (the water the hull's footprint needs at a
+  launch).
+* The speed is the server's: `ship_models.velocity * MoveSpeedMul^2 / 8`, plus up to 15 percent for a
+  sailing ship that heads north or south (the official wind model). A trip is given up after 40
+  minutes, or after 8 minutes and 2.5 times the time the route takes at top speed if longer.
+* A boat that runs aground (the server never says so) is noticed by its speed: the bot backs off
+  and plans again; a fourth grounding ends the trip.
+* Issue reports of the goal are `sail:*` (no boat, no seat, dead wheel, no thrust, slow boat, ignored
+  despawn); see [ISSUES.md](ISSUES.md).
 
 ## Selling (`[market]`)
 

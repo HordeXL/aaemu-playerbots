@@ -330,7 +330,7 @@ mod tests {
             }
             let err = wrap_pi(g.target_yaw - plant.yaw);
             let s = helm.steer(err, plant.yaw_rate_estimate(), plant.speed);
-            helm.watch(now, err, s);
+            helm.watch(now, err, s, plant.yaw_rate_estimate());
             let th = throttle(plant.speed, wanted_speed(&hull, err, g.v_limit));
             plant.request(th, s);
             plant.advance(0.25);
