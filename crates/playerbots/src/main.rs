@@ -279,6 +279,12 @@ async fn run(
     } else {
         coordinator
     };
+    // (founding teams for guilds: only when the bots may found guilds at all)
+    let coordinator = if cfg.guild.enabled && cfg.guild.found && cfg.guild.max_guilds > 0 {
+        coordinator.with_guilds(cfg.guild.party_size, cfg.guild.max_guilds)
+    } else {
+        coordinator
+    };
     let coord_task = tokio::spawn(coordinator.run(cancel.clone()));
 
     let shared = Arc::new(Shared {

@@ -37,6 +37,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::cmd::{BotCmd, PairKind, PairOrder, PairRole};
+use super::guild::forming::Wishes as GuildWishes;
+use super::guild::plan::GuildWish;
 use super::party::{self, PartyOrder, PartyPurpose, Site, Wish};
 use crate::hub::Hub;
 
@@ -49,6 +51,10 @@ pub trait Dispatch: Send + Sync {
     /// Level of a bot (0 when unknown); level differences are not held against unknown levels.
     fn level(&self, _bot: u32) -> u8 {
         0
+    }
+    /// What the bots share about guilds (the founding teams reserve their places there).
+    fn guild_book(&self) -> Option<&super::guild::GuildBook> {
+        None
     }
 }
 
@@ -71,6 +77,10 @@ impl Dispatch for Hub {
 
     fn level(&self, bot: u32) -> u8 {
         self.slot(bot).map_or(0, |s| s.with(|g| g.snap.level))
+    }
+
+    fn guild_book(&self) -> Option<&super::guild::GuildBook> {
+        Some(&self.guilds)
     }
 }
 
@@ -120,6 +130,8 @@ pub enum CoordMsg {
     },
     /// A bot wants to run a dungeon with a party.
     Party(Wish),
+    /// A bot wants to sign a charter with others and found a guild.
+    Guild(GuildWish),
 }
 
 /// The cheap, cloneable end bots talk to the coordinator with.
@@ -139,6 +151,11 @@ impl CoordHandle {
     /// Asks for a party for an instance dungeon. False when the coordinator's inbox is full.
     pub fn request_party(&self, wish: Wish) -> bool {
         self.tx.try_send(CoordMsg::Party(wish)).is_ok()
+    }
+
+    /// Asks for a founding team for a guild. False when the coordinator's inbox is full.
+    pub fn request_guild(&self, wish: GuildWish) -> bool {
+        self.tx.try_send(CoordMsg::Guild(wish)).is_ok()
     }
 
     /// Withdraws a request.
@@ -196,6 +213,8 @@ pub struct Coordinator {
     wishing: Vec<Wishing>,
     formed: Vec<Formed>,
     next_party: u32,
+    /// The wishes for a founding team (set by [`Coordinator::with_guilds`]).
+    guilds: Option<GuildWishes>,
 }
 
 /// Creates the coordinator and the handle bots use.
@@ -212,6 +231,7 @@ pub fn channel(sink: Arc<dyn Dispatch>) -> (CoordHandle, Coordinator) {
             wishing: Vec::new(),
             formed: Vec::new(),
             next_party: 1,
+            guilds: None,
         },
     )
 }
@@ -221,6 +241,18 @@ impl Coordinator {
     pub fn with_sites(mut self, sites: Vec<Site>) -> Coordinator {
         self.sites = sites;
         self
+    }
+
+    /// Lets the coordinator form founding teams of `party_size` bots for guilds, while the bots
+    /// run fewer than `max_guilds` of them (see [`super::guild::forming`]).
+    pub fn with_guilds(mut self, party_size: u8, max_guilds: u32) -> Coordinator {
+        self.guilds = Some(GuildWishes::new(party_size, max_guilds));
+        self
+    }
+
+    /// Number of bots waiting for a founding team.
+    pub fn guild_wishes(&self) -> usize {
+        self.guilds.as_ref().map_or(0, GuildWishes::len)
     }
 
     /// The parties formed lately, oldest first.
@@ -254,6 +286,15 @@ impl Coordinator {
             CoordMsg::Cancel { bot } => {
                 self.waiting.retain(|w| w.bot != bot);
                 self.wishing.retain(|w| w.wish.bot != bot);
+                if let Some(g) = self.guilds.as_mut() {
+                    g.cancel(bot);
+                }
+            }
+            CoordMsg::Guild(wish) => {
+                if let Some(g) = self.guilds.as_mut() {
+                    g.add(wish, now);
+                    self.form_guilds(now);
+                }
             }
             CoordMsg::Party(wish) => {
                 self.wishing.retain(|w| w.wish.bot != wish.bot);
@@ -284,8 +325,40 @@ impl Coordinator {
             .retain(|w| now.saturating_duration_since(w.since) < WISH_TTL);
         self.formed
             .retain(|f| now.saturating_duration_since(f.at) < FORMED_TTL);
+        if let Some(g) = self.guilds.as_mut() {
+            g.expire(now);
+        }
         self.pair_up(now);
         self.form_parties(now);
+        self.form_guilds(now);
+    }
+
+    /// Forms founding teams out of the wishes until no more can be formed and orders every
+    /// member: the first one founds, the others sign.
+    fn form_guilds(&mut self, now: Instant) {
+        let (Some(wishes), Some(book)) = (self.guilds.as_mut(), self.sink.guild_book()) else {
+            return;
+        };
+        let unix = crate::hub::unix_ms();
+        while let Some(team) = wishes.form(now, book, unix, self.next_party) {
+            self.next_party = self.next_party.wrapping_add(1).max(1);
+            tracing::info!(party = team.party_id, bots = ?team.members, "guild founding team formed");
+            for (i, &bot) in team.members.iter().enumerate() {
+                let order = PartyOrder {
+                    party_id: team.party_id,
+                    leader: team.members[0],
+                    members: team.members.iter().copied().collect(),
+                    purpose: PartyPurpose::Guild,
+                };
+                if let Err(e) = self.sink.send(bot, BotCmd::Party(Box::new(order))) {
+                    tracing::debug!("guild order to {bot}: {e}");
+                    if i == 0 {
+                        // (no founder, no founding: the place in the book is free again)
+                        book.release(team.party_id);
+                    }
+                }
+            }
+        }
     }
 
     /// Forms parties out of the wishes until no more can be formed, and orders every member.
@@ -446,6 +519,7 @@ mod tests {
     struct Recorder {
         sent: Mutex<Vec<(u32, BotCmd)>>,
         levels: Mutex<HashMap<u32, u8>>,
+        book: crate::bot::guild::GuildBook,
     }
 
     impl Dispatch for Recorder {
@@ -458,6 +532,9 @@ mod tests {
         }
         fn level(&self, bot: u32) -> u8 {
             self.levels.lock().get(&bot).copied().unwrap_or(0)
+        }
+        fn guild_book(&self) -> Option<&crate::bot::guild::GuildBook> {
+            Some(&self.book)
         }
     }
 
@@ -809,5 +886,134 @@ mod tests {
         // wishes that waited too long are dropped
         c.expire(t0 + WISH_TTL + Duration::from_secs(1));
         assert_eq!(c.wishing(), 0);
+    }
+
+    fn guild_card(bot: u32, mother: u32, level: u8, flags: u8) -> crate::bot::guild::Card {
+        crate::bot::guild::Card {
+            bot,
+            char_id: bot * 100,
+            name: format!("Bot{bot}").into(),
+            mother,
+            level,
+            guild: 0,
+            flags,
+            seen_ms: 0,
+        }
+    }
+
+    fn guild_wish(bot: u32, mother: u32, level: u8) -> GuildWish {
+        GuildWish {
+            bot,
+            mother,
+            level,
+            can_pay: true,
+        }
+    }
+
+    /// `n` bots of faction 7 that can sign a charter (their cards are in the book).
+    fn charter_bots(rec: &Recorder, n: u32) {
+        use crate::bot::guild::book::{CAN_FOUND, CAN_JOIN, WISHING};
+        for b in 1..=n {
+            rec.book.update_card(
+                guild_card(b, 7, 10 + b as u8, CAN_JOIN | CAN_FOUND | WISHING),
+                crate::hub::unix_ms(),
+            );
+        }
+    }
+
+    fn guild_orders(rec: &Recorder) -> Vec<(u32, PartyOrder)> {
+        rec.sent
+            .lock()
+            .iter()
+            .map(|(bot, cmd)| match cmd {
+                BotCmd::Party(o) => (*bot, (**o).clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn five_wishes_for_a_guild_make_a_team_and_the_founder_comes_first() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_guilds(5, 3);
+        charter_bots(&rec, 5);
+        let t0 = Instant::now();
+        for b in 1..=4u32 {
+            c.handle(CoordMsg::Guild(guild_wish(b, 7, 10 + b as u8)), t0);
+        }
+        assert!(rec.sent.lock().is_empty(), "four are too few");
+        assert_eq!(c.guild_wishes(), 4);
+        c.handle(CoordMsg::Guild(guild_wish(5, 7, 15)), t0);
+        let sent = guild_orders(&rec);
+        assert_eq!(sent.len(), 5);
+        let order = &sent[0].1;
+        assert_eq!(order.purpose, PartyPurpose::Guild);
+        assert_eq!(order.leader, 5, "the highest level founds");
+        assert_eq!(sent[0].0, 5, "and is told first");
+        assert!(
+            sent.iter().all(|(_, o)| o == order),
+            "one order for everybody"
+        );
+        assert_eq!(order.members.len(), 5);
+        assert_eq!(c.guild_wishes(), 0);
+        assert_eq!(
+            rec.book.foundings(),
+            1,
+            "the guild has its place in the book"
+        );
+    }
+
+    #[test]
+    fn guilds_are_not_founded_without_the_switch_and_not_beyond_the_limit() {
+        // (no `with_guilds`: the wishes are ignored)
+        let (rec, _h, mut c) = coordinator();
+        charter_bots(&rec, 5);
+        let t0 = Instant::now();
+        for b in 1..=5u32 {
+            c.handle(CoordMsg::Guild(guild_wish(b, 7, 10)), t0);
+        }
+        assert!(rec.sent.lock().is_empty());
+        assert_eq!(c.guild_wishes(), 0);
+        // one guild at most: the second team waits until the first founding is over
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_guilds(2, 1);
+        charter_bots(&rec, 4);
+        for b in 1..=4u32 {
+            c.handle(CoordMsg::Guild(guild_wish(b, 7, 10)), t0);
+        }
+        assert_eq!(guild_orders(&rec).len(), 2, "one team of two");
+        assert_eq!(c.guild_wishes(), 2, "the others wait");
+        let party = guild_orders(&rec)[0].1.party_id;
+        rec.book.release(party);
+        c.expire(t0 + Duration::from_secs(SWEEP_SECS));
+        assert_eq!(guild_orders(&rec).len(), 4, "the place is free again");
+    }
+
+    #[test]
+    fn a_guild_wish_is_cancelled_with_the_bot_and_expires() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_guilds(5, 3);
+        charter_bots(&rec, 2);
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Guild(guild_wish(1, 7, 10)), t0);
+        c.handle(CoordMsg::Guild(guild_wish(2, 7, 10)), t0);
+        assert_eq!(c.guild_wishes(), 2);
+        c.handle(CoordMsg::Cancel { bot: 1 }, t0);
+        assert_eq!(c.guild_wishes(), 1);
+        c.expire(t0 + crate::bot::guild::plan::WISH_TTL);
+        assert_eq!(c.guild_wishes(), 0);
+    }
+
+    #[test]
+    fn a_guild_team_does_not_disturb_duels_and_dungeon_parties() {
+        let (rec, _h, c) = coordinator();
+        let mut c = c.with_guilds(2, 3);
+        charter_bots(&rec, 2);
+        let t0 = Instant::now();
+        c.handle(CoordMsg::Guild(guild_wish(1, 7, 10)), t0);
+        c.handle(req(PairKind::Duel, 7, (0.0, 0.0)), t0);
+        c.handle(req(PairKind::Duel, 8, (3.0, 0.0)), t0);
+        assert_eq!(pairs(&rec).len(), 2, "the duel pair is made");
+        assert_eq!(c.guild_wishes(), 1, "the wish waits");
     }
 }

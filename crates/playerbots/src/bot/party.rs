@@ -56,6 +56,9 @@ pub enum PartyPurpose {
         /// orders by).
         zone_group: u32,
     },
+    /// Sign the charter of a new guild: the leader founds it, the others sign (the guild feature,
+    /// [`super::guild`]).
+    Guild,
 }
 
 /// The coordinator's order to one member of a party.
@@ -86,6 +89,8 @@ impl PartyOrder {
     pub fn zone_group(&self) -> u32 {
         match self.purpose {
             PartyPurpose::Dungeon { zone_group } => zone_group,
+            // (a charter has no dungeon)
+            PartyPurpose::Guild => 0,
         }
     }
 }
