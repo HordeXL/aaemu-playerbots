@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context};
 
-use crate::pak::Pak;
+use crate::pak::ClientFiles;
 
 pub use graph::{assemble, AssembleOptions, AssembleStats};
 pub use merge::{MergeStats, NavBuilder};
@@ -198,7 +198,7 @@ fn split_net_name(name: &str) -> Option<(&str, NavLayout, &str, &str)> {
 
 /// The worlds of the pak that have navigation data, with the layout each uses. A world with
 /// zone folders is a `Zones` world.
-pub fn nav_worlds_in_pak(pak: &Pak) -> BTreeMap<String, NavLayout> {
+pub fn nav_worlds_in_pak(pak: &dyn ClientFiles) -> BTreeMap<String, NavLayout> {
     let mut out: BTreeMap<String, NavLayout> = BTreeMap::new();
     for name in pak.names_with_prefix("game/worlds/") {
         if let Some((world, layout, _, _)) = split_net_name(name) {
@@ -213,7 +213,7 @@ pub fn nav_worlds_in_pak(pak: &Pak) -> BTreeMap<String, NavLayout> {
 
 /// The folders of `world` with navigation files and where their local origins lie.
 pub fn nav_folders(
-    pak: &Pak,
+    pak: &dyn ClientFiles,
     world: &str,
     zone_origins: &HashMap<u32, (i32, i32)>,
 ) -> (NavLayout, Vec<NavFolder>) {
@@ -269,7 +269,7 @@ pub fn nav_folders(
 /// Reads, merges and assembles the navigation data of `world` and writes
 /// `<out_dir>/nav_<world>.bin`.
 pub fn bake_nav_world(
-    pak: &mut Pak,
+    pak: &mut dyn ClientFiles,
     world: &str,
     zone_origins: &HashMap<u32, (i32, i32)>,
     out_dir: &Path,

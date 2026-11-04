@@ -31,8 +31,24 @@ use anyhow::{bail, Context};
 
 use crate::compact::{Compact, RectF};
 use crate::heights::{bake_heights, validate_step, HeightGrid, HeightsReport};
-use crate::pak::Pak;
+use crate::pak::{ClientFiles, DirFiles, Pak};
 use crate::worldxml::{parse_world_xml, WorldDef};
+
+/// Opens the client's files: a `game_pak` archive or a folder of extracted client files.
+///
+/// A folder is walked once and keeps every file it holds; an archive keeps only the entries the
+/// filter accepts (the file table of the full `game_pak` has hundreds of thousands of them).
+pub fn open_source(
+    path: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> anyhow::Result<Box<dyn ClientFiles>> {
+    if path.is_dir() {
+        let dir = DirFiles::open(path)?;
+        Ok(Box::new(dir))
+    } else {
+        Ok(Box::new(Pak::open_filtered(path, keep)?))
+    }
+}
 
 /// Scratch directory for tests: below `$AA_TEST_TMP` when set (a roomier volume), else the OS
 /// temp dir.
@@ -282,7 +298,7 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
     let t = Instant::now();
     let world_prefix = format!("game/worlds/{world_name}/");
     let nav_instances = steps.nav_instances;
-    let mut pak = Pak::open_filtered(&opts.pak, |n| {
+    let mut pak = open_source(&opts.pak, |n| {
         n.starts_with(&world_prefix)
             || n.starts_with("game/ui/map/world/")
             // other worlds: only what the navigation meshes need
@@ -321,7 +337,7 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
 
     if steps.heights {
         let t = Instant::now();
-        let (g, hr) = bake_heights(&mut pak, &world, opts.step)?;
+        let (g, hr) = bake_heights(pak.as_mut(), &world, opts.step)?;
         let path = opts.out.join(format!("heights_{world_name}.bin"));
         write_height_grid(&path, &g.header, &g.samples)?;
         report
@@ -455,7 +471,7 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
         } else {
             nav::MIN_COMPONENT_INSTANCE
         };
-        match nav::bake_nav_world(&mut pak, world_name, &origins, &opts.out, min_nodes) {
+        match nav::bake_nav_world(pak.as_mut(), world_name, &origins, &opts.out, min_nodes) {
             Ok(r) => finish_nav(&mut report, &opts.out, r),
             Err(e) => report.warn(format!("navigation mesh of {world_name} not baked: {e:#}")),
         }
@@ -466,7 +482,7 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
 
     if steps.nav_instances {
         let t = Instant::now();
-        let others: Vec<String> = nav::nav_worlds_in_pak(&pak)
+        let others: Vec<String> = nav::nav_worlds_in_pak(pak.as_ref())
             .into_keys()
             .filter(|w| w != world_name)
             .collect();
@@ -476,7 +492,7 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
                 _ => Default::default(),
             };
             match nav::bake_nav_world(
-                &mut pak,
+                pak.as_mut(),
                 &w,
                 &origins,
                 &opts.out,
@@ -499,7 +515,14 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
             None => HeightGrid::from_file(&opts.out.join(format!("heights_{world_name}.bin")))
                 .context("the map needs the height grid: run the heights step first")?,
         };
-        bake_map(&mut pak, &world, &grid, compact.as_ref(), opts, &mut report)?;
+        bake_map(
+            pak.as_mut(),
+            &world,
+            &grid,
+            compact.as_ref(),
+            opts,
+            &mut report,
+        )?;
         report
             .timings
             .push(("map".into(), t.elapsed().as_secs_f32()));
@@ -575,7 +598,7 @@ fn finish_nav(report: &mut BakeReport, out: &Path, r: nav::NavReport) {
 const RELIEF_WIDTH: u32 = 2240;
 
 fn bake_map(
-    pak: &mut Pak,
+    pak: &mut dyn ClientFiles,
     world: &WorldDef,
     grid: &HeightGrid,
     compact: Option<&Compact>,

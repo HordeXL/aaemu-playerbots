@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use aa_world::nav::format::{flag, NavData};
 
-use crate::pak::Pak;
+use crate::pak::ClientFiles;
 
 /// Object type of the road prefab.
 pub const OBJECT_ROAD: i32 = 13;
@@ -502,7 +502,7 @@ fn mark(d: &mut NavData, nodes: &[u32]) -> usize {
 /// Reads the roads of `world` from the pak and flags the mesh. Problems are collected as
 /// warnings in the report; a world without road data just flags nothing.
 pub fn flag_roads(
-    pak: &mut Pak,
+    pak: &mut dyn ClientFiles,
     world: &str,
     zone_origins: &HashMap<u32, (i32, i32)>,
     d: &mut NavData,

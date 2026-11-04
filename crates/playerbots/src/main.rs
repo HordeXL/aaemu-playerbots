@@ -53,7 +53,8 @@ enum Command {
     /// Extract terrain, zones, housing areas, quest spheres and the world map from the client's
     /// `game_pak` (needed once; the bots work without it on flat terrain).
     Bake {
-        /// The client's `game_pak`.
+        /// The client's `game_pak`, or a folder of extracted client files (the layout of an
+        /// unpacked client: the directory that holds `game/`).
         #[arg(long)]
         pak: PathBuf,
         /// Output directory (`data.baked` in the config).

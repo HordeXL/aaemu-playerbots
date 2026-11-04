@@ -6,7 +6,7 @@ use aa_world::terrain::HeightGridHeader;
 use anyhow::{bail, ensure};
 
 use crate::hmap::{decode_cell, CELL_SAMPLES};
-use crate::pak::Pak;
+use crate::pak::ClientFiles;
 use crate::worldxml::{WorldDef, CELL_SIZE};
 
 /// Metres per raw unit of the baked grid: 1/32 m, so the u16 range reaches 2047.97 m (the raw
@@ -84,7 +84,7 @@ pub fn validate_step(step: f32) -> anyhow::Result<()> {
 /// Reads every cell's heightmap and assembles the grid at `step` metres per sample, processing
 /// one cell at a time. Cells without terrain stay raw 0.
 pub fn bake_heights(
-    pak: &mut Pak,
+    pak: &mut dyn ClientFiles,
     world: &WorldDef,
     step: f32,
 ) -> anyhow::Result<(HeightGrid, HeightsReport)> {
@@ -109,7 +109,7 @@ pub fn bake_heights(
         ..Default::default()
     };
 
-    // Visit the cells in pak order: sequential-ish disk reads.
+    // Visit the cells in file order: sequential-ish disk reads.
     let mut cells: Vec<(u64, u32, u32, String)> = Vec::new();
     for cy in 0..world.cell_y {
         for cx in 0..world.cell_x {
@@ -117,8 +117,11 @@ pub fn bake_heights(
                 "game/worlds/{}/cells/{cx:03}_{cy:03}/client/terrain/heightmap.dat",
                 world.name
             );
-            if let Some(e) = pak.entry(&name) {
-                cells.push((e.offset, cx, cy, name));
+            // The offset is only a sort key (an archive stores the files one after another); a
+            // folder of extracted files has none, so the cell order is used there.
+            let offset = pak.entry(&name).map_or(0, |e| e.offset);
+            if pak.contains(&name) {
+                cells.push((offset, cx, cy, name));
             }
         }
     }

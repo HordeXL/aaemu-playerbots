@@ -114,6 +114,132 @@ fn norm(name: &str) -> String {
     name.replace('\\', "/").to_lowercase()
 }
 
+/// A read-only source of the client's files: a `game_pak` archive or a folder of
+/// extracted client files.
+///
+/// The bake only needs to look a file up by its client path (`game/worlds/...`), read it and
+/// list the names under a prefix. A folder of extracted files serves the same purpose, so the
+/// bake can run on a client that was unpacked instead of packaged (`ArcheRipper` and friends).
+pub trait ClientFiles {
+    /// Number of files the source knows.
+    fn len(&self) -> usize;
+
+    /// Whether the source has no files.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the source has the file.
+    fn contains(&self, name: &str) -> bool;
+
+    /// Where the file's data starts, for a source that reads sequentially (`None` for a
+    /// folder, which has no table of offsets).
+    fn entry(&self, name: &str) -> Option<PakEntry>;
+
+    /// The names (lower case, forward slashes) starting with `prefix`, sorted.
+    fn names_with_prefix(&self, prefix: &str) -> Vec<&str>;
+
+    /// Reads a file's raw bytes; `None` if the source does not have it.
+    fn read(&mut self, name: &str) -> anyhow::Result<Option<Vec<u8>>>;
+
+    /// [`ClientFiles::read`] as text, honouring a UTF-8/UTF-16 byte order mark.
+    fn read_text(&mut self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.read(name)?.map(|b| decode_text(&b)))
+    }
+
+    /// What the source is, for error messages.
+    fn path(&self) -> &Path;
+}
+
+/// A folder of extracted client files (the layout of an unpacked `game_pak`).
+///
+/// The file list is built once by walking the tree; the names are the client paths, lower case
+/// with forward slashes (`game/worlds/main_world/world.xml`).
+pub struct DirFiles {
+    root: PathBuf,
+    /// Lower-case client path -> the file's path on disk.
+    entries: HashMap<String, PathBuf>,
+}
+
+impl DirFiles {
+    /// Walks `root` and collects every file under it.
+    pub fn open(root: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(root.is_dir(), "{}: not a directory", root.display());
+        let mut entries = HashMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let read = std::fs::read_dir(&dir)
+                .with_context(|| format!("read directory {}", dir.display()))?;
+            for entry in read {
+                let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+                let path = entry.path();
+                let file_type = entry.file_type().context("file type")?;
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(rel) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let name = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+                    .to_lowercase();
+                entries.insert(name, path);
+            }
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            entries,
+        })
+    }
+}
+
+impl ClientFiles for DirFiles {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(&norm(name))
+    }
+
+    fn entry(&self, _name: &str) -> Option<PakEntry> {
+        // A folder has no table of offsets: the bake only uses the offset to sort the cells by
+        // their position in the file, which is meaningless here.
+        None
+    }
+
+    fn names_with_prefix(&self, prefix: &str) -> Vec<&str> {
+        let p = norm(prefix);
+        let mut v: Vec<&str> = self
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&p))
+            .map(String::as_str)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn read(&mut self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(path) = self.entries.get(&norm(name)).cloned() else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        Ok(Some(bytes))
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
 impl Pak {
     /// Opens `path` with the default XLGames key, keeping every file table entry.
     pub fn open(path: &Path) -> anyhow::Result<Pak> {
@@ -269,6 +395,44 @@ impl Pak {
     /// [`Pak::read`] as text, honouring a UTF-8/UTF-16 byte order mark.
     pub fn read_text(&mut self, name: &str) -> anyhow::Result<Option<String>> {
         Ok(self.read(name)?.map(|b| decode_text(&b)))
+    }
+}
+
+impl ClientFiles for Pak {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(&norm(name))
+    }
+
+    fn entry(&self, name: &str) -> Option<PakEntry> {
+        self.entries.get(&norm(name)).copied()
+    }
+
+    fn names_with_prefix(&self, prefix: &str) -> Vec<&str> {
+        let p = norm(prefix);
+        let mut v: Vec<&str> = self
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&p))
+            .map(String::as_str)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn read(&mut self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Pak::read(self, name)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -431,5 +595,69 @@ mod tests {
         assert_eq!(decode_text(b"\xEF\xBB\xBFabc"), "abc");
         assert_eq!(decode_text(b"\xFF\xFEa\0b\0"), "ab");
         assert_eq!(decode_text(b"plain"), "plain");
+    }
+
+    /// A folder of extracted client files serves the same purpose as an archive.
+    #[test]
+    fn a_folder_of_extracted_files_is_a_client_source() {
+        let dir = crate::test_dir("dir-source");
+        std::fs::create_dir_all(dir.join("game/worlds/main_world")).unwrap();
+        std::fs::write(dir.join("game/worlds/main_world/world.xml"), b"<world/>").unwrap();
+        std::fs::create_dir_all(dir.join("game/ui")).unwrap();
+        std::fs::write(dir.join("game/ui/map.png"), b"png").unwrap();
+
+        let mut files = DirFiles::open(&dir).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains("game/worlds/main_world/world.xml"));
+        assert!(!files.is_empty());
+        assert_eq!(
+            files
+                .read("game/worlds/main_world/world.xml")
+                .unwrap()
+                .unwrap(),
+            b"<world/>"
+        );
+        // A missing file is None, not an error.
+        assert!(files.read("game/nope").unwrap().is_none());
+        assert_eq!(
+            files.names_with_prefix("game/worlds/"),
+            vec!["game/worlds/main_world/world.xml"]
+        );
+        // The names are lower case, like the archive's.
+        assert!(files.contains("GAME/WORLDS/MAIN_WORLD/WORLD.XML"));
+        assert_eq!(
+            files
+                .read_text("game/worlds/main_world/world.xml")
+                .unwrap()
+                .unwrap(),
+            "<world/>"
+        );
+    }
+
+    /// Both sources answer the same questions the bake asks.
+    #[test]
+    fn a_folder_and_an_archive_answer_the_same() {
+        let dir = crate::test_dir("dir-vs-pak");
+        std::fs::create_dir_all(dir.join("game/sub")).unwrap();
+        std::fs::write(dir.join("game/sub/b.xml"), b"big").unwrap();
+        std::fs::write(dir.join("game/a.txt"), b"hello").unwrap();
+
+        let mut folder = DirFiles::open(&dir).unwrap();
+        let mut archive = Pak::open(&build_pak_file(&dir, &[("game/a.txt", b"hello")])).unwrap();
+
+        assert_eq!(
+            folder.read("game/a.txt").unwrap().unwrap(),
+            archive.read("game/a.txt").unwrap().unwrap()
+        );
+        assert!(folder.contains("game/a.txt"));
+        assert!(archive.contains("game/a.txt"));
+    }
+
+    /// Writes a TypeA pak with the given files and returns its path.
+    fn build_pak_file(dir: &std::path::Path, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let bytes = build_pak(files);
+        let path = dir.join("game.aacm.pak");
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 }
