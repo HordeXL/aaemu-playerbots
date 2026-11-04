@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use crate::archetype::Archetypes;
 use crate::bot::{initial_snapshot, run_bot, Shared};
 use crate::config::{Config, MAX_BOTS};
-use crate::hub::SupCmd;
+use crate::hub::{unix_ms, SupCmd};
+use crate::population::select::{pick_stops, Candidate, Selector, StopRule};
 use crate::roster::{RosterSpec, SharedRoster};
 
 /// How long shutdown waits for the bots to log out before it aborts their tasks.
@@ -46,10 +47,28 @@ pub fn ensure_roster(
     creatable: &dyn Fn(u8, u8) -> bool,
     count: usize,
 ) -> anyhow::Result<usize> {
-    let races = cfg.bots.race_ids();
+    ensure_roster_races(
+        roster,
+        cfg,
+        archetypes,
+        creatable,
+        count,
+        &cfg.bots.race_ids(),
+    )
+}
+
+/// [`ensure_roster`] with the new bots' races limited to `races` (a filtered spawn).
+pub fn ensure_roster_races(
+    roster: &SharedRoster,
+    cfg: &Config,
+    archetypes: &Archetypes,
+    creatable: &dyn Fn(u8, u8) -> bool,
+    count: usize,
+    races: &[u8],
+) -> anyhow::Result<usize> {
     let spec = RosterSpec {
         account_prefix: &cfg.server.account_prefix,
-        races: &races,
+        races,
         creatable,
         archetypes: archetypes.all(),
     };
@@ -186,10 +205,25 @@ impl<T: Task> Book<T> {
         ids: &mut dyn FnMut() -> Vec<u32>,
         grow: &mut dyn FnMut(usize),
     ) -> usize {
+        let total = ids().len();
+        self.spawn_matching(n, total, ids, grow).len()
+    }
+
+    /// [`Book::spawn`] for a subset of the roster: `ids` lists only the entries that may be
+    /// started (the ones a filter matches), `total` is the size of the whole roster (which the
+    /// [`MAX_BOTS`] limit applies to) and `grow(k)` must add `k` entries that match. Returns the
+    /// ids that were queued.
+    pub fn spawn_matching(
+        &mut self,
+        n: usize,
+        total: usize,
+        ids: &mut dyn FnMut() -> Vec<u32>,
+        grow: &mut dyn FnMut(usize),
+    ) -> Vec<u32> {
         let all = ids();
         let free = self.pick_idle(&all, n).len();
         let missing = n.saturating_sub(free);
-        let room = (MAX_BOTS as usize).saturating_sub(all.len());
+        let room = (MAX_BOTS as usize).saturating_sub(total);
         let add = missing.min(room);
         let picked = if add > 0 {
             grow(add);
@@ -197,9 +231,42 @@ impl<T: Task> Book<T> {
         } else {
             self.pick_idle(&all, n)
         };
-        let queued = picked.len();
-        self.pending.extend(picked);
-        queued
+        self.pending.extend(picked.iter().copied());
+        picked
+    }
+
+    /// The bots that run and were not told to stop, lowest id first.
+    pub fn live_ids(&self) -> Vec<u32> {
+        self.running
+            .iter()
+            .filter(|(_, e)| !e.stopping)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The bots waiting for their start, in queue order.
+    pub fn pending_ids(&self) -> Vec<u32> {
+        self.pending.iter().copied().collect()
+    }
+
+    /// Takes `ids` out of the start queue; returns how many were in it.
+    pub fn unqueue(&mut self, ids: &[u32]) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|id| !ids.contains(id));
+        before - self.pending.len()
+    }
+
+    /// Tells the running bots among `ids` to stop; returns how many were told.
+    pub fn stop(&mut self, ids: &[u32]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            if let Some(e) = self.running.get_mut(id).filter(|e| !e.stopping) {
+                e.stopping = true;
+                e.task.cancel();
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Tells the `n` highest running bots to stop; bots that never started leave the queue first.
@@ -373,6 +440,146 @@ impl Supervisor {
         tracing::info!(requested = n, unqueued, stopping, "stopping bots");
     }
 
+    /// Starts `n` bots of the kind `sel` names; the roster grows with matching races when it has
+    /// too few. `owned`: the population director started them.
+    fn queue_spawn_where(&mut self, n: usize, sel: Selector, owned: bool) {
+        let shared = self.shared.clone();
+        let allowed = sel.races(&shared.cfg.bots.race_ids());
+        let total = shared.roster.read(|r| r.len());
+        let mut ids = || -> Vec<u32> {
+            shared.roster.read(|r| {
+                r.entries()
+                    .iter()
+                    .filter(|e| sel.matches_race(e.race))
+                    .map(|e| e.id)
+                    .collect()
+            })
+        };
+        let mut added = 0usize;
+        let mut grow = |k: usize| {
+            if allowed.is_empty() {
+                tracing::warn!(
+                    "no race in bots.races matches {sel:?}; no new bot can be created for it"
+                );
+                return;
+            }
+            let target = shared.roster.read(|r| r.len()) + k;
+            let w = shared.world.clone();
+            let creatable = move |r: u8, g: u8| w.creatable(r, g);
+            match ensure_roster_races(
+                &shared.roster,
+                &shared.cfg,
+                &shared.archetypes,
+                &creatable,
+                target,
+                &allowed,
+            ) {
+                Ok(a) => added += a,
+                Err(e) => tracing::warn!("cannot add bots: {e:#}"),
+            }
+            register_slots(&shared);
+        };
+        let picked = self.book.spawn_matching(n, total, &mut ids, &mut grow);
+        if owned {
+            shared.hub.pop.own(&picked, unix_ms());
+        }
+        tracing::info!(
+            requested = n,
+            queued = picked.len(),
+            created = added,
+            owned,
+            "starting bots ({sel:?})"
+        );
+        if owned {
+            self.report(
+                &sel,
+                "spawn",
+                picked.len() as u32,
+                format!("{} queued, {added} new character(s)", picked.len()),
+            );
+        }
+    }
+
+    /// Stops up to `n` bots of the kind `sel` names that are safe to stop (see
+    /// [`pick_stops`]); bots that never started leave the queue first.
+    fn despawn_where(&mut self, n: usize, sel: Selector, rule: StopRule) {
+        let shared = self.shared.clone();
+        let race_of = |id: u32| shared.roster.read(|r| r.get(id).map(|e| e.race));
+        let owned = |id: u32| shared.hub.pop.is_owned(id);
+        // queued bots have not logged in: they are the cheapest to drop
+        let queued: Vec<u32> = self
+            .book
+            .pending_ids()
+            .into_iter()
+            .filter(|id| !rule.owned_only || owned(*id))
+            .filter(|id| race_of(*id).is_some_and(|r| sel.matches_race(r)))
+            .take(n)
+            .collect();
+        let unqueued = self.book.unqueue(&queued);
+        let left = n.saturating_sub(unqueued);
+        let mut stopped = Vec::new();
+        if left > 0 {
+            let snaps: Vec<(u32, u8, pb_web::BotSnapshot)> = self
+                .book
+                .live_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let race = race_of(id)?;
+                    Some((id, race, shared.hub.slot(id)?.snapshot()))
+                })
+                .collect();
+            let cands: Vec<Candidate<'_>> = snaps
+                .iter()
+                .map(|(id, race, s)| Candidate {
+                    id: *id,
+                    race: *race,
+                    alliance: s.alliance,
+                    continent: s.continent,
+                    activity: s.activity,
+                    goal: &s.goal,
+                    online_secs: s.online_secs,
+                    owned: owned(*id),
+                })
+                .collect();
+            let ids = pick_stops(&cands, &sel, rule, left);
+            self.book.stop(&ids);
+            stopped = ids;
+        }
+        let mut gone = queued;
+        gone.extend(&stopped);
+        shared.hub.pop.disown(&gone);
+        tracing::info!(
+            requested = n,
+            unqueued,
+            stopping = stopped.len(),
+            "stopping bots ({sel:?}, {rule:?})"
+        );
+        if rule.owned_only {
+            self.report(
+                &sel,
+                "despawn",
+                gone.len() as u32,
+                format!(
+                    "{unqueued} taken off the queue, {} logging out",
+                    stopped.len()
+                ),
+            );
+        }
+    }
+
+    /// Writes what the supervisor did for the population director into its log.
+    fn report(&self, sel: &Selector, kind: &str, count: u32, result: String) {
+        self.shared.hub.pop.director.note(pb_web::ActionRecord {
+            at_ms: unix_ms(),
+            kind: "result".into(),
+            alliance: sel.alliance.unwrap_or_default(),
+            count,
+            applied: true,
+            reason: format!("the supervisor handled the {kind}"),
+            result,
+        });
+    }
+
     /// Runs the supervisor: starts `initial` bots (ramped), serves `rx` and, when `cancel` fires,
     /// logs everything out.
     pub async fn run(
@@ -400,6 +607,12 @@ impl Supervisor {
                 cmd = rx.recv(), if commands_open => match cmd {
                     Some(SupCmd::Spawn(n)) => self.queue_spawn(n as usize),
                     Some(SupCmd::Despawn(n)) => self.despawn(n as usize),
+                    Some(SupCmd::SpawnWhere { n, sel, owned }) => {
+                        self.queue_spawn_where(n as usize, sel, owned)
+                    }
+                    Some(SupCmd::DespawnWhere { n, sel, rule }) => {
+                        self.despawn_where(n as usize, sel, rule)
+                    }
                     None => commands_open = false,
                 },
             }
@@ -656,6 +869,80 @@ mod tests {
         assert_eq!(rig.roster.borrow().len(), limit as usize);
     }
 
+    /// A rig whose roster entries with an even id are "east" bots.
+    fn east(rig: &Rig) -> impl FnMut() -> Vec<u32> {
+        let roster = rig.roster.clone();
+        move || {
+            roster
+                .borrow()
+                .iter()
+                .copied()
+                .filter(|i| i % 2 == 0)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_filtered_spawn_starts_only_matching_bots_and_grows_the_roster_with_matches() {
+        let mut rig = Rig::new(6, &[2]);
+        let total = rig.roster.borrow().len();
+        let grown = rig.grown.clone();
+        let roster = rig.roster.clone();
+        // two east bots are free (4 and 6): no growth
+        let picked = rig
+            .book
+            .spawn_matching(2, total, &mut east(&rig), &mut |k| {
+                grown.set(grown.get() + k)
+            });
+        assert_eq!(picked, vec![4, 6]);
+        assert_eq!(rig.grown.get(), 0);
+        assert_eq!(rig.book.pending_ids(), vec![4, 6]);
+        // three more: none is free any more, the roster grows by three east entries
+        let picked = rig
+            .book
+            .spawn_matching(3, total, &mut east(&rig), &mut |k| {
+                grown.set(grown.get() + k);
+                let mut r = roster.borrow_mut();
+                for _ in 0..k {
+                    let next = r.last().copied().unwrap_or(0) + 1;
+                    // (the next even id)
+                    r.push(next + next % 2);
+                }
+            });
+        assert_eq!(rig.grown.get(), 3);
+        assert_eq!(picked.len(), 3);
+        assert!(picked.iter().all(|i| i % 2 == 0), "{picked:?}");
+        assert!(!picked.contains(&2) && !picked.contains(&4) && !picked.contains(&6));
+        // the bot limit counts the whole roster, not the matching part
+        let mut full = Rig::new(MAX_BOTS - 1, &[]);
+        let total = full.roster.borrow().len();
+        let mut added = 0usize;
+        let ids = east(&full);
+        let mut ids = ids;
+        let picked = full
+            .book
+            .spawn_matching(usize::MAX / 2, total, &mut ids, &mut |k| added += k);
+        assert_eq!(added, 1, "one entry fits");
+        assert_eq!(picked.len() as u32, (MAX_BOTS - 1) / 2);
+    }
+
+    #[test]
+    fn queued_and_running_bots_can_be_taken_back_by_id() {
+        let mut rig = Rig::new(8, &[1, 2, 3]);
+        assert_eq!(rig.spawn(3), 3);
+        assert_eq!(rig.book.pending_ids(), vec![4, 5, 6]);
+        assert_eq!(rig.book.live_ids(), vec![1, 2, 3]);
+        // ids that are not queued are ignored
+        assert_eq!(rig.book.unqueue(&[5, 7, 99]), 1);
+        assert_eq!(rig.book.pending_ids(), vec![4, 6]);
+        // only running bots that were not told to stop yet are stopped, once
+        assert_eq!(rig.book.stop(&[2, 3, 4, 99]), 2);
+        assert!(rig.book.is_stopping(2) && rig.book.is_stopping(3) && !rig.book.is_stopping(1));
+        assert!(rig.current(2).cancelled.get() && !rig.current(1).cancelled.get());
+        assert_eq!(rig.book.live_ids(), vec![1]);
+        assert_eq!(rig.book.stop(&[2, 3]), 0);
+    }
+
     #[test]
     fn a_running_bot_is_not_started_twice() {
         let mut rig = Rig::new(3, &[2]);
@@ -711,6 +998,27 @@ mod tests {
         });
         let err = h.await.expect_err("panicked");
         assert_eq!(panic_text(err), "formatted 3");
+    }
+
+    #[test]
+    fn a_filtered_spawn_grows_the_roster_with_the_races_it_names() {
+        let cfg = Config::parse(
+            "[bots]
+races = [\"nuian\", \"elf\", \"ferre\"]
+",
+        )
+        .unwrap();
+        let archetypes = Archetypes::builtin().unwrap();
+        let dir = crate::testutil::temp_dir("sup-roster-races");
+        let roster = SharedRoster::new(crate::roster::Roster::new(), dir.join("roster.json"));
+        let any = |_: u8, _: u8| true;
+        let haranya = Selector::side(pb_web::Alliance::Haranya).races(&cfg.bots.race_ids());
+        assert_eq!(haranya, vec![6]);
+        let added = ensure_roster_races(&roster, &cfg, &archetypes, &any, 12, &haranya).unwrap();
+        assert_eq!(added, 12);
+        roster.read(|r| assert!(r.entries().iter().all(|e| e.race == 6)));
+        // no race to create: an error, not a loop
+        assert!(ensure_roster_races(&roster, &cfg, &archetypes, &any, 20, &[]).is_err());
     }
 
     #[test]
