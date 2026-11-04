@@ -55,6 +55,9 @@ pub mod unit_type {
 const EQUIPMENT_SLOTS: u8 = 28;
 /// Appearance slots (face .. beard) are written as the template id only (models/container.rs:66).
 const BODY_PART_SLOTS: std::ops::RangeInclusive<u8> = 19..=25;
+/// The backpack slot of the equipment (`equip_slot::BACKPACK`, models/container.rs:73): where a
+/// carried trade pack (or a glider) sits.
+pub const BACKPACK_SLOT: u8 = 26;
 
 /// Detail body lengths after the type byte, indexed by `ItemDetailType`
 /// (aaemu-game models/item.rs:158).
@@ -211,6 +214,9 @@ pub struct UnitInfo {
     pub skills: Box<[(u32, u8)]>,
     /// Active buffs.
     pub buffs: Box<[BuffInfo]>,
+    /// Template of the item in the backpack slot ([`BACKPACK_SLOT`]) of a character: a carried
+    /// trade pack, a glider; 0 when the slot is empty and for every other kind of unit.
+    pub backpack: u32,
     /// Whether the whole body was parsed.
     pub complete: bool,
 }
@@ -613,6 +619,24 @@ pub enum WorldEvent {
         /// The change is temporary.
         temp: bool,
     },
+    /// `SCUnitEquipmentsChangedPacket` (systems/economy/item_packets.rs:64): equipment slots of
+    /// a unit changed; a trade pack picked up or dropped is a change of [`BACKPACK_SLOT`].
+    UnitEquipmentsChanged {
+        /// Object id of the unit.
+        obj: u32,
+        /// `(slot, item template)` per changed slot; template 0 = the slot is empty now.
+        slots: SmallVec<[(u8, u32); 2]>,
+    },
+    /// `SCUnitPvPPointsChangedPacket` (packets/g2c_misc.rs:104): a unit's honor or hostile
+    /// kills changed (broadcast to the unit's neighbours after a player kill).
+    PvpPoints {
+        /// Object id of the unit.
+        obj: u32,
+        /// 0 = honor gained in combat, 1 = hostile faction kills (see [`pvp_points`]).
+        kind: u8,
+        /// The new total.
+        points: i32,
+    },
     /// `SCConflictZoneStatePacket` (packets/world.rs:334): the conflict state of a zone group,
     /// sent once per zone group at world entry and again on every change. `state` is one of
     /// [`conflict_state`].
@@ -1011,8 +1035,10 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCCombatEngagedPacket => |s| some(WorldEvent::CombatEngaged { obj: s.read_bc()? }),
         sc::SCCombatClearedPacket => |s| some(WorldEvent::CombatCleared { obj: s.read_bc()? }),
         sc::SCUnitFactionChangedPacket => read_faction_changed,
-        // zone conflicts
+        // zone conflicts, pvp
         sc::SCConflictZoneStatePacket => read_conflict_zone_state,
+        sc::SCUnitEquipmentsChangedPacket => read_unit_equipments_changed,
+        sc::SCUnitPvPPointsChangedPacket => read_pvp_points,
         // portals
         sc::SCCharacterPortalsPacket => sc_travel::read_portal_book,
         sc::SCCharacterReturnDistrictsPacket => sc_travel::read_return_districts,
@@ -1443,7 +1469,10 @@ fn equip_layout(unit_type: u8) -> EquipLayout {
     }
 }
 
-fn skip_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<()> {
+/// Reads (and mostly skips) the equipment block of a unit; returns the template in the backpack
+/// slot ([`BACKPACK_SLOT`]), 0 when it is empty or the layout has no such slot.
+fn read_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<u32> {
+    let mut backpack = 0;
     for slot in 0..EQUIPMENT_SLOTS {
         let body_part = BODY_PART_SLOTS.contains(&slot);
         if body_part && layout != EquipLayout::Slave {
@@ -1460,13 +1489,16 @@ fn skip_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<()> {
         if template == 0 {
             continue;
         }
+        if slot == BACKPACK_SLOT && layout == EquipLayout::Full {
+            backpack = template;
+        }
         if layout == EquipLayout::Npc && slot != 27 {
             skip(s, 8 + 1)?; // id, grade
         } else {
             read_item_body(s, template)?;
         }
     }
-    Ok(())
+    Ok(backpack)
 }
 
 /// `SCUnitStatePacket` (world/unit_state.rs:108 characters, :413 other kinds).
@@ -1524,7 +1556,7 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     skip(s, 4)?; // scale
     let level = s.read_u8()?;
     skip(s, 4)?; // model id
-    skip_unit_equipment(s, equip_layout(ty))?;
+    let backpack = read_unit_equipment(s, equip_layout(ty))?;
     skip_model_params(s)?;
     skip(s, 3)?; // bc(0)
     let hp = s.read_i32()? / POINTS_SCALE;
@@ -1548,6 +1580,11 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         yaw: 0,
         skills: Box::default(),
         buffs: Box::default(),
+        backpack: if ty == unit_type::CHARACTER {
+            backpack
+        } else {
+            0
+        },
         complete: false,
     };
     // The tail is best effort: a character packet the server truncated, or a layout drift, keeps
@@ -1828,6 +1865,38 @@ fn read_conflict_zone_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         state,
         end_unix_s,
     })
+}
+
+/// `SCUnitEquipmentsChangedPacket` (systems/economy/item_packets.rs:64): `bc obj, u8 count`, then
+/// per slot `u8 slot` and an item (`Item.Write`, or the 4-byte empty form).
+fn read_unit_equipments_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let obj = s.read_bc()?;
+    let count = usize::from(s.read_u8()?);
+    // (a slot is at least 5 bytes: the slot and the empty item)
+    check_count(s, count, 5, "equipment slot")?;
+    let mut slots = SmallVec::new();
+    for _ in 0..count {
+        let slot = s.read_u8()?;
+        let template = read_item(s)?.map_or(0, |i| i.template);
+        slots.push((slot, template));
+    }
+    some(WorldEvent::UnitEquipmentsChanged { obj, slots })
+}
+
+/// The `kind` values of `SCUnitPvPPointsChangedPacket` (systems/skills/combat.rs:749).
+pub mod pvp_points {
+    /// The honor gained in combat.
+    pub const HONOR: u8 = 0;
+    /// The kills of hostile-faction players.
+    pub const HOSTILE_KILLS: u8 = 1;
+}
+
+/// `SCUnitPvPPointsChangedPacket` (packets/g2c_misc.rs:104): `bc obj, u8 kind, i32 points`.
+fn read_pvp_points(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let obj = s.read_bc()?;
+    let kind = s.read_u8()?;
+    let points = s.read_i32()?;
+    some(WorldEvent::PvpPoints { obj, kind, points })
 }
 
 // ---- doodad readers ------------------------------------------------------------------------

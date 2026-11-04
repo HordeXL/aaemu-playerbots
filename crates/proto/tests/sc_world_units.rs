@@ -494,6 +494,11 @@ fn house_mate_transfer_and_shipyard() {
 
 /// `write_unit_state` (world/unit_state.rs:108) of a character; `visual` = visual options present.
 fn character_state(visual: bool, bonded: bool) -> PacketStream {
+    character_state_with(visual, bonded, &[])
+}
+
+/// A character unit state whose equipment also holds `extra` items.
+fn character_state_with(visual: bool, bonded: bool, extra: &[EquipItem]) -> PacketStream {
     let mut s = PacketStream::new();
     s.write_bc(0x0400)
         .write_str("Aria")
@@ -505,26 +510,24 @@ fn character_state(visual: bool, bonded: bool) -> PacketStream {
         .write_f32(1.0)
         .write_u8(30)
         .write_u32(555);
-    write_equipment(
-        &mut s,
-        Layout::Full,
-        &[
-            EquipItem {
-                slot: 15,
-                template: 40_001,
-                id: 0x77,
-                grade: 3,
-                detail: 1,
-            },
-            EquipItem {
-                slot: 19,
-                template: 55_550,
-                id: 0,
-                grade: 0,
-                detail: 0,
-            },
-        ],
-    );
+    let mut items = vec![
+        EquipItem {
+            slot: 15,
+            template: 40_001,
+            id: 0x77,
+            grade: 3,
+            detail: 1,
+        },
+        EquipItem {
+            slot: 19,
+            template: 55_550,
+            id: 0,
+            grade: 0,
+            detail: 0,
+        },
+    ];
+    items.extend_from_slice(extra);
+    write_equipment(&mut s, Layout::Full, &items);
     write_model_params(&mut s, 3);
     s.write_bc(0)
         .write_i32(1_500 * 100)
@@ -602,6 +605,68 @@ fn character_unit_state_reaches_every_field() {
     assert_eq!(info.buffs[2].charge, 1);
     assert!(info.complete);
     no_panic_on_truncation(sc::SCUnitStatePacket, s.as_bytes());
+}
+
+#[test]
+fn a_carried_pack_is_the_backpack_slot_of_a_character() {
+    // no pack: the slot is empty
+    assert_eq!(unit_info(&character_state(true, false)).backpack, 0);
+    // models/container.rs:73: the backpack is equipment slot 26; a trade pack's item is a full
+    // `Item.Write`, whatever the layout of the slots before it (here a weapon in slot 15)
+    let pack = EquipItem {
+        slot: 26,
+        template: 28_091,
+        id: 0x99,
+        grade: 1,
+        detail: 1,
+    };
+    let s = character_state_with(true, false, &[pack]);
+    let info = unit_info(&s);
+    assert_eq!(info.backpack, 28_091);
+    // the rest of the packet is still read
+    assert_eq!((info.faction_id, info.expedition_id), (101, 77));
+    assert_eq!(info.buffs.len(), 3);
+    assert!(info.complete);
+    no_panic_on_truncation(sc::SCUnitStatePacket, s.as_bytes());
+    // the pack of a bonded character, and one in a truncated packet
+    assert_eq!(
+        unit_info(&character_state_with(true, true, &[pack])).backpack,
+        28_091
+    );
+    let cut = character_state_with(false, false, &[pack]);
+    let info = unit_info(&cut);
+    assert_eq!(info.backpack, 28_091);
+    assert!(!info.complete);
+}
+
+#[test]
+fn only_characters_have_a_backpack() {
+    // an NPC with a template in slot 26 and a slave with an item there: not a carried pack
+    let mut s = PacketStream::new();
+    s.write_bc(0x0555).write_str("Guard").write_u8(1);
+    s.write_bc(0x0555)
+        .write_u32(0x1234)
+        .write_u32(0)
+        .write_u8(0);
+    s.write_str("");
+    s.write_position(100.0, 200.0, 30.0)
+        .write_f32(1.0)
+        .write_u8(10)
+        .write_u32(0);
+    write_equipment(
+        &mut s,
+        Layout::Npc,
+        &[EquipItem {
+            slot: 26,
+            template: 28_091,
+            id: 5,
+            grade: 1,
+            detail: 0,
+        }],
+    );
+    write_model_params(&mut s, 0);
+    s.write_bc(0).write_i32(100).write_i32(100);
+    assert_eq!(unit_info(&s).backpack, 0);
 }
 
 #[test]
