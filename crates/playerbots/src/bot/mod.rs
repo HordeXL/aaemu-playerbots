@@ -38,6 +38,7 @@ pub mod session;
 pub mod state;
 pub mod travel;
 pub mod vehicle;
+pub mod war;
 pub mod watch;
 pub mod zones;
 
