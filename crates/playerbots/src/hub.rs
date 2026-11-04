@@ -467,8 +467,22 @@ impl Hub {
             })
         });
         let pop = crate::events::Population::from_levels(levels);
-        for report in self.events.sweep(Some(pop)) {
-            self.report_issue(report);
+        for w in self.events.sweep_witnessed(Some(pop)) {
+            // The bots that stood in the event saw the problem: each files it with its own
+            // context, so one rift that goes wrong is an issue seen by several bots.
+            let mut filed = false;
+            for bot in w.bots {
+                if let Some(slot) = self.slot(bot) {
+                    let r = slot.with(|inner| {
+                        crate::issues::attach_context(w.report.clone(), inner, 0, None)
+                    });
+                    self.report_issue(r);
+                    filed = true;
+                }
+            }
+            if !filed {
+                self.report_issue(w.report);
+            }
         }
     }
 

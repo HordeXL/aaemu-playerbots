@@ -29,7 +29,7 @@ pub mod detect;
 #[cfg(test)]
 mod tests;
 
-pub use board::{EventBoard, Stats};
+pub use board::{EventBoard, Stats, Witnessed, MAX_WITNESSES};
 
 use aa_proto::sc::ServerEvent;
 use aa_proto::sc_event::EventId;

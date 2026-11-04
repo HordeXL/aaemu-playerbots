@@ -37,6 +37,18 @@ struct Slot {
     lease_until: u64,
 }
 
+/// Most bots an issue report is filed for: the ones that stood in the event when it went wrong.
+pub const MAX_WITNESSES: usize = 3;
+
+/// An issue report the board made and the bots that witnessed what it says.
+#[derive(Debug)]
+pub struct Witnessed {
+    /// The report, without a bot.
+    pub report: IssueReport,
+    /// The bots in the event at the time (empty when nobody was).
+    pub bots: SmallVec<[u32; MAX_WITNESSES]>,
+}
+
 /// The kill-target NPCs of the current wave that died, each object counted once.
 #[derive(Debug, Default)]
 struct Kills {
@@ -686,9 +698,18 @@ impl EventBoard {
 
     // ---- housekeeping ----------------------------------------------------------------------
 
-    /// About once a second: expires leases, judges the evidence and returns the issue reports.
-    /// `pop` replaces the population the share cap reads.
+    /// [`EventBoard::sweep_witnessed`] without the witnesses.
     pub fn sweep(&self, pop: Option<Population>) -> Vec<IssueReport> {
+        self.sweep_witnessed(pop)
+            .into_iter()
+            .map(|w| w.report)
+            .collect()
+    }
+
+    /// About once a second: expires leases, judges the evidence and returns the issue reports,
+    /// each with the bots that were in the event (up to [`MAX_WITNESSES`]) and so saw it.
+    /// `pop` replaces the population the share cap reads.
+    pub fn sweep_witnessed(&self, pop: Option<Population>) -> Vec<Witnessed> {
         let now = self.now_ms();
         let mut g = self.inner.lock();
         let g = &mut *g;
@@ -721,7 +742,10 @@ impl EventBoard {
             e.satisfied_since = satisfied;
             for f in findings {
                 e.told |= f.bit();
-                reports.push(detect::report(&facts, f));
+                reports.push(Witnessed {
+                    report: detect::report(&facts, f),
+                    bots: e.slots.iter().map(|s| s.bot).take(MAX_WITNESSES).collect(),
+                });
             }
         }
         // an event the server never ended and nobody told us about leaves the board

@@ -532,6 +532,36 @@ fn wave_npcs_that_never_show_are_reported_once_after_the_walk() {
 }
 
 #[test]
+fn the_report_names_the_bots_that_stood_in_the_event() {
+    let b = board();
+    start(&b, RIFT);
+    wave(&b, RIFT, 2);
+    let c = caps(8, 1.0);
+    for bot in [7, 8, 9, 10, 11] {
+        assert_eq!(b.join(RIFT, bot, &c), Join::Joined);
+    }
+    // the bots stand at the target and renew their leases as they tick
+    for _ in 0..40 {
+        at_the_target(&b, 10);
+        for bot in [7, 8, 9, 10, 11] {
+            assert!(b.renew(RIFT, bot));
+        }
+    }
+    let w = b.sweep_witnessed(None);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(&w[0].bots[..], &[7, 8, 9], "the first {MAX_WITNESSES}");
+    // nobody there: the report has no witnesses and is still made
+    let b = board();
+    start(&b, RIFT);
+    wave(&b, RIFT, 2);
+    at_the_target(&b, 40);
+    b.advance(400_000);
+    let w = b.sweep_witnessed(None);
+    assert_eq!(w.len(), 1);
+    assert!(w[0].bots.is_empty());
+}
+
+#[test]
 fn a_wave_npc_that_shows_up_clears_the_suspicion() {
     let b = board();
     start(&b, RIFT);
