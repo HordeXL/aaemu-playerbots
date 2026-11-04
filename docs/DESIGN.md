@@ -80,6 +80,7 @@ optional LLM director may choose among the same eligible goals instead.
 | Trade | Coordinator pairs two bots; they meet, open a trade window, put up an item and/or money, lock, confirm. |
 | Trade run | Walk to a specialty workbench, craft a trade pack (`CSExecuteCraft`), carry it to a specialty NPC that buys it, sell (`CSSellBackpackGoods`), collect the payment mail. |
 | Housing | Get a design (and tax certificates), walk to a free spot inside a housing area, quote (`CSConstructHouseTax`) and place (`CSCreateHouse`); later "go home" when resting. |
+| Farm | Buy seeds, plant them on own land or a public farm, remember the plots, come back when they are ripe, harvest and replant; grows what the population director wishes for or the economy board calls scarce (see [Farming](#farming-botfarm-goal-farm)). |
 | Rest | Stand still out of combat until HP/MP recover. |
 | Social | Reply to whispers/local chat from real players (LLM if enabled, canned lines otherwise). |
 
@@ -290,13 +291,13 @@ already name its goal.
 | `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table (done) | `bot/goals/warzone.rs`, `config.rs` | pvp |
 | `Event` goal (`goals::event`, built: see [Events](#events-goal-event)), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
 | `Companion` goal (`goals::companion`), `[party]` | `bot/goals/companion.rs`, `config.rs` | party with real players |
-| `Farm` goal (`goals::farm`), `[farm]` | `bot/goals/farm.rs`, `config.rs` | farming |
+| `Farm` goal (`goals::farm`, built: see [Farming](#farming-botfarm-goal-farm)), `[farm]` | `bot/goals/farm.rs`, `bot/goals/farm/`, `bot/farm/`, `config.rs` | farming (done) |
 | `[population]` (the web UI's population director and the server API poll, see [Population](#population-census-economy-board-and-director)) | `config.rs`, `population/` | web director (done) |
 | `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`, `war_kill_cap`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
 | `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
 | `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
 
-Every stub goal (the event goal is no longer one) fails with `NotImplemented` (the brain then
+Every stub goal (the event and farm goals are no longer stubs) fails with `NotImplemented` (the brain then
 switches it off for the bot) and its `score` is 0, so no bot picks it; forcing one from the web UI does no harm. A feature scores its goal
 through its own `score(ctx, base)` (gate on its `[section]`; the brain applies none of its factors to
 it) and turns the stub's methods into the real thing (`owns_combat` for the pvp goals).
@@ -312,8 +313,86 @@ conflict and war only, and false for a zone group the server has not announced.
 **Masks and the per-bot budget.** The brain's goal masks (`disabled`, `blocked`, the gate) are a
 `GoalMask` (`u32`, 32 goals; a compile-time check fails the build when the goals outgrow it). The
 failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
-pays one pointer for it. With eighteen goals, the zone table, the guild state and the pvp memory, `size_of::<Bot>()` is 3192 bytes
-(limit 3200) and `Goal` stays 152: a new per-bot structure belongs behind a pointer.
+pays one pointer for it. With eighteen goals, the zone table, the guild state, the pvp memory and the farm memory,
+`size_of::<Bot>()` is 3192 bytes (limit 3200) and `Goal` stays 152: a new per-bot structure belongs
+behind a pointer (the farm memory is one `Option<Box<FarmMem>>` in the market state, the running
+farm machine one `Option<Box<Machine>>` in the goal).
+
+## Farming (`bot/farm/`, goal `farm`)
+
+Bots buy seeds, plant them, wait and harvest, and they grow what the economy is short of. Everything
+is off until `[farm] enabled`.
+
+* **Protocol** (`aa-proto`): `cs::create_doodad` (`CSCreateDoodad`: doodad id, fixed-point x and y,
+  z, rotation, scale, the seed's item id), `cs::buy_items` (`CSBuyItems`: the merchant's object id and
+  the stacks to buy, paid in money), `cs::request_common_farm_list`; the harvest is the ordinary
+  `cs::start_skill_doodad`. `SCResponseCommonFarmListPacket` becomes `WorldEvent::CommonFarmList`
+  (the character's crops on the public farms, which carry no object ids). All have byte-exact tests.
+  `motion::range_checked` pins the bot's position before the two new packets because the server
+  checks the distance (3 m to a merchant, 30 m to the planting spot).
+* **Data** (`aa-world` `farm.rs`, `Farming`, from `World::farm()`): a seed is an item with a row in
+  `item_spawn_doodads`; its `Crop` has the doodad, the phases (a phase is ripe when a use function
+  with a harvest skill leads to a phase that hands out items), the total growth time (the sum of the
+  growth delays, divided by the world's `GrowthRate` and shortened under a matching climate:
+  `Crop::grow_ms_at(rate)`), the yield per produce item (`Yield { min, max }`, no drop chance:
+  rare drops of a loot pack are overvalued), the labor per harvest skill (13980 to 20486), the seed
+  vendors (`vendors_of`) and the farm kinds that allow it. The public farms (sub zones 966, 967,
+  968, 974, 998; `FarmKind` Farm, Ranch, Nursery, Stable; ten crops per character on a field farm,
+  five on the others) are polygons baked from `subzone_area.xml` into `farm_areas.json` (`aa-bake`
+  `areas.rs`, `--only farms`); a world without them has gardens only.
+* **Memory** (`bot/farm/mod.rs`, `FarmMem`): up to 64 `Plot`s (crop object id, doodad, seed, position,
+  phase, ripe flag, the time to look again, when it was planted, whether it is honest, the land it
+  stands on), the spots and seeds the server refused (with an expiry) and a few counters. It follows
+  the server through `farm::observe`, which the bot loop calls for every world event before the
+  `keep_doodad` filter drops the doodads it does not track: a `SCDoodadCreated` whose owner is the
+  bot's character marks its own crop; a phase change marks it ripe; a crop that vanishes while the bot
+  stands within 12 m is gone (harvested or destroyed), further away it only left the view; the common
+  farm list replaces the plots on the public farms after a reconnect (such plots are not honest).
+* **Planner** (`bot/farm/plan.rs`): `choose` scores every crop that grows on dry land,
+  `(0.05 + profit + need) * time * reach * held`, with the profit per hour of produce value less half
+  the seed price, the need per produce item `(3 if wished + 2 * scarcity) / (1 + units other bots
+  grow / 40)`, `1 / (1 + hours / 6)` for the time to ripen, the distance to the seed vendor and a
+  bonus when the bot already holds seeds. Everything it reads is behind the `Env` trait (the
+  scarcity view, the wish list, the vendors, the bag, the farm board), so it is tested without a
+  world. `make_plan` caps a run at five seeds and decides how to get them: buy (a vendor and the
+  money), mint with a GM command (`bots.gm_bootstrap` only), or the seeds in the bag.
+* **Sites** (`bot/farm/site.rs`): a `Site` is the garden of one of the bot's houses (the square of
+  `garden_radius` around the house, from the housing data) or a public farm polygon; `pick_spot` draws
+  a free point at least 1.6 m from any known crop, away from the polygon's edge, not on a refused
+  spot. The spot is claimed in `contest` (`plot_key`, 3 m cells) so two bots do not pick one square.
+* **Machine** (`bot/goals/farm/machine.rs`): a pure state machine over an `Input` (what the bot
+  knows this tick) and the `FarmMem`, returning `Act`s (walk, buy, plant, cast, GM line, ...), so a
+  whole run is tested against a scripted server (`goals/farm/tests.rs`) without a network. Phases:
+  `Fetch` (ask for the public-farm crops once per session), then for a plant run `Shop` (walk next to
+  the vendor, stay within its 3 m, buy, check the bag) or `Mint`, then `Sow` (draw a spot, walk
+  there, face it, `CSCreateDoodad`, wait for the crop to appear, retry another spot on a typed
+  refusal), and for a harvest run `Reap` (walk to the crop, cast the harvest skill, wait for the
+  crop to change, wait for it to go, plant the seed on the same spot). The glue in `goals/farm.rs`
+  (`RealOps`, `RealEnv`) turns `Act`s into packets and movement and builds the input from `Ctx`.
+* **Honest produce.** The ledger counts the reasons an item arrives clean (`reason::*`); a harvest
+  arrives as `DOODAD_INTERACTION` (17), which is not clean by itself. The machine opens
+  `MarketState::open_harvest(honest)` for the length of a harvest cast, and `counts(17)` is true only
+  inside an open honest window; `None` adds nothing and `Some(false)` counts nothing. A plot is honest
+  when the ledger counted the planted seed as clean (`clean_count(seed) >= 1` at planting), so
+  seeds bought from the vendor (`STORE_BUY`) give sellable produce and GM-minted ones never do. The
+  seed that leaves the bag arrives as `DOODAD_CREATE` (14).
+* **Scoring** (`goals::farm::score`): 0 unless `farm.enabled`, the bot is settled (90 s online),
+  healthy (60 % hit points), in the main world and not within five minutes of its last plant run.
+  Otherwise a due plot scores three times the weight, and a bot with room for plots and a crop it can
+  get seeds for scores the weight plus half of the need of the best crop (capped at 3). The weight is
+  `0.35 * (0.5 + 0.5 * homebody + 0.5 * merchant)`. The director's per-goal bias and its 1.5 times
+  nudge for wishes apply on top, in `brain::scores_now`.
+* **The board** (`bot/farm/board.rs`, `hub.farms`): per bot, what it expects its plots to give
+  (item, count), published after each plant and harvest and dropped when the bot leaves. The planner
+  damps the need by what the others grow; the Economy view's "Growing" column is its sum.
+* **Web**: the bot snapshot gets `plots` (`PlotLine`: position, crop, state with the time left,
+  honest, land; skipped when empty) and the economy rows `growing`; both are additive fields with
+  defaults.
+
+Live behaviour is in the farm notes of [OPERATING.md](OPERATING.md#farming-farm); the tests are the
+unit and flow tests in `bot/farm/` and `bot/goals/farm/`, and `tests/farm_real_data.rs` (ignored,
+needs `AA_COMPACT` and `AA_SERVER_DATA`) which runs the whole loop against the real data and a fake
+server.
 
 ## Guilds (`bot/guild/`, goal `guild`)
 
@@ -772,6 +851,7 @@ data/
   map_main_world.png       # painted world map (or relief fallback)
   map_main_world.json      # calibration: world rect covered by the image
   housing_areas.json       # polygons per housing area id
+  farm_areas.json          # polygons of the public farm sub zones
   quest_spheres.json       # quest sign spheres (quest id, component id, pos, radius)
   zones_main_world.bin     # zone key per 64 m sector (optional)
   nav_main_world.bin       # navigation mesh for path finding (mmap'd), one more per instance world

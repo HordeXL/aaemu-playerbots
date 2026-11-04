@@ -1431,7 +1431,11 @@ fn mock_economy(policy: &Policy) -> EconomyView {
                 wts,
                 reasons,
                 boosted: policy.boosts.iter().any(|b| b.template == template),
-                growing: if template.is_multiple_of(5) { 12.0 } else { 0.0 },
+                growing: if template.is_multiple_of(5) {
+                    12.0
+                } else {
+                    0.0
+                },
             }
         })
         .collect();
