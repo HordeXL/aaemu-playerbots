@@ -44,6 +44,11 @@ pub struct BotRow {
     pub x: f32,
     pub y: f32,
     pub presence: Presence,
+    /// Seconds in the world this session.
+    pub online_secs: u32,
+    /// The bot is doing something that is harmless to interrupt (see
+    /// [`super::select::stop_rank`]).
+    pub calm: bool,
 }
 
 /// The bots by side, as the director counts them.
@@ -206,9 +211,11 @@ pub fn world_view(i: WorldInputs<'_>) -> WorldView {
         })
         .collect();
 
-    // the server's count of players: its online characters minus our bots
+    // the server's count of players: its online characters minus our bots (the ones the server
+    // names as ours; without the character list, the bots that are in the world here)
     let players_server = match (i.server.online, i.server.online_bots) {
         (Some(all), Some(bots)) => Some(all.saturating_sub(bots)),
+        (Some(all), None) => Some(all.saturating_sub(bots_online)),
         _ => None,
     };
     let totals = WorldTotals {
@@ -255,6 +262,8 @@ mod tests {
             x,
             y: 100.0,
             presence,
+            online_secs: 0,
+            calm: true,
         }
     }
 
@@ -468,6 +477,45 @@ mod tests {
     }
 
     #[test]
+    fn without_the_character_list_our_online_bots_are_taken_off_the_server_count() {
+        let row = |id: u32, presence: Presence| BotRow {
+            id,
+            alliance: Alliance::Nuia,
+            continent: Continent::West,
+            zone_key: 5,
+            x: 10.0,
+            y: 10.0,
+            presence,
+            online_secs: 0,
+            calm: true,
+        };
+        let rows = [
+            row(1, Presence::Online),
+            row(2, Presence::Online),
+            row(3, Presence::Offline),
+        ];
+        let t = world_view(WorldInputs {
+            now_ms: 2_000,
+            rows: &rows,
+            players: &[],
+            server: ServerView {
+                configured: true,
+                reachable: true,
+                online: Some(7),
+                online_bots: None,
+                ..ServerView::default()
+            },
+            geo: &Table,
+        })
+        .totals;
+        assert_eq!(
+            t.players_server,
+            Some(5),
+            "7 characters, 2 of them our bots in the world"
+        );
+    }
+
+    #[test]
     fn the_lists_are_bounded() {
         use Presence::*;
         let rows: Vec<BotRow> = (0..3000)
@@ -479,6 +527,8 @@ mod tests {
                 x: i as f32 * 600.0,
                 y: 0.0,
                 presence: Online,
+                online_secs: 0,
+                calm: true,
             })
             .collect();
         let players: Vec<(u32, Seen)> = (0..200)

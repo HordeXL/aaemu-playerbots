@@ -567,6 +567,13 @@ impl Hub {
         if sel.is_all() || !sel.races(self.pop.races()).is_empty() {
             return Ok(());
         }
+        let every_race: Vec<u8> = (1..=8).collect();
+        if sel.races(&every_race).is_empty() {
+            return Err(
+                "no race matches that filter: Nuian and Elf (Nuia) start on the west continent,                  Hariharan and Ferre (Haranya) on the east continent"
+                    .to_string(),
+            );
+        }
         let has_entry = self.slots().iter().any(|s| {
             s.with(|g| crate::config::race_id(&g.snap.race))
                 .is_some_and(|r| sel.matches_race(r))

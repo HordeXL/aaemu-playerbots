@@ -1776,7 +1776,7 @@ function tick() {
 
 function restoreHash() {
   S.restoredHash = true;
-  const t = /^#tab=([a-z]+)$/.exec(location.hash);
+  const t = /^#tab=([a-z]+)(?:&.*)?$/.exec(location.hash);
   if (t && TABS.includes(t[1])) { setTab(t[1]); return; }
   const m = /^#bot=(\d+)$/.exec(location.hash);
   if (!m) return;

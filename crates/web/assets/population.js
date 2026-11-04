@@ -49,7 +49,7 @@ const P = {
   tab: 'bots', world: null, economy: null, director: null,
   last: { world: -Infinity, economy: -Infinity, director: -Infinity },
   busy: { world: false, economy: false, director: false },
-  heat: lsGet('pb_heat') === '1',
+  heat: lsGet('pb_heat') === '1' || /[#&]heat=1/.test(location.hash),
   ok: { world: true, economy: true, director: true },
 };
 const E = {}; // elements
@@ -284,10 +284,11 @@ function renderWorld() {
     tile('Bots online', fmtCount(t.bots_online), 'of ' + fmtCount(t.bots_total)),
   ];
   if (t.players_server != null) {
-    tiles.push(tile('Players on server', fmtCount(t.players_server), 'unlocated: ' + fmtCount(t.players_unlocated)));
+    tiles.push(tile('Players on server', fmtCount(t.players_server),
+      'unlocated: ' + fmtCount(t.players_unlocated) + (srv.online_bots == null ? ' (approx.)' : '')));
     tiles.push(tile('Coverage', num(t.coverage_pct) + '%', 'of them seen by a bot'));
   } else {
-    tiles.push(tile('Players on server', '?', srv.configured ? 'needs the API key' : 'no server API'));
+    tiles.push(tile('Players on server', '?', srv.configured ? 'no answer yet' : 'no server API'));
     tiles.push(tile('Coverage', '?', 'unknown'));
   }
   tiles.push(tile('Watched', num(t.watched_km2).toFixed(2) + ' km²', 'a bot sees about 128 m'));

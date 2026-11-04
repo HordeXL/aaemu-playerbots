@@ -80,6 +80,8 @@ pub struct Inputs<'a> {
     pub bots: [u32; 2],
     /// Of those, the ones the director started and may stop.
     pub owned: [u32; 2],
+    /// Of the owned bots, the ones that may be stopped now (see [`MIN_STAY_SECS`]).
+    pub ready: [u32; 2],
     /// Bots in the world or logging in, all together.
     pub total_online: u32,
     /// Why starting bots is on hold (see [`holding_reason`]).
@@ -228,7 +230,7 @@ pub fn plan(i: &Inputs<'_>) -> Plan {
     // a side with more bots than it needs: the biggest surplus first, but only past the dead band
     if p.despawn {
         let long = (0..2)
-            .filter(|s| i.bots[*s] > t[*s] + p.hysteresis && i.owned[*s] > 0)
+            .filter(|s| i.bots[*s] > t[*s] + p.hysteresis && i.ready[*s] > 0)
             .max_by_key(|s| (i.bots[*s] - t[*s], 1 - *s));
         if let Some(s) = long {
             let surplus = i.bots[s] - t[s];
@@ -248,7 +250,7 @@ pub fn plan(i: &Inputs<'_>) -> Plan {
                     why: format!("{why}; next action in {wait_secs} s"),
                 };
             }
-            let n = surplus.min(p.step.max(1)).min(i.owned[s]);
+            let n = surplus.min(p.step.max(1)).min(i.ready[s]);
             return Plan {
                 targets: t,
                 act: Some(Act::Despawn { side: s, n }),
@@ -284,6 +286,8 @@ pub struct StepInputs {
     pub players: [u32; 2],
     pub bots: [u32; 2],
     pub owned: [u32; 2],
+    /// Of the owned bots, the ones that may be stopped now.
+    pub ready: [u32; 2],
     pub total_online: u32,
     pub health: HealthView,
 }
@@ -544,6 +548,7 @@ impl Director {
             players: i.players,
             bots,
             owned: i.owned,
+            ready: i.ready,
             total_online,
             holding,
             since_action_ms: since,
@@ -631,6 +636,8 @@ impl Director {
                 },
             );
             tracing::info!(target: "pb_pop", "dry run: would {kind} {n} {} bots: {}", alliance.as_str(), plan.why);
+            // (a dry run keeps the pace of a live one: the next proposal comes a gap later)
+            st.last_action_ms = Some(i.now_ms);
             return;
         }
         // live: the lock is held across the call (the supervisor's queue is a try_send)
@@ -827,6 +834,7 @@ mod tests {
             players: [0, 0],
             bots: [0, 0],
             owned: [0, 0],
+            ready: [0, 0],
             total_online: 0,
             holding: None,
             since_action_ms: u64::MAX,
@@ -1009,6 +1017,7 @@ mod tests {
             players: [0, 0],
             bots: [10, 0],
             owned: [10, 0],
+            ready: [10, 0],
             total_online: 10,
             holding: Some("busy".into()),
             ..inputs(&p)
@@ -1086,6 +1095,7 @@ mod tests {
                 players,
                 bots: [bots, 0],
                 owned: [owned, 0],
+                ready: [owned, 0],
                 total_online: bots,
                 ..inputs(&p)
             })
@@ -1110,6 +1120,7 @@ mod tests {
         let plan = plan(&Inputs {
             bots: [8, 0],
             owned: [8, 0],
+            ready: [8, 0],
             total_online: 8,
             ..inputs(&no)
         });
@@ -1119,10 +1130,32 @@ mod tests {
             players: [0, 4],
             bots: [0, 9],
             owned: [0, 9],
+            ready: [0, 9],
             total_online: 9,
             ..inputs(&p)
         });
         assert_eq!(both.act, Some(Act::Spawn { side: 0, n: 3 }));
+    }
+
+    #[test]
+    fn only_bots_that_may_be_stopped_now_are_asked_for() {
+        let p = policy();
+        let at = |owned: u32, ready: u32| {
+            plan(&Inputs {
+                bots: [8, 0],
+                owned: [owned, 0],
+                ready: [ready, 0],
+                total_online: 8,
+                ..inputs(&p)
+            })
+            .act
+        };
+        // eight bots for a target of none: all of them the director's, but none up long enough
+        // (or all of them busy): nothing is ordered
+        assert_eq!(at(8, 0), None);
+        // two are ready: two are asked for, not the step of three
+        assert_eq!(at(8, 2), Some(Act::Despawn { side: 0, n: 2 }));
+        assert_eq!(at(8, 5), Some(Act::Despawn { side: 0, n: 3 }));
     }
 
     #[test]
@@ -1139,6 +1172,7 @@ mod tests {
                 players,
                 bots: [bots, 0],
                 owned: [bots, 0],
+                ready: [bots, 0],
                 total_online: bots,
                 since_action_ms: since,
                 ..inputs(&p)
@@ -1178,6 +1212,7 @@ mod tests {
             players,
             bots,
             owned,
+            ready: owned,
             total_online: bots.iter().sum(),
             health: HealthView::default(),
         }
@@ -1257,6 +1292,27 @@ mod tests {
         run(&d, &step_in(1_500_000, [0, 2], [0, 0], [0, 0]));
         assert_eq!(d.view(HealthView::default(), 0).log.len(), 3);
         assert_eq!(d.view(HealthView::default(), 0).spawned_last_min, 0);
+    }
+
+    #[test]
+    fn a_dry_run_keeps_the_pace_of_a_live_run() {
+        let d = Director::new(&PopulationCfg {
+            dry_run: true,
+            ..cfg(true)
+        });
+        run(&d, &step_in(1_000_000, [0, 2], [0, 0], [0, 0]));
+        assert_eq!(d.view(HealthView::default(), 0).log.len(), 1);
+        // the numbers change a few seconds later (bots log in, a player walks by): the new
+        // proposal waits for the gap and is not written down yet
+        run(&d, &step_in(1_005_000, [0, 9], [2, 0], [0, 0]));
+        run(&d, &step_in(1_030_000, [0, 9], [2, 0], [0, 0]));
+        assert_eq!(d.view(HealthView::default(), 0).log.len(), 1);
+        assert_eq!(d.view(HealthView::default(), 0).next_action_secs, 30);
+        // a gap after the first line it is written
+        run(&d, &step_in(1_060_000, [0, 9], [2, 0], [0, 0]));
+        let log = d.view(HealthView::default(), 0).log;
+        assert_eq!(log.len(), 2);
+        assert!(log[0].reason.contains("it has 2"), "{}", log[0].reason);
     }
 
     #[test]

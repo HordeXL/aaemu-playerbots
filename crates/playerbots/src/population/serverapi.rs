@@ -4,7 +4,8 @@
 //! `server_poll_secs` for
 //!
 //! * `GET /status` (public): uptime, players online, job counts, as the `label: value` rows of the
-//!   page;
+//!   page. Without the key its `Players online` count (which includes every bot of every process) is
+//!   all there is, and the web UI takes our own bots in the world off it ("approx.");
 //! * `GET /api/world/logged-characters` (needs the bearer key): the exact list of online characters.
 //!   The ones that are not our bots are the real players; the census sees only those near a bot,
 //!   so the difference is the part of the world nobody is watching;
@@ -148,6 +149,13 @@ pub fn parse_status(html: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The `Players online` count of the status page, when it has one.
+fn status_online(rows: &[(String, String)]) -> Option<u32> {
+    rows.iter()
+        .find(|r| r.0.eq_ignore_ascii_case("players online"))
+        .and_then(|r| r.1.trim().parse().ok())
 }
 
 /// The online characters of `/api/world/logged-characters` as `(character id, online)`.
@@ -304,7 +312,8 @@ pub async fn poll_once(
     };
     let latency_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
     let mut error = None;
-    let mut online = None;
+    // (characters online, of them ours); without the list the status page's count has no split
+    let mut online: Option<(u32, Option<u32>)> = None;
     let mut auction = None;
     if api.has_key() {
         match get(client, api, "/api/world/logged-characters", true)
@@ -315,7 +324,7 @@ pub async fn poll_once(
                 let on: Vec<u32> = list.iter().filter(|c| c.1).map(|c| c.0).collect();
                 online = Some((
                     on.len() as u32,
-                    on.iter().filter(|id| is_bot(**id)).count() as u32,
+                    Some(on.iter().filter(|id| is_bot(**id)).count() as u32),
                 ));
             }
             Err(e) => error = Some(format!("character list: {e}")),
@@ -333,16 +342,17 @@ pub async fn poll_once(
             }
         }
     }
+    if online.is_none() {
+        online = status_online(&status).map(|n| (n, None));
+    }
     state.update(|v| {
         v.reachable = true;
         v.error = error;
         v.checked_ms = now_ms;
         v.status = status;
         v.latency_ms = latency_ms;
-        if let Some((all, bots)) = online {
-            v.online = Some(all);
-            v.online_bots = Some(bots);
-        }
+        v.online = online.map(|o| o.0);
+        v.online_bots = online.and_then(|o| o.1);
         if lots {
             // (a failed list keeps the last count; the board drops it when it goes stale)
             if let Some(n) = auction {
@@ -649,7 +659,11 @@ mod tests {
         let err = v.error.unwrap();
         assert!(err.contains("refused"), "{err}");
         assert!(!err.contains("wrong") && !err.contains("right"), "{err}");
-        assert_eq!(v.online, None);
+        assert_eq!(
+            (v.online, v.online_bots),
+            (Some(5), None),
+            "the status page's count stands in, without the split"
+        );
         let _ = server.await;
 
         // without a key only the status page is used
@@ -666,7 +680,8 @@ mod tests {
         )
         .await;
         let v = state.view();
-        assert!(v.reachable && v.error.is_none() && v.online.is_none());
+        assert!(v.reachable && v.error.is_none());
+        assert_eq!((v.online, v.online_bots), (Some(5), None));
         let seen = server.await.unwrap();
         assert_eq!(seen, ["/status auth=false"]);
 

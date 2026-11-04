@@ -36,6 +36,7 @@ use rustc_hash::FxHashMap;
 use self::census::Census;
 use self::director::{Director, Order, StepInputs};
 use self::economy::{Economy, ScarcityView, VIEW_ROWS};
+use self::select::stop_rank;
 use self::serverapi::ServerState;
 use self::view::{count_bots, world_view, BotRow, Presence, WorldInputs};
 use crate::bot::cmd::GoalKind;
@@ -249,7 +250,7 @@ impl Population {
         }
         let rows = bot_rows(hub);
         let counts = count_bots(&rows);
-        let owned = self.count_owned(&rows, now);
+        let (owned, ready) = self.count_owned(&rows, now);
         let health = self.health(hub, counts.connecting, now);
         self.director.step(
             &StepInputs {
@@ -257,6 +258,7 @@ impl Population {
                 players: self.census.per_side(now),
                 bots: counts.by_side,
                 owned,
+                ready,
                 total_online: counts.total,
                 health,
             },
@@ -276,15 +278,17 @@ impl Population {
         }
     }
 
-    /// Owned bots per side that are in the world or logging in; forgets the ones that went
-    /// offline long ago.
-    fn count_owned(&self, rows: &[BotRow], now_ms: u64) -> [u32; 2] {
+    /// Owned bots per side that are in the world or logging in, and of those the ones the
+    /// director may stop now (up for [`director::MIN_STAY_SECS`] and doing nothing that must not be
+    /// interrupted); forgets the ones that went offline long ago.
+    fn count_owned(&self, rows: &[BotRow], now_ms: u64) -> ([u32; 2], [u32; 2]) {
         let mut own = self.owned.lock();
         if own.is_empty() {
-            return [0, 0];
+            return ([0, 0], [0, 0]);
         }
         let by_id: FxHashMap<u32, &BotRow> = rows.iter().map(|r| (r.id, r)).collect();
         let mut n = [0u32; 2];
+        let mut ready = [0u32; 2];
         own.retain(|id, since| match by_id.get(id) {
             None => false,
             Some(r) if r.presence == Presence::Offline => {
@@ -293,11 +297,14 @@ impl Population {
             Some(r) => {
                 if let Some(s) = r.alliance.side() {
                     n[s] += 1;
+                    if r.calm && r.online_secs >= director::MIN_STAY_SECS {
+                        ready[s] += 1;
+                    }
                 }
                 true
             }
         });
-        n
+        (n, ready)
     }
 
     fn health(&self, hub: &Hub, connecting: u32, now_ms: u64) -> HealthView {
@@ -356,7 +363,7 @@ impl Population {
         let now = unix_ms();
         let rows = bot_rows(hub);
         let counts = count_bots(&rows);
-        let owned = self.count_owned(&rows, now);
+        let (owned, _) = self.count_owned(&rows, now);
         self.director.view(
             self.health(hub, counts.connecting, now),
             owned[0] + owned[1],
@@ -406,6 +413,8 @@ pub fn bot_rows(hub: &Hub) -> Vec<BotRow> {
                         Activity::Connecting => Presence::Connecting,
                         _ => Presence::Online,
                     },
+                    online_secs: b.online_secs,
+                    calm: stop_rank(b.activity, &b.goal).is_some(),
                 }
             })
         })
@@ -498,6 +507,8 @@ mod tests {
             x: 0.0,
             y: 0.0,
             presence,
+            online_secs: 600,
+            calm: true,
         };
         let rows = [
             row(1, pb_web::Alliance::Nuia, Presence::Online),
@@ -506,19 +517,32 @@ mod tests {
             row(4, pb_web::Alliance::Haranya, Presence::Offline),
             row(5, pb_web::Alliance::Nuia, Presence::Online),
         ];
-        assert_eq!(p.count_owned(&rows, 1_000), [0, 0]);
+        assert_eq!(p.count_owned(&rows, 1_000), ([0, 0], [0, 0]));
         p.own(&[1, 2, 3, 4, 99], 1_000);
         // 99 has no slot any more; 4 is offline but was queued a moment ago (it may be waiting
         // for the ramp)
-        assert_eq!(p.count_owned(&rows, 2_000), [2, 1]);
+        assert_eq!(p.count_owned(&rows, 2_000), ([2, 1], [2, 1]));
         assert!(p.is_owned(4) && !p.is_owned(99));
         // long offline: not the director's any more
-        assert_eq!(p.count_owned(&rows, 1_000 + DISOWN_AFTER_MS), [2, 1]);
+        assert_eq!(
+            p.count_owned(&rows, 1_000 + DISOWN_AFTER_MS),
+            ([2, 1], [2, 1])
+        );
         assert!(!p.is_owned(4));
         p.disown(&[1]);
-        assert_eq!(p.count_owned(&rows, 3_000), [1, 1]);
+        assert_eq!(p.count_owned(&rows, 3_000), ([1, 1], [1, 1]));
+        // a bot that fights, or is new, is not ready to be stopped
+        let mut busy = [
+            row(1, pb_web::Alliance::Nuia, Presence::Online),
+            row(2, pb_web::Alliance::Nuia, Presence::Online),
+            row(3, pb_web::Alliance::Haranya, Presence::Online),
+        ];
+        busy[0].calm = false;
+        busy[1].online_secs = director::MIN_STAY_SECS - 1;
+        p.own(&[1, 2, 3], 5_000);
+        assert_eq!(p.count_owned(&busy, 6_000), ([2, 1], [0, 1]));
         let mut ids = p.owned_ids();
         ids.sort_unstable();
-        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
