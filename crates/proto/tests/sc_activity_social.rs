@@ -481,3 +481,226 @@ fn truncated_bodies_fail_and_never_panic() {
         }
     }
 }
+
+/// `TeamMember.WritePerson` (team.rs:46-66): 50 bytes.
+#[allow(clippy::too_many_arguments)]
+fn write_person(
+    s: &mut PacketStream,
+    id: u32,
+    zone: u32,
+    instance: u32,
+    level: u8,
+    hp: (i32, i32),
+    mp: (i32, i32),
+    pos: (f32, f32, f32),
+    obj: u32,
+) {
+    s.write_u32(id)
+        .write_u32(zone)
+        .write_u32(instance)
+        .write_u8(level)
+        .write_i32(hp.0)
+        .write_i32(hp.1)
+        .write_i32(mp.0)
+        .write_i32(mp.1)
+        .write_raw(&aa_proto::pos::encode_position(pos.0, pos.1, pos.2))
+        .write_bc(obj)
+        .write_raw(&[0, 1, 2, 3, 0, 0, 0, 0, 0]); // flag, three abilities, reserved
+}
+
+/// The position the codec gives back (the codec rounds to its fixed point).
+fn close(a: [f32; 3], b: [f32; 3]) {
+    for i in 0..3 {
+        assert!((a[i] - b[i]).abs() < 0.01, "{a:?} vs {b:?}");
+    }
+}
+
+#[test]
+fn team_remote_members_read_zone_instance_vitals_and_position() {
+    // SCTeamRemoteMembersExPacket: i32 count, WritePerson each (team.rs:282-288).
+    let mut s = PacketStream::new();
+    s.write_i32(2);
+    write_person(
+        &mut s,
+        1001,
+        100,
+        0,
+        30,
+        (900, 1200),
+        (40, 60),
+        (15_346.5, 14_922.25, 117.5),
+        0x0A0B0C,
+    );
+    write_person(
+        &mut s,
+        1002,
+        301,
+        7,
+        30,
+        (900, 1200),
+        (40, 60),
+        (-12.5, 640.0, 150.0),
+        0,
+    );
+    assert_eq!(s.len(), 4 + 2 * 50, "WritePerson is 50 bytes");
+    match event(sc::SCTeamRemoteMembersExPacket, &s) {
+        ActivityEvent::TeamRemoteMembers { members } => {
+            assert_eq!(members.len(), 2);
+            let (a, b) = (members[0], members[1]);
+            assert_eq!((a.char_id, a.zone_id, a.instance_id), (1001, 100, 0));
+            assert_eq!(
+                (a.level, a.hp, a.hp_max, a.mp, a.mp_max),
+                (30, 900, 1200, 40, 60)
+            );
+            assert_eq!(a.obj_id, 0x0A0B0C);
+            close(a.pos, [15_346.5, 14_922.25, 117.5]);
+            assert_eq!((b.char_id, b.zone_id, b.instance_id), (1002, 301, 7));
+            assert_eq!(b.obj_id, 0, "an offline member has object id 0");
+            close(b.pos, [-12.5, 640.0, 150.0]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // a count that promises more members than the body holds is refused before any allocation
+    let mut lie = PacketStream::new();
+    lie.write_i32(i32::MAX);
+    write_person(&mut lie, 1, 1, 0, 1, (1, 1), (1, 1), (0.0, 0.0, 0.0), 1);
+    assert!(parse(1, sc::SCTeamRemoteMembersExPacket, lie.as_bytes()).is_err());
+    // a negative count is no members
+    let mut negative = PacketStream::new();
+    negative.write_i32(-1);
+    assert_eq!(
+        event(sc::SCTeamRemoteMembersExPacket, &negative),
+        ActivityEvent::TeamRemoteMembers {
+            members: Default::default()
+        }
+    );
+    // zero members is fine
+    let mut none = PacketStream::new();
+    none.write_i32(0);
+    assert_eq!(
+        event(sc::SCTeamRemoteMembersExPacket, &none),
+        ActivityEvent::TeamRemoteMembers {
+            members: Default::default()
+        }
+    );
+}
+
+#[test]
+fn team_member_disconnected_carries_the_last_state() {
+    // SCTeamMemberDisconnectedPacket: u32 team, u32 character, WritePerson (team.rs:218-224).
+    let mut s = PacketStream::new();
+    s.write_u32(77).write_u32(1002);
+    write_person(
+        &mut s,
+        1002,
+        100,
+        0,
+        25,
+        (500, 800),
+        (10, 20),
+        (100.0, 200.0, 50.0),
+        0,
+    );
+    match event(sc::SCTeamMemberDisconnectedPacket, &s) {
+        ActivityEvent::TeamMemberDisconnected {
+            team_id,
+            char_id,
+            person,
+        } => {
+            assert_eq!((team_id, char_id), (77, 1002));
+            assert_eq!((person.char_id, person.hp, person.hp_max), (1002, 500, 800));
+            assert_eq!(person.obj_id, 0);
+            close(person.pos, [100.0, 200.0, 50.0]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn team_member_role_refresh_and_looting_rule() {
+    // SCTeamMemberRoleChangedPacket: u32 team, u32 member, u8 role (team.rs:255-262).
+    let mut s = PacketStream::new();
+    s.write_u32(77).write_u32(1002).write_u8(2);
+    assert_eq!(
+        event(sc::SCTeamMemberRoleChangedPacket, &s),
+        ActivityEvent::TeamMemberRoleChanged {
+            team_id: 77,
+            char_id: 1002,
+            role: 2
+        }
+    );
+    // SCRefreshTeamMemberPacket: u32 team, u32 member, bc object id (team.rs:161-168).
+    let mut s = PacketStream::new();
+    s.write_u32(77).write_u32(1002).write_bc(0x0A0B0C);
+    assert_eq!(
+        event(sc::SCRefreshTeamMemberPacket, &s),
+        ActivityEvent::TeamRefreshMember {
+            team_id: 77,
+            char_id: 1002,
+            obj_id: 0x0A0B0C
+        }
+    );
+    // SCTeamLootingRuleChangedPacket: u32 team, LootingRule (u8, u8, u32, bool), u8 flags.
+    let mut s = PacketStream::new();
+    s.write_u32(77)
+        .write_u8(2)
+        .write_u8(3)
+        .write_u32(1001)
+        .write_bool(true)
+        .write_u8(5);
+    assert_eq!(
+        event(sc::SCTeamLootingRuleChangedPacket, &s),
+        ActivityEvent::TeamLootingRuleChanged {
+            team_id: 77,
+            method: 2,
+            min_grade: 3,
+            master: 1001,
+            roll_bop: true,
+            flags: 5
+        }
+    );
+}
+
+#[test]
+fn the_new_team_packets_fail_cleanly_when_cut_short() {
+    let mut remote = PacketStream::new();
+    remote.write_i32(1);
+    write_person(
+        &mut remote,
+        1,
+        2,
+        3,
+        4,
+        (5, 6),
+        (7, 8),
+        (9.0, 10.0, 11.0),
+        12,
+    );
+    let mut role = PacketStream::new();
+    role.write_u32(77).write_u32(1002).write_u8(2);
+    let mut refresh = PacketStream::new();
+    refresh.write_u32(77).write_u32(1002).write_bc(5);
+    let mut rule = PacketStream::new();
+    rule.write_u32(77)
+        .write_u8(2)
+        .write_u8(3)
+        .write_u32(1001)
+        .write_bool(true)
+        .write_u8(5);
+    let samples: [(u16, &PacketStream); 4] = [
+        (sc::SCTeamRemoteMembersExPacket, &remote),
+        (sc::SCTeamMemberRoleChangedPacket, &role),
+        (sc::SCRefreshTeamMemberPacket, &refresh),
+        (sc::SCTeamLootingRuleChangedPacket, &rule),
+    ];
+    for (opcode, full) in samples {
+        assert!(parse(1, opcode, full.as_bytes()).unwrap().is_some());
+        for end in 0..full.len() {
+            let r = parse(1, opcode, &full.as_bytes()[..end]);
+            assert!(
+                matches!(r, Err(MarshalError::EndOfStream { .. })),
+                "opcode {opcode:#x} cut at {end}: {r:?}"
+            );
+        }
+    }
+}
