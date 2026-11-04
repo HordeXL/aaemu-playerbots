@@ -694,7 +694,7 @@ rising price (up to 0.15 at +50 % in half an hour) and more people asking than o
 0.15). The farming goal reads it through `population::economy::ScarcityView` (`scarcity`,
 `most_scarce`, `wished`), which `hub.pop` implements. The "Growing" column of the Economy table is
 what the farming bots have planted and not yet harvested, per item (the expected count; zero when
-no bot farms).
+no bot farms); an item that is being grown gets a row even when no bot noted a price for it.
 
 ### The director
 

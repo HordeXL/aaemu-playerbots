@@ -427,6 +427,19 @@ impl Economy {
         boosted: &[u32],
         limit: usize,
     ) -> EconomyView {
+        self.view_with(now_ms, items, boosted, &[], limit)
+    }
+
+    /// [`Economy::view`] with a row for every item in `grown` as well (what the farming bots have
+    /// planted), whatever the evidence says about it.
+    pub fn view_with(
+        &self,
+        now_ms: u64,
+        items: &dyn ItemInfo,
+        boosted: &[u32],
+        grown: &[u32],
+        limit: usize,
+    ) -> EconomyView {
         let g = self.inner.lock();
         let mut rows: Vec<ItemRow> = Vec::new();
         let row = |template: u32, stat: &ItemStat| -> ItemRow {
@@ -470,7 +483,7 @@ impl Economy {
                 }
             }
         }
-        for t in boosted {
+        for t in boosted.iter().chain(grown) {
             if !rows.iter().any(|r| r.template == *t) {
                 rows.push(row(*t, &ItemStat::default()));
             }
@@ -481,11 +494,11 @@ impl Economy {
                 .then(b.scarcity.total_cmp(&a.scarcity))
                 .then(a.template.cmp(&b.template))
         });
-        // (the boosted ones are shown on top of the limit, which counts the others)
-        let mut kept = Vec::with_capacity(rows.len().min(limit + boosted.len()));
+        // (the boosted and the grown ones are shown on top of the limit, which counts the others)
+        let mut kept = Vec::with_capacity(rows.len().min(limit + boosted.len() + grown.len()));
         let mut others = 0usize;
         for r in rows {
-            if r.boosted {
+            if r.boosted || grown.contains(&r.template) {
                 kept.push(r);
             } else if others < limit {
                 others += 1;
@@ -1073,6 +1086,29 @@ mod tests {
             v.items.len(),
             4,
             "the limit counts the rows that are not boosted"
+        );
+    }
+
+    #[test]
+    fn grown_items_get_a_row_whatever_the_evidence_and_the_limit_say() {
+        let e = Economy::default();
+        for t in 1..=5u32 {
+            e.note_price(1, 3000 + t, Some((100, 90, 20)), MIN);
+        }
+        let v = e.view_with(MIN, &Items, &[], &[4001, 3002], 2);
+        let templates: Vec<u32> = v.items.iter().map(|r| r.template).collect();
+        assert!(templates.contains(&4001), "no evidence, still a row");
+        assert!(templates.contains(&3002), "a row with evidence is kept");
+        assert!(v.items.iter().all(|r| !r.boosted), "growing is not a wish");
+        assert_eq!(
+            v.items.len(),
+            4,
+            "two grown rows beside the two of the limit"
+        );
+        assert_eq!(
+            e.view(MIN, &Items, &[], 2).items.len(),
+            2,
+            "without grown items the limit alone counts"
         );
     }
 

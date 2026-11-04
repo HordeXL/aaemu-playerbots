@@ -1062,6 +1062,7 @@ impl Machine {
                 self.reap.gone_ms = io.now_ms;
                 self.harvested += 1;
                 mem.harvested += 1;
+                mem.last_crop = self.reap.doodad;
                 mem.harvest_honest = None;
                 acts.push(Act::Say(format!(
                     "farm: harvested the crop at ({:.0}, {:.0})",

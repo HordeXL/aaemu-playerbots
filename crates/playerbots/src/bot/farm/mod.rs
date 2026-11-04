@@ -135,6 +135,8 @@ pub struct FarmMem {
     pub harvested: u32,
     /// Crops that vanished near the bot without a harvest.
     pub lost: u32,
+    /// The doodad of the crop harvested last (the goal logs what the ledger made of its produce).
+    pub last_crop: u32,
     /// Crops the bot just harvested, whose removal is expected (not a loss).
     reaped: SmallVec<[u32; 4]>,
 }

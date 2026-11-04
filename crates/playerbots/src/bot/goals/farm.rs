@@ -104,6 +104,7 @@ impl Farm {
             return GoalStatus::Failed(FailReason::Other("farming is switched off"));
         }
         let mut mem = ctx.state.market.take_farm();
+        let harvested_before = mem.harvested;
         let mut acts = Vec::new();
         let status = {
             let world = ctx.world;
@@ -140,8 +141,12 @@ impl Farm {
             };
             machine.step(&io, &mut mem, &mut acts)
         };
+        let last_crop = (mem.harvested != harvested_before).then_some(mem.last_crop);
         ctx.state.market.put_farm(mem);
         apply(ctx, acts);
+        if let Some(doodad) = last_crop {
+            log_produce(ctx, doodad);
+        }
         status
     }
 
@@ -357,6 +362,23 @@ fn nearest_merchant(state: &BotState, template: u32, me: [f32; 3]) -> Option<(u3
         .map(|(&obj, u)| (obj, u.pos, u.dist2d(me)))
         .min_by(|a, b| a.2.total_cmp(&b.2))
         .map(|(obj, pos, _)| (obj, pos))
+}
+
+/// Logs what the bot holds of the produce of the crop it just harvested, and how much of it the
+/// ledger counts as its own (the operator's evidence that the honest window worked).
+fn log_produce(ctx: &mut Ctx<'_>, doodad: u32) {
+    let Some(crop) = ctx.world.farm().crop_of_doodad(doodad) else {
+        return;
+    };
+    for y in crop.produce.iter().take(4) {
+        let held = ctx.state.item_count(y.item);
+        let clean = ctx.state.market.clean_count(y.item);
+        let name = ctx.world.item_name(y.item).unwrap_or("?");
+        ctx.log.say(format!(
+            "farm: holds {held} of {name} ({}), the ledger counts {clean} as its own",
+            y.item
+        ));
+    }
 }
 
 /// Carries out what the machine asked for.

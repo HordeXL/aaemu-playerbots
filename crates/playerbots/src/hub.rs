@@ -865,8 +865,10 @@ impl BotHub for Hub {
     }
 
     fn economy(&self) -> EconomyView {
-        let mut view = self.pop.economy_view();
-        let growing: FxHashMap<u32, f32> = self.farms.totals().into_iter().collect();
+        let totals = self.farms.totals();
+        let grown: Vec<u32> = totals.iter().map(|t| t.0).take(32).collect();
+        let mut view = self.pop.economy_view(&grown);
+        let growing: FxHashMap<u32, f32> = totals.into_iter().collect();
         if !growing.is_empty() {
             for row in &mut view.items {
                 row.growing = growing.get(&row.template).copied().unwrap_or(0.0);

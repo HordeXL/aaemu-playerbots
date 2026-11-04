@@ -346,7 +346,7 @@ impl Population {
     }
 
     /// The Economy panel.
-    pub fn economy_view(&self) -> EconomyView {
+    pub fn economy_view(&self, grown: &[u32]) -> EconomyView {
         let now = unix_ms();
         let Some(world) = &self.world else {
             return EconomyView {
@@ -355,7 +355,8 @@ impl Population {
             };
         };
         let wished = self.director.wishes(now);
-        self.economy.view(now, &**world, &wished, VIEW_ROWS)
+        self.economy
+            .view_with(now, &**world, &wished, grown, VIEW_ROWS)
     }
 
     /// The Director panel.
