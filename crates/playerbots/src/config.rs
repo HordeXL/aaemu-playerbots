@@ -325,6 +325,10 @@ pub struct GuildCfg {
     pub max_guilds: u32,
     /// Bots accept the guild invitations of real players.
     pub accept_player_invites: bool,
+    /// How many times an hour a bot that has been in a bot guild for a quarter of an hour leaves
+    /// it, on average (0 = never). An owner hands the guild to another bot first; the bot can be
+    /// invited again after a while.
+    pub churn_per_hour: f32,
 }
 
 impl Default for GuildCfg {
@@ -336,6 +340,7 @@ impl Default for GuildCfg {
             party_size: 5,
             max_guilds: 3,
             accept_player_invites: false,
+            churn_per_hour: 0.2,
         }
     }
 }
@@ -777,6 +782,10 @@ impl Config {
             g.max_guilds <= MAX_BOTS,
             "guild.max_guilds {} is above the limit of {MAX_BOTS}",
             g.max_guilds
+        );
+        ensure!(
+            g.churn_per_hour.is_finite() && (0.0..=60.0).contains(&g.churn_per_hour),
+            "guild.churn_per_hour must be a number in 0..=60"
         );
         let pv = &self.pvp;
         ensure!(
@@ -1397,15 +1406,18 @@ emote = true
                 "party_size = 5",
                 "max_guilds = 3",
                 "accept_player_invites = false",
+                "churn_per_hour = 0.2",
             ],
         );
+        assert_eq!((g.churn_per_hour, ex.churn_per_hour), (0.2, 0.2));
         let cfg = Config::parse(
-            "[guild]\nenabled = true\nfound = false\nmin_level = 20\nparty_size = 2\nmax_guilds = 0\naccept_player_invites = true\n",
+            "[guild]\nenabled = true\nfound = false\nmin_level = 20\nparty_size = 2\nmax_guilds = 0\naccept_player_invites = true\nchurn_per_hour = 6\n",
         )
         .unwrap();
         let g = cfg.guild;
         assert!(g.enabled && !g.found && g.accept_player_invites);
         assert_eq!((g.min_level, g.party_size, g.max_guilds), (20, 2, 0));
+        assert_eq!(g.churn_per_hour, 6.0);
         for bad in [
             "[guild]\nfounds = true\n",
             "[guild]\nenabled = 1\n",
@@ -1415,6 +1427,9 @@ emote = true
             "[guild]\nparty_size = 51\n",
             "[guild]\nmax_guilds = -1\n",
             "[guild]\nmax_guilds = 5001\n",
+            "[guild]\nchurn_per_hour = -1\n",
+            "[guild]\nchurn_per_hour = 61\n",
+            "[guild]\nchurn_per_hour = \"often\"\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
