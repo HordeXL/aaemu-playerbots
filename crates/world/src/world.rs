@@ -14,6 +14,7 @@ use crate::baked::{Baked, QuestSphere};
 use crate::chars::Chars;
 use crate::doodad::{DoodadData, DoodadTemplate};
 use crate::economy::{Craft, Economy};
+use crate::event::Events;
 use crate::faction::{Factions, Relation};
 use crate::geom::{IdMap, StrTable, Vec3};
 use crate::housing::{AreaIndex, Housing, HousingDesign};
@@ -126,6 +127,8 @@ pub struct World {
     spheres: FxHashMap<(u32, u32), u32>,
     /// Portals, instance dungeons and boats (the travel abilities' static data).
     travel: Travel,
+    /// Tower defence events ("rifts"): their places, levels and kill targets.
+    events: Events,
     /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
     water: OnceLock<Option<WaterMap>>,
     /// Where the quests are, built at the first [`World::quest_atlas`].
@@ -216,6 +219,17 @@ impl World {
             items: &items,
         })
         .context("load travel data")?;
+        let events = {
+            let zone_group = |x: f32, y: f32| {
+                baked
+                    .zones
+                    .as_ref()
+                    .and_then(|z| z.zone_key_at(x, y))
+                    .and_then(|k| travel.zone_groups.of_key(k))
+                    .map_or(0, |g| u16::try_from(g).unwrap_or(0))
+            };
+            Events::load(&conn, &npcs, &npc_spawns, &zone_group).context("load events")?
+        };
 
         let world = World {
             baked,
@@ -241,6 +255,7 @@ impl World {
             gather_doodads,
             spheres,
             travel,
+            events,
             water: OnceLock::new(),
             quest_atlas: OnceLock::new(),
         };
@@ -266,6 +281,7 @@ impl World {
             dungeons = world.travel.dungeons.dungeons().len(),
             instance_worlds = world.travel.dungeons.worlds().all().len(),
             boat_scrolls = world.travel.boats.scrolls().len(),
+            events = world.events.all().len(),
             factions = world.factions.len(),
             terrain = world.baked.terrain.is_some(),
             memory_kib = world.memory_estimate() / 1024,
@@ -319,6 +335,7 @@ impl World {
             ("indexes", gather + self.spheres.capacity() * 16),
         ];
         v.extend(self.travel.memory_breakdown());
+        v.push(("events", self.events.bytes()));
         v.push((
             "water map",
             self.water
@@ -342,6 +359,11 @@ impl World {
     /// Portals, instance dungeons and boats; see [`crate::travel`].
     pub fn travel(&self) -> &Travel {
         &self.travel
+    }
+
+    /// Tower defence events ("rifts"); see [`crate::event`].
+    pub fn events(&self) -> &Events {
+        &self.events
     }
 
     /// The sea map boats are planned on, built from the baked terrain the first time it is asked
