@@ -12,8 +12,6 @@ pub enum Class {
     Target,
     /// A monster of another wave of the event (a straggler of the one before).
     Wave,
-    /// Any hostile monster near the target, when the wave has no kill targets to name.
-    Loose,
 }
 
 /// What the goal knows about a monster in view.
@@ -32,29 +30,17 @@ pub struct Cand {
 }
 
 /// The class of an NPC of `template` for wave `step` of `def`; `None` for what the bots leave
-/// alone: the event's own controllers (the Rift itself, the summoners), monsters that are not the
-/// event's, and bosses where the wave names no targets.
-pub fn classify(
-    events: &Events,
-    def: &EventDef,
-    step: u32,
-    template: u32,
-    grade: u8,
-    level: u8,
-) -> Option<Class> {
+/// alone: the event's own controllers (the Rift itself, the summoners) and every monster that is
+/// not one of the event's own (the camps around a rift are not the bots' business, and a wave that
+/// names no kill targets is waited out at the target).
+pub fn classify(events: &Events, def: &EventDef, step: u32, template: u32) -> Option<Class> {
     if events.is_controller(template) {
         return None;
     }
     if def.is_kill_target(step, template) {
         return Some(Class::Target);
     }
-    if def.is_wave_npc(template) {
-        return Some(Class::Wave);
-    }
-    let names_targets = def.step(step).is_some_and(|s| !s.kills.is_empty());
-    let fair =
-        level.saturating_add(5) >= def.min_level && level <= def.max_level.saturating_add(10);
-    (!names_targets && grade <= 2 && fair).then_some(Class::Loose)
+    def.is_wave_npc(template).then_some(Class::Wave)
 }
 
 /// The monster to fight: the best class first, one nobody holds before one somebody holds, then
@@ -136,37 +122,29 @@ mod tests {
     fn the_current_wave_decides_what_is_a_target() {
         let (ev, d) = fixture();
         // wave 2 waits for archers; a soldier is a straggler of the event
-        assert_eq!(classify(&ev, &d, 2, ARCHER, 1, 40), Some(Class::Target));
-        assert_eq!(classify(&ev, &d, 2, SOLDIER, 1, 40), Some(Class::Wave));
-        assert_eq!(classify(&ev, &d, 3, SOLDIER, 1, 40), Some(Class::Target));
+        assert_eq!(classify(&ev, &d, 2, ARCHER), Some(Class::Target));
+        assert_eq!(classify(&ev, &d, 2, SOLDIER), Some(Class::Wave));
+        assert_eq!(classify(&ev, &d, 3, SOLDIER), Some(Class::Target));
         // the controllers are never attacked
         for step in 0..6 {
-            assert_eq!(classify(&ev, &d, step, CTRL, 3, 50), None, "step {step}");
+            assert_eq!(classify(&ev, &d, step, CTRL), None, "step {step}");
         }
     }
 
     #[test]
-    fn a_wave_without_targets_takes_any_fair_monster() {
+    fn monsters_that_are_not_the_events_are_left_alone() {
         let (ev, d) = fixture();
-        // wave 1 and 4 name no kill targets
-        for step in [1, 4] {
-            assert_eq!(classify(&ev, &d, step, 77, 1, 42), Some(Class::Loose));
-            // not a boss, not too weak, not too strong
-            assert_eq!(classify(&ev, &d, step, 77, 3, 42), None);
-            assert_eq!(classify(&ev, &d, step, 77, 1, 30), None);
-            assert_eq!(classify(&ev, &d, step, 77, 1, 56), None);
-            assert_eq!(classify(&ev, &d, step, 77, 2, 35), Some(Class::Loose));
+        // the camps around a rift, in a wave with kill targets and in one without (waves 1 and 4
+        // name none; the bots wait those out at the target), and before the first wave
+        for step in 0..6 {
+            assert_eq!(classify(&ev, &d, step, 77), None, "step {step}");
         }
-        // a wave with targets leaves other monsters alone
-        assert_eq!(classify(&ev, &d, 2, 77, 1, 42), None);
-        // before the first wave nothing names targets either
-        assert_eq!(classify(&ev, &d, 0, 77, 1, 42), Some(Class::Loose));
     }
 
     #[test]
     fn the_best_class_wins_then_a_free_monster_then_the_nearest() {
         let c = [
-            cand(1, Class::Loose, 2.0, false),
+            cand(1, Class::Wave, 2.0, false),
             cand(2, Class::Wave, 3.0, false),
             cand(3, Class::Target, 30.0, true),
             cand(4, Class::Target, 40.0, false),
@@ -181,9 +159,9 @@ mod tests {
             cand(2, Class::Wave, 3.0, false),
         ];
         assert_eq!(choose(&c), Some(6));
-        // no target in reach: a straggler, then anything loose
+        // no target in reach: a straggler of another wave, the nearest first
         let c = [
-            cand(1, Class::Loose, 2.0, false),
+            cand(1, Class::Wave, 40.0, false),
             cand(2, Class::Wave, 30.0, false),
         ];
         assert_eq!(choose(&c), Some(2));
@@ -200,7 +178,7 @@ mod tests {
         let far_from_bot = cand(2, Class::Target, VIEW_M + 1.0, false);
         let edge = Cand {
             d_rally: ENGAGE_M,
-            ..cand(3, Class::Loose, VIEW_M, false)
+            ..cand(3, Class::Wave, VIEW_M, false)
         };
         assert_eq!(choose(&[far_from_target, far_from_bot]), None);
         assert_eq!(choose(&[far_from_target, far_from_bot, edge]), Some(3));

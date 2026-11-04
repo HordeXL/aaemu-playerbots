@@ -1,6 +1,6 @@
 //! Whether a bot may join an event and where it stands there. Pure functions, no `Ctx`.
 
-use aa_world::event::EventDef;
+use aa_world::event::{EventDef, Step};
 
 use crate::config::EventsCfg;
 
@@ -22,6 +22,11 @@ pub const MAX_PORTAL_M: f32 = 15_000.0;
 pub const SPOT_M: (f32, f32) = (6.0, 18.0);
 /// How a bot's level may fall short of the event's lowest kill target.
 pub const LEVEL_SLACK: u8 = 0;
+/// Nothing to fight for this long and the bot goes home.
+pub const IDLE_LEAVE_MS: u64 = 8 * 60_000;
+/// A wave with a timer is waited out: after the timer the monsters still have to march to the
+/// target.
+pub const TIMER_SLACK_MS: u64 = 3 * 60_000;
 
 /// What the join decision looks at.
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +90,14 @@ pub fn may_join(cfg: &EventsCfg, def: &EventDef, who: &Who, zone_at_war: bool) -
         return Err(Skip::Far);
     }
     Ok(())
+}
+
+/// How long a bot at the target may wait for something to fight in wave `step` before it gives
+/// up: [`IDLE_LEAVE_MS`], or the wave's timer and [`TIMER_SLACK_MS`] when that is longer (a wave
+/// that is only a timer, such as the first one, has nothing to fight until it runs out).
+pub fn idle_limit_ms(step: Option<&Step>) -> u64 {
+    let timer_ms = step.map_or(0, |s| (s.timer_s.max(0.0) * 1000.0) as u64);
+    IDLE_LEAVE_MS.max(timer_ms.saturating_add(TIMER_SLACK_MS))
 }
 
 /// How long a trip of `dist_m` may take: three minutes and the walk at 3 m/s, at most 25 minutes.
@@ -218,6 +231,26 @@ mod tests {
             Err(Skip::Far)
         );
         assert_eq!(may_join(&c, &d, &far(30_000.0, true, true), false), Ok(()));
+    }
+
+    #[test]
+    fn a_wave_with_a_timer_is_waited_out() {
+        let d = def(40, None);
+        let s = d.step(1).unwrap();
+        // a one second timer changes nothing; no wave at all is the plain limit
+        assert_eq!(idle_limit_ms(Some(s)), IDLE_LEAVE_MS);
+        assert_eq!(idle_limit_ms(None), IDLE_LEAVE_MS);
+        // the first wave of the Grimghast Rift: ten minutes and the march
+        let timer = Step {
+            timer_s: 600.0,
+            ..s.clone()
+        };
+        assert_eq!(idle_limit_ms(Some(&timer)), 600_000 + TIMER_SLACK_MS);
+        let silly = Step {
+            timer_s: f32::MAX,
+            ..s.clone()
+        };
+        assert!(idle_limit_ms(Some(&silly)) >= IDLE_LEAVE_MS);
     }
 
     #[test]

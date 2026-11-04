@@ -9,8 +9,10 @@
 //!
 //! The dungeon, sail, auction, market, guild, gank, warzone, event, companion and farm goals are the
 //! exception: the features that own them score them from the whole tick context (`own_scores`),
-//! with none of the factors above (the guild, gank, warzone, event, companion and farm goals are
-//! stubs and score 0 until their features exist).
+//! with none of the factors above (the guild, gank, warzone, companion and farm goals are stubs and
+//! score 0 until their features exist). The event goal also has a duty hook: a running event it may
+//! join pulls a bot out of the small goals at once ([`super::goals::event::duty`]), so a rift does
+//! not wait for the end of a grind.
 //!
 //! Goals that cannot succeed for the bot right now (a trade run below the level of the lowest
 //! pack recipe, housing without GM help or a design item) are left out of the draw up front
@@ -131,7 +133,7 @@ fn own_scores(
     s[market] = own_score(blocked, market, || {
         super::goals::market::score(ctx, base[market])
     });
-    // (the wave-one goals are stubs: 0 until their features exist)
+    // (the wave-one goals that are not built yet are stubs: 0 until their features exist)
     let wave_one: [(GoalKind, OwnScore); 6] = [
         (GoalKind::Guild, super::goals::guild::score),
         (GoalKind::Gank, super::goals::gank::score),

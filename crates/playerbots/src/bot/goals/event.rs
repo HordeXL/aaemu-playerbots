@@ -7,7 +7,7 @@
 //! small, see the board's docs), walks to the defended target, stays within [`HOLD_M`] of it and
 //! kills the monsters the current wave waits for, each bot taking one nobody else has claimed.
 //! It leaves when the event ends, when its hit points fall below [`LEAVE_HP_PCT`], after three
-//! deaths or when nothing has come to fight for [`IDLE_LEAVE_MS`].
+//! deaths or when nothing has come to fight for [`plan::IDLE_LEAVE_MS`] (longer in a wave with a timer).
 //!
 //! How a bot gets into the goal:
 //!
@@ -51,8 +51,6 @@ use plan::{Who, HOLD_M, LEAVE_HP_PCT};
 
 /// What an eligible bot's score is: far above the everyday goals, so a bot that may join does.
 const SCORE: f32 = 12.0;
-/// Nothing to fight for this long and the bot goes home.
-const IDLE_LEAVE_MS: u64 = 8 * 60_000;
 /// The bot tells the board it stands at the target this often.
 const OBSERVE_GAP_MS: u64 = 1_000;
 /// A walk is re-issued at most this often.
@@ -217,6 +215,10 @@ impl Event {
         }
 
         // where the target is
+        if run.step != view.step {
+            // a new wave: the wait starts again
+            run.idle_since_ms = now;
+        }
         run.step = view.step;
         if let Some(rally) = rally_of(def, &view, ctx.state.me.pos) {
             if dist2d(rally, run.rally) > 10.0 {
@@ -281,7 +283,8 @@ impl Event {
                     run.idle_since_ms = now;
                     return GoalStatus::Running;
                 }
-                if now.saturating_sub(run.idle_since_ms) >= IDLE_LEAVE_MS {
+                if now.saturating_sub(run.idle_since_ms) >= plan::idle_limit_ms(def.step(view.step))
+                {
                     return finish(run, ctx, Leave::Idle, "nothing came");
                 }
                 if run.dist_m > HOLD_M {
@@ -472,11 +475,10 @@ fn pick_target(run: &Run, ctx: &Ctx<'_>, def: &EventDef, view: &View) -> Option<
         if d_bot > plan::VIEW_M || d_rally > plan::ENGAGE_M {
             continue;
         }
-        let Some(t) = attackable(ctx.world, faction, u) else {
+        if attackable(ctx.world, faction, u).is_none() {
             continue;
-        };
-        let level = if u.level != 0 { u.level } else { t.level };
-        let Some(class) = pick::classify(events, def, view.step, u.id, t.grade, level) else {
+        }
+        let Some(class) = pick::classify(events, def, view.step, u.id) else {
             continue;
         };
         cands.push(Cand {
