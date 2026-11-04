@@ -31,7 +31,7 @@ reads it (default `playerbots.toml`).
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones` (see [World events](#world-events-events)). |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
-| `[farm]` | Farming, off by default: `enabled` and `max_plots`. |
+| `[farm]` | Farming, off by default: `enabled`, `max_plots`, `growth_rate`, `public_farms`, `own_land`, `replant` and `max_trip_m`. |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -186,7 +186,12 @@ features can be added without changing the file.
 | | `follow_into_dungeons` | `false` | A bot in a player's party follows it into instance dungeons. |
 | `[population]` | `enabled` | `false` | Master switch of the population director (see [World metrics and the population director](#world-metrics-and-the-population-director), which lists every key). |
 | `[farm]` | `enabled` | `false` | Master switch of the farming features (goal `farm`). |
-| | `max_plots` | `5` | One bot tends at most this many plots. |
+| | `max_plots` | `5` | One bot tends at most this many plots (the server allows 10 on a public field farm, 5 on the other kinds). |
+| | `growth_rate` | `1.0` | The game server's `World.GrowthRate` (not on the wire): ripe times are planned with it. |
+| | `public_farms` | `true` | Plant on the public farms (needs `farm_areas.json` in the baked data). |
+| | `own_land` | `true` | Plant on the land of the bot's own houses. |
+| | `replant` | `true` | Plant the seeds a harvest gives back on the spot the crop stood. |
+| | `max_trip_m` | `4000.0` | The farthest a bot walks to a farm, a vendor or a plot (metres). |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
 
