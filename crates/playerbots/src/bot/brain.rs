@@ -551,6 +551,8 @@ impl Brain {
         };
         let mut s = scores(&self.base, &input);
         own_scores(ctx, &self.base, blocked, &mut s);
+        // the population director's goal multipliers (all 1.0 unless its policy sets some)
+        ctx.hub.pop.bias.apply(&mut s);
         s
     }
 

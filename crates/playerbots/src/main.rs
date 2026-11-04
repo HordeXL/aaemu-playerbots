@@ -24,6 +24,7 @@ use playerbots::bot::{Shared, LOGIN_PERMITS};
 use playerbots::config::Config;
 use playerbots::hub::{Hub, HubParams, SupCmd};
 use playerbots::issues::Issues;
+use playerbots::population::{serverapi, Population};
 use playerbots::roster::{Roster, SharedRoster};
 use playerbots::secrets::{self, Source};
 use playerbots::supervisor::{ensure_roster, register_slots, Supervisor};
@@ -267,7 +268,12 @@ async fn run(
             supervisor: sup_tx,
             llm,
         })
-        .with_issues(issues),
+        .with_issues(issues)
+        .with_population(Population::new(
+            &cfg.population,
+            cfg.bots.race_ids(),
+            Some(world.clone()),
+        )),
     );
     let issue_tasks = hub.start_issues();
 
@@ -326,6 +332,8 @@ async fn run(
         })
     };
 
+    let server_api = serverapi::spawn(&cfg.population, hub.clone(), cancel.clone());
+
     let supervisor = tokio::spawn(Supervisor::new(shared).run(wanted, sup_rx, cancel.clone()));
 
     let timer = async {
@@ -355,6 +363,9 @@ async fn run(
     }
     let _ = coord_task.await;
     let _ = ticker.await;
+    if let Some(t) = server_api {
+        let _ = t.await;
+    }
     // (the bots are gone: whatever they changed last is written now)
     saver.stop().await;
     issue_tasks.stop().await;
