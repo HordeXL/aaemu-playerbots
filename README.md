@@ -84,6 +84,12 @@ and clears the dungeon along a route of its hostile spawns: the leader picks tar
 follow and assist, everybody rests when low. Then they use the exit and disband. The server's
 refusals are answered by kind and the entry limit is counted like the server counts it.
 
+**Parties of real players.** With `[party]` on, a bot joins the party a real player invites it to (or
+invites the player who whispers `inv`), follows the leader across the map, helps in the fights, obeys
+`follow`, `stay`, `come`, `assist`, `leave` and `dungeon <name>`, and goes through a dungeon door
+behind the leader and out again with it. It says no at once when it is busy, in a team already or
+the levels are too far apart. See [OPERATING.md](docs/OPERATING.md#parties-of-real-players-party).
+
 ### Server QA
 
 Bots are the first players of a new server, so they also find its bugs. They notice problems with the

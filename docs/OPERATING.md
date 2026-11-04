@@ -428,6 +428,12 @@ team gets no party chat from the server, so nothing is said there).
 for healers, attacker for the rest. Healing allies is **not** done: the rotation heals are
 self-only (`Aim::SelfOnly`), a healer fights like a damage dealer and heals itself.
 
+**Web.** The snapshot of a bot in a party (`GET /api/bots/{id}`, `GET /api/bots`) carries
+`party`: `{id, leader, mode, members: [{name, role, level, leader, online, bot}]}` (`bot` is true for the
+bots of this process; the field is absent when the bot is in no party). The goal shows as
+`companion` with what it does (`following`, `staying`, `resting`, `going to the dungeon door`, `in the
+dungeon`, ...).
+
 **Dungeons** (`follow_into_dungeons`). The bot reads the leader's world from the position records of
 the team: when the instance id is not 0 the leader is inside a dungeon (the record carries the
 instance's zone key, which names the dungeon); a leader that was in view next to an entrance and
