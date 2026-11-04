@@ -74,7 +74,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
-| **Guild** | A bot with no guild that can pay the charter asks the coordinator for a founding team; five bots of one faction found a guild together. What a bot does in its guild afterwards (answer invitations, recruit, promote, talk, leave) is a duty that runs whatever the goal is. Needs `[guild] enabled`; see [Guilds](#guilds-guild). |
+| **Guild** | A bot with no guild that can pay the charter asks the coordinator for a founding team (a duty, whatever it is doing); five bots of one faction found a guild together. What a bot does in its guild afterwards (answer invitations, recruit, promote, talk, leave) is a duty that runs whatever the goal is. Needs `[guild] enabled`; see [Guilds](#guilds-guild). |
 | **Gank, Warzone, Event, Companion, Farm** | Reserved: ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
@@ -215,8 +215,8 @@ churn_per_hour = 0.2          # how often a member leaves a bot guild (0 = never
 | `churn_per_hour` | `0.2` | How many times an hour a bot that has been in a bot guild for a quarter of an hour leaves it, on average (0 to 60). |
 
 **Founding.** A bot with no guild, level 5 or more, 10000 copper (or `gm_bootstrap`, which mints the
-gold) and no other business picks the goal `guild`, which posts a wish with the coordinator and is
-done. When `party_size` such bots of one faction wish, the coordinator orders them to a founding
+gold) and no other business posts a wish with the coordinator (the guild duty does that, whatever the
+bot is doing). When `party_size` such bots of one faction wish, the coordinator orders them to a founding
 team: the highest level founds. The founder invites the others into a team by name (the server
 checks no distance), creates the guild with a generated name (letters and spaces; a taken name is
 replaced, up to five tries), and dismisses the team. A failure rests the bot for a minute to half an

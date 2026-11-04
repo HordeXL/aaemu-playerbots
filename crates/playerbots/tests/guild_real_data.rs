@@ -699,9 +699,7 @@ async fn a_bot_that_can_sign_a_charter_wishes_and_the_coordinator_orders_the_tea
     // ... the coordinator knows the bot can sign (its card is in the sink's book as well) ...
     sink.book
         .update_card(ready(CAN_JOIN | CAN_FOUND), unix_ms());
-    // ... the bot is picked for the goal and asks for a team (once, however often it is picked)
-    rig.brain
-        .command(&BotCmd::Goal(GoalChoice::Forced(GoalKind::Guild)));
+    // ... and the bot asks for a team on its own, once, whatever it does (it rests here)
     for _ in 0..10 {
         rig.tick(1_000);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

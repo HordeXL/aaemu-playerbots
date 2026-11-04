@@ -32,7 +32,7 @@ use super::life::{
     INVITE_STALE_MS, JOIN_WAIT_MS, LEAVE_WAIT_MS, LIFE_EVERY_MS, PROMOTE_EVERY_MS, PROMOTE_WAIT_MS,
     RECRUIT_EVERY_MS, REJOIN_PAUSE_MS,
 };
-use super::plan::WISH_TTL;
+use super::plan::{GuildWish, WISH_TTL};
 use super::report::{self, Problem};
 use crate::bot::cmd::GoalKind;
 use crate::bot::ctx::Ctx;
@@ -248,6 +248,38 @@ fn publish(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
             },
             unix_ms(),
         );
+    }
+    post_wish(ctx, &f);
+}
+
+/// A bot that can sign a charter tells the coordinator it wants a founding team, whatever it is
+/// doing; the coordinator keeps the wish for [`WISH_TTL`] and, when a team forms, orders the bot to
+/// the goal `guild` (see [`crate::bot::goals::guild`]). Asked once per wish.
+fn post_wish(ctx: &mut Ctx<'_>, f: &Facts) {
+    if !can_found(f) {
+        return;
+    }
+    let now = ctx.now_ms;
+    let ttl = WISH_TTL.as_millis() as u64;
+    let wished = ctx
+        .state
+        .guild
+        .get()
+        .is_some_and(|m| m.t.wished_ms != 0 && now.saturating_sub(m.t.wished_ms) < ttl);
+    // (the card above was published in the same tick or earlier: the coordinator reads it)
+    if wished || ctx.hub.guilds.card(ctx.persona.id, unix_ms()).is_none() {
+        return;
+    }
+    let wish = GuildWish {
+        bot: ctx.persona.id,
+        mother: mother_of(ctx),
+        level: ctx.state.me.level,
+        can_pay: f.can_pay,
+    };
+    if ctx.coord.request_guild(wish) {
+        ctx.state.guild.mem().t.wished_ms = now.max(1);
+        ctx.log
+            .say("guild: wants to found a guild, waiting for a founding team");
     }
 }
 

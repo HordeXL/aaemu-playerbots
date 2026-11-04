@@ -331,13 +331,13 @@ into packets.
 | `life.rs` | `View` over the log: who may recruit, whom the owner promotes, who succeeds a leaving owner, who may leave, whom to greet; the clocks and plans in `Timers`. |
 | `duty.rs` | The glue every brain tick (`guild::duty`): card and membership to the book, invitation answers (a human pause first), the join-ignored detector, life steps, requests of real players, the web snapshot (`snapshot_if_changed`). |
 | `chat.rs`, `names.rs`, `report.rs` | The lines (no repeat of a recent one, all pass the safety filter), the request detector for whispers ("ginv", "guild invite", "can i join"; not "party", "group", "dungeon", ...), the name generator (mirrors the server's `^[a-zA-Z ]{3,32}$`, five shapes, a Roman numeral from the third try), the issue reports. |
-| `goals/guild.rs` | The goal: without an order a wish (`CoordHandle::request_guild`), with a `PartyPurpose::Guild` order the founding. |
+| `goals/guild.rs` | The goal: with a `PartyPurpose::Guild` order the founding (without one, when an operator forces it, a wish). Its score is 0: the wish itself (`CoordHandle::request_guild`) is posted by the duty. |
 
 **Per-bot cost.** `BotState::guild` is `GuildState(Option<Box<Mem>>)`: one pointer until the first
 guild packet or duty tick with the feature on. `size_of::<Bot>()` is 3184 with it (limit 3200).
 
-**Founding through the coordinator.** The goal posts a `GuildWish` and is done; the bot goes on
-with its day and the coordinator keeps the wish for 20 minutes. `Coordinator::form_guilds` runs on
+**Founding through the coordinator.** The duty posts a `GuildWish` when the bot can sign a charter; the
+bot goes on with its day and the coordinator keeps the wish for 20 minutes. `Coordinator::form_guilds` runs on
 every wish and every sweep; it sends every member of a team the same `PartyOrder` (leader first,
 purpose `Guild`), which the brain turns into the goal with the order. Nobody walks anywhere: the
 team invitation and `CSInviteToExpedition` go by name and the server checks no distance. The founder

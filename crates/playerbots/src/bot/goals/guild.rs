@@ -1,12 +1,11 @@
 //! Guild: sign a charter and found a guild together (the guild feature, see
 //! [`crate::bot::guild`]).
 //!
-//! The goal has two modes.
+//! The wish for a founding team is posted by the guild duty ([`duty`]) whatever the bot is doing:
+//! a bot with no guild that can pay the charter tells the coordinator it wants a team
+//! ([`CoordHandle::request_guild`](crate::bot::coordinator::CoordHandle)) and goes on with its day;
+//! the coordinator keeps the wish for [`WISH_TTL`]. The goal itself has two modes.
 //!
-//! * **Wish** (no order): a bot with no guild that can pay the charter tells the coordinator it
-//!   wants a founding team ([`CoordHandle::request_guild`](crate::bot::coordinator::CoordHandle))
-//!   and is done; it goes on with whatever it did, and the coordinator keeps the wish for
-//!   [`WISH_TTL`](crate::bot::guild::plan::WISH_TTL).
 //! * **Founding** (a [`PartyOrder`] with the purpose `Guild`): the coordinator found
 //!   `party_size` bots of one faction; the first founds, the others sign. The bot runs the pure
 //!   [`found::Machine`](crate::bot::guild::found::Machine) and turns its acts into packets: team
@@ -14,12 +13,11 @@
 //!   generated name, the dismissal of the team. A failure rests the bot for
 //!   [`Fail::back_off_ms`], files a report when the failure points at the server (see
 //!   [`report`]), and frees the place the founding held in the guild book.
+//! * **Wish** (no order, an operator forced the goal): posts the wish if the duty has not.
 //!
-//! What a bot does in its guild afterwards is the duty's ([`crate::bot::guild::duty`]), whatever
-//! goal it runs.
+//! What a bot does in its guild afterwards is the duty's too.
 //!
-//! * [`score`]: the goal's whole eligibility and weight, read by the brain instead of the usual
-//!   `scores` table.
+//! * [`score`]: always 0, nothing picks the goal by itself.
 //! * [`base_weight`]: the weight before the situation is looked at (0: the goal has its own).
 
 use aa_proto::cs;
@@ -40,9 +38,6 @@ use crate::roster::Temperament;
 
 use super::{FailReason, GoalStatus};
 
-/// The score of the goal for a bot that can found a guild and has not asked yet: above the
-/// everyday goals, because the goal takes a single tick.
-const WISH_SCORE: f32 = 1.5;
 /// A wish the coordinator's inbox did not take is repeated for this long.
 const POST_RETRY_MS: u64 = 5_000;
 /// The peers (names and character ids of the founding team) are read again this often.
@@ -375,25 +370,11 @@ pub fn base_weight(_behavior: &BehaviorCfg, _temper: &Temperament) -> f32 {
     0.0
 }
 
-/// The score of the goal for this tick, given its `base` weight: [`WISH_SCORE`] for a bot that
-/// can sign a charter and has not asked for a team lately, else 0.
-pub fn score(ctx: &Ctx<'_>, _base: f32) -> f32 {
-    let cfg = &ctx.cfg.guild;
-    if !(cfg.enabled && cfg.found) {
-        return 0.0;
-    }
-    let wished = ctx.state.guild.get().is_some_and(|m| {
-        m.t.wished_ms != 0 && ctx.now_ms.saturating_sub(m.t.wished_ms) < WISH_TTL.as_millis() as u64
-    });
-    if wished {
-        return 0.0;
-    }
-    let facts = duty::facts(ctx, None);
-    if duty::can_found(&facts) {
-        WISH_SCORE
-    } else {
-        0.0
-    }
+/// The score of the goal for this tick: always 0. The wish for a founding team is posted by the
+/// guild duty whatever the bot is doing ([`duty`]), so nothing needs to pick the goal; it runs when
+/// the coordinator's order puts a bot in a founding team, or when an operator forces it.
+pub fn score(_ctx: &Ctx<'_>, _base: f32) -> f32 {
+    0.0
 }
 
 #[cfg(test)]
