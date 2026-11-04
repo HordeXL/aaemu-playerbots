@@ -27,7 +27,7 @@ reads it (default `playerbots.toml`).
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
 | `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds` and `accept_player_invites` (see [Switched-off features](#switched-off-features)). |
-| `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad` and `retreat_hp_pct`. |
+| `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct` and `war_kill_cap`. |
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones`. |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
@@ -176,6 +176,7 @@ checked now so the features can be added without changing the file.
 | | `only_names` | `[]` | When not empty: the only real players that may be attacked. |
 | | `max_squad` | `3` | Most bots that attack together (1 to 50). |
 | | `retreat_hp_pct` | `35` | A bot below this many percent of its hit points breaks off a fight (0 to 100). |
+| | `war_kill_cap` | `10` | Most characters one bot kills in one war of a zone group before it leaves the war (1 to 100). |
 | `[events]` | `enabled` | `false` | Master switch of the event features (goal `event`). |
 | | `max_bots_per_event` | `6` | At most this many bots join one event. |
 | | `max_share` | `0.25` | At most this share (0 to 1) of all bots takes part in events at once. |

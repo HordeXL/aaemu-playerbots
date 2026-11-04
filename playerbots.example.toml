@@ -155,6 +155,8 @@ only_names = []
 max_squad = 3
 # A bot below this many percent of its hit points breaks off a fight (0 to 100).
 retreat_hp_pct = 35
+# Most characters one bot kills in one war of a zone group before it leaves the war (1 to 100).
+war_kill_cap = 10
 
 [events]
 # Bots at world events such as rifts (goal "event"). Off until enabled.
