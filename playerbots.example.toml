@@ -117,6 +117,83 @@ max_ads_per_hour = 12
 # ... and one bot posts one at most this often, in seconds (at least 60).
 ad_interval_secs = 900
 
+[guild]
+# Bots in guilds (expeditions): found one together, join one, keep one running (goal "guild").
+# Off until enabled.
+enabled = false
+# Bots may found guilds. false = they only join existing ones.
+found = true
+# A bot founds or joins a guild from this level on.
+min_level = 5
+# Bots that found a guild together (1 to 50).
+party_size = 5
+# This process founds at most this many guilds (0 = none).
+max_guilds = 3
+# Bots accept the guild invitations of real players.
+accept_player_invites = false
+
+[pvp]
+# Player versus player: defending, fights between bots, ganks and warzones. Off until enabled.
+# Attacking real players is a switch of its own (attack_players) and never happens while
+# bots.gm_bootstrap is on: what a GM-bootstrapped bot holds may be minted.
+enabled = false
+# A bot fights back when a player attacks it.
+defend = true
+# Bots of hostile factions attack each other.
+attack_bots = false
+# Bots attack real players (characters that are not ours).
+attack_players = false
+# Bots ambush trade-pack carriers (goal "gank").
+gank = false
+# Bots fight in zones at war (goal "warzone").
+warzone = false
+# Character names that are never attacked (game masters, friends).
+never_names = []
+# When not empty: the only real players that may be attacked.
+only_names = []
+# Most bots that attack together (1 to 50).
+max_squad = 3
+# A bot below this many percent of its hit points breaks off a fight (0 to 100).
+retreat_hp_pct = 35
+
+[events]
+# Bots at world events such as rifts (goal "event"). Off until enabled.
+enabled = false
+# At most this many bots join one event ...
+max_bots_per_event = 6
+# ... and at most this share (0 to 1) of all bots takes part in events at once.
+max_share = 0.25
+# A bot waits a random number of seconds in this range [low, high] before it joins.
+join_delay_secs = [10, 120]
+# Bots stay out of zones at war.
+avoid_war_zones = true
+
+[party]
+# Bots and the parties of real players. All off by default.
+# Bots join the parties of real players when invited (goal "companion").
+join_player_parties = false
+# Bots obey party chat commands of the player who leads the party.
+chat_commands = false
+# A bot in a player's party follows it into instance dungeons.
+follow_into_dungeons = false
+
+[population]
+# The population director of the web UI: starts and stops bots to follow the players. Off until
+# enabled.
+enabled = false
+# The director only logs what it would do.
+dry_run = true
+# It starts at most this many bots per minute (0 = none) ...
+max_spawn_per_min = 10
+# ... and waits at least this many seconds between two of its actions (at least 1).
+min_action_gap_secs = 60
+
+[farm]
+# Bots plant and harvest crops (goal "farm"). Off until enabled.
+enabled = false
+# One bot tends at most this many plots.
+max_plots = 5
+
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.
 bind = "127.0.0.1:8790"

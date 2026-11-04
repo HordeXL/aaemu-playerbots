@@ -26,6 +26,12 @@ reads it (default `playerbots.toml`).
 | `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings, reconnect back-off. |
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
+| `[guild]` | Guilds, off by default: `enabled`, `found`, `min_level`, `party_size`, `max_guilds` and `accept_player_invites` (see [Switched-off features](#switched-off-features)). |
+| `[pvp]` | Player versus player, off by default: `enabled`, `defend`, `attack_bots`, `attack_players`, `gank`, `warzone`, `never_names`, `only_names`, `max_squad` and `retreat_hp_pct`. |
+| `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones`. |
+| `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
+| `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
+| `[farm]` | Farming, off by default: `enabled` and `max_plots`. |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -68,6 +74,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Trade run** | Crafts a trade pack at a specialty workbench, carries it to a specialty NPC that buys it, sells it and collects the payment mail. |
 | **Dungeon** | Bots that like a fight ask the coordinator for a party of three (same alliance, a level the dungeon accepts; with `dungeon_level_up` and GM rights a lower level is raised). The leader invites, the party walks to the entrance doodad, goes in one by one, clears the dungeon along a route of its hostile spawns (the leader picks targets, the members follow and assist, everybody rests when low), uses the exit doodad and disbands. The server's refusals are typed and answered (a dungeon it turned away is left alone, the three entries per four hours are counted); what the server does that the data contradicts is filed as an issue. |
 | **Sail** | Summons a boat from a scroll at a beach, sails it 1 to 3 km over the sea (a crossing to another beach or a loop) with a heading controller that finds the wheel's direction itself, then leaves the boat, despawns it and swims ashore. Sea only (no lakes or rivers). Needs a boat scroll in the bag or `gm_bootstrap`. See [DESIGN.md](DESIGN.md#sailing-goal-sail). |
+| **Guild, Gank, Warzone, Event, Companion, Farm** | Reserved: found or join a guild, ambush trade-pack carriers, fight in zones at war, join a world event, follow a real player's party, plant and harvest crops. The goals exist (the web UI can name them) but are not implemented yet: a bot that is told to do one switches it off. Their settings are in [Switched-off features](#switched-off-features). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -143,6 +150,48 @@ Safety of the GM lines:
   straight lines. Without the baked mesh the option does nothing. Counters (searches inline and
   pooled, latency, fallbacks, stuck events, trips) are in `/api/stats` under `nav` and in the log
   once a minute.
+
+## Switched-off features
+
+These sections are all off by default; `enabled = false` (or the `false` default of the switch named
+below) keeps the bots exactly as they were without them. The goals they belong to are reserved and
+not implemented yet (see [Goals and behaviour](#goals-and-behaviour)); the settings are read and
+checked now so the features can be added without changing the file.
+
+| Section | Key | Default | Meaning |
+| --- | --- | --- | --- |
+| `[guild]` | `enabled` | `false` | Master switch of the guild features. |
+| | `found` | `true` | Bots may found guilds (otherwise they only join). |
+| | `min_level` | `5` | A bot founds or joins a guild from this level on. |
+| | `party_size` | `5` | Bots that found a guild together (1 to 50). |
+| | `max_guilds` | `3` | This process founds at most this many guilds (0 = none). |
+| | `accept_player_invites` | `false` | Bots accept the guild invitations of real players. |
+| `[pvp]` | `enabled` | `false` | Master switch of the pvp features. |
+| | `defend` | `true` | A bot fights back when a player attacks it. |
+| | `attack_bots` | `false` | Bots of hostile factions attack each other. |
+| | `attack_players` | `false` | Bots attack real players; never while `bots.gm_bootstrap` is on (what a GM-bootstrapped bot holds may be minted), like `sell_to_players`. |
+| | `gank` | `false` | Bots ambush trade-pack carriers (goal `gank`). |
+| | `warzone` | `false` | Bots fight in zones at war (goal `warzone`). |
+| | `never_names` | `[]` | Character names that are never attacked (game masters, friends). |
+| | `only_names` | `[]` | When not empty: the only real players that may be attacked. |
+| | `max_squad` | `3` | Most bots that attack together (1 to 50). |
+| | `retreat_hp_pct` | `35` | A bot below this many percent of its hit points breaks off a fight (0 to 100). |
+| `[events]` | `enabled` | `false` | Master switch of the event features (goal `event`). |
+| | `max_bots_per_event` | `6` | At most this many bots join one event. |
+| | `max_share` | `0.25` | At most this share (0 to 1) of all bots takes part in events at once. |
+| | `join_delay_secs` | `[10, 120]` | A bot waits a random number of seconds in `[low, high]` before it joins. |
+| | `avoid_war_zones` | `true` | Bots stay out of zones at war. |
+| `[party]` | `join_player_parties` | `false` | Bots join the parties of real players when invited (goal `companion`). |
+| | `chat_commands` | `false` | Bots obey party chat commands of the player who leads the party. |
+| | `follow_into_dungeons` | `false` | A bot in a player's party follows it into instance dungeons. |
+| `[population]` | `enabled` | `false` | Master switch of the population director. |
+| | `dry_run` | `true` | The director only logs what it would do. |
+| | `max_spawn_per_min` | `10` | It starts at most this many bots per minute (0 = none). |
+| | `min_action_gap_secs` | `60` | Seconds between two of its actions (at least 1). |
+| `[farm]` | `enabled` | `false` | Master switch of the farming features (goal `farm`). |
+| | `max_plots` | `5` | One bot tends at most this many plots. |
+
+The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
 
 ## Selling (`[market]`)
 
@@ -336,7 +385,8 @@ playerbots run --config playerbots.toml
 The map shows every bot by activity, with houses, duel flags and trade outlets; the list can be
 searched; selecting a bot shows its state, quests, extra details, the last chat lines it heard or
 said and its event log. Commands per bot: pause/resume, force a goal (quest, grind, duel, trade,
-trade run, housing, dungeon, sail, auction, market, rest, wander, or auto), duel or trade with another bot, say a line, whisper a
+trade run, housing, dungeon, sail, auction, market, guild, gank, warzone, event, companion, farm,
+rest, wander, or auto), duel or trade with another bot, say a line, whisper a
 line to a character. Global: spawn/despawn bots, pause or resume all. With `[web] token` set, POST
 requests need the header `x-playerbots-token`. While the UI is bound to a loopback address, every
 route (reads included) refuses a request whose `Host` is not a loopback name (a DNS-rebinding page
