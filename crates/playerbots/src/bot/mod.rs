@@ -23,22 +23,28 @@ pub mod avoid;
 pub mod brain;
 pub mod cmd;
 pub mod combat;
+pub mod companion;
 pub mod coordinator;
 pub mod ctx;
 pub mod director;
+pub mod farm;
 pub mod goals;
+pub mod guild;
 pub mod manner;
 pub mod market;
 pub mod motion;
 pub mod nav;
 pub mod party;
 pub mod place;
+pub mod pvp;
 pub mod rotation;
 pub mod session;
 pub mod state;
 pub mod travel;
 pub mod vehicle;
+pub mod war;
 pub mod watch;
+pub mod zones;
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
@@ -298,6 +304,8 @@ impl Bot {
                     if online >= HEALTHY_SESSION {
                         backoff = min;
                         self.outage_reported = false;
+                    } else {
+                        self.shared.hub.pop.note_failed_session();
                     }
                     if let Some(f) = fault {
                         self.report_fault(f, &why);
@@ -329,6 +337,8 @@ impl Bot {
     fn go_offline(&mut self) {
         self.online_since = None;
         self.shared.hub.contest.release_bot(self.entry.id);
+        self.shared.hub.events.release_bot(self.entry.id);
+        self.shared.hub.farms.release_bot(self.entry.id);
         self.motion.leave_world();
         self.slot.set_offline();
     }
@@ -668,6 +678,19 @@ impl Bot {
                 return;
             }
         };
+        // (the crops of the bot are not kept as doodads in view: the farm memory follows them)
+        if self.shared.cfg.farm.enabled {
+            if let ServerEvent::World(w) = &ev {
+                if farm::observe(&mut self.state, &self.shared.world, w) {
+                    farm::publish(
+                        &self.shared.hub,
+                        self.entry.id,
+                        &self.state,
+                        &self.shared.world,
+                    );
+                }
+            }
+        }
         if let ServerEvent::World(WorldEvent::DoodadsCreated(list)) = &mut ev {
             let world = &self.shared.world;
             list.retain(|d| keep_doodad(world, d));
@@ -676,6 +699,16 @@ impl Bot {
             }
         }
         self.state.apply(&ev);
+        // (the guild lists the server sends name the guilds that exist: those names are taken)
+        if let ServerEvent::Activity(aa_proto::sc_activity::ActivityEvent::Guild(g)) = &ev {
+            guild::observe(&self.shared.hub.guilds, g);
+        }
+        crate::events::on_server_event(
+            &self.shared.hub.events,
+            &self.shared.world,
+            &ev,
+            &self.state,
+        );
         let queued = self.out.len();
         self.combat
             .on_event(&ev, self.state.me.obj, now, &mut self.out);
@@ -988,8 +1021,35 @@ impl Bot {
         self.real_near = self
             .state
             .any_character_within(WATCH_RADIUS, |id| hub.is_bot_char(id));
+        self.feed_population();
         self.watch_server();
         self.publish(conn);
+    }
+
+    /// Hands the players in view to the census and, every ten seconds (staggered by bot id), the
+    /// fresh auction price notes to the economy board.
+    fn feed_population(&mut self) {
+        let hub = &self.shared.hub;
+        let now = crate::hub::unix_ms();
+        crate::population::census::observe(
+            &self.state,
+            &hub.pop.census,
+            &*self.shared.world,
+            &|id| hub.is_bot_char(id),
+            self.entry.id,
+            now,
+        );
+        if self.secs.wrapping_add(self.entry.id).is_multiple_of(10) {
+            if let Some(m) = self.state.market.get() {
+                crate::population::economy::sample_notes(
+                    &hub.pop.economy,
+                    self.entry.id,
+                    m.auction.prices(),
+                    self.state.now_ms,
+                    now,
+                );
+            }
+        }
     }
 
     /// The once-a-second pass of the detectors that look at time: requests the server never
@@ -1078,7 +1138,26 @@ impl Bot {
         let paused = self.paused;
         let has_house = !self.state.houses.is_empty();
         let (level, hp, pos, money) = (me.level, me.hp_pct(), me.pos, me.money);
+        // (the guild part of the snapshot is rebuilt only when the guild changed)
+        let char_id = me.char_id;
+        let hub = &self.shared.hub;
+        let guild_info =
+            guild::snapshot_if_changed(&mut self.state.guild, |c| hub.is_bot_char(c), char_id);
+        // (and so is the party part)
+        let party_info =
+            companion::snapshot_if_changed(&mut self.state.party, |c| hub.is_bot_char(c), char_id);
+        let mother = if me.faction != 0 {
+            world.mother_faction(me.faction)
+        } else {
+            0
+        };
         self.slot.with(|g| {
+            if let Some(info) = guild_info {
+                g.snap.guild = info;
+            }
+            if let Some(info) = party_info {
+                g.snap.party = info;
+            }
             g.path.clear();
             self.motion.route_points(&mut g.path, PATH_POINTS_MAX);
             let s = &mut g.snap;
@@ -1102,6 +1181,12 @@ impl Bot {
             }
             if zone_changed {
                 s.zone = zone_key.and_then(|k| world.zone_name(k)).map(str::to_owned);
+                s.zone_key = zone_key.unwrap_or(0);
+                s.continent = crate::population::region::continent_of_zone(&**world, s.zone_key);
+            }
+            if mother != 0 && s.mother_faction != mother {
+                s.mother_faction = mother;
+                s.alliance = crate::population::region::alliance_of_mother(mother);
             }
             if with_extra {
                 g.extra.clear();
@@ -1121,6 +1206,8 @@ impl Bot {
                 g.extra.push(("sessions".into(), self.sessions.to_string()));
                 g.extra
                     .push(("quests".into(), goals::quest::summary(world, &self.state)));
+                g.plots.clear();
+                farm::plot_lines(&self.state, world, self.state.now_ms, &mut g.plots);
             }
         });
         self.slot.obj_id.store(self.state.me.obj, Ordering::Relaxed);
@@ -1163,6 +1250,7 @@ pub fn initial_snapshot(entry: &RosterEntry, archetype: &Archetype) -> pb_web::B
         class: archetype.name.clone(),
         level: 1,
         hp_pct: 100,
+        alliance: crate::population::region::alliance_of_race(entry.race),
         activity: Activity::Offline,
         ..pb_web::BotSnapshot::default()
     }
@@ -1183,10 +1271,12 @@ fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
     d.mul_f32(0.5 + rng.f32())
 }
 
-/// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it.
+/// Whether a doodad is worth remembering: it can be used, looted, crafted at, or a quest wants it
+/// (or it is a trade pack on the ground, which the gank goal picks up).
 fn keep_doodad(world: &World, d: &DoodadInfo) -> bool {
     d.has_loot
         || d.quest_glow != 0
+        || world.is_pack_doodad(d.template)
         || world.is_dungeon_door(d.template)
         || world.is_mirage_door(d.template)
         || world

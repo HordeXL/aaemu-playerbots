@@ -108,6 +108,18 @@ impl RowExt for Row<'_> {
     }
 }
 
+/// Whether the database has a table called `name`. Loaders of optional data use it to skip a
+/// table a trimmed-down database (a test fixture) does not carry.
+pub fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .with_context(|| format!("look for table `{name}`"))
+}
+
 /// Runs `sql` and calls `f` for every row.
 pub fn each_row(conn: &Connection, sql: &str, mut f: impl FnMut(&Row<'_>)) -> Result<()> {
     let mut stmt = conn
@@ -146,5 +158,13 @@ mod tests {
         .unwrap();
         assert_eq!(seen[0], (true, false, 7, 0, "abc".into()));
         assert_eq!(seen[1], (true, false, 12, 2, "x".into()));
+    }
+
+    #[test]
+    fn tables_are_looked_up_by_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a);").unwrap();
+        assert!(table_exists(&conn, "t").unwrap());
+        assert!(!table_exists(&conn, "missing").unwrap());
     }
 }

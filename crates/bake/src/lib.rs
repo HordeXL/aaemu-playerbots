@@ -1,12 +1,13 @@
 //! Extracts the data player bots need from the ArcheAge 1.2 client `game_pak`.
 //!
 //! [`bake`] reads, for one world, the per-cell heightmaps, `world.xml`, the housing area polygons,
-//! the quest sign spheres and the painted world map from the pak and writes the files described in
+//! the public farm polygons, the quest sign spheres and the painted world map from the pak and writes the files described in
 //! `docs/DATA-FORMATS.md` into the output directory:
 //!
 //! ```text
 //! heights_<world>.bin  map_<world>.png  map_<world>_relief.png  map_<world>.json
-//! housing_areas.json   quest_spheres.json   zones_<world>.bin   debug_map_markers.png
+//! housing_areas.json   farm_areas.json   quest_spheres.json   zones_<world>.bin
+//! debug_map_markers.png
 //! ```
 
 pub mod areas;
@@ -96,6 +97,8 @@ pub struct BakeSteps {
     pub heights: bool,
     pub zones: bool,
     pub housing: bool,
+    /// The public farm polygons (`farm_areas.json`).
+    pub farms: bool,
     pub spheres: bool,
     pub map: bool,
     /// The navigation mesh of the world being baked (`nav_<world>.bin`).
@@ -111,6 +114,7 @@ impl BakeSteps {
             heights: true,
             zones: true,
             housing: true,
+            farms: true,
             spheres: true,
             map: true,
             nav: true,
@@ -123,6 +127,7 @@ impl BakeSteps {
             heights: false,
             zones: false,
             housing: false,
+            farms: false,
             spheres: false,
             map: false,
             nav: false,
@@ -150,6 +155,7 @@ pub struct BakeReport {
     pub zone_sectors_assigned: usize,
     pub housing_areas: usize,
     pub housing_areas_dropped_unknown_id: usize,
+    pub farm_areas: usize,
     pub quest_spheres: usize,
     /// `"painted"` or `"relief"`: what `map_<world>.json` points at.
     pub map_source: Option<String>,
@@ -198,11 +204,12 @@ impl fmt::Display for BakeReport {
         }
         writeln!(
             f,
-            "zones: {} in world.xml, {} sectors assigned; housing areas: {} ({} dropped: id not in compact); quest spheres: {}",
+            "zones: {} in world.xml, {} sectors assigned; housing areas: {} ({} dropped: id not in compact); farm areas: {}; quest spheres: {}",
             self.zones,
             self.zone_sectors_assigned,
             self.housing_areas,
             self.housing_areas_dropped_unknown_id,
+            self.farm_areas,
             self.quest_spheres
         )?;
         if let (Some(src), Some(r)) = (&self.map_source, &self.map_rect) {
@@ -434,6 +441,43 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
         report
             .timings
             .push(("housing areas".into(), t.elapsed().as_secs_f32()));
+    }
+
+    if steps.farms {
+        let t = Instant::now();
+        let mut polys: Vec<HousingAreaPoly> = Vec::new();
+        for zone in &world.zones {
+            let name = format!(
+                "{world_prefix}level_design/zone/{}/client/subzone_area.xml",
+                zone.key
+            );
+            let Some(text) = pak.read_text(&name)? else {
+                continue;
+            };
+            match areas::parse_sub_zone_areas(&text, zone.key, zone.origin) {
+                Ok(v) => polys.extend(v.into_iter().filter(|p| {
+                    aa_world::farm::FarmKind::of_sub_zone(p.id).is_some() && p.points.len() >= 3
+                })),
+                Err(e) => report.warn(format!("{name}: {e:#}")),
+            }
+        }
+        let path = opts.out.join("farm_areas.json");
+        write_json(&path, &polys)?;
+        report
+            .files
+            .push(("farm_areas.json".into(), file_size(&path)));
+        report.farm_areas = polys.len();
+        for p in &polys {
+            tracing::info!(
+                "farm area: sub zone {} zone {} corners {}",
+                p.id,
+                p.zone_key,
+                p.points.len()
+            );
+        }
+        report
+            .timings
+            .push(("farm areas".into(), t.elapsed().as_secs_f32()));
     }
 
     if steps.spheres {

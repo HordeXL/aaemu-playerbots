@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::population::{
+    Alliance, Continent, DirectorView, EconomyView, PolicyPatch, SpawnFilter, WorldView,
+};
+
 /// What a bot is doing right now. Serialized as `snake_case` (`"trade_run"`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +83,18 @@ pub struct BotSnapshot {
     pub y: f32,
     pub z: f32,
     pub zone: Option<String>,
+    /// Mother faction id of the bot's faction (0 = unknown); the alliance comes from it.
+    #[serde(default)]
+    pub mother_faction: u32,
+    /// The side the bot plays (by its race until it is in the world).
+    #[serde(default)]
+    pub alliance: Alliance,
+    /// The continent the bot stands on (`unknown` while offline).
+    #[serde(default)]
+    pub continent: Continent,
+    /// Zone key of the position (0 = none).
+    #[serde(default)]
+    pub zone_key: u16,
     pub activity: Activity,
     /// Short goal name ("quest", "grind", …).
     pub goal: String,
@@ -91,6 +107,63 @@ pub struct BotSnapshot {
     pub has_house: bool,
     pub online_secs: u32,
     pub paused: bool,
+    /// The guild (expedition) the bot belongs to, with its members; none for a bot in no guild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guild: Option<Box<GuildInfo>>,
+    /// The party of real players the bot is in (a companion), with its members; none for a bot
+    /// in no party or in a party of bots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub party: Option<Box<PartyInfo>>,
+}
+
+/// The guild of a bot as its web snapshot shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GuildInfo {
+    /// The guild id.
+    pub id: u32,
+    pub name: String,
+    /// The bot's own rank: "General" (the owner), "Commander", "Officer", "Member", "Apprentice".
+    pub role: String,
+    /// The members the bot knows, the owner first.
+    pub members: Vec<GuildMember>,
+}
+
+/// A member of a guild.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GuildMember {
+    pub name: String,
+    /// Rank, as in [`GuildInfo::role`].
+    pub role: String,
+    pub level: u8,
+    pub online: bool,
+    /// One of our bots (else a real player).
+    pub bot: bool,
+}
+
+/// The party of a bot as its web snapshot shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PartyInfo {
+    /// The server's team id.
+    pub id: u32,
+    /// Name of the leader (the owner of the team).
+    pub leader: String,
+    /// What the bot does when nothing special is going on: `follow` or `stay`.
+    pub mode: String,
+    /// The members the bot knows, the bot itself included.
+    pub members: Vec<PartyMember>,
+}
+
+/// A member of a party.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PartyMember {
+    pub name: String,
+    /// `tank`, `healer`, `attacker` or empty (no role chosen).
+    pub role: String,
+    pub level: u8,
+    pub leader: bool,
+    pub online: bool,
+    /// One of our bots (else a real player).
+    pub bot: bool,
 }
 
 /// One line of a bot's event log.
@@ -110,6 +183,22 @@ pub struct QuestLine {
     pub status: String,
 }
 
+/// One crop of a bot (the farming goal).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlotLine {
+    /// Where it stands.
+    pub x: f32,
+    pub y: f32,
+    /// What grows there (the crop's name).
+    pub crop: String,
+    /// `growing`, `ripe`, `due` (worth a look) or `out of view`, with the time left when known.
+    pub state: String,
+    /// The seeds were bought: the harvest may be sold.
+    pub honest: bool,
+    /// Where it is: `own land` or the kind of public farm.
+    pub land: String,
+}
+
 /// Everything the detail panel shows about one bot.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BotDetail {
@@ -127,6 +216,9 @@ pub struct BotDetail {
     /// the motion controller; the UI draws it for the selected bot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<[f32; 2]>,
+    /// The bot's crops (the farming goal), empty when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plots: Vec<PlotLine>,
 }
 
 /// Token-budget numbers of the optional LLM.
@@ -307,11 +399,25 @@ pub enum Command {
     Despawn {
         count: u32,
     },
+    /// Global: log in `count` more bots that match the filter (their race decides the side and
+    /// the home continent). The roster grows with matching races when too few are free.
+    SpawnWhere {
+        count: u32,
+        #[serde(default)]
+        filter: SpawnFilter,
+    },
+    /// Global: log out up to `count` bots that match the filter, idle and resting ones first; a bot
+    /// that trades, duels, runs a dungeon or meets a buyer is left alone.
+    DespawnWhere {
+        count: u32,
+        #[serde(default)]
+        filter: SpawnFilter,
+    },
 }
 
 impl Command {
     /// Values accepted by [`Command::Goal`].
-    pub const GOALS: [&'static str; 13] = [
+    pub const GOALS: [&'static str; 19] = [
         "quest",
         "grind",
         "duel",
@@ -322,6 +428,12 @@ impl Command {
         "sail",
         "auction",
         "market",
+        "guild",
+        "gank",
+        "warzone",
+        "event",
+        "companion",
+        "farm",
         "rest",
         "wander",
         "auto",
@@ -396,6 +508,15 @@ impl Command {
                     Err(format!("count must be 1..={}", Command::MAX_COUNT))
                 } else {
                     Ok(())
+                }
+            }
+            Command::SpawnWhere { count, filter } | Command::DespawnWhere { count, filter } => {
+                if bot.is_some() {
+                    Err("spawn/despawn are global: POST /api/command".into())
+                } else if *count == 0 || *count > Command::MAX_COUNT {
+                    Err(format!("count must be 1..={}", Command::MAX_COUNT))
+                } else {
+                    filter.validate()
                 }
             }
         }
@@ -516,6 +637,24 @@ pub trait BotHub: Send + Sync + 'static {
     fn issue_action(&self, _fingerprint: &str, _action: IssueAction) -> Result<(), String> {
         Err("issue reports are not available".into())
     }
+
+    /// Players and bots by continent and side, zones, heat, and what the game server says.
+    fn world(&self) -> WorldView {
+        WorldView::default()
+    }
+    /// Scarce items, prices and supply.
+    fn economy(&self) -> EconomyView {
+        EconomyView::default()
+    }
+    /// The population director: policy, targets, health and the log of its actions.
+    fn director(&self) -> DirectorView {
+        DirectorView::default()
+    }
+    /// Changes the director's policy (only the fields present change). The error text is shown to
+    /// the operator.
+    fn set_policy(&self, _patch: PolicyPatch) -> Result<(), String> {
+        Err("the population director is not available".into())
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +760,9 @@ mod tests {
         assert!(g("sail").validate(Some(1)).is_ok());
         assert!(g("auction").validate(Some(1)).is_ok());
         assert!(g("market").validate(Some(1)).is_ok());
+        for name in ["guild", "gank", "warzone", "event", "companion", "farm"] {
+            assert!(g(name).validate(Some(1)).is_ok(), "{name}");
+        }
 
         assert!(Command::Spawn { count: 10 }.validate(None).is_ok());
         assert!(Command::Spawn { count: 0 }.validate(None).is_err());
@@ -756,13 +898,44 @@ mod tests {
             extra: Vec::new(),
             chat: Vec::new(),
             path: Vec::new(),
+            plots: Vec::new(),
         };
         let v = serde_json::to_value(&d).unwrap();
         assert!(v.get("path").is_none(), "{v}");
+        assert!(v.get("plots").is_none(), "{v}");
         d.path = vec![[1.5, 2.0], [3.0, -4.25]];
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains(r#""path":[[1.5,2.0],[3.0,-4.25]]"#), "{json}");
         let back: BotDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn the_plots_of_a_detail_are_left_out_when_empty_and_round_trip_otherwise() {
+        let mut d = BotDetail {
+            snapshot: BotSnapshot::default(),
+            log: Vec::new(),
+            quests: Vec::new(),
+            extra: Vec::new(),
+            chat: Vec::new(),
+            path: Vec::new(),
+            plots: Vec::new(),
+        };
+        d.plots.push(PlotLine {
+            x: 10.5,
+            y: -3.0,
+            crop: "Potato".into(),
+            state: "ripe".into(),
+            honest: true,
+            land: "farm".into(),
+        });
+        let json = serde_json::to_string(&d).unwrap();
+        let back: BotDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+        // a detail from before the field existed still reads
+        let mut v = serde_json::to_value(&d).unwrap();
+        v.as_object_mut().unwrap().remove("plots");
+        let old: BotDetail = serde_json::from_value(v).unwrap();
+        assert!(old.plots.is_empty());
     }
 }

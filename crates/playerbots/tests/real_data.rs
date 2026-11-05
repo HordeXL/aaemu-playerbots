@@ -184,7 +184,7 @@ impl Rig {
     }
 
     /// The goals the brain leaves out of its choice for this bot right now.
-    fn gate(&mut self) -> u16 {
+    fn gate(&mut self) -> playerbots::bot::cmd::GoalMask {
         let ctx = Ctx {
             world: &self.world,
             cfg: &self.cfg,
@@ -654,7 +654,7 @@ fn goals_that_cannot_succeed_are_left_out_of_the_choice() {
         eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
         return;
     };
-    let both = (1u16 << GoalKind::TradeRun.index()) | (1u16 << GoalKind::Housing.index());
+    let both = (1 << GoalKind::TradeRun.index()) | (1 << GoalKind::Housing.index());
     let mut rig = Rig::new(world.clone(), "Reaper", 22);
     assert!(!rig.cfg.bots.gm_bootstrap);
     assert_eq!(
@@ -693,7 +693,7 @@ fn goals_that_cannot_succeed_are_left_out_of_the_choice() {
         id: 77,
         grade: 0,
     });
-    assert_eq!(rig.gate(), 1u16 << GoalKind::Housing.index());
+    assert_eq!(rig.gate(), 1 << GoalKind::Housing.index());
 }
 
 #[test]

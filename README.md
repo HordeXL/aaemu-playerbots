@@ -28,11 +28,15 @@ whatever it is doing. Most features have a switch in `[behavior]`, `[social]`, `
 | **Quests** | Journal first, then story, then the nearest side quest: walks to the giver, accepts, does the objectives (talk, kill, gather, use an item or doodad, reach a sphere) and turns in. Failures back off, repeated ones quarantine the quest. |
 | **Grinding** | Kills level-appropriate monsters near the bot and loots them. |
 | **Duels** | A coordinator pairs two idle bots; they meet at a flag, fight with their PvP rotation and rest afterwards. |
+| **PvP** | Off by default (`[pvp]`). Bots fight back, retreat when hurt, ambush hostile trade-pack carriers (alone or in a squad, then collect and sell the dropped pack) and fight in zones at war; they never attack a friendly character, a character in its home zone or a name in `never_names`. |
 | **Player trade** | Two bots meet, open the trade window, put up goods and money, lock and confirm. Trades with real players are off unless `trade_with_players` is set (and never while `gm_bootstrap` is on). |
 | **Trade-chat market** | Bots with honestly gathered surplus advertise in trade chat, answer buyers (price, one counter, the place), meet them in town or on Mirage Isle and trade only a window that holds exactly what was agreed (`[market]`, see `docs/OPERATING.md`). |
 | **Trade runs** | Crafts a trade pack at a specialty workbench, carries it to the NPC that buys it, sells it and collects the payment mail. |
 | **Auction house** | Walks to the nearest auctioneer now and then, lists whole stacks of honestly gathered goods at a price under the going rate, buys a bargain when the bot has gold of its own, and collects the sale, refund and won-lot mails. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and goes home to rest there. |
+| **Farming** | Off unless `[farm] enabled`. Buys seeds from a vendor with the bot's own money, plants them in the garden of its house or on a public farm, remembers the plots, comes back when they are ripe, harvests and replants. It grows what is wished for (the director or the Economy view) or scarce before what merely pays, and the produce counts as the bot's own to sell only when the seeds were bought (never when they were minted with a GM command). Public farm polygons (`farm_areas.json`) come from `playerbots bake`; the web UI lists a bot's plots and the Economy view what is being grown. See `docs/OPERATING.md`. |
+| **Guilds** | Off unless `[guild] enabled`. Five bots of one faction found a guild together (team, charter, a generated name), then the officers recruit unguilded bots of the faction, the owner appoints one or two officers, the members greet newcomers and chat now and then, and a member leaves now and then (an owner hands the guild over first). A real player gets an invitation by whispering "ginv" or "can i join" to an officer; bots never expel or demote a real player, and accept a player's invitation only with `accept_player_invites` (see `docs/OPERATING.md`). |
+| **World events** | With `[events] enabled`, bots join a running rift (tower defence event): they walk to the defended target, hold within 40 m of it, kill the monsters of the current wave next to each other (a few at a time, `max_bots_per_event` and `max_share`) and leave when it ends or they are hurt. Bots keep out of zone groups at war (`avoid_war_zones`), and a rift whose waves never show, never advance or never end is filed as a server issue. |
 | **Rest, wander, chat** | Recovers hit points and mana, strolls around, answers whispers and nearby players (canned lines or, optionally, an LLM in character). |
 | **Life-like movement** | In front of a real player a bot jumps now and then (on a straight run, at a step, to cheer a level), turns on the spot, pauses at corners, runs at its own pace, greets passers-by, answers an emote and sits down to rest. Each bot has its own temperament (some never jump); nothing happens without an audience or while the bot fights, trades or sails. Switch: `[behavior] lifelike`, `jump_rate`, `emotes`. |
 
@@ -66,7 +70,10 @@ recall points when that is faster than walking, and hop through each other's gat
 
 **Sailing.** A bot summons a rowboat from a scroll at a beach, sails it 1 to 3 km across the sea (to
 another beach or on a loop) with a heading controller that finds the wheel's direction by itself,
-then leaves the boat, despawns it and swims ashore. Sea only.
+then leaves the boat, despawns it and swims ashore. Sea only. `[sail] ship` lets the bots sail the
+bigger hulls instead (clipper, cutter, junk, yawl, merchant schooner, or a mix with `auto`): they
+launch where the server has room for the hull, steer with its real speed and turn radius, take
+rounded routes and berth out at sea.
 
 ![The web UI with seven bots sailing rowboats across the Arcadian Sea between two islands; one is selected and its detail panel shows the sail goal and its steering log](docs/images/webui-sail.png)
 
@@ -80,6 +87,12 @@ level the dungeon accepts). The leader invites, the party walks to the entrance,
 and clears the dungeon along a route of its hostile spawns: the leader picks targets, the members
 follow and assist, everybody rests when low. Then they use the exit and disband. The server's
 refusals are answered by kind and the entry limit is counted like the server counts it.
+
+**Parties of real players.** With `[party]` on, a bot joins the party a real player invites it to (or
+invites the player who whispers `inv`), follows the leader across the map, helps in the fights, obeys
+`follow`, `stay`, `come`, `assist`, `leave` and `dungeon <name>`, and goes through a dungeon door
+behind the leader and out again with it. It says no at once when it is busy, in a team already or
+the levels are too far apart. See [OPERATING.md](docs/OPERATING.md#parties-of-real-players-party).
 
 ### Server QA
 
@@ -105,6 +118,12 @@ How the detectors judge, what is reportable, the queue file and the privacy rule
   duel flags and trade outlets, a searchable bot list, per-bot state, quests, chat and event log, the
   Issues panel and the process stats. Commands: pause or resume, force a goal, make two bots duel or
   trade, say a line, whisper, spawn and despawn bots.
+* **World metrics and a population director**: World, Economy and Director views in the web UI show
+  where the players and the bots are by continent and side (and on the map as heat), which items are
+  scarce, and what the director does. The director can log bots in and out to follow the players
+  (the west gets bots when the east fills up) within caps, and it is off, then a dry run, by default.
+  Spawn and despawn by side, race and continent. Optional use of the game server's web API for exact
+  counts. See [docs/OPERATING.md](docs/OPERATING.md#world-metrics-and-the-population-director).
 * **Optional LLM** (DeepSeek, or any OpenAI-compatible `chat/completions` endpoint): bots answer
   players with a short in-character line and, with the director on, now and then choose a goal. It is
   off by default, never on the tick path, rate limited and budgeted per UTC day, and its output is
@@ -237,7 +256,8 @@ else is bounded: [docs/OPERATING.md](docs/OPERATING.md#memory-and-scale)).
 * Quest progression walks: a bot never rides a carriage or an airship, so a trip to a zone it
   can only reach that way fails and the destination rests for a while. A trip ends as soon as
   any quest comes within 1500 m, so a bot on its way can be drawn aside by a side quest.
-* Sailing is sea only (no lakes or rivers) and has no passengers yet.
+* Sailing is sea only (no lakes or rivers) and has no passengers yet; the bigger hulls sail with
+  their driver only (no crew, no cannons, no cargo).
 * Portal ink and stones, boat scrolls and the dungeon level-up need the GM bootstrap unless the bot
   already carries them.
 * Built for, and tested against, AAEmu-1.2-Rust and the 1.2 client (r208022) only.
@@ -248,7 +268,7 @@ else is bounded: [docs/OPERATING.md](docs/OPERATING.md#memory-and-scale)).
 | --- | --- |
 | `crates/proto` (`aa-proto`) | Wire protocol: framing, login client, game connection, packet builders and parsers. |
 | `crates/world` (`aa-world`) | Static world knowledge from `compact.sqlite3`, the server's spawn files and the baked data: spatial index, terrain, navigation meshes, sea map, travel data. |
-| `crates/bake` (`aa-bake`) | One-off extraction of terrain, navigation meshes, map, zones, housing areas and quest spheres from `game_pak`; the `nav_render` example draws a mesh and a route. |
+| `crates/bake` (`aa-bake`) | One-off extraction of terrain, navigation meshes, map, zones, housing areas, public farm polygons and quest spheres from `game_pak`; the `nav_render` example draws a mesh and a route. |
 | `crates/web` (`pb-web`) | Operator web UI (JSON API and a single-page map). |
 | `crates/llm` (`pb-llm`) | The optional OpenAI-compatible client with rate limit, concurrency cap and token budget. |
 | `crates/playerbots` | The binary: config, roster, bot runtime, goals, coordinator, hub, supervisor, server issue reports. |

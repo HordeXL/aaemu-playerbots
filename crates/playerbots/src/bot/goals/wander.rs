@@ -74,7 +74,9 @@ impl Wander {
             manner::wander_pause(ctx);
             return GoalStatus::Running;
         }
-        match random_point(ctx.world, ctx.rng, self.home, LEG_MIN_M, LEG_MAX_M, 8) {
+        match random_point(ctx.world, ctx.rng, self.home, LEG_MIN_M, LEG_MAX_M, 8)
+            .filter(|&(x, y)| !ctx.in_war_zone(x, y))
+        {
             Some((x, y)) => {
                 let pace = if ctx.rng.f32() < WALK_CHANCE {
                     Pace::Walk

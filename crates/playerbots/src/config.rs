@@ -30,8 +30,22 @@ pub struct Config {
     pub bots: BotsCfg,
     /// Goal weights.
     pub behavior: BehaviorCfg,
+    /// Sailing: which boat the bots sail.
+    pub sail: SailCfg,
     /// Selling: the auction house, trade-chat advertisements, buyers.
     pub market: MarketCfg,
+    /// Guilds (expeditions): bots found, join and run them.
+    pub guild: GuildCfg,
+    /// Player versus player: defending, bot against bot, attacking players, ganks, warzones.
+    pub pvp: PvpCfg,
+    /// World events such as rifts.
+    pub events: EventsCfg,
+    /// Parties with real players.
+    pub party: PartyCfg,
+    /// The population director of the web UI: starts and stops bots by itself.
+    pub population: PopulationCfg,
+    /// Farming: planting and harvesting crops.
+    pub farm: FarmCfg,
     /// Operator web UI (`bind`, `token`).
     pub web: pb_web::WebConfig,
     /// Optional LLM add-on.
@@ -245,6 +259,54 @@ impl Default for BehaviorCfg {
     }
 }
 
+/// Which boat a bot sails (`[sail] ship`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShipChoice {
+    /// The rowboat (3.2 m/s, one passenger).
+    #[default]
+    Rowboat,
+    /// The clipper (6.5 m/s, driver only).
+    Clipper,
+    /// The Eznan cutter (6.3 m/s, 8 cannons, 4 pack racks).
+    Cutter,
+    /// The Lutesong junk (the cutter's hull).
+    Junk,
+    /// The Growling yawl (9.8 m/s).
+    Yawl,
+    /// The Merchant Schooner (6.5 m/s, 2 cannons, 20 pack racks).
+    Schooner,
+    /// A bot sails the boat whose scroll it holds, else each bot has a boat of its own: mostly
+    /// rowboats and clippers, some cutters, junks and schooners (merchants like the schooner).
+    Auto,
+}
+
+impl ShipChoice {
+    /// The hull family of a fixed choice; `None` for `auto`.
+    pub fn family(self) -> Option<aa_world::travel::ShipFamily> {
+        use aa_world::travel::ShipFamily as F;
+        match self {
+            ShipChoice::Rowboat => Some(F::Rowboat),
+            ShipChoice::Clipper => Some(F::Clipper),
+            ShipChoice::Cutter => Some(F::Cutter),
+            ShipChoice::Junk => Some(F::Junk),
+            ShipChoice::Yawl => Some(F::Yawl),
+            ShipChoice::Schooner => Some(F::Schooner),
+            ShipChoice::Auto => None,
+        }
+    }
+}
+
+/// `[sail]`: the boats of the sailing goal (switched on and off by `[behavior] sailing`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SailCfg {
+    /// The boat the bots sail: `rowboat` (default), `clipper`, `cutter`, `junk`, `yawl`,
+    /// `schooner` or `auto`. With `bots.gm_bootstrap` a bot gets the scroll with the GM
+    /// `/item add` command; without, it needs the scroll in its bag.
+    pub ship: ShipChoice,
+}
+
 /// Where a bot meets the buyer of something it advertised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -292,6 +354,311 @@ impl Default for MarketCfg {
             meet_at: MeetAt::Auto,
             max_ads_per_hour: 12,
             ad_interval_secs: 900,
+        }
+    }
+}
+
+/// `[guild]`: bots in guilds (expeditions). Everything is off until `enabled` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuildCfg {
+    /// Master switch of the guild features (goal `guild`). Off: no bot founds, joins or runs a
+    /// guild.
+    pub enabled: bool,
+    /// Bots may found guilds. Off: they only join existing ones.
+    pub found: bool,
+    /// A bot founds or joins a guild from this level on.
+    pub min_level: u8,
+    /// Bots that found a guild together (the party that signs the charter).
+    pub party_size: u8,
+    /// This process founds at most this many guilds (0 = none).
+    pub max_guilds: u32,
+    /// Bots accept the guild invitations of real players.
+    pub accept_player_invites: bool,
+    /// How many times an hour a bot that has been in a bot guild for a quarter of an hour leaves
+    /// it, on average (0 = never). An owner hands the guild to another bot first; the bot can be
+    /// invited again after a while.
+    pub churn_per_hour: f32,
+}
+
+impl Default for GuildCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            found: true,
+            min_level: 5,
+            party_size: 5,
+            max_guilds: 3,
+            accept_player_invites: false,
+            churn_per_hour: 0.2,
+        }
+    }
+}
+
+/// `[pvp]`: fights between players. Everything is off until `enabled` is set, and attacking real
+/// players is a switch of its own (see [`Config::may_attack_players`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PvpCfg {
+    /// Master switch of the pvp features (goals `gank` and `warzone`, the defence below).
+    pub enabled: bool,
+    /// A bot fights back when a player attacks it.
+    pub defend: bool,
+    /// Bots of hostile factions attack each other.
+    pub attack_bots: bool,
+    /// Bots attack real players (characters that are not ours); ignored while `bots.gm_bootstrap`
+    /// is on, see [`Config::may_attack_players`].
+    pub attack_players: bool,
+    /// Bots ambush trade-pack carriers (goal `gank`).
+    pub gank: bool,
+    /// Bots fight in zones at war (goal `warzone`).
+    pub warzone: bool,
+    /// Character names that are never attacked (game masters, friends).
+    pub never_names: Vec<String>,
+    /// When not empty: the only real players that may be attacked.
+    pub only_names: Vec<String>,
+    /// Most bots that attack together.
+    pub max_squad: u8,
+    /// A bot below this many percent of its hit points breaks off a fight.
+    pub retreat_hp_pct: u8,
+    /// Most characters one bot kills in one war of a zone group; it leaves the war after that.
+    pub war_kill_cap: u8,
+}
+
+impl Default for PvpCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defend: true,
+            attack_bots: false,
+            attack_players: false,
+            gank: false,
+            warzone: false,
+            never_names: Vec::new(),
+            only_names: Vec::new(),
+            max_squad: 3,
+            retreat_hp_pct: 35,
+            war_kill_cap: 10,
+        }
+    }
+}
+
+/// `[events]`: bots at world events such as rifts. Everything is off until `enabled` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventsCfg {
+    /// Master switch of the event features (goal `event`).
+    pub enabled: bool,
+    /// At most this many bots join one event.
+    pub max_bots_per_event: u32,
+    /// At most this share (0..=1) of all bots joins events at once.
+    pub max_share: f32,
+    /// A bot waits a random number of seconds in this range (low, high) before it joins.
+    #[serde(deserialize_with = "pair_of_secs")]
+    pub join_delay_secs: [u64; 2],
+    /// Bots stay out of zones at war.
+    pub avoid_war_zones: bool,
+}
+
+impl Default for EventsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bots_per_event: 6,
+            max_share: 0.25,
+            join_delay_secs: [10, 120],
+            avoid_war_zones: true,
+        }
+    }
+}
+
+/// A `[low, high]` pair of seconds. Exactly two numbers: serde would otherwise ignore a third.
+fn pair_of_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u64; 2], D::Error> {
+    let v = Vec::<u64>::deserialize(d)?;
+    <[u64; 2]>::try_from(v)
+        .map_err(|v| serde::de::Error::invalid_length(v.len(), &"a [low, high] pair"))
+}
+
+/// `[party]`: bots and the parties of real players. Everything is off by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PartyCfg {
+    /// Bots join the parties of real players when invited (goal `companion`).
+    pub join_player_parties: bool,
+    /// Bots obey party chat commands of the player who leads the party.
+    pub chat_commands: bool,
+    /// A bot in a player's party follows it into instance dungeons.
+    pub follow_into_dungeons: bool,
+    /// A bot declines the invitation of a player whose level (when it is known) differs from its
+    /// own by more than this.
+    pub max_level_gap: u8,
+    /// This process has at most this many bots in the parties of real players at once; more
+    /// invitations are declined.
+    pub max_companions: u32,
+    /// At most this many of our bots join one player's party (a party holds five).
+    pub max_per_player: u8,
+}
+
+impl Default for PartyCfg {
+    fn default() -> Self {
+        Self {
+            join_player_parties: false,
+            chat_commands: false,
+            follow_into_dungeons: false,
+            max_level_gap: 10,
+            max_companions: 8,
+            max_per_player: 4,
+        }
+    }
+}
+
+/// `[population]`: the population director of the web UI, which starts and stops bots to follow
+/// the players. Off by default; with `dry_run` it only says what it would do. The policy keys
+/// (`max_online` ... `backoff_open_issues`) are the start values of the policy the operator edits in
+/// the web UI; `max_spawn_per_min` and `min_action_gap_secs` are hard limits the UI cannot lift.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PopulationCfg {
+    /// Master switch of the director.
+    pub enabled: bool,
+    /// The director only logs what it would do.
+    pub dry_run: bool,
+    /// It starts at most this many bots per minute (0 = none).
+    pub max_spawn_per_min: u32,
+    /// Seconds between two of its actions (at least 1).
+    pub min_action_gap_secs: u64,
+    /// Bots online, all together, that it will not exceed when it starts more.
+    pub max_online: u32,
+    /// Each side keeps at least this many bots.
+    pub min_per_side: u32,
+    /// A side aims for this many characters (players plus bots) per 100 players on the other side.
+    pub mirror_pct: u32,
+    /// No side gets more bots than this from the director.
+    pub per_side_cap: u32,
+    /// The most bots one action starts or stops.
+    pub step: u32,
+    /// Bots above the target a side keeps before the director stops some.
+    pub hysteresis: u32,
+    /// The director may stop the bots it started.
+    pub despawn: bool,
+    /// Stops starting bots above this much process memory in megabytes (0 = ignore).
+    pub backoff_rss_mb: u32,
+    /// ... above this many packets per second from the server (0 = ignore).
+    pub backoff_packets_in: u32,
+    /// ... after this many failed or short sessions within five minutes (0 = ignore).
+    pub backoff_login_failures: u32,
+    /// ... with this many open server issues (0 = ignore).
+    pub backoff_open_issues: u32,
+    /// Where the policy's numbers, wishes and goal weights are kept between runs; empty = in memory
+    /// only. `enabled` and `dry_run` are not restored from it: they start as configured.
+    pub policy_file: Option<PathBuf>,
+    /// The game server's web API (`http://host:port`); empty = not used. Adds the exact number of
+    /// players online, the server's status and the auction house's lots to the web UI.
+    pub server_api: String,
+    /// The name of the environment variable that holds the API's bearer key.
+    pub server_api_key_env: String,
+    /// A file whose first line is the API's bearer key (used when the variable is not set).
+    pub server_api_key_file: Option<PathBuf>,
+    /// Seconds between two polls of the server API (at least 5).
+    pub server_poll_secs: u64,
+}
+
+impl Default for PopulationCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            max_spawn_per_min: 10,
+            min_action_gap_secs: 60,
+            max_online: 50,
+            min_per_side: 0,
+            mirror_pct: 100,
+            per_side_cap: 20,
+            step: 3,
+            hysteresis: 2,
+            despawn: true,
+            backoff_rss_mb: 3072,
+            backoff_packets_in: 30_000,
+            backoff_login_failures: 8,
+            backoff_open_issues: 50,
+            policy_file: None,
+            server_api: String::new(),
+            server_api_key_env: String::new(),
+            server_api_key_file: None,
+            server_poll_secs: 30,
+        }
+    }
+}
+
+impl PopulationCfg {
+    /// The policy the web UI starts with.
+    pub fn policy(&self) -> pb_web::Policy {
+        pb_web::Policy {
+            active: self.enabled,
+            dry_run: self.dry_run,
+            max_online: self.max_online,
+            min_per_side: self.min_per_side,
+            mirror_pct: self.mirror_pct,
+            per_side_cap: self.per_side_cap,
+            step: self.step,
+            hysteresis: self.hysteresis,
+            despawn: self.despawn,
+            backoff_rss_mb: self.backoff_rss_mb,
+            backoff_packets_in: self.backoff_packets_in,
+            backoff_login_failures: self.backoff_login_failures,
+            backoff_open_issues: self.backoff_open_issues,
+            ..pb_web::Policy::default()
+        }
+    }
+}
+
+/// Whether `url` is an `http://` or `https://` address with a host and no credentials in it.
+fn plain_http_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `[farm]`: bots that plant and harvest crops (goal `farm`). Off by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FarmCfg {
+    /// Master switch of the farming features.
+    pub enabled: bool,
+    /// One bot tends at most this many plots.
+    pub max_plots: u32,
+    /// The game server's `World.GrowthRate` (crops grow this many times faster). It is not on the
+    /// wire; set it when the server does.
+    pub growth_rate: f32,
+    /// Bots plant on the public farms (the farm sub zones, needs `farm_areas.json` in the baked
+    /// data). Off: only on the land of their own houses.
+    pub public_farms: bool,
+    /// Bots plant on the land of their own houses.
+    pub own_land: bool,
+    /// A bot plants the seeds a harvest gives back on the spot it harvested.
+    pub replant: bool,
+    /// The farthest a bot walks to a farm, a vendor or a plot (metres); trips longer than
+    /// `bots.long_travel_teleport_m` use the GM `/move` when `bots.gm_bootstrap` is on.
+    pub max_trip_m: f32,
+}
+
+impl Default for FarmCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_plots: 5,
+            growth_rate: 1.0,
+            public_farms: true,
+            own_land: true,
+            replant: true,
+            max_trip_m: 4_000.0,
         }
     }
 }
@@ -501,6 +868,14 @@ impl Config {
         self.market.enabled && self.market.sell_to_players && !self.bots.gm_bootstrap
     }
 
+    /// Whether bots may attack real players (characters that are not one of ours):
+    /// `pvp.attack_players` with `pvp.enabled`, and never while `bots.gm_bootstrap` is on, because
+    /// a GM-bootstrapped bot may hold minted gear and levels that a player cannot match (the same
+    /// rule as [`Config::may_sell_to_players`]).
+    pub fn may_attack_players(&self) -> bool {
+        self.pvp.enabled && self.pvp.attack_players && !self.bots.gm_bootstrap
+    }
+
     /// Checks the values that would otherwise fail late and obscurely.
     pub fn validate(&self) -> anyhow::Result<()> {
         let s = &self.server;
@@ -576,6 +951,138 @@ impl Config {
         ensure!(
             self.market.ad_interval_secs >= 60,
             "market.ad_interval_secs must be at least 60"
+        );
+        let g = &self.guild;
+        ensure!(g.min_level >= 1, "guild.min_level must be at least 1");
+        ensure!(
+            (1..=50).contains(&g.party_size),
+            "guild.party_size must be in 1..=50"
+        );
+        ensure!(
+            g.max_guilds <= MAX_BOTS,
+            "guild.max_guilds {} is above the limit of {MAX_BOTS}",
+            g.max_guilds
+        );
+        ensure!(
+            g.churn_per_hour.is_finite() && (0.0..=60.0).contains(&g.churn_per_hour),
+            "guild.churn_per_hour must be a number in 0..=60"
+        );
+        let pt = &self.party;
+        ensure!(
+            pt.max_level_gap >= 1,
+            "party.max_level_gap must be at least 1"
+        );
+        ensure!(
+            (1..=4).contains(&pt.max_per_player),
+            "party.max_per_player must be in 1..=4"
+        );
+        ensure!(
+            pt.max_companions <= MAX_BOTS,
+            "party.max_companions {} is above the limit of {MAX_BOTS}",
+            pt.max_companions
+        );
+        let pv = &self.pvp;
+        ensure!(
+            (1..=50).contains(&pv.max_squad),
+            "pvp.max_squad must be in 1..=50"
+        );
+        ensure!(
+            pv.retreat_hp_pct <= 100,
+            "pvp.retreat_hp_pct must be in 0..=100"
+        );
+        ensure!(
+            (1..=100).contains(&pv.war_kill_cap),
+            "pvp.war_kill_cap must be in 1..=100"
+        );
+        for (key, names) in [
+            ("never_names", &pv.never_names),
+            ("only_names", &pv.only_names),
+        ] {
+            ensure!(
+                names.iter().all(|n| !n.trim().is_empty()),
+                "pvp.{key} must not hold an empty name"
+            );
+        }
+        let ev = &self.events;
+        ensure!(
+            ev.max_bots_per_event <= MAX_BOTS,
+            "events.max_bots_per_event {} is above the limit of {MAX_BOTS}",
+            ev.max_bots_per_event
+        );
+        ensure!(
+            ev.max_share.is_finite() && (0.0..=1.0).contains(&ev.max_share),
+            "events.max_share must be in 0..=1"
+        );
+        ensure!(
+            ev.join_delay_secs[0] <= ev.join_delay_secs[1],
+            "events.join_delay_secs must be [low, high] with low <= high"
+        );
+        let po = &self.population;
+        ensure!(
+            po.max_spawn_per_min <= MAX_BOTS,
+            "population.max_spawn_per_min {} is above the limit of {MAX_BOTS}",
+            po.max_spawn_per_min
+        );
+        ensure!(
+            po.min_action_gap_secs >= 1,
+            "population.min_action_gap_secs must be at least 1"
+        );
+        for (key, v) in [
+            ("max_online", po.max_online),
+            ("min_per_side", po.min_per_side),
+            ("per_side_cap", po.per_side_cap),
+        ] {
+            ensure!(
+                v <= MAX_BOTS,
+                "population.{key} {v} is above the limit of {MAX_BOTS}"
+            );
+        }
+        ensure!(
+            po.mirror_pct <= 1000,
+            "population.mirror_pct must be at most 1000"
+        );
+        ensure!(
+            (1..=1000).contains(&po.step),
+            "population.step must be in 1..=1000"
+        );
+        ensure!(
+            po.hysteresis <= 1000,
+            "population.hysteresis must be at most 1000"
+        );
+        ensure!(
+            po.server_poll_secs >= 5,
+            "population.server_poll_secs must be at least 5"
+        );
+        ensure!(
+            po.server_api.is_empty() || plain_http_url(&po.server_api),
+            "population.server_api must be an http:// or https:// address without a login in it \
+             (the key goes in server_api_key_env or server_api_key_file)"
+        );
+        ensure!(
+            po.server_api_key_env.is_empty()
+                || (po
+                    .server_api_key_env
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !po
+                        .server_api_key_env
+                        .starts_with(|c: char| c.is_ascii_digit())),
+            "population.server_api_key_env must be the NAME of an environment variable"
+        );
+        ensure!(
+            self.farm.max_plots <= 1000,
+            "farm.max_plots {} is above the limit of 1000",
+            self.farm.max_plots
+        );
+        ensure!(
+            self.farm.growth_rate.is_finite() && (0.01..=10_000.0).contains(&self.farm.growth_rate),
+            "farm.growth_rate {} must be between 0.01 and 10000",
+            self.farm.growth_rate
+        );
+        ensure!(
+            self.farm.max_trip_m.is_finite() && (50.0..=100_000.0).contains(&self.farm.max_trip_m),
+            "farm.max_trip_m {} must be between 50 and 100000",
+            self.farm.max_trip_m
         );
         let c = &self.social;
         ensure!(
@@ -1089,6 +1596,367 @@ lifelike = 1
             "[behavior]
 emote = true
 ",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The text of `[section]` in the example config.
+    fn example_section(name: &str) -> &'static str {
+        let head = format!("\n[{name}]\n");
+        Config::example()
+            .split(head.as_str())
+            .nth(1)
+            .and_then(|s| s.split("\n[").next())
+            .unwrap_or_else(|| panic!("a [{name}] section"))
+    }
+
+    /// Every `key = value` line must be in the section of the example, so the file documents each
+    /// key with its default.
+    fn assert_documented(section: &str, lines: &[&str]) {
+        let text = example_section(section);
+        for line in lines {
+            assert!(
+                text.contains(&format!("\n{line}\n")),
+                "[{section}] {line} is not in the example"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wave_one_sections_are_all_off_by_default() {
+        let c = Config::default();
+        assert!(!c.guild.enabled && !c.pvp.enabled && !c.events.enabled);
+        assert!(!c.population.enabled && !c.farm.enabled);
+        assert!(!c.party.join_player_parties && !c.party.chat_commands);
+        assert!(!c.party.follow_into_dungeons);
+        // the example file documents every key with its default and parses to the same values
+        let ex = Config::parse(Config::example()).unwrap();
+        assert!(!ex.guild.enabled && !ex.pvp.enabled && !ex.events.enabled);
+        assert!(!ex.population.enabled && !ex.farm.enabled);
+        assert!(!ex.party.join_player_parties && !ex.party.chat_commands);
+        assert!(!ex.party.follow_into_dungeons);
+        assert!(!c.may_attack_players() && !ex.may_attack_players());
+    }
+
+    #[test]
+    fn the_guild_keys_have_quiet_defaults() {
+        let g = Config::default().guild;
+        assert!(!g.enabled && g.found && !g.accept_player_invites);
+        assert_eq!((g.min_level, g.party_size, g.max_guilds), (5, 5, 3));
+        let ex = Config::parse(Config::example()).unwrap().guild;
+        assert!(!ex.enabled && ex.found && !ex.accept_player_invites);
+        assert_eq!((ex.min_level, ex.party_size, ex.max_guilds), (5, 5, 3));
+        assert_documented(
+            "guild",
+            &[
+                "enabled = false",
+                "found = true",
+                "min_level = 5",
+                "party_size = 5",
+                "max_guilds = 3",
+                "accept_player_invites = false",
+                "churn_per_hour = 0.2",
+            ],
+        );
+        assert_eq!((g.churn_per_hour, ex.churn_per_hour), (0.2, 0.2));
+        let cfg = Config::parse(
+            "[guild]\nenabled = true\nfound = false\nmin_level = 20\nparty_size = 2\nmax_guilds = 0\naccept_player_invites = true\nchurn_per_hour = 6\n",
+        )
+        .unwrap();
+        let g = cfg.guild;
+        assert!(g.enabled && !g.found && g.accept_player_invites);
+        assert_eq!((g.min_level, g.party_size, g.max_guilds), (20, 2, 0));
+        assert_eq!(g.churn_per_hour, 6.0);
+        for bad in [
+            "[guild]\nfounds = true\n",
+            "[guild]\nenabled = 1\n",
+            "[guild]\nmin_level = 0\n",
+            "[guild]\nmin_level = 256\n",
+            "[guild]\nparty_size = 0\n",
+            "[guild]\nparty_size = 51\n",
+            "[guild]\nmax_guilds = -1\n",
+            "[guild]\nmax_guilds = 5001\n",
+            "[guild]\nchurn_per_hour = -1\n",
+            "[guild]\nchurn_per_hour = 61\n",
+            "[guild]\nchurn_per_hour = \"often\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_pvp_keys_have_quiet_defaults() {
+        let p = Config::default().pvp;
+        assert!(!p.enabled && p.defend && !p.attack_bots && !p.attack_players);
+        assert!(!p.gank && !p.warzone);
+        assert!(p.never_names.is_empty() && p.only_names.is_empty());
+        assert_eq!((p.max_squad, p.retreat_hp_pct, p.war_kill_cap), (3, 35, 10));
+        let ex = Config::parse(Config::example()).unwrap().pvp;
+        assert!(!ex.enabled && ex.defend && !ex.attack_bots && !ex.attack_players);
+        assert!(!ex.gank && !ex.warzone);
+        assert!(ex.never_names.is_empty() && ex.only_names.is_empty());
+        assert_eq!(
+            (ex.max_squad, ex.retreat_hp_pct, ex.war_kill_cap),
+            (3, 35, 10)
+        );
+        assert_documented(
+            "pvp",
+            &[
+                "enabled = false",
+                "defend = true",
+                "attack_bots = false",
+                "attack_players = false",
+                "gank = false",
+                "warzone = false",
+                "never_names = []",
+                "only_names = []",
+                "max_squad = 3",
+                "retreat_hp_pct = 35",
+                "war_kill_cap = 10",
+            ],
+        );
+        let cfg = Config::parse(
+            "[pvp]\nenabled = true\ndefend = false\nattack_bots = true\nattack_players = true\ngank = true\nwarzone = true\nnever_names = [\"Admin\", \"Gm Bob\"]\nonly_names = [\"Rival\"]\nmax_squad = 5\nretreat_hp_pct = 0\nwar_kill_cap = 4\n",
+        )
+        .unwrap();
+        let p = cfg.pvp;
+        assert!(p.enabled && !p.defend && p.attack_bots && p.attack_players);
+        assert!(p.gank && p.warzone);
+        assert_eq!(p.never_names, ["Admin", "Gm Bob"]);
+        assert_eq!(p.only_names, ["Rival"]);
+        assert_eq!((p.max_squad, p.retreat_hp_pct, p.war_kill_cap), (5, 0, 4));
+        for bad in [
+            "[pvp]\ngangk = true\n",
+            "[pvp]\nattack_players = \"yes\"\n",
+            "[pvp]\nnever_names = \"Admin\"\n",
+            "[pvp]\nnever_names = [\"\"]\n",
+            "[pvp]\nonly_names = [\"  \"]\n",
+            "[pvp]\nmax_squad = 0\n",
+            "[pvp]\nmax_squad = 51\n",
+            "[pvp]\nretreat_hp_pct = 101\n",
+            "[pvp]\nretreat_hp_pct = -1\n",
+            "[pvp]\nwar_kill_cap = 0\n",
+            "[pvp]\nwar_kill_cap = 101\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn players_are_attacked_only_when_every_switch_says_so() {
+        let mut cfg = Config::default();
+        assert!(!cfg.may_attack_players(), "off by default");
+        cfg.pvp.attack_players = true;
+        assert!(!cfg.may_attack_players(), "the master switch is off");
+        cfg.pvp.enabled = true;
+        assert!(cfg.may_attack_players());
+        // attacking bots, ganking and warzones do not open the players
+        cfg.pvp.attack_players = false;
+        cfg.pvp.attack_bots = true;
+        cfg.pvp.gank = true;
+        cfg.pvp.warzone = true;
+        assert!(!cfg.may_attack_players());
+        cfg.pvp.attack_players = true;
+        // what a GM-bootstrapped bot holds may be minted: it never attacks a player
+        cfg.bots.gm_bootstrap = true;
+        assert!(!cfg.may_attack_players());
+        cfg.bots.gm_bootstrap = false;
+        assert!(cfg.may_attack_players());
+    }
+
+    #[test]
+    fn the_events_keys_have_quiet_defaults() {
+        let e = Config::default().events;
+        assert!(!e.enabled && e.avoid_war_zones);
+        assert_eq!(e.max_bots_per_event, 6);
+        assert_eq!(e.max_share, 0.25);
+        assert_eq!(e.join_delay_secs, [10, 120]);
+        let ex = Config::parse(Config::example()).unwrap().events;
+        assert!(!ex.enabled && ex.avoid_war_zones);
+        assert_eq!((ex.max_bots_per_event, ex.max_share), (6, 0.25));
+        assert_eq!(ex.join_delay_secs, [10, 120]);
+        assert_documented(
+            "events",
+            &[
+                "enabled = false",
+                "max_bots_per_event = 6",
+                "max_share = 0.25",
+                "join_delay_secs = [10, 120]",
+                "avoid_war_zones = true",
+            ],
+        );
+        let cfg = Config::parse(
+            "[events]\nenabled = true\nmax_bots_per_event = 0\nmax_share = 1\njoin_delay_secs = [0, 0]\navoid_war_zones = false\n",
+        )
+        .unwrap();
+        let e = cfg.events;
+        assert!(e.enabled && !e.avoid_war_zones);
+        assert_eq!((e.max_bots_per_event, e.max_share), (0, 1.0));
+        assert_eq!(e.join_delay_secs, [0, 0]);
+        for bad in [
+            "[events]\nenable = true\n",
+            "[events]\nmax_share = 1.5\n",
+            "[events]\nmax_share = -0.1\n",
+            "[events]\nmax_share = \"half\"\n",
+            "[events]\nmax_bots_per_event = 5001\n",
+            "[events]\njoin_delay_secs = [120, 10]\n",
+            "[events]\njoin_delay_secs = [10]\n",
+            "[events]\njoin_delay_secs = [1, 2, 3]\n",
+            "[events]\njoin_delay_secs = [-1, 5]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_party_keys_are_all_off() {
+        let p = Config::default().party;
+        assert!(!p.join_player_parties && !p.chat_commands && !p.follow_into_dungeons);
+        assert_eq!(
+            (p.max_level_gap, p.max_companions, p.max_per_player),
+            (10, 8, 4)
+        );
+        assert_documented(
+            "party",
+            &[
+                "join_player_parties = false",
+                "chat_commands = false",
+                "follow_into_dungeons = false",
+                "max_level_gap = 10",
+                "max_companions = 8",
+                "max_per_player = 4",
+            ],
+        );
+        let cfg = Config::parse(
+            "[party]\njoin_player_parties = true\nchat_commands = true\nfollow_into_dungeons = true\nmax_level_gap = 5\nmax_companions = 2\nmax_per_player = 3\n",
+        )
+        .unwrap();
+        let p = cfg.party;
+        assert!(p.join_player_parties && p.chat_commands && p.follow_into_dungeons);
+        assert_eq!(
+            (p.max_level_gap, p.max_companions, p.max_per_player),
+            (5, 2, 3)
+        );
+        for bad in [
+            "[party]\njoin_parties = true\n",
+            "[party]\nchat_commands = 1\n",
+            "[party]\nmax_level_gap = 0\n",
+            "[party]\nmax_per_player = 0\n",
+            "[party]\nmax_per_player = 5\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_population_keys_are_off_and_a_dry_run_by_default() {
+        let p = Config::default().population;
+        assert!(!p.enabled && p.dry_run);
+        assert_eq!((p.max_spawn_per_min, p.min_action_gap_secs), (10, 60));
+        let ex = Config::parse(Config::example()).unwrap().population;
+        assert!(!ex.enabled && ex.dry_run);
+        assert_eq!((ex.max_spawn_per_min, ex.min_action_gap_secs), (10, 60));
+        assert_documented(
+            "population",
+            &[
+                "enabled = false",
+                "dry_run = true",
+                "max_spawn_per_min = 10",
+                "min_action_gap_secs = 60",
+                "max_online = 50",
+                "min_per_side = 0",
+                "mirror_pct = 100",
+                "per_side_cap = 20",
+                "step = 3",
+                "hysteresis = 2",
+                "despawn = true",
+                "backoff_rss_mb = 3072",
+                "backoff_packets_in = 30000",
+                "backoff_login_failures = 8",
+                "backoff_open_issues = 50",
+                "server_api = \"\"",
+                "server_api_key_env = \"\"",
+                "server_poll_secs = 30",
+            ],
+        );
+        let cfg = Config::parse(
+            "[population]\nenabled = true\ndry_run = false\nmax_spawn_per_min = 0\nmin_action_gap_secs = 1\n",
+        )
+        .unwrap();
+        let p = cfg.population;
+        assert!(p.enabled && !p.dry_run);
+        assert_eq!((p.max_spawn_per_min, p.min_action_gap_secs), (0, 1));
+        for bad in [
+            "[population]\ndryrun = true\n",
+            "[population]\nmin_action_gap_secs = 0\n",
+            "[population]\nmax_spawn_per_min = 5001\n",
+            "[population]\nmax_spawn_per_min = -1\n",
+            "[population]\nenabled = \"on\"\n",
+            "[population]\nmax_online = 5001\n",
+            "[population]\nper_side_cap = 5001\n",
+            "[population]\nmirror_pct = 1001\n",
+            "[population]\nstep = 0\n",
+            "[population]\nserver_poll_secs = 4\n",
+            "[population]\nserver_api = \"ftp://x\"\n",
+            "[population]\nserver_api = \"http://user:secret@127.0.0.1:1280\"\n",
+            "[population]\nserver_api = \"http://\"\n",
+            "[population]\nserver_api_key_env = \"sk-abc def\"\n",
+            "[population]\nserver_api_key_env = \"1KEY\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_population_policy_starts_from_the_keys() {
+        let cfg = Config::parse(
+            "[population]\nenabled = true\ndry_run = false\nmax_online = 80\nmirror_pct = 150\n\
+             step = 5\nserver_api = \"http://127.0.0.1:1280\"\nserver_api_key_env = \"AAEMU_API_KEY\"\n",
+        )
+        .unwrap();
+        let p = cfg.population.policy();
+        assert!(p.active && !p.dry_run);
+        assert_eq!((p.max_online, p.mirror_pct, p.step), (80, 150, 5));
+        assert!(cfg.population.server_api_key_file.is_none());
+        let off = Config::default().population.policy();
+        assert!(!off.active && off.dry_run);
+        assert_eq!(off.hysteresis, 2);
+    }
+
+    #[test]
+    fn the_farm_keys_are_off_by_default() {
+        let f = Config::default().farm;
+        assert!(!f.enabled);
+        assert_eq!(f.max_plots, 5);
+        let ex = Config::parse(Config::example()).unwrap().farm;
+        assert!(!ex.enabled);
+        assert_eq!(ex.max_plots, 5);
+        assert_eq!((ex.growth_rate, ex.max_trip_m), (1.0, 4_000.0));
+        assert!(ex.public_farms && ex.own_land && ex.replant);
+        assert_documented(
+            "farm",
+            &[
+                "enabled = false",
+                "max_plots = 5",
+                "growth_rate = 1.0",
+                "public_farms = true",
+                "own_land = true",
+                "replant = true",
+                "max_trip_m = 4000.0",
+            ],
+        );
+        let cfg = Config::parse("[farm]\nenabled = true\nmax_plots = 0\n").unwrap();
+        assert!(cfg.farm.enabled);
+        assert_eq!(cfg.farm.max_plots, 0);
+        for bad in [
+            "[farm]\nplots = 3\n",
+            "[farm]\nmax_plots = 1001\n",
+            "[farm]\nmax_plots = -1\n",
+            "[farm]\nenabled = 1\n",
+            "[farm]\ngrowth_rate = 0.0\n",
+            "[farm]\ngrowth_rate = nan\n",
+            "[farm]\nmax_trip_m = 10.0\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

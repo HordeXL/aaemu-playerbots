@@ -36,6 +36,13 @@ pure function with tests in `watch/classify.rs`):
   revived; a bot that died and is not resurrected after asking.
 * **Money and goods:** a finished trade whose purse or bag moved by something other than the two
   offers; a sold trade pack whose payment mail is empty or cannot be read.
+* **World events (rifts)**, with `[events] enabled` (`crates/playerbots/src/events/detect.rs`): a
+  wave none of whose monsters a bot at the target saw (`event-wave-no-npcs def D wave N`; judged 60 s
+  plus the controllers' walk after the wave began, and only after a bot stood at the target for 30 s);
+  a wave that stayed after every kill it waits for was seen (`event-wave-stuck def D wave N`); an event
+  still running 60 s past its time cap (`event-not-ended def D`). Each is told once and is filed for
+  each of up to three bots that were in the event, so it counts as seen by several bots and gets the
+  bots' trails. Suspect: server, area `systems/instances/tower_def.rs`.
 
 Every report carries the **packet trail**: the last 48 packets sent and received, with their names
 and ages (`trail.txt` in the evidence folder).

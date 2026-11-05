@@ -24,6 +24,7 @@ use playerbots::bot::{Shared, LOGIN_PERMITS};
 use playerbots::config::Config;
 use playerbots::hub::{Hub, HubParams, SupCmd};
 use playerbots::issues::Issues;
+use playerbots::population::{serverapi, Population};
 use playerbots::roster::{Roster, SharedRoster};
 use playerbots::secrets::{self, Source};
 use playerbots::supervisor::{ensure_roster, register_slots, Supervisor};
@@ -237,6 +238,11 @@ async fn run(
             "market.sell_to_players is ignored while bots.gm_bootstrap is on: what the bots hold may be GM-made, so real players cannot buy from them"
         );
     }
+    if cfg.pvp.enabled && cfg.pvp.attack_players && cfg.bots.gm_bootstrap {
+        tracing::warn!(
+            "pvp.attack_players is ignored while bots.gm_bootstrap is on: what the bots hold may be GM-made, so they never attack real players"
+        );
+    }
     announce_password(&resolved, &roster_path);
     let roster = Arc::new(SharedRoster::new(roster, roster_path));
     let wanted = cfg.bots.count as usize;
@@ -263,7 +269,12 @@ async fn run(
             supervisor: sup_tx,
             llm,
         })
-        .with_issues(issues),
+        .with_issues(issues)
+        .with_population(Population::new(
+            &cfg.population,
+            cfg.bots.race_ids(),
+            Some(world.clone()),
+        )),
     );
     let issue_tasks = hub.start_issues();
 
@@ -272,6 +283,12 @@ async fn run(
     // (without sites the coordinator never answers a wish for a dungeon)
     let coordinator = if cfg.behavior.dungeons {
         coordinator.with_sites(playerbots::bot::party::sites(&world))
+    } else {
+        coordinator
+    };
+    // (founding teams for guilds: only when the bots may found guilds at all)
+    let coordinator = if cfg.guild.enabled && cfg.guild.found && cfg.guild.max_guilds > 0 {
+        coordinator.with_guilds(cfg.guild.party_size, cfg.guild.max_guilds)
     } else {
         coordinator
     };
@@ -322,6 +339,8 @@ async fn run(
         })
     };
 
+    let server_api = serverapi::spawn(&cfg.population, hub.clone(), cancel.clone());
+
     let supervisor = tokio::spawn(Supervisor::new(shared).run(wanted, sup_rx, cancel.clone()));
 
     let timer = async {
@@ -351,6 +370,9 @@ async fn run(
     }
     let _ = coord_task.await;
     let _ = ticker.await;
+    if let Some(t) = server_api {
+        let _ = t.await;
+    }
     // (the bots are gone: whatever they changed last is written now)
     saver.stop().await;
     issue_tasks.stop().await;

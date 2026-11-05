@@ -6,8 +6,10 @@
 //!
 //! About 200 fake bots wander around Solzreed (world x 15000..16200, y 14800..15800), change
 //! activity at random, pair up for duels and trades and answer the commands of the UI. The map is
-//! a generated PNG calibrated to the real world rectangle, with the Solzreed area outlined so the
-//! calibration can be checked by eye.
+//! a generated PNG calibrated to the real world rectangle, with the Solzreed area (west) and a
+//! made-up east area outlined so the calibration can be checked by eye. A handful of "players"
+//! wander about, mostly in the east, so the World, Economy and Director panels have something to
+//! show; the director is a toy that follows the same rules in a few lines.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -16,12 +18,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
-    IssueSample, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind, QuestLine,
-    WebConfig, WorldRect,
+    ActionRecord, Activity, Alliance, BotDetail, BotHub, BotSnapshot, Command, Continent,
+    DirectorView, EconomySources, EconomyView, HealthView, HeatCell, HubStats, IssueAction,
+    IssueDetail, IssueSample, IssueSummary, ItemRow, LlmStats, LogLine, MapInfo, Marker,
+    MarkerKind, PlayerSeen, PlotLine, Policy, PolicyPatch, QuestLine, RegionCell, ServerView,
+    SideRow, WebConfig, WorldRect, WorldTotals, WorldView, ZoneRow,
 };
 
 const AREA: (f32, f32, f32, f32) = (15000.0, 14800.0, 16200.0, 15800.0);
+/// A made-up area on the east continent.
+const AREA_EAST: (f32, f32, f32, f32) = (30200.0, 20400.0, 31400.0, 21400.0);
 const WORLD: WorldRect = WorldRect {
     min_x: -14731.0,
     min_y: 46.0,
@@ -38,7 +44,8 @@ const CLASSES: [&str; 8] = [
     "Defense",
     "Songcraft",
 ];
-const RACES: [&str; 4] = ["Nuian", "Elf", "Hariharan", "Dwarf"];
+const RACES_WEST: [&str; 2] = ["Nuian", "Elf"];
+const RACES_EAST: [&str; 2] = ["Hariharan", "Ferre"];
 const ACTIVITY_WEIGHTS: [(Activity, u32); 11] = [
     (Activity::Idle, 14),
     (Activity::Traveling, 16),
@@ -54,6 +61,7 @@ const ACTIVITY_WEIGHTS: [(Activity, u32); 11] = [
 ];
 
 struct MockBot {
+    east: bool,
     snap: BotSnapshot,
     target: (f32, f32),
     next_change: f32,
@@ -66,6 +74,42 @@ struct Inner {
     next_id: u32,
     started: Instant,
     tick: u64,
+    pop: MockPop,
+}
+
+/// A made-up player.
+struct MockPlayer {
+    name: String,
+    level: u8,
+    east: bool,
+    pos: (f32, f32),
+    target: (f32, f32),
+}
+
+/// The population panels' state.
+struct MockPop {
+    players: Vec<MockPlayer>,
+    policy: Policy,
+    log: VecDeque<ActionRecord>,
+    owned: Vec<u32>,
+    last_action: f32,
+    clock: f32,
+}
+
+fn area(east: bool) -> (f32, f32, f32, f32) {
+    if east {
+        AREA_EAST
+    } else {
+        AREA
+    }
+}
+
+fn zone_of(east: bool) -> (u16, &'static str) {
+    if east {
+        (9, "Mahadevi")
+    } else {
+        (5, "Solzreed")
+    }
 }
 
 struct MockHub {
@@ -95,10 +139,11 @@ fn random_name() -> String {
     format!("{}{}{}", pick(&A), pick(&B), fastrand::u16(10..99))
 }
 
-fn random_point() -> (f32, f32) {
+fn random_point(east: bool) -> (f32, f32) {
+    let a = area(east);
     (
-        fastrand::f32() * (AREA.2 - AREA.0) + AREA.0,
-        fastrand::f32() * (AREA.3 - AREA.1) + AREA.1,
+        fastrand::f32() * (a.2 - a.0) + a.0,
+        fastrand::f32() * (a.3 - a.1) + a.1,
     )
 }
 
@@ -116,20 +161,38 @@ fn weighted_activity() -> Activity {
 
 impl MockBot {
     fn new(id: u32) -> Self {
-        let (x, y) = random_point();
+        Self::new_on(id, fastrand::u8(0..10) < 4)
+    }
+
+    fn new_on(id: u32, east: bool) -> Self {
+        let (x, y) = random_point(east);
         let activity = weighted_activity();
+        let (zone_key, zone_name) = zone_of(east);
         let mut bot = MockBot {
+            east,
             snap: BotSnapshot {
                 id,
                 name: random_name(),
-                race: pick(&RACES).to_string(),
+                race: pick(if east { &RACES_EAST } else { &RACES_WEST }).to_string(),
                 class: pick(&CLASSES).to_string(),
                 level: fastrand::u8(1..=55),
                 hp_pct: fastrand::u8(40..=100),
                 x,
                 y,
                 z: 120.0 + fastrand::f32() * 30.0,
-                zone: Some("Solzreed".into()),
+                zone: Some(zone_name.into()),
+                mother_faction: if east { 149 } else { 148 },
+                alliance: if east {
+                    Alliance::Haranya
+                } else {
+                    Alliance::Nuia
+                },
+                continent: if east {
+                    Continent::East
+                } else {
+                    Continent::West
+                },
+                zone_key,
                 activity,
                 goal: String::new(),
                 detail: String::new(),
@@ -138,8 +201,9 @@ impl MockBot {
                 has_house: fastrand::u8(0..10) == 0,
                 online_secs: fastrand::u32(0..40_000),
                 paused: false,
+                ..BotSnapshot::default()
             },
-            target: random_point(),
+            target: random_point(east),
             next_change: 3.0 + fastrand::f32() * 25.0,
             log: VecDeque::new(),
             quest: 330 + fastrand::u32(0..40),
@@ -226,6 +290,8 @@ impl Inner {
 
     fn step(&mut self, dt: f32) {
         self.tick += 1;
+        self.pop.step(dt);
+        self.toy_director();
         for i in 0..self.bots.len() {
             let paused = self.bots[i].snap.paused;
             if !paused {
@@ -255,7 +321,7 @@ impl Inner {
                             activity
                         };
                         bot.snap.partner = None;
-                        bot.target = random_point();
+                        bot.target = random_point(bot.east);
                         bot.next_change = 4.0 + fastrand::f32() * 25.0;
                         bot.snap.hp_pct = match bot.snap.activity {
                             Activity::Dead => 0,
@@ -289,7 +355,7 @@ impl Inner {
                 let dist = dx.hypot(dy);
                 if dist < 2.0 {
                     if !matches!(bot.snap.activity, Activity::Dueling | Activity::Trading) {
-                        bot.target = random_point();
+                        bot.target = random_point(bot.east);
                     }
                 } else {
                     let step = (speed * dt).min(dist);
@@ -437,7 +503,7 @@ impl MockHub {
         let bots = (1..=count as u32).map(MockBot::new).collect();
         let mut markers = Vec::new();
         for i in 0..24 {
-            let (x, y) = random_point();
+            let (x, y) = random_point(i % 3 == 0);
             markers.push(Marker {
                 kind: MarkerKind::House,
                 x,
@@ -445,7 +511,7 @@ impl MockHub {
                 label: format!("{}'s house", random_name()),
             });
             if i < 8 {
-                let (x, y) = random_point();
+                let (x, y) = random_point(false);
                 markers.push(Marker {
                     kind: MarkerKind::QuestGiver,
                     x,
@@ -482,6 +548,7 @@ impl MockHub {
                 next_id: count as u32 + 1,
                 started: Instant::now(),
                 tick: 0,
+                pop: MockPop::new(),
             }),
             issues: Mutex::new(mock_issues()),
             markers,
@@ -531,6 +598,28 @@ impl BotHub for MockHub {
                 .cloned()
                 .collect(),
             path: Vec::new(),
+            plots: if id.is_multiple_of(3) {
+                vec![
+                    PlotLine {
+                        x: 14_210.0,
+                        y: 9_020.5,
+                        crop: "Potato".into(),
+                        state: "ripe".into(),
+                        honest: true,
+                        land: "farm".into(),
+                    },
+                    PlotLine {
+                        x: 14_214.5,
+                        y: 9_020.5,
+                        crop: "Potato".into(),
+                        state: "growing, about 6 min left".into(),
+                        honest: false,
+                        land: "own land".into(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -635,6 +724,70 @@ impl BotHub for MockHub {
         Ok(())
     }
 
+    fn world(&self) -> WorldView {
+        let inner = self.inner.lock();
+        inner.world_view()
+    }
+
+    fn economy(&self) -> EconomyView {
+        mock_economy(&self.inner.lock().pop.policy)
+    }
+
+    fn director(&self) -> DirectorView {
+        self.inner.lock().director_view()
+    }
+
+    fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {
+        let mut inner = self.inner.lock();
+        let p = &mut inner.pop.policy;
+        macro_rules! set {
+            ($($f:ident),*) => { $( if let Some(v) = patch.$f { p.$f = v; } )* };
+        }
+        set!(
+            active,
+            dry_run,
+            max_online,
+            min_per_side,
+            mirror_pct,
+            per_side_cap,
+            step,
+            hysteresis,
+            despawn,
+            backoff_rss_mb,
+            backoff_packets_in,
+            backoff_login_failures,
+            backoff_open_issues,
+            auto_boost_min,
+            auto_boost
+        );
+        if let Some(b) = patch.boosts {
+            p.boosts = b
+                .into_iter()
+                .map(|w| pb_web::BoostWish {
+                    template: w.template,
+                    until_ms: if w.hours == 0 {
+                        0
+                    } else {
+                        now_ms() + u64::from(w.hours) * 3_600_000
+                    },
+                    auto: false,
+                })
+                .collect();
+        }
+        if let Some(g) = patch.goal_bias {
+            p.goal_bias = g;
+        }
+        inner.pop.note(
+            "policy",
+            Alliance::Unknown,
+            0,
+            true,
+            "changed by the operator",
+            "",
+        );
+        Ok(())
+    }
+
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
         let mut inner = self.inner.lock();
         let idx = match bot {
@@ -671,7 +824,7 @@ impl BotHub for MockHub {
                 let b = &mut inner.bots[i];
                 b.snap.activity = activity;
                 b.snap.goal = goal.clone();
-                b.target = random_point();
+                b.target = random_point(b.east);
                 b.next_change = 20.0;
                 b.describe();
                 b.say_log(format!("operator set goal {goal}"));
@@ -711,6 +864,42 @@ impl BotHub for MockHub {
                     let i = inner.bots.len() - 1;
                     inner.unpair(i);
                     inner.bots.pop();
+                }
+            }
+            Command::SpawnWhere { count, filter } => {
+                let east = match (&filter.alliance, &filter.continent, &filter.race) {
+                    (Some(a), _, _) => a == "haranya",
+                    (_, Some(c), _) => c == "east",
+                    (_, _, Some(r)) => r == "hariharan" || r == "ferre",
+                    _ => fastrand::bool(),
+                };
+                for _ in 0..count {
+                    let id = inner.next_id;
+                    inner.next_id += 1;
+                    inner.bots.push(MockBot::new_on(id, east));
+                }
+            }
+            Command::DespawnWhere { count, filter } => {
+                let mut left = count;
+                let mut i = inner.bots.len();
+                while i > 0 && left > 0 {
+                    i -= 1;
+                    let b = &inner.bots[i].snap;
+                    let side = |a: &Option<String>, want: &str, have: &str| {
+                        a.as_deref().is_none_or(|a| a == want || have.is_empty())
+                    };
+                    let ok = side(&filter.alliance, b.alliance.as_str(), "")
+                        && side(&filter.continent, b.continent.as_str(), "")
+                        && filter
+                            .race
+                            .as_deref()
+                            .is_none_or(|r| r.eq_ignore_ascii_case(&b.race))
+                        && !matches!(b.activity, Activity::Dueling | Activity::Trading);
+                    if ok {
+                        inner.unpair(i);
+                        inner.bots.remove(i);
+                        left -= 1;
+                    }
                 }
             }
         }
@@ -815,10 +1004,12 @@ fn make_map_png(w: u32, h: u32) -> Vec<u8> {
             }
             // Solzreed outline, widened to stay visible at this resolution
             let m = 450.0;
-            let inside = x > AREA.0 - m && x < AREA.2 + m && y > AREA.1 - m && y < AREA.3 + m;
-            let core = x > AREA.0 && x < AREA.2 && y > AREA.1 && y < AREA.3;
-            if inside && !core {
-                rgb = [235, 60, 60];
+            for a in [AREA, AREA_EAST] {
+                let inside = x > a.0 - m && x < a.2 + m && y > a.1 - m && y < a.3 + m;
+                let core = x > a.0 && x < a.2 && y > a.1 && y < a.3;
+                if inside && !core {
+                    rgb = [235, 60, 60];
+                }
             }
             px.extend_from_slice(&rgb);
         }
@@ -871,4 +1062,391 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
+}
+
+// ---------------------------------------------------------------- the population panels
+
+impl MockPop {
+    fn new() -> Self {
+        let players = (0..9)
+            .map(|i| {
+                let east = i < 7;
+                let pos = random_point(east);
+                MockPlayer {
+                    name: random_name(),
+                    level: fastrand::u8(10..=55),
+                    east,
+                    pos,
+                    target: random_point(east),
+                }
+            })
+            .collect();
+        MockPop {
+            players,
+            policy: Policy {
+                active: true,
+                dry_run: true,
+                ..Policy::default()
+            },
+            log: VecDeque::new(),
+            owned: Vec::new(),
+            last_action: 0.0,
+            clock: 0.0,
+        }
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.clock += dt;
+        for p in &mut self.players {
+            let (dx, dy) = (p.target.0 - p.pos.0, p.target.1 - p.pos.1);
+            let d = dx.hypot(dy);
+            if d < 3.0 {
+                p.target = random_point(p.east);
+            } else {
+                let s = (5.0 * dt).min(d);
+                p.pos.0 += dx / d * s;
+                p.pos.1 += dy / d * s;
+            }
+        }
+    }
+
+    fn note(
+        &mut self,
+        kind: &str,
+        alliance: Alliance,
+        count: u32,
+        applied: bool,
+        reason: &str,
+        result: &str,
+    ) {
+        if self.log.len() >= 100 {
+            self.log.pop_back();
+        }
+        self.log.push_front(ActionRecord {
+            at_ms: now_ms(),
+            kind: kind.into(),
+            alliance,
+            count,
+            applied,
+            reason: reason.into(),
+            result: result.into(),
+        });
+    }
+}
+
+impl Inner {
+    fn bots_on(&self, east: bool) -> u32 {
+        self.bots.iter().filter(|b| b.east == east).count() as u32
+    }
+
+    fn players_on(&self, east: bool) -> u32 {
+        self.pop.players.iter().filter(|p| p.east == east).count() as u32
+    }
+
+    /// The mirror rule in a few lines: each side aims for as many characters as the other side has
+    /// players.
+    fn target_for(&self, east: bool) -> u32 {
+        let p = &self.pop.policy;
+        let mirror = (p.mirror_pct * self.players_on(!east)).div_ceil(100);
+        mirror
+            .saturating_sub(self.players_on(east))
+            .max(p.min_per_side)
+            .min(p.per_side_cap)
+    }
+
+    fn toy_director(&mut self) {
+        let p = self.pop.policy.clone();
+        if !p.active || self.pop.clock - self.pop.last_action < 20.0 {
+            return;
+        }
+        for east in [false, true] {
+            let (have, want) = (self.bots_on(east), self.target_for(east));
+            let side = if east {
+                Alliance::Haranya
+            } else {
+                Alliance::Nuia
+            };
+            let name = if east { "east" } else { "west" };
+            if have < want && (self.bots.len() as u32) < p.max_online {
+                let n = (want - have).min(p.step);
+                let reason = format!(
+                    "{} players on the {} side, {} on the {}: {name} wants {want} bots, has {have}",
+                    self.players_on(!east),
+                    if east { "west" } else { "east" },
+                    self.players_on(east),
+                    name
+                );
+                if p.dry_run {
+                    self.pop.note("spawn", side, n, false, &reason, "dry run");
+                } else {
+                    for _ in 0..n {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        self.pop.owned.push(id);
+                        self.bots.push(MockBot::new_on(id, east));
+                    }
+                    self.pop
+                        .note("spawn", side, n, true, &reason, &format!("{n} bots queued"));
+                }
+                self.pop.last_action = self.pop.clock;
+                return;
+            }
+        }
+    }
+
+    fn world_view(&self) -> WorldView {
+        let mut cells: Vec<RegionCell> = Vec::new();
+        let mut zones: Vec<ZoneRow> = Vec::new();
+        let mut heat: Vec<HeatCell> = Vec::new();
+        let mut add = |east: bool, player: bool, x: f32, y: f32| {
+            let (key, name) = zone_of(east);
+            let (continent, alliance) = if east {
+                (Continent::East, Alliance::Haranya)
+            } else {
+                (Continent::West, Alliance::Nuia)
+            };
+            let c = match cells
+                .iter()
+                .position(|c| c.continent == continent && c.alliance == alliance)
+            {
+                Some(i) => i,
+                None => {
+                    cells.push(RegionCell {
+                        continent,
+                        alliance,
+                        ..RegionCell::default()
+                    });
+                    cells.len() - 1
+                }
+            };
+            let z = match zones.iter().position(|z| z.zone_key == key) {
+                Some(i) => i,
+                None => {
+                    zones.push(ZoneRow {
+                        zone_key: key,
+                        name: name.into(),
+                        continent,
+                        ..ZoneRow::default()
+                    });
+                    zones.len() - 1
+                }
+            };
+            let (cx, cy) = (
+                (x / 512.0).floor() * 512.0 + 256.0,
+                (y / 512.0).floor() * 512.0 + 256.0,
+            );
+            let h = match heat.iter().position(|h| h.x == cx && h.y == cy) {
+                Some(i) => i,
+                None => {
+                    heat.push(HeatCell {
+                        x: cx,
+                        y: cy,
+                        players: 0,
+                        bots: 0,
+                    });
+                    heat.len() - 1
+                }
+            };
+            if player {
+                cells[c].players_seen += 1;
+                zones[z].players_seen += 1;
+                heat[h].players += 1;
+            } else {
+                cells[c].bots_online += 1;
+                zones[z].bots_online += 1;
+                heat[h].bots += 1;
+            }
+        };
+        for b in &self.bots {
+            add(b.east, false, b.snap.x, b.snap.y);
+        }
+        for p in &self.pop.players {
+            add(p.east, true, p.pos.0, p.pos.1);
+        }
+        let players: Vec<PlayerSeen> = self
+            .pop
+            .players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (_, zone) = zone_of(p.east);
+                PlayerSeen {
+                    name: p.name.clone(),
+                    level: p.level,
+                    alliance: if p.east {
+                        Alliance::Haranya
+                    } else {
+                        Alliance::Nuia
+                    },
+                    continent: if p.east {
+                        Continent::East
+                    } else {
+                        Continent::West
+                    },
+                    zone: zone.into(),
+                    x: p.pos.0,
+                    y: p.pos.1,
+                    age_secs: (i as u32 * 7) % 40,
+                    seen_by: 1 + i as u32,
+                }
+            })
+            .collect();
+        let seen = players.len() as u32;
+        let server_players = seen + 3;
+        WorldView {
+            at_ms: now_ms(),
+            ttl_secs: 60,
+            cells,
+            zones,
+            players,
+            heat,
+            totals: WorldTotals {
+                players_seen: seen,
+                bots_online: self.bots.len() as u32,
+                bots_total: self.bots.len() as u32 + 20,
+                players_server: Some(server_players),
+                players_unlocated: Some(server_players - seen),
+                coverage_pct: Some(seen * 100 / server_players),
+                watched_km2: self.bots.len() as f32 * 0.05,
+            },
+            server: ServerView {
+                configured: true,
+                reachable: true,
+                checked_ms: now_ms(),
+                status: vec![
+                    ("Server uptime".into(), "03:12:44".into()),
+                    (
+                        "Players online".into(),
+                        format!("{}", server_players + self.bots.len() as u32),
+                    ),
+                    ("Number of TaskManager Jobs".into(), "0".into()),
+                ],
+                online: Some(server_players + self.bots.len() as u32),
+                online_bots: Some(self.bots.len() as u32),
+                auction_lots: Some(214),
+                latency_ms: 4,
+                error: None,
+            },
+        }
+    }
+
+    fn director_view(&self) -> DirectorView {
+        let p = self.pop.policy.clone();
+        let sides = [false, true]
+            .into_iter()
+            .map(|east| SideRow {
+                alliance: if east {
+                    Alliance::Haranya
+                } else {
+                    Alliance::Nuia
+                },
+                players: self.players_on(east),
+                bots: self.bots_on(east),
+                owned: self
+                    .bots
+                    .iter()
+                    .filter(|b| b.east == east && self.pop.owned.contains(&b.snap.id))
+                    .count() as u32,
+                target: self.target_for(east),
+            })
+            .collect();
+        let mode = if !p.active {
+            "off"
+        } else if p.dry_run {
+            "dry_run"
+        } else {
+            "live"
+        };
+        DirectorView {
+            available: true,
+            policy: p,
+            mode: mode.into(),
+            sides,
+            health: HealthView {
+                rss_mb: 190 + self.bots.len() as u32 / 3,
+                packets_in_per_sec: self.bots.len() as f32 * 3.1,
+                packets_out_per_sec: self.bots.len() as f32 * 1.4,
+                login_failures: 0,
+                open_issues: 3,
+                connecting: 0,
+                holding: None,
+            },
+            owned: self.pop.owned.len() as u32,
+            next_action_secs: (20.0 - (self.pop.clock - self.pop.last_action)).max(0.0) as u32,
+            spawned_last_min: 0,
+            max_spawn_per_min: 10,
+            min_action_gap_secs: 20,
+            auto_wishes: vec![3412],
+            log: self.pop.log.iter().cloned().collect(),
+        }
+    }
+}
+
+fn mock_economy(policy: &Policy) -> EconomyView {
+    // (template, name, lots, unit price, vendor price, trend %, wtb, wts)
+    type Row = (u32, &'static str, u32, u32, u32, f32, u32, u32);
+    let rows: [Row; 10] = [
+        (3412, "Copper", 0, 1500, 300, 22.0, 5, 0),
+        (3411, "Copper Ore", 1, 900, 250, 12.0, 3, 1),
+        (3712, "Hay Bale", 2, 640, 200, 8.0, 2, 0),
+        (7765, "Blue Salt", 4, 1100, 700, 3.0, 1, 1),
+        (8001, "Rough Log", 5, 210, 180, 0.0, 0, 0),
+        (8002, "Iron Ore", 6, 320, 300, -2.0, 0, 1),
+        (8003, "Cloth", 9, 140, 150, -6.0, 0, 2),
+        (8004, "Lumber", 14, 200, 250, -10.0, 0, 3),
+        (8005, "Flax", 20, 90, 100, 0.0, 0, 0),
+        (8006, "Wool", 31, 70, 90, -4.0, 0, 1),
+    ];
+    let items: Vec<ItemRow> = rows
+        .into_iter()
+        .map(|(template, name, lots, unit, vendor, trend, wtb, wts)| {
+            let ratio = unit as f32 / vendor as f32;
+            let supply = 1.0 / (1.0 + lots as f32 / 2.0);
+            let scarcity = (0.45 * supply
+                + 0.25 * ((ratio - 1.0) / 3.0).clamp(0.0, 1.0)
+                + 0.15 * (trend / 50.0).clamp(0.0, 1.0)
+                + 0.15 * ((wtb as f32 - wts as f32) / 4.0).clamp(0.0, 1.0))
+            .clamp(0.0, 1.0);
+            let mut reasons = Vec::new();
+            if lots <= 2 {
+                reasons.push(format!("only {lots} lots"));
+            }
+            if ratio >= 1.8 {
+                reasons.push(format!("{ratio:.1}x the vendor price"));
+            }
+            if wtb > wts {
+                reasons.push(format!("{wtb} wanted"));
+            }
+            ItemRow {
+                template,
+                name: name.into(),
+                scarcity,
+                lots,
+                supply_source: if template < 7000 { "bots" } else { "server" }.into(),
+                unit_price: unit,
+                vendor_price: vendor,
+                price_ratio: ratio,
+                trend_pct: trend,
+                wtb,
+                wts,
+                reasons,
+                boosted: policy.boosts.iter().any(|b| b.template == template),
+                growing: if template.is_multiple_of(5) {
+                    12.0
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect();
+    EconomyView {
+        at_ms: now_ms(),
+        sources: EconomySources {
+            bot_notes: 31,
+            server_lots: Some(214),
+            chat_lines: 17,
+            chat_window_secs: 600,
+        },
+        items,
+    }
 }

@@ -80,6 +80,7 @@ optional LLM director may choose among the same eligible goals instead.
 | Trade | Coordinator pairs two bots; they meet, open a trade window, put up an item and/or money, lock, confirm. |
 | Trade run | Walk to a specialty workbench, craft a trade pack (`CSExecuteCraft`), carry it to a specialty NPC that buys it, sell (`CSSellBackpackGoods`), collect the payment mail. |
 | Housing | Get a design (and tax certificates), walk to a free spot inside a housing area, quote (`CSConstructHouseTax`) and place (`CSCreateHouse`); later "go home" when resting. |
+| Farm | Buy seeds, plant them on own land or a public farm, remember the plots, come back when they are ripe, harvest and replant; grows what the population director wishes for or the economy board calls scarce (see [Farming](#farming-botfarm-goal-farm)). |
 | Rest | Stand still out of combat until HP/MP recover. |
 | Social | Reply to whispers/local chat from real players (LLM if enabled, canned lines otherwise). |
 
@@ -250,11 +251,24 @@ facts, the provenance ledger and the chat forwarding.
 | --- | --- | --- |
 | `Auction` goal, `goals::auction::{base_weight, score}`, `AuctionMemory` (`BotState::market`, `Inner::auction`) | `bot/goals/auction.rs`, `bot/market/auction.rs` | auction house |
 | `Market` goal, `goals::market::{base_weight, score}`, `AdState` (`Inner::ads`) fed by `AdState::on_chat` | `bot/goals/market.rs`, `bot/market/ads.rs`, `bot/goals/trade*` | trade-chat sales |
-| `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` | `aa-world` `items.rs` | shared (done) |
+| `ItemFacts` / `World::item_facts(template)`: price, refund, stack, bind kind, level, fixed grade, auction categories and the quest-item flag of every item, 20 bytes each (about 0.5 MB for the whole table), `ItemFacts::tradable()` (sellable, unbound, not a quest item) | `aa-world` `items.rs` | shared (done) |
 | `Ledger` (`MarketState::clean_count`, `sellable_surplus`): the quantity of each item the bot may sell, fed by `BotState::apply` from the item task reasons | `bot/market/ledger.rs`, `bot/state.rs` | shared (done) |
+| `QuestNeeds::of(world, &state.quests)`: what the active quests still ask of each item (gather and use objectives), the part of the bag the sale paths keep back | `bot/market/needs.rs` | shared (done) |
 | `MarketState::on_chat(kind, sender, text, now_ms)`: shouts, trade chat, group-finding chat and whispers, forwarded by the social duty before it files the inbox (`market::forward_chat`; which kinds: `ads::hears`) | `bot/market/`, `bot/goals/social.rs` | shared (done), kinds are the market feature's |
 | `[behavior] lifelike`, `jump_rate`, `emotes` | `config.rs` | life-like movement (done, see below) |
 | `[market]` | `config.rs`, `Config::may_sell_to_players` | shared (done) |
+
+**What may change hands.** Every path that sells, asks for, buys or gives an item away goes through
+`ItemFacts::tradable()`, and the paths that part with the bot's own goods also keep back
+`QuestNeeds`: the sellable surplus (`Ledger::sellable_surplus`, behind the chat ads, the chat deals
+and the auction listings), the trade-chat name index (`ads::names::global`), the WTB goods
+(`goals::market::duty::wanted_goods`), the stand-in offers of random trades
+(`goals::trade::choose_offer`, rule `keep_of`: unknown items are not offered) and the auction
+buys (`auction::Env::tradable`). A quest item is detected from the compact database when the
+item table loads (the quest item category, quest-only loot, and the items the quest tables hand
+out except in the reward step); quest gather and use targets are ordinary materials and only
+count in `QuestNeeds`. A chat deal re-checks `QuestNeeds` when the meeting starts, since a quest
+taken since may need the goods.
 
 `MarketState` is one pointer per bot (`Option<Box<Inner>>`, allocated by the first gain the ledger
 counts), because the per-bot budget is tight (`size_of::<Bot>() < 3200`). The brain scores
@@ -262,6 +276,329 @@ counts), because the per-bot budget is tight (`size_of::<Bot>() < 3200`). The br
 are stubs, so no bot picks them); forcing one from the web UI makes it fail with `NotImplemented`,
 which switches it off for that bot. The brain's failure cooldowns are whole seconds in a `u32`
 for the same reason.
+
+## Wave-1 hooks (guilds, pvp, events, companion, farming, population)
+
+Six more features plug in the same way as the market ones. Shared and done: the goal stubs, the
+configuration, the goal mask and the zone conflict table. A feature fills in its own files and
+reads its own `[section]`; the brain, the goal enum, the web goal lists and the director text
+already name its goal.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `Guild` goal (`GoalKind::Guild`, `goals::guild::{base_weight, score}`), `[guild]` | `bot/goals/guild.rs`, `bot/guild/`, `config.rs` | guilds (done, see [Guilds](#guilds-botguild-goal-guild)) |
+| `Gank` goal (`goals::gank`), `[pvp]` `gank`, `attack_bots`, `attack_players` (done, see [PvP](#pvp-botpvp-goals-gank-and-warzone)) | `bot/goals/gank.rs`, `config.rs` | pvp |
+| `Warzone` goal (`goals::warzone`), `[pvp]` `warzone`; reads the zone conflict table (done) | `bot/goals/warzone.rs`, `config.rs` | pvp |
+| `Event` goal (`goals::event`, built: see [Events](#events-goal-event)), `[events]`; reads the zone conflict table (`avoid_war_zones`) | `bot/goals/event.rs`, `config.rs` | events |
+| `Companion` goal (`goals::companion`, built: see [Parties of real players](#parties-of-real-players-botcompanion-goal-companion)), `[party]` | `bot/goals/companion.rs`, `bot/companion/`, `config.rs` | party with real players (done) |
+| `Farm` goal (`goals::farm`, built: see [Farming](#farming-botfarm-goal-farm)), `[farm]` | `bot/goals/farm.rs`, `bot/goals/farm/`, `bot/farm/`, `config.rs` | farming (done) |
+| `[population]` (the web UI's population director and the server API poll, see [Population](#population-census-economy-board-and-director)) | `config.rs`, `population/` | web director (done) |
+| `[pvp]` `enabled`, `defend`, `never_names`, `only_names`, `max_squad`, `retreat_hp_pct`, `war_kill_cap`; `Config::may_attack_players()` (real players only, never while `bots.gm_bootstrap` is on) | `config.rs` | pvp |
+| `WorldEvent::ConflictZoneState { zone_group, state, end_unix_s }` (`SCConflictZoneStatePacket`, opcode 0x0ee), `conflict_state::{TENSION .. PEACE, at_war, name}` | `aa-proto` `sc_world.rs` | shared (done) |
+| `BotState::zone_states` (`ZoneStates`, at most 64 zone groups), `BotState::zone_state(zone_group) -> Option<(state, end_unix_s)>`, `BotState::at_war(zone_group)` (state conflict or war) | `bot/zones.rs`, `bot/state.rs` | pvp and events (shared, done) |
+
+All six goals are built now (no stub is left). A goal added as a stub fails with `NotImplemented` (the
+brain then switches it off for the bot) and its `score` is 0, so no bot picks it; forcing one from the
+web UI does no harm. A feature scores its goal through its own `score(ctx, base)` (gate on its
+`[section]`; the brain applies none of its factors to it) and turns the stub's methods into the real
+thing (`owns_combat` for the pvp goals).
+
+**The zone conflict table.** The server sends one `SCConflictZoneStatePacket` per zone group at world
+entry and one on every change: a `u16` zone group, a `u8` state (0 tension, 1 danger, 2 dispute,
+3 unrest, 4 crisis, 5 conflict, 6 war, 7 peace) and the `i64` Unix second the state ends. Each bot
+keeps the latest of each zone group in `BotState::zone_states`, a table behind one pointer
+(allocated by the first packet, bounded at 64 zone groups, cleared by a reconnect). The end time is
+the server's schedule; the state holds until a new packet replaces it. `at_war` is true for
+conflict and war only, and false for a zone group the server has not announced.
+
+**Masks and the per-bot budget.** The brain's goal masks (`disabled`, `blocked`, the gate) are a
+`GoalMask` (`u32`, 32 goals; a compile-time check fails the build when the goals outgrow it). The
+failure cooldown table is allocated by a goal's first failure, so a bot that never failed a goal
+pays one pointer for it. With eighteen goals, the zone table, the guild state, the pvp memory and the farm memory,
+`size_of::<Bot>()` is 3192 bytes (limit 3200) and `Goal` stays 152: a new per-bot structure belongs
+behind a pointer (the farm memory is one `Option<Box<FarmMem>>` in the market state, the running
+farm machine one `Option<Box<Machine>>` in the goal).
+
+## Farming (`bot/farm/`, goal `farm`)
+
+Bots buy seeds, plant them, wait and harvest, and they grow what the economy is short of. Everything
+is off until `[farm] enabled`.
+
+* **Protocol** (`aa-proto`): `cs::create_doodad` (`CSCreateDoodad`: doodad id, fixed-point x and y,
+  z, rotation, scale, the seed's item id), `cs::buy_items` (`CSBuyItems`: the merchant's object id and
+  the stacks to buy, paid in money), `cs::request_common_farm_list`; the harvest is the ordinary
+  `cs::start_skill_doodad`. `SCResponseCommonFarmListPacket` becomes `WorldEvent::CommonFarmList`
+  (the character's crops on the public farms, which carry no object ids). All have byte-exact tests.
+  `motion::range_checked` pins the bot's position before the two new packets because the server
+  checks the distance (3 m to a merchant, 30 m to the planting spot).
+* **Data** (`aa-world` `farm.rs`, `Farming`, from `World::farm()`): a seed is an item with a row in
+  `item_spawn_doodads`; its `Crop` has the doodad, the phases (a phase is ripe when a use function
+  with a harvest skill leads to a phase that hands out items), the total growth time (the sum of the
+  growth delays, divided by the world's `GrowthRate` and shortened under a matching climate:
+  `Crop::grow_ms_at(rate)`), the yield per produce item (`Yield { min, max }`, no drop chance:
+  rare drops of a loot pack are overvalued), the labor per harvest skill (13980 to 20486), the seed
+  vendors (`vendors_of`) and the farm kinds that allow it. The public farms (sub zones 966, 967,
+  968, 974, 998; `FarmKind` Farm, Ranch, Nursery, Stable; ten crops per character on a field farm,
+  five on the others) are polygons baked from `subzone_area.xml` into `farm_areas.json` (`aa-bake`
+  `areas.rs`, `--only farms`); a world without them has gardens only.
+* **Memory** (`bot/farm/mod.rs`, `FarmMem`): up to 64 `Plot`s (crop object id, doodad, seed, position,
+  phase, ripe flag, the time to look again, when it was planted, whether it is honest, the land it
+  stands on), the spots and seeds the server refused (with an expiry) and a few counters. It follows
+  the server through `farm::observe`, which the bot loop calls for every world event before the
+  `keep_doodad` filter drops the doodads it does not track: a `SCDoodadCreated` whose owner is the
+  bot's character marks its own crop; a phase change marks it ripe; a crop that vanishes while the bot
+  stands within 12 m is gone (harvested or destroyed), further away it only left the view; the common
+  farm list replaces the plots on the public farms after a reconnect (such plots are not honest).
+* **Planner** (`bot/farm/plan.rs`): `choose` scores every crop that grows on dry land,
+  `(0.05 + profit + need) * time * reach * held`, with the profit per hour of produce value less half
+  the seed price, the need per produce item `(3 if wished + 2 * scarcity) / (1 + units other bots
+  grow / 40)`, `1 / (1 + hours / 6)` for the time to ripen, the distance to the seed vendor and a
+  bonus when the bot already holds seeds. Everything it reads is behind the `Env` trait (the
+  scarcity view, the wish list, the vendors, the bag, the farm board), so it is tested without a
+  world. `make_plan` caps a run at five seeds and decides how to get them: buy (a vendor and the
+  money), mint with a GM command (`bots.gm_bootstrap` only), or the seeds in the bag.
+* **Sites** (`bot/farm/site.rs`): a `Site` is the garden of one of the bot's houses (the square of
+  `garden_radius` around the house, from the housing data) or a public farm polygon; `pick_spot` draws
+  a free point at least 1.6 m from any known crop, away from the polygon's edge, not on a refused
+  spot. The spot is claimed in `contest` (`plot_key`, 3 m cells) so two bots do not pick one square.
+* **Machine** (`bot/goals/farm/machine.rs`): a pure state machine over an `Input` (what the bot
+  knows this tick) and the `FarmMem`, returning `Act`s (walk, buy, plant, cast, GM line, ...), so a
+  whole run is tested against a scripted server (`goals/farm/tests.rs`) without a network. Phases:
+  `Fetch` (ask for the public-farm crops once per session), then for a plant run `Shop` (walk next to
+  the vendor, stay within its 3 m, buy, check the bag) or `Mint`, then `Sow` (draw a spot, walk
+  there, face it, `CSCreateDoodad`, wait for the crop to appear, retry another spot on a typed
+  refusal), and for a harvest run `Reap` (walk to the crop, cast the harvest skill, wait for the
+  crop to change, wait for it to go, plant the seed on the same spot). The glue in `goals/farm.rs`
+  (`RealOps`, `RealEnv`) turns `Act`s into packets and movement and builds the input from `Ctx`.
+* **Honest produce.** The ledger counts the reasons an item arrives clean (`reason::*`); a harvest
+  arrives as `DOODAD_INTERACTION` (17), which is not clean by itself. The machine opens
+  `MarketState::open_harvest(honest)` for the length of a harvest cast, and `counts(17)` is true only
+  inside an open honest window; `None` adds nothing and `Some(false)` counts nothing. A plot is honest
+  when the ledger counted the planted seed as clean (`clean_count(seed) >= 1` at planting), so
+  seeds bought from the vendor (`STORE_BUY`) give sellable produce and GM-minted ones never do. The
+  seed that leaves the bag arrives as `DOODAD_CREATE` (14).
+* **Scoring** (`goals::farm::score`): 0 unless `farm.enabled`, the bot is settled (90 s online),
+  healthy (60 % hit points), in the main world and not within five minutes of its last plant run.
+  Otherwise a due plot scores three times the weight, and a bot with room for plots and a crop it can
+  get seeds for scores the weight plus half of the need of the best crop (capped at 3). The weight is
+  `0.35 * (0.5 + 0.5 * homebody + 0.5 * merchant)`. The director's per-goal bias and its 1.5 times
+  nudge for wishes apply on top, in `brain::scores_now`.
+* **The board** (`bot/farm/board.rs`, `hub.farms`): per bot, what it expects its plots to give
+  (item, count), published after each plant and harvest and dropped when the bot leaves. The planner
+  damps the need by what the others grow; the Economy view's "Growing" column is its sum.
+* **Web**: the bot snapshot gets `plots` (`PlotLine`: position, crop, state with the time left,
+  honest, land; skipped when empty) and the economy rows `growing`; both are additive fields with
+  defaults.
+
+Live behaviour is in the farm notes of [OPERATING.md](OPERATING.md#farming-farm); the tests are the
+unit and flow tests in `bot/farm/` and `bot/goals/farm/`, and `tests/farm_real_data.rs` (ignored,
+needs `AA_COMPACT` and `AA_SERVER_DATA`) which runs the whole loop against the real data and a fake
+server.
+
+## Parties of real players (`bot/companion/`, goal `companion`)
+
+A bot in the party of a real player: it joins when invited, follows the leader, helps in the fights,
+obeys a closed set of chat commands and goes through a dungeon door behind the leader. The pieces
+are pure decision code, tested without a connection, and thin glue that turns them into packets.
+
+| File | What it is |
+| --- | --- |
+| `aa-proto` `sc_activity.rs`, `cs.rs` | The team packets a companion needs besides the join ones: `SCTeamRemoteMembersEx` (0xe4: zone key, instance id, level, hit points, mana and position of every member), `SCTeamMemberDisconnected`, `SCTeamMemberRoleChanged`, `SCRefreshTeamMember`, `SCTeamLootingRuleChanged`; the requests `make_team_owner` and `set_team_member_role`. Byte-exact tests were written from the server's encoders; counts are bounded by the bytes left. |
+| `bot/party/remote.rs` | `Remote` per team member (role, online, level, object id, zone key, instance id, vitals, position, when it was seen) next to the `TeamLog`; a pure function of the packets, boxed with the rest of `PartyMem`. |
+| `policy.rs` | `judge(&Facts)`: may the bot join (or invite) now? In a team, away, dead, trading, dueling, on a journey, busy with a goal it does not drop, the level gap, the caps. |
+| `command.rs` | `parse(text)` into the closed set (`follow`, `stay`, `come`, `assist`, `leave`, `dungeon <name>`, `inv`), the dungeon name search (word prefixes), the short lines the bot answers with. |
+| `follow.rs` | `decide(&Inputs)`: hold, rest, keep the trip or walk (to the leader, a different stop distance per bot, catching up beyond 20 m, a trip beyond 120 m, rest below 40 % until 70 % with hysteresis); `should_assist(&AssistIn)`: the leader's last target. |
+| `upkeep.rs` | `plan(&Facts)`: announce the role once, hand the lead to the first real player online (four tries), leave (asked, no real player, offline for three minutes, level gap plus five). |
+| `lead.rs` | `leader_state(&In)`: main world, a dungeon (instance id) or *vanished at an entrance* from the unit in view and the position records; `position` says where to walk. |
+| `enter.rs` | `Machine`: the dungeon follow (outside, door, cast, load, inside, exit, away) with its deadlines, typed reasons (`Why`) and the refusals answered by kind through the dungeon goal's `entry::reaction`. `step(&Facts) -> Intent` is pure. |
+| `duty.rs` | The glue the brain calls every tick: answer invitations, upkeep, queued whispers, the chat commands, the web snapshot. |
+| `mod.rs` | `Mem` (the per-bot state, one box inside `PartyMem`) and `Board` (the hub's count of companions per process and per player, places expire after 45 s). |
+| `bot/goals/companion.rs` | The goal: facts for the machine from the tick context, the intents carried out (walk, cast the entrance and exit skills, `/level`, leave the team), the follow step, the assist. |
+
+**Size.** `size_of::<Bot>()` did not grow: the companion memory is an `Option<Box<Mem>>` inside the
+existing `PartyMem` box (allocated by the first invitation or command), the caps are on the hub, and
+the goal is one pointer.
+
+**Hooks in shared files** (all additive): `Brain::tick` calls `companion::duty` (and starts the goal
+when the bot is in a real player's party and runs nothing it must not drop), `route_inbox` hands the
+chat lines to `companion::forward_chat`, `dungeon::unsolicited` leaves a real player's invitation to
+the party feature, `pick_assist` in the combat controller shrinks the help radius to 12 m for a bot
+told to `stay`, `publish` fills `BotSnapshot.party`.
+
+**What the server does that the design works around** (live-verified, see OPERATING.md):
+
+* An invitation never expires and a pending one blocks every later invitation to the same
+  character: every invitation is answered within seconds, a no at once.
+* Accepting does not check the membership of another team, so a bot never accepts while it is in one.
+* A late joiner of an existing team receives no party chat: replies are whispers.
+* A character that logs in again is still a member of its team (the server keeps the offline
+  member), and gets the join packet again: a restarted bot follows its party at once.
+* A team member that casts the entrance of a dungeon its team has opened joins the team's
+  instance; the entry limit (`enter_count` per four hours and character) still counts.
+* The `0xe4` record carries the zone *key* (the instance's key inside a dungeon), not `zones.id`.
+* The server announces a target change only: a fight that began before a bot joined, or that goes
+  on for minutes, is invisible to an event-driven assist, so the goal looks at the leader's last
+  announced target itself.
+* Whispers between the factions are refused by the server (`CHAT_CANNOT_WHISPER_TO_HOSTILE`).
+
+**Not done.** Healing allies: the rotation's heals are `Aim::SelfOnly` and `rotation::Inputs` knows
+only the bot's own hit points; a healer fights like a damage dealer and heals itself.
+
+## Guilds (`bot/guild/`, goal `guild`)
+
+A guild is what the server calls an expedition (`systems/social/expedition.rs`). The feature is
+split into pure decision code, tested without a connection, and thin glue that turns the decisions
+into packets.
+
+| File | What it is |
+| --- | --- |
+| `aa-proto` `guild.rs` | The requests (`create`, `invite`, `reply_invite`, `leave`, `kick`, `set_member_role`, `change_owner`, `dismiss`), the `GuildEvent` parser for the nine packets a bot needs (faction list, created, member list in chunks, member status, invitation, join/leave/expel, role, owner, dismissed), the role and error-code constants. Counts are bounded by the bytes left, byte-exact tests were written from the server's writers. `cs::chat_type::CLAN` is guild chat. |
+| `log.rs` | `GuildLog`: id, name, owner, members (`since_ms`, role, online), the pending invitation, how the bot last lost a guild, the newcomers to greet. A pure function of the packets (`apply`), idempotent where the server repeats itself (`SCUnitExpeditionChanged` may arrive twice on a leave). |
+| `book.rs` | `GuildBook` in the `Hub`: one mutex around plain data, the clock is an argument. A card per bot (character, mother faction, level, guild, can-join / can-found / wishing, refreshed every 5 s, stale after 20 s), the guilds the bots belong to, the foundings under way (`reserve` / `release`, so `max_guilds` counts them), the guild names that are taken, the claim on an invited bot, the pace of invitations and chat lines per guild. |
+| `plan.rs`, `forming.rs` | `plan` picks `party_size` wishes of one mother faction (longest wait first, the founder is the highest-level bot that can pay); `Wishes` is the coordinator's list (`CoordMsg::Guild`), which first drops the wishes of bots that left, joined a guild or changed faction (the book knows) and reserves the place in the book. |
+| `found.rs` | `Machine`: the founder (wait for the others, invite one after the other, name, create, dismiss the team) and the member (answer the leader's invitation, turn others down, wait for the guild, leave the team). `step(&Snap) -> (Status, Acts)` is pure; every wait has a deadline and a typed `Fail` with a back-off. |
+| `life.rs` | `View` over the log: who may recruit, whom the owner promotes, who succeeds a leaving owner, who may leave, whom to greet; the clocks and plans in `Timers`. |
+| `duty.rs` | The glue every brain tick (`guild::duty`): card and membership to the book, invitation answers (a human pause first), the join-ignored detector, life steps, requests of real players, the web snapshot (`snapshot_if_changed`). |
+| `chat.rs`, `names.rs`, `report.rs` | The lines (no repeat of a recent one, all pass the safety filter), the request detector for whispers ("ginv", "guild invite", "can i join"; not "party", "group", "dungeon", ...), the name generator (mirrors the server's `^[a-zA-Z ]{3,32}$`, five shapes, a Roman numeral from the third try), the issue reports. |
+| `goals/guild.rs` | The goal: with a `PartyPurpose::Guild` order the founding (without one, when an operator forces it, a wish). Its score is 0: the wish itself (`CoordHandle::request_guild`) is posted by the duty. |
+
+**Per-bot cost.** `BotState::guild` is `GuildState(Option<Box<Mem>>)`: one pointer until the first
+guild packet or duty tick with the feature on. `size_of::<Bot>()` is 3192 with it and the other features (limit 3200).
+
+**Founding through the coordinator.** The duty posts a `GuildWish` when the bot can sign a charter; the
+bot goes on with its day and the coordinator keeps the wish for 20 minutes. `Coordinator::form_guilds` runs on
+every wish and every sweep; it sends every member of a team the same `PartyOrder` (leader first,
+purpose `Guild`), which the brain turns into the goal with the order. Nobody walks anywhere: the
+team invitation and `CSInviteToExpedition` go by name and the server checks no distance. The founder
+releases the reservation in `stop`; one that is never released ends after ten minutes.
+
+**Server facts the bots keep to** (read from `expedition.rs`, `team.rs`):
+
+* A charter needs a team of `PartyMemberCount` (five), every member level 5 or more, unguilded and of
+  the founder's mother faction, and 10000 copper from the founder; the name is compared exactly
+  and must match the regex. Refusals are `SCErrorMsg` codes 293, 294, 295, 296, 297, 299, 321,
+  330 and 761; each has a back-off (`Fail::back_off_ms`).
+* An owner who leaves leaves the guild without a leader: the bots hand the guild over first
+  (`CSChangeExpeditionOwner`) and wait for `SCExpeditionOwnerChanged` before they leave.
+* By default only role 2 and up may invite, only the general (255) may promote and expel. Refused
+  invitations and replies are silent, so every request has a deadline and a detector.
+* An invitation lasts 60 s and a target has one pending; a team invitation never expires and
+  blocks later ones, so a founding member answers at once and turns down strays
+  (`dungeon::unsolicited` spares the goal `guild` for the same reason).
+
+**Detectors.** A "join" that did not become a membership within 15 s, a creation without an
+answer, a leave or hand-over or promotion that changed nothing, and a creation refused for a
+reason the bots' own checks exclude are reported with the keys `guild join-ignored`,
+`guild create-no-answer`, `guild create-refused code=N`, `guild leave-ignored`,
+`guild owner-change-ignored` and `guild promote-ignored` (area `systems/social/expedition.rs`).
+
+**Tests.** Unit tests cover every pure part (the parser with byte-exact packets, the log, the
+book, the planner, the coordinator's forming, the machine, the decisions, the lines, the names, the
+reports, the config). `tests/guild_real_data.rs` (ignored without the server data, see its header)
+drives the real brain against the real world: an owner promoting and recruiting its own faction
+only, the invitation policy, whispers for an invitation, a hand-over before a leave and the rest
+after it, a founder gathering a team, a wish reaching the coordinator.
+
+## PvP (`bot/pvp/`, goals `gank` and `warzone`)
+
+Everything is behind `[pvp] enabled`. The pieces:
+
+| Piece | Where | What |
+| --- | --- | --- |
+| Rules | `bot/pvp/rules.rs` | Pure: may the bot attack a character, for a defence, a hunt or a gank? Mirrors the server's `can_attack`: the hostile relation is by mother faction (Nuia 148 against Haranya 149); a character is protected where its alliance owns the zone (the target's mother faction is the zone's faction or its mother; a zone without an owner counts as the neutral faction 2); the town peace buffs (2149, 2221, 4828) forbid combat skills. Then the operator's limits. |
+| Self-defence | `bot/pvp/defence.rs`, `bot/pvp/fight.rs`, `bot/combat.rs` | `defence::pick` finds the character that attacks the bot (the controller's threat list, or a character that lost hit points next to the bot); `fight::judge` ends a fight with a character (retreat, the protected-zone signature, time); `fight::start_flee` runs. The controller has a `fleeing` flag, so goals that do not own combat wait. |
+| Post planner | `bot/pvp/post.rs` | Pure: walks the line between each workbench and the best buyer of its best pack, keeps the points outside the victims' land and scores them (pack price, conflict zone, war, the first point past the home land, minus the way). |
+| Squads | `bot/pvp/squad.rs`, `bot/coordinator.rs`, `bot/party.rs` | A waiting bot sends a `Standby` offer; the coordinator groups offers of one alliance and sends every member a `BotCmd::Party` with `PartyPurpose::Ambush { x, y }`, which the brain turns into a gank goal that knows its squad. The squad needs no further messages: all members pick the same carrier (`squad::pick_target`) and take turns at the doodad. |
+| Gank | `bot/goals/gank.rs` | `Plan -> ToPost -> Lurk -> Fight -> Collect`. `verdict` and `CollectJob` are pure. A finished gank with a pack in the backpack slot continues as a trade run (`Gank::resumes_run`, the same hand-over the rest goal uses), whose carry-only plan sells it. |
+| Warzone | `bot/goals/warzone.rs` | `Plan -> Go -> Patrol <-> Fight -> Regroup`; pure `wars`, `pick_war`, `engage`, `patrol_spot`. |
+
+**State.** `BotState::pvp` is one pointer (`Option<Box<PvpMem>>`, allocated by the first use): the
+backpack templates of the characters in view, the shun table, blocked posts, the flee in progress,
+war kill counts and the last honor the server said. The one cheap per-unit fact is the `U_PACK`
+flag in `Unit::flags` (the backpack slot is occupied). `size_of::<Bot>()` is 3192 bytes with the guild and the other features (limit
+3200).
+
+**Protocol.** The backpack is equipment slot 26 (`BACKPACK_SLOT`); a character's state packet carries
+it in its equipment block, `SCUnitEquipmentsChangedPacket` (0x094: `u8 count`, then `u8 slot` and an
+item or four zero bytes per slot) updates it, and `SCUnitPvPPointsChangedPacket` (0x204: `u8 kind`,
+`i32 points`; kind 0 honor, kind 1 hostile faction kills) follows every kill of a hostile character.
+When a character dies its pack drops as a doodad (one of the `put_down_backpack_effects` doodads,
+`World::is_pack_doodad`) that anybody with an empty backpack slot picks up with the doodad's func
+skill (11361) within a few metres; the pack goes straight to slot 26. The doodad is kept in the
+view although it has no flags the bots otherwise care about.
+
+**Zone groups.** `World::zone_info_at` gives the zone group and the owning faction of a point,
+`World::zone_group_spots` the spots (every fourth sector centre) of a conflict zone group, and
+`World::is_conflict_group` the groups that take part in the zone conflicts (`conflict_zones`, not
+closed).
+
+## Events (goal `event`)
+
+The server runs *rifts*: tower defence events (its `tower_defs` tables) in which controller NPCs
+summon waves of monsters. An event is keyed by (definition id, zone group) in world 0; the waves are
+"steps", a 1-based index into the definition's progs ordered by id. A wave ends when its timer ran out
+(if it has one) and/or every kill target it names has died (`cond_comp_by_and` picks AND or OR); kills
+count for anyone in the zone group. The event ends after its last wave, by `/towerdef end` or at
+`force_end_time` (3600 s for the Crimson Rift).
+
+* **Packets** (`aa-proto` `sc_event.rs`, wired in `sc_world.rs`): `SCTowerDefList` 0x16b, `Start` 0x16c,
+  `End` 0x16d, `WaveStart` 0x16e become `WorldEvent::{TowerDefList, TowerDefStart, TowerDefEnd,
+  TowerDefWave}`. A list entry is 41 bytes (def `u32`, zone group `u16`, zone `u32`, spot `u32`, target
+  object `bc`, x and y as fixed-point `i64`, z `f32`, step `u32`); the count is checked against the body.
+  The server sends a list on world entry and after each start and wave. Its position is where the
+  *target unit* stood at that moment, and the target of the Crimson Rift **walks a path** (about 1 m/s),
+  so a bot that sees the unit (`state.unit(obj)`) follows its live position (`live_rally`).
+* **Data** (`aa-world` `event.rs`): `Events::load` joins `tower_defs`, `tower_def_progs`, spawn targets,
+  kill targets, `npc_spawner_npcs` and the conflict zones with the NPC spawn data. An `EventDef` has the
+  controllers (spawner, step, template, position, zone group), the kill targets per step (template and
+  count), the timer, the time cap, the level range (the levels of the kill-target NPCs; a definition
+  without kill targets has 0 and is not joinable) and the war zone group of a conflict definition.
+* **The board** (`playerbots` `events/board.rs`, `hub.events`): the process-wide `EventBoard`. The first
+  bot to hear a packet posts it (`on_server_event`, called by the bot loop after `state.apply`); the
+  others find it there. One short mutex plus an atomic count, so a bot with no event running reads one
+  atomic. It keeps the running events, the step and its start, the target, the slots (leases that
+  the goal renews every tick, `LEASE_MS` 25 s), the join delays, the bars (hurt 5 min, idle 10 min, three
+  deaths) and the evidence of the detectors. Flood control: `max_bots_per_event`; `max_share` of the
+  online bots that are high enough for the event (`Population`, rebuilt by `Hub::tick` once a second
+  while an event runs; unknown means no share cap); the join delay is a deterministic draw in
+  `join_delay_secs` from (bot, definition, first seen). It logs `event started / wave / target / ended`
+  on target `pb_events`.
+* **The goal** (`bot/goals/event.rs`, decisions in `event/plan.rs` and `event/pick.rs`):
+  `Event{run: Option<Box<Run>>}` is one pointer, so `Bot` stays within its size budget. `duty` (called by
+  the brain every tick, one atomic read when idle) starts it in place of none, wander, rest, grind or
+  quest; `score` (12) does the same when the brain draws. `offer` is the eligibility: `enabled`, a
+  running event, level at least the definition's, hit points 70 % or more, not away (instance, loading,
+  dead), not a war definition, the zone group not at war with `avoid_war_zones`, a way short enough
+  (4000 m on foot, 15000 m with portals, any with GM `/move`), the join delay over, a free slot.
+  Phases: *Go* (`Ctx::travel`, so a long trip takes portals or `/move`; trips are limited in time and
+  continued while they gain) and *Hold* (within 40 m of the target, at an own spot in a ring of 6 to
+  18 m so bots spread). In *Hold* the bot fights the nearest unit that is a kill target of the current
+  wave, else a monster of another wave of the event (a straggler), within 55 m of the target and 70 m of
+  the bot, one nobody holds before one somebody holds (`hub.contest` claims). Controllers (the Rift
+  itself, the summoners) and every monster that is not the event's own are never attacked: a wave that
+  names no kill targets (the first, a timer) is waited out. It leaves when the event ends, below
+  40 % hit points, after three deaths, or after 8 minutes of nothing to fight (the wave timer and three
+  minutes when that is longer; a new wave restarts the wait).
+* **War zones** (`bot/war.rs`): `Ctx::in_war_zone(x, y)` is `[events] enabled`, `avoid_war_zones` and the
+  zone group at (x, y) (`World::zone_key_at`, `travel.zone_groups`) at conflict or war in
+  `BotState::zone_states`. Grind (`find_spawn`), wander (`random_point` filter) and the quest planner
+  (`plan_target`, `find_candidate`) do not choose such a destination; the `warzone` and `gank` goals never
+  ask. A bot already inside is not moved out.
+* **Detectors** (`events/detect.rs`, pure `judge`, run by `EventBoard::sweep_witnessed` about once a
+  second): *no wave monster*: a participant stood at the target for 30 s, 60 s plus the walk from the
+  farthest controller (4 m/s, at most 240 s) after the wave began, and no unit of the wave and no
+  kill was seen (`event-wave-no-npcs def D wave N`); *stuck wave*: every kill the wave waits for was
+  seen but the event stayed in the wave 30 s later (`event-wave-stuck def D wave N`); *not ended*: the
+  event outlived its cap by 60 s (`event-not-ended def D`). Each is told once per wave (per event for
+  the last) and is filed for each of up to three bots that stood in the event (so it is an issue seen
+  by several bots, with their trail), suspect server, area `systems/instances/tower_def.rs`. A stale
+  event is dropped from the board 120 s later.
+
+Deviations from the brief, on purpose: the "no wave monster" wait is 60 s *plus the walk* (the
+summoners stand up to 1500 m from the target); `max_share` counts the online bots that are high enough
+for the event, not all bots (so a share of 0.3 of 20 such bots is 6 whatever else is online); a bot
+does not fight monsters that are merely near the target when the wave names no kill targets (the first
+live run did, and the camp around the Grimghast Rift killed the bots in under a minute).
 
 ## Navigation motion (`bot/nav/`)
 
@@ -416,47 +753,66 @@ skills 11215, 11216, 10594 and 16841); `apply_unit_state` tells it about gate NP
 
 A bot gets a boat summon scroll, summons a boat, sails it along a planned route and comes ashore.
 Only the sea is planned: lakes and rivers are out of scope (the sea mask knows nothing of them).
+The boat is the rowboat unless `[sail] ship` names another hull; the bigger hulls (clipper, cutter,
+junk, yawl, schooner) launch, steer, plan and berth differently, see [Bigger hulls](#bigger-hulls).
 
 ```text
 Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every failure, then Failed)
 ```
 
-- **Gear**: a scroll in the bag is used; otherwise, with `gm_bootstrap`, `/item add self 17906 1`
-  (the cheapest boat scroll of the data with a driver seat and a top speed of 4 m/s or more; the
-  rowboat). A boat left over from an earlier trip is despawned first. Without GM and without a
-  scroll the goal fails (`NoTarget`) and the brain's 60 s failure cooldown applies.
+- **Gear**: a scroll in the bag is used; otherwise, with `gm_bootstrap`, `/item add self <scroll> 1`
+  with the cheapest scroll of the hull family (`ShipFamily`, `Boats::scroll_for`): the default is
+  17906, the rowboat (the cheapest scroll of the data with a driver seat and a top speed of 2.5 m/s
+  or more). `[sail] ship = "auto"` takes the family of a scroll the bag holds, else a boat of the
+  bot's own (a roll seeded by the character id; merchants favour the schooner). A boat left over
+  from an earlier trip is despawned first. Without GM and without a scroll the goal fails
+  (`NoTarget`) and the brain's 60 s failure cooldown applies.
 - **Plan** (`goals/sail/trip.rs`): the nearest beach with open water in front of it is the launch
   (`find_shore`: land 3 m behind the stand point, water 12 to 28 m off the beach); the landing is a
-  beach near a random open-water point 1 to 3 km away whose sea route is at most 2.2 times the
-  straight line; otherwise a sightseeing loop out to a point at sea and back to the launch. Aggressive
-  monsters that live on the water (`danger_zones`: the spawns of NPC templates that attack on sight
-  and that the bot's faction is hostile to, e.g. 8563 / 13012 near (15344, 16346); at most 400)
-  close a 100 m disc each to the planner (140 m shuts the whole of Castaway Strait to a trip).
+  beach near a random open-water point 1 to 3 km away (twice as far for a hull that does 6 m/s)
+  whose sea route is at most 2.2 times the straight line; otherwise a sightseeing loop out to a
+  point at sea and back to the launch. Aggressive monsters that live on the water (`danger_zones`:
+  the spawns of NPC templates that attack on sight and that the bot's faction is hostile to, e.g.
+  8563 / 13012 near (15344, 16346); at most 400) close a 100 m disc each to the planner (140 m
+  shuts the whole of Castaway Strait to a trip). A failed plan says why in the bot's log.
 - **Sea map** (`aa-world::water`, `World::water()`): 16 m cells from the 4 m height grid, built on
   first use by up to four threads (about 1.4 s in a debug build, a tenth in release) and shared by
   all bots: a cell is sea when every height sample it touches is a real terrain sample under 98 m.
-  35 x 2431 cells of bits, **664 KiB**. The planner is an A* over open cells (a cell is open when
-  its square neighbourhood of `clear` cells is all sea) with hashed scratch, a node bound,
-  a shore penalty and line-of-sight smoothing; the route keeps two cells (32 m) off the beach, one
-  as a fallback.
+  35 x 2431 cells of bits, **664 KiB**. The large hulls use a second mask of the same size
+  (`World::water_deep()`, terrain under 95.5 m: 4.5 m of water), built at their first trip. The
+  planner is an A* over open cells (a cell is open when its square neighbourhood of `clear` cells
+  is all sea) with hashed scratch, a node bound, a shore penalty and line-of-sight smoothing; the
+  rowboat's route keeps two cells (32 m) off the beach, one as a fallback.
 - **Shore / Summon**: the bot walks to the stand point, faces the water, waits 0.8 s and casts the
   scroll's skill on itself (`start_skill_item`). Refusals of the place (`SkillResult` 0x23, error
   messages 100 / 583) pick another beach, at most two more times; an unexpected refusal is a
   `SkillRefused` finding; a boat that does not appear within the cast time plus 10 s is an issue.
 - **Board**: the bot swims to the hull (the server measures the bind reach to the hull's mass box,
-  under 4 m of surface gap) and sends `CSBindSlave` from 2.8 m, closer after a "too far" answer.
-- **Sail** (`bot/vehicle/{helm,follow}.rs`): pure-pursuit on the waypoints (lookahead 70 m, waypoint
-  reach 40 m, arrival 18 m) and a hull-aware rate-tracking heading controller. The server turns
-  slowly (a rowboat 4.35 degrees per second, angular acceleration 0.125 rad/s^2 at full helm; both
-  from `ship_models.turn_accel` and the kind's turn cap, `SlaveTemplate::turn`), so the controller
-  asks for the yaw rate that stops on the target heading (`sqrt(2 a err)`), converts the rate error
-  to a steering value and slows down for sharp turns. A steering probe at the start (80 steering
-  with 100 throttle for 2.5 s) measures which way the wheel turns (the documented direction is a
-  positive steering that lowers the yaw), and a divergence watch flips the sign once more if the
-  heading runs away. A `ShipRequest` is sent when the throttle changes, the steering moves by 6 or
-  more, or as a 1 s heartbeat (the server keeps a request until the next one).
-- **Stuck**: less than 3 m of progress in 8 s with the engine on, or the server's `stuck` flag, backs
-  the boat off astern for 4 s and plans the route again from where it is; the fourth episode aborts.
+  under 4 m of surface gap; for the bigger hulls the bot aims at a point 0.3 m outside the box and
+  binds from a gap of 1.4 m) and sends `CSBindSlave` from 2.8 m, closer after a "too far" answer.
+- **Sail** (`bot/vehicle/{helm,follow}.rs`): pure-pursuit on the waypoints (rowboat: lookahead 70 m,
+  waypoint reach 40 m, arrival 18 m) and a hull-aware rate-tracking heading controller. The server
+  turns slowly (a rowboat 4.35 degrees per second, angular acceleration 0.125 rad/s^2 at full helm;
+  both from `ship_models.turn_accel` and the kind's turn cap, `SlaveTemplate::turn`), so the
+  controller asks for the yaw rate that stops on the target heading (`sqrt(2 a err)`), converts the
+  rate error to a steering value and slows down for sharp turns. The turn factor of the server
+  (0.5 at a standstill, 1 from 2.5 internal units, which are twice the real speed) enters the rate
+  conversion. A steering probe at the start (80 steering with 100 throttle for 2.5 s) measures which
+  way the wheel turns (the documented direction is a positive steering that lowers the yaw), and a
+  divergence watch flips the sign once more if the heading runs away *and* the hull turns against
+  the helm (a hull that turns the right way but too slowly for the route keeps its sign). A
+  `ShipRequest` is sent when the throttle changes, the steering moves by 6 or more, or as a 1 s
+  heartbeat (the server keeps a request until the next one).
+- **Speed**: the throttle is an acceleration request, not a speed: the server accelerates the hull
+  for as long as the throttle is ahead, up to its cap, and brakes it with an astern throttle (2.4
+  times as hard as it accelerates). So `throttle(speed, wanted)` goes ahead in proportion to the
+  shortfall, to 0 within a small band and astern in proportion to the excess, and `wanted_speed`
+  is the top speed (1.1 times: the server caps the hull itself) unless the route asks for less
+  (`Guide.v_limit`) or the bow is far off the wanted heading.
+- **Stuck**: less than 3 m of progress in 8 s with the engine on, or the server's `stuck` flag
+  (which is never set), or an impact (a hull that ran at 1.5 m/s or more within the last 6 s and
+  now stands still with the engine on), backs the boat off astern (4 s and a tenth of a second per
+  metre of hull) and plans the route again from where it is; the fourth episode aborts.
 - **Land**: brake (astern while above 2.5 m/s), set the throttle to 0, `CSDiscardSlave`, then
   `CSDespawnSlave`, then walk (swim) to the landing stand point. Each request is repeated once
   after a timeout; a missing answer is an issue and the trip goes on.
@@ -476,28 +832,144 @@ Gear -> Plan -> Shore -> Summon -> Board -> Sail -> Land            Abort (every
   no boat), `sail:bind_no_attach` (`SCSlaveBound` names the bot, no `SCUnitAttached`),
   `sail:bind_no_response`, `sail:no_ship_movement`, `sail:no_thrust` (engine on 5 s, deep water,
   not aground, speed 0), `sail:dead_wheel` (helm hard over at speed for 10 s, no turn),
+  `sail:slow_boat` (the top speed seen is under 75 percent of the data's, on a route over 600 m),
   `sail:despawn_ignored`, `sail:discard_ignored`, `sail:error_code:<id>` (an unexpected
   `SCErrorMsg` after a boat action).
 - **Memory**: `VehicleState` is one pointer (the `Sailor` is allocated by the first sail goal or
-  summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea map
-  is 664 KiB once. `size_of::<Bot>()` went from 3152 to 3160 bytes (limit 3200), `Goal` is 152
-  bytes (limit 160).
-- **Live behaviour** (QA server, rowboat scroll 17906, slave 15): the boat takes 10 to 20 s from the
-  cast to the bind, the helm probe finds the documented steering sign, the boat holds its heading
-  within a degree on the straights and its top speed is 3.2 m/s (`ship_models.velocity` 6.4 divided
-  by 2: the `MoveSpeedMul` of 2.0 the data estimate assumes is not in effect, so `sail:slow_boat`
-  files a low-severity report). A crossing of 1.6 to 3.4 km takes 9 to 18 minutes, landing, despawn
-  and the swim ashore about 20 seconds. The server keeps a despawned (or logged out with) boat in its
-  `slaves` table and puts it back on the water at login, at its old position: the Gear phase
-  despawns such a boat first. A scroll is not consumed by the cast.
+  summon and kept), `Sail` is one boxed `Machine` (a few hundred bytes while a trip runs), the sea
+  map is 664 KiB once (and the deep one 664 KiB more once a large hull sails). `size_of::<Bot>()`
+  is 3192 bytes (limit 3200), `Goal` is 152 bytes (limit 160); the hull data and the route live
+  in the boxed machine.
+- **Live behaviour of the rowboat** (QA server, scroll 17906, slave 15): the boat takes 10 to 20 s
+  from the cast to the bind, the helm probe finds the documented steering sign, the boat holds its
+  heading within a degree on the straights and its top speed is 3.2 m/s: `ship_models.velocity`
+  6.4 times `MoveSpeedMul` squared (2.0) over 8. (This document used to say velocity times
+  `MoveSpeedMul` over 2, which is twice the speed; the server moves the body at the internal
+  speed times `MoveSpeedMul / 4` and caps the internal speed at `velocity * MoveSpeedMul / 2`.) A
+  crossing of 1.6 to 3.4 km takes 9 to 18 minutes, landing, despawn and the swim ashore about 20
+  seconds. The server keeps a despawned (or logged out with) boat in its `slaves` table and puts it
+  back on the water at login, at its old position: the Gear phase despawns such a boat first. A
+  scroll is not consumed by the cast.
 - **Limits**: sea only; the bot that is made to leave the goal at sea (a forced goal, a rest) is left
-  swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done.
-- **Tests**: the water mask, the planner (detour, no route, discs), the shore finder, the heading
-  controller (also with an inverted wheel and other hulls), the route follower, and the whole
-  machine against a scripted server (`goals/sail/tests.rs`: a rowboat with the server's turn
-  physics, GM scroll, refused places, no boat, no seat, ignored bind / discard / despawn, a dead
-  engine, a boat aground, an interruption at every point of the trip, a late boat of an interrupted
-  cast). Real-data check: `AA_BAKED=... cargo test -p aa-world --test water_real -- --ignored`.
+  swimming where it is; passengers (`take_passenger_seat` on seat 2 of the rowboat) are not done;
+  the bigger hulls sail with their driver only (no crew, no cannons, no cargo yet).
+- **Tests**: the water mask, the planner (detour, no route, discs), the shore and launch finders,
+  the heading controller (also with an inverted wheel and other hulls), the route follower, and the
+  whole machine against a scripted server (`goals/sail/tests.rs`: a rowboat, a clipper and a
+  cutter with the server's turn and speed physics (`vehicle/sim.rs`), GM scroll, refused places, no
+  boat, no seat, ignored bind / discard / despawn, a dead engine, a boat aground, a hull that hits
+  a wall without the server saying so, rounding the end of a wall, an interruption at every point of
+  the trip, a late boat of an interrupted cast). Real-data checks: `AA_BAKED=... cargo test -p
+  aa-world --test water_real -- --ignored` and `--test travel_real_data` (hull classes).
+
+### Bigger hulls
+
+`[sail] ship` picks the scroll family: `rowboat` (default, today's behaviour), `clipper`, `cutter`,
+`junk`, `yawl`, `schooner` or `auto`. The hull's numbers come from the server data
+(`aa_world::travel::ShipClass::of`, the constants `ROWBOAT`, `CLIPPER` and `CUTTER` are checked
+against the data by `ship_classes` in `travel_real_data.rs`):
+
+| Hull (scroll) | Kind | Top speed | Turn rate / radius at top speed | Box (beam x length x height) | Summon (ahead / side) | Portal | Guns / racks |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Rowboat (17906) | boat | 3.2 m/s | 4.35 deg/s, 42 m | 1 x 3 x 0.5 | 2 / 2 m | none | 0 / 0 |
+| Clipper (17626; the harpoon and adventurer's clippers 27266 / 23618 spawn 25 / 15) | speedboat | 6.5 m/s | 5.85 deg/s, 64 m | 4 x 8 x 7 | 5 / 5 m | 7 s | 0 / 0 |
+| Eznan cutter (5223), Lutesong junk (25739) | small sailing ship | 6.3 m/s | 2.6 deg/s, 139 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 8 / 4 |
+| Growling yawl (13711) | small sailing ship | 9.8 m/s | 2.6 deg/s, 216 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 8 / 4 |
+| Merchant schooner (23398) | small sailing ship | 6.5 m/s | 2.6 deg/s, 143 m | 6.5 x 30 x 14.5 | 30 / 20 m | 7 s | 2 / 20 |
+
+The top speed is `velocity * MoveSpeedMul^2 / 8` (see the rowboat note above) and the sailing ships
+add the wind: with the server's default (official) wind model a small or big sailing ship or a
+fishing boat goes 15 percent faster while its bow is within 15 degrees of north or south, which the
+bots see as a cutter at 7.2 m/s or a schooner at 7.0 on a northward leg (the table is the speed
+without it). The radius is the top speed over the turn rate cap, so a cutter needs a circle of 280
+m across; the helm is ignored for the portal time (7 s) after the summon.
+
+- **Launch**: the server places the hull in `summon_candidate_1_2` (40 steps ahead of the caster,
+  starting at the "ahead" offset, on the line and to both sides by the "side" offset, the hull laid
+  across the caster's view with its bow to the caster's left) and refuses the first place where
+  the hull box touches the terrain or the line of sight is blocked. `find_launch` /
+  `launch_ok` (`aa-world::water::shore`) run the same search on the sea mask and the height grid
+  (footprint sampled in 15 points, `LAUNCH_DEPTH_MEDIUM_M` 2.5 m and `LAUNCH_DEPTH_LARGE_M` 6 m of
+  water under it, a 2 m margin) so a beach is only chosen when the server will have room. The planner
+  tries up to six beaches (a beach without open sea within 260 m of it is skipped). The Large depth
+  is a guess until the server's mass box test is known (the cutter's mass box reaches 13.5 m down,
+  its model less): the live runs below saw no refusal at 6 m.
+- **Berth**: the hull ends the trip at `moor_point`: the first point, going straight out to sea
+  from the landing beach (or the launch, for a loop) in 8 m steps up to 260 m, with `plan_clear`
+  cells of sea around it. The bot leaves the hull there, despawns it and swims the rest.
+- **Route**: a wider margin to the shore (`ShipClass::route_clear`: half the hull, a third of the
+  radius and half a cell, 2 to 6 cells; the wider margin falls back cell by cell, and a route more
+  than 1.35 times the planned one plus 300 m, as when the wide margin closes a passage, is not
+  taken while a narrower margin has a shorter one), the deep mask for the large hulls, then
+  `round_corners`: every corner becomes an arc of 1.15 times the radius (smaller where the legs
+  are short; kept sharp where the arc would leave the water) and a hairpin, as the far end of a loop
+  trip, becomes a half circle with the way back `2 * radius` beside the way out. The route is
+  resampled every 20 m so that the follower sees the curvature.
+- **Follower** (`Params::for_hull`): lookahead 0.9 radius (70 m at least), waypoint reach 10 m,
+  arrival 0.6 hull length (18 m at least), and a speed plan: `Guide.v_limit` is the lowest of the
+  end braking (0.4 of the astern deceleration, to 0.8 m/s at the end) and the corner limits (the
+  route's discrete curvature against 0.85 of the turn cap, 1.2 m/s at least for steerage).
+- **Helm**: the angular response uses the hull's own acceleration and cap (`Hull`), the probe lasts
+  2.5 to 7 s depending on the acceleration, the first sample is waited for `6 s + portal time`.
+  The trip limit is `max(40 min, 8 min + 2.5 * route / top speed)`.
+- **Aground**: the server never sets `stuck`, so the machine infers an impact from the speed (see
+  Stuck) and backs off at once; a hull stopped at the beach for 8 s is the old stuck window plus 4 s
+  for the big hulls.
+
+## Population: census, economy board and director
+
+Everything lives in `crates/playerbots/src/population/` and hangs on the hub as `hub.pop`
+(`Population`); the web types are in `crates/web/src/population.rs`.
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| `Geo`, `alliance_of_*`, `place_at` | `region.rs` | Side of a faction or race (mother faction 148 / 149), continent of a zone (`zone_groups.target_id`: 3 west, 4 east, 5 Auroria, 1 / 2 / 6 seas). A trait, so the tests use a table instead of a `World`. |
+| `Census` | `census.rs` | Real players in view of a bot: a bounded map (2048) keyed by character id, 60 s time to live. `observe` runs in the bot's once-a-second housekeeping and takes the characters in `state.units` that are not the bot and not ours (`Hub::is_bot_char`). |
+| `Economy` | `economy.rs` | Items (1500 at most): per-bot price observations, price history, chat lines, the server's lots; `score` -> 0..1; `ScarcityView` for the farming goal. Chat is counted once per line (hash of speaker and text within 20 s). |
+| `ServerApi`, `poll_once` | `serverapi.rs` | The optional poller of the game server's web API; key in a `Secret`, fail-soft, bounded body. |
+| `world_view` | `view.rs` | The World panel from bot rows (one per slot, read without copying text) and the census: cells, zones, heat squares (512 m), the watched area (128 m cells), coverage. |
+| `Selector`, `stop_rank`, `pick_stops` | `select.rs` | A checked spawn filter; how willingly a running bot is stopped; the despawn choice. |
+| `Director`, `plan`, `targets` | `director.rs` | The policy, the pure planner, pacing, back-off, the action log, the policy file. |
+| `GoalBias` | `mod.rs` | Per-goal multipliers (atomics); the brain applies them at the end of `scores_now`. |
+
+**Feeding the board.** A bot does three small things in `housekeeping` / `route_inbox` / `publish`:
+hands the players in view to the census (once a second, taking the census lock only when there are
+any), hands its fresh `PriceNote`s to the economy (every ten seconds, staggered by bot id) and files
+the trade chat it hears through the same `forward_chat` sink the market uses. `publish` fills the
+snapshot's `mother_faction`, `alliance`, `continent` and `zone_key`. No new per-bot state exists:
+the board deduplicates by bot id instead of keeping a watermark in the bot, so
+`size_of::<Bot>()` is unchanged.
+
+**The director's loop.** `Hub::tick` (once a second) calls `Population::tick`: rows from the slots,
+the census per side, the director's own bots (a set kept by the supervisor, with a count of those
+that may be stopped now: up for 3 minutes and doing something `stop_rank` allows), the process
+health from `stats()`, then `Director::step`. `plan` is a pure function of the policy and those
+numbers (see the rule and the safety list in
+[OPERATING.md](OPERATING.md#world-metrics-and-the-population-director)); `step` adds the pacing
+(gap, bots per minute), the dry-run bookkeeping, a floor for bots it just queued (they count
+towards their side for 2 minutes, until they show as online) and the log. A live order goes to the
+supervisor as `SupCmd::SpawnWhere` or `DespawnWhere`; the supervisor writes a `result` line into
+the log when it has acted.
+
+**Supervisor.** `Book::spawn_matching` starts only roster entries that match the selector and grows
+the roster (`ensure_roster_races`) with the races the selector allows among `bots.races`; the
+`MAX_BOTS` limit counts the whole roster. `despawn_where` takes matching bots out of the start queue
+first, then asks `pick_stops` for the running ones. Ownership (`Population::own`, `disown`) is kept
+by the supervisor, so a bot the operator started is never the director's.
+
+**Deviations and choices.** The census is a lower bound by nature (about 128 m around each bot); the
+server API gives the exact count when a key is set. A policy file never restores the kill switch or
+`dry_run`: a restart is as safe as the configuration. Wishes only record the want for the farming
+goal and nudge its weight; the goal itself is another feature. The economy treats a bot's chat
+line as a quarter of a player's so that the bots' stand-in advertisements do not drive the
+scarcity they then react to.
+
+**Tests.** The census, economy, director, selector, view and server-API parser have unit tests next to
+the code; the web crate's `tests/api.rs` drives the new endpoints against a mocked hub; the
+supervisor tests cover filtered spawn, despawn and roster growth. `tests/population_real_data.rs`
+(ignored, needs `AA_COMPACT` and `AA_SERVER_DATA` like the other real-data tests) checks the sides
+and continents of real factions and zones, the census through a real hub, the filtered commands and
+the policy.
 
 ## Data directory
 
@@ -509,6 +981,7 @@ data/
   map_main_world.png       # painted world map (or relief fallback)
   map_main_world.json      # calibration: world rect covered by the image
   housing_areas.json       # polygons per housing area id
+  farm_areas.json          # polygons of the public farm sub zones
   quest_spheres.json       # quest sign spheres (quest id, component id, pos, radius)
   zones_main_world.bin     # zone key per 64 m sector (optional)
   nav_main_world.bin       # navigation mesh for path finding (mmap'd), one more per instance world
@@ -537,7 +1010,11 @@ Static data for the portal, instance-dungeon and boat abilities, loaded once wit
   carries is matched to a world by `zones.name` (the client's `world.xml` is not server data).
 - **Boats** (`boat.rs`): items whose use skill has the `SpawnSlave` effect and summon a boat-kind
   slave, with seats (`model_bindings`), `ship_models.velocity` and the slave's `MoveSpeedMul`
-  (top speed = velocity x MoveSpeedMul / 2) and an estimated hit point pool.
+  (top speed = velocity x MoveSpeedMul^2 / 8, `SlaveTemplate::top_speed`), the model's box,
+  turn data, spawn offsets, portal time, cannon and rack attach points and an estimated hit point
+  pool. `ShipClass::of(&template)` condenses a template into what driving it needs (top speed,
+  turn rate and radius, hull box, draft, sizes `Small` / `Medium` / `Large`, route margins, the
+  launch request); `ShipFamily` groups the scrolls of one hull (`Boats::scroll_for`).
 
 Fixed ids (Teleport Book 4045, skills 11215 / 11216 / 10594 / 14602 / 16841 / 15802, ...) are
 checked against `compact.sqlite3` at load and only warn when missing. Real-data checks:

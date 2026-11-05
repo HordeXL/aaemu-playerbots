@@ -1191,6 +1191,7 @@ dependencies = [
  "parking_lot",
  "pb-llm",
  "pb-web",
+ "reqwest",
  "rusqlite",
  "rustc-hash",
  "serde",

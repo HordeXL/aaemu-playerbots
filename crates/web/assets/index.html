@@ -27,6 +27,7 @@
       <label title="显示房屋、决斗旗和交易点"><input id="o-markers" type="checkbox" checked> 标记</label>
       <label title="在决斗和交易搭档之间画线"><input id="o-lines" type="checkbox" checked> 配对</label>
       <label title="放大时显示机器人名字"><input id="o-names" type="checkbox" checked> 名称</label>
+      <label title="用 512 米方格显示玩家（红）和机器人（蓝）的分布"><input id="o-heat" type="checkbox"> 热力</label>
     </div>
     <div id="legend" aria-label="图例"></div>
     <div id="coords" aria-hidden="true" hidden></div>
@@ -46,6 +47,9 @@
 
     <div id="tabs" role="group" aria-label="侧边面板视图">
       <button id="tab-bots" type="button" aria-pressed="true">机器人</button>
+      <button id="tab-world" type="button" aria-pressed="false" title="按大陆和阵营查看玩家与机器人">世界</button>
+      <button id="tab-economy" type="button" aria-pressed="false" title="稀缺物品、价格与供应">经济</button>
+      <button id="tab-director" type="button" aria-pressed="false" title="人口调度器">调度<b id="tab-mode" class="badge" hidden></b></button>
       <button id="tab-issues" type="button" aria-pressed="false" aria-label="服务器问题">问题<b id="tab-open" class="badge open" hidden></b><b id="tab-queued" class="badge queued" hidden></b></button>
     </div>
 
@@ -108,6 +112,10 @@
         <h3>详细信息</h3>
         <dl id="d-extra" class="kv"></dl>
       </div>
+      <div id="d-plots-wrap" hidden>
+        <h3>地块</h3>
+        <ul id="d-plots" class="plain"></ul>
+      </div>
       <div id="d-chat-wrap" hidden>
         <h3>聊天 <span class="muted">（最新在前）</span></h3>
         <ol id="d-chat" class="log"></ol>
@@ -143,6 +151,10 @@
       </div>
     </section>
 
+    <section id="world" class="pop-view" aria-label="World"></section>
+    <section id="economy" class="pop-view" aria-label="Economy"></section>
+    <section id="director" class="pop-view" aria-label="Director"></section>
+
     <details id="global">
       <summary>全局控制</summary>
       <div class="cmd-row">
@@ -162,5 +174,6 @@
   </aside>
 </div>
 <script src="/app.js"></script>
+<script src="/population.js"></script>
 </body>
 </html>

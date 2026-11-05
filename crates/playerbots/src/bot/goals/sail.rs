@@ -18,6 +18,11 @@
 //!
 //! Boats are small and turn slowly (a rowboat 4.35 degrees per second), so the goal asks the bot task
 //! for fast ticks while the bot is on a boat (`VehicleState::fast_tick`).
+//!
+//! Which boat is `[sail] ship` ([`crate::config::ShipChoice`]): the rowboat by default, or a
+//! clipper, cutter, junk, yawl or schooner ([`aa_world::travel::ShipClass`]). The bigger hulls
+//! launch from beaches with room and deep water, sail on the deep sea mask with a wide margin and
+//! rounded corners, slow down for the corners and for the berth, and berth out at sea.
 
 mod machine;
 pub mod trip;
@@ -28,6 +33,7 @@ mod tests;
 use std::cell::RefCell;
 
 use aa_proto::cs;
+use aa_world::travel::{ShipClass, ShipFamily};
 use aa_world::water::{find_shore, Disc, ShoreSpot, WaterMap, NAV_FLOOR_M};
 use aa_world::World;
 use pb_web::Activity;
@@ -35,8 +41,7 @@ use pb_web::Activity;
 use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, Pace};
 use crate::bot::state::BotState;
-use crate::bot::vehicle::helm::Hull;
-use crate::config::BehaviorCfg;
+use crate::config::{BehaviorCfg, ShipChoice};
 use crate::roster::Temperament;
 
 use self::machine::{Act, Input, Machine, Ops, Pick, MIN_SPEED};
@@ -74,17 +79,19 @@ impl Sail {
             return GoalStatus::Failed(FailReason::Other("sailing is switched off"));
         }
         let world = ctx.world;
-        let Some(map) = world.water() else {
-            return GoalStatus::Failed(FailReason::Other("no sea map"));
-        };
-        let Some(pick) = pick_scroll(world, |item| ctx.state.item_count(item)) else {
+        let Some(pick) = pick_for(ctx) else {
             return GoalStatus::Failed(FailReason::Other("no boat scroll in the data"));
+        };
+        let (Some(map), Some(shore_map)) = (world.water_for(&pick.class), world.water()) else {
+            return GoalStatus::Failed(FailReason::Other("no sea map"));
         };
         let mut acts = Vec::new();
         let status = {
             let ops = RealOps {
                 world,
                 map,
+                shore_map,
+                class: pick.class,
                 faction: ctx.state.me.faction,
                 rng: RefCell::new(&mut *ctx.rng),
             };
@@ -106,15 +113,16 @@ impl Sail {
     pub fn stop(&mut self, ctx: &mut Ctx<'_>) {
         if let Some(mut machine) = self.trip.take() {
             let world = ctx.world;
-            if let (Some(map), Some(pick)) = (
-                world.water(),
-                pick_scroll(world, |item| ctx.state.item_count(item)),
-            ) {
+            if let Some((pick, map, shore_map)) = pick_for(ctx)
+                .and_then(|pick| Some((pick, world.water_for(&pick.class)?, world.water()?)))
+            {
                 let mut acts = Vec::new();
                 {
                     let ops = RealOps {
                         world,
                         map,
+                        shore_map,
+                        class: pick.class,
                         faction: ctx.state.me.faction,
                         rng: RefCell::new(&mut *ctx.rng),
                     };
@@ -195,12 +203,10 @@ pub fn score(ctx: &Ctx<'_>, _base: f32) -> f32 {
         }
     }
     let world = ctx.world;
-    let boats = &world.travel().boats;
-    let has_scroll = boats
-        .scrolls()
-        .iter()
-        .any(|s| ctx.state.item_count(s.item) > 0);
-    if !(ctx.gm_allowed() || has_scroll) || boats.cheapest_scroll(MIN_SPEED).is_none() {
+    let Some(pick) = pick_for(ctx) else {
+        return 0.0;
+    };
+    if !(ctx.gm_allowed() || ctx.state.item_count(pick.item) > 0) {
         return 0.0;
     }
     if !coast_near(world, ctx.state.me.pos) {
@@ -225,28 +231,78 @@ fn coast_near(world: &World, pos: [f32; 3]) -> bool {
     })
 }
 
-/// The scroll to use: one the bag holds (cheapest first), else the cheapest boat's scroll that has
-/// a driver seat and is fast enough.
-fn pick_scroll(world: &World, bag_count: impl Fn(u32) -> i64) -> Option<Pick> {
+/// The scroll and boat of this bot ([`pick_scroll`] with the bot's config, bag and temperament).
+fn pick_for(ctx: &Ctx<'_>) -> Option<Pick> {
+    pick_scroll(
+        ctx.world,
+        ctx.cfg.sail.ship,
+        ctx.state.me.char_id,
+        ctx.persona.temper.merchant,
+        |item| ctx.state.item_count(item),
+    )
+}
+
+/// The boat family a bot sails. A fixed choice is that family. `auto` is the first family the bag
+/// holds a scroll of (`holds`), else a boat of the bot's own: a roll seeded by its character id
+/// (rowboat 40, clipper 30, cutter 12, junk 6, schooner 12; a merchant (`merchant` over 0.6) takes
+/// the schooner for the rowboat's share).
+pub fn family_of(
+    choice: ShipChoice,
+    char_id: u32,
+    merchant: f32,
+    holds: impl Fn(ShipFamily) -> bool,
+) -> ShipFamily {
+    if let Some(f) = choice.family() {
+        return f;
+    }
+    if let Some(f) = ShipFamily::ALL.into_iter().find(|&f| holds(f)) {
+        return f;
+    }
+    let mut rng = fastrand::Rng::with_seed(u64::from(char_id) ^ 0x5a11_0b0a);
+    let (rowboat, schooner) = if merchant > 0.6 { (10, 42) } else { (40, 12) };
+    let roll = rng.u32(0..100);
+    let table = [
+        (rowboat, ShipFamily::Rowboat),
+        (30, ShipFamily::Clipper),
+        (12, ShipFamily::Cutter),
+        (6, ShipFamily::Junk),
+        (schooner, ShipFamily::Schooner),
+    ];
+    let total: u32 = table.iter().map(|t| t.0).sum();
+    let mut at = roll * total / 100;
+    for (w, f) in table {
+        if at < w {
+            return f;
+        }
+        at -= w;
+    }
+    ShipFamily::Rowboat
+}
+
+/// The scroll to use: of the family the bot sails ([`family_of`]), one the bag holds, else the
+/// cheapest scroll of the family; with the class of the boat it summons.
+fn pick_scroll(
+    world: &World,
+    choice: ShipChoice,
+    char_id: u32,
+    merchant: f32,
+    bag_count: impl Fn(u32) -> i64,
+) -> Option<Pick> {
     let boats = &world.travel().boats;
-    let fits = |s: &&aa_world::travel::BoatScroll| {
+    let holds = |f: ShipFamily| {
         boats
-            .slave_template(s.slave)
-            .is_some_and(|b| b.has_driver_seat() && b.top_speed() >= MIN_SPEED)
+            .scrolls()
+            .iter()
+            .any(|s| f.slaves().contains(&s.slave) && bag_count(s.item) > 0)
     };
-    let scroll = boats
-        .scrolls()
-        .iter()
-        .filter(fits)
-        .find(|s| bag_count(s.item) > 0)
-        .or_else(|| boats.cheapest_scroll(MIN_SPEED))?;
+    let family = family_of(choice, char_id, merchant, holds);
+    let scroll = boats.scroll_for(family, &bag_count)?;
     let boat = boats.slave_template(scroll.slave)?;
-    Some(Pick {
+    (boat.has_driver_seat() && boat.top_speed() >= MIN_SPEED).then(|| Pick {
         item: scroll.item,
         skill: scroll.skill.id,
         cast_ms: scroll.skill.cast_ms,
-        hull: Hull::of(boat),
-        top_speed: boat.top_speed(),
+        class: boat.class(),
     })
 }
 
@@ -321,14 +377,18 @@ fn apply(ctx: &mut Ctx<'_>, acts: Vec<Act>) {
 /// The machine's view of the world: the sea map, the terrain and the monsters.
 struct RealOps<'a> {
     world: &'a World,
+    /// The sea mask of the boat's class (the deep one for the large hulls).
     map: &'a WaterMap,
+    /// The standard sea mask: the swimmer's beaches and the monsters.
+    shore_map: &'a WaterMap,
+    class: ShipClass,
     faction: u32,
     rng: RefCell<&'a mut fastrand::Rng>,
 }
 
 impl Ops for RealOps<'_> {
     fn danger(&self, from: (f32, f32)) -> Vec<Disc> {
-        trip::danger_zones(self.world, self.map, self.faction, from, 5000.0)
+        trip::danger_zones(self.world, self.shore_map, self.faction, from, 5000.0)
     }
 
     fn plan(&self, from: (f32, f32), avoid: &[Disc]) -> Result<Plan, PlanError> {
@@ -338,18 +398,18 @@ impl Ops for RealOps<'_> {
             &ground,
             &mut self.rng.borrow_mut(),
             from,
-            &TripCfg::default(),
+            &TripCfg::for_ship(self.class),
             avoid,
         )
     }
 
     fn route(&self, start: (f32, f32), plan: &Plan, avoid: &[Disc]) -> Option<Vec<(f32, f32)>> {
-        trip::sail_route(self.map, start, plan, avoid)
+        trip::sail_route(self.map, start, plan, avoid, &self.class)
     }
 
     fn shore_near(&self, from: (f32, f32), max_r: f32) -> Option<ShoreSpot> {
         let ground = |x: f32, y: f32| self.world.ground_z(x, y);
-        find_shore(self.map, &ground, from, max_r, &[])
+        find_shore(self.shore_map, &ground, from, max_r, &[])
     }
 
     fn ground(&self, x: f32, y: f32) -> Option<f32> {

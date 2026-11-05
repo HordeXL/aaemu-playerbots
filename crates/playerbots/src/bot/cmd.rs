@@ -31,11 +31,30 @@ pub enum GoalKind {
     Auction,
     /// Advertise goods in trade chat and sell them (owned by the market feature).
     Market,
+    /// Found, join and run an expedition (owned by the guild feature).
+    Guild,
+    /// Ambush trade-pack carriers (owned by the pvp feature).
+    Gank,
+    /// Fight in zones at war (owned by the pvp feature).
+    Warzone,
+    /// Join a world event such as a rift (owned by the events feature).
+    Event,
+    /// Follow a real player's party, e.g. into a dungeon (owned by the party feature).
+    Companion,
+    /// Plant and harvest crops (owned by the farming feature).
+    Farm,
 }
+
+/// A set of goals, one bit per [`GoalKind::index`] (the brain's `disabled`, `blocked` and gate
+/// masks).
+pub type GoalMask = u32;
+
+// (a goal past the mask's width would shift out of it silently)
+const _: () = assert!(GoalKind::COUNT <= GoalMask::BITS as usize);
 
 impl GoalKind {
     /// Every goal.
-    pub const ALL: [GoalKind; 12] = [
+    pub const ALL: [GoalKind; 18] = [
         GoalKind::Wander,
         GoalKind::Rest,
         GoalKind::Grind,
@@ -48,6 +67,12 @@ impl GoalKind {
         GoalKind::Sail,
         GoalKind::Auction,
         GoalKind::Market,
+        GoalKind::Guild,
+        GoalKind::Gank,
+        GoalKind::Warzone,
+        GoalKind::Event,
+        GoalKind::Companion,
+        GoalKind::Farm,
     ];
 
     /// Number of goals.
@@ -73,6 +98,12 @@ impl GoalKind {
             GoalKind::Sail => "sail",
             GoalKind::Auction => "auction",
             GoalKind::Market => "market",
+            GoalKind::Guild => "guild",
+            GoalKind::Gank => "gank",
+            GoalKind::Warzone => "warzone",
+            GoalKind::Event => "event",
+            GoalKind::Companion => "companion",
+            GoalKind::Farm => "farm",
         }
     }
 
@@ -214,6 +245,31 @@ mod tests {
             assert!(pb_web::Command::GOALS.contains(&name));
         }
         assert_eq!(GoalKind::ALL.len(), GoalKind::COUNT);
+    }
+
+    #[test]
+    fn the_wave_one_goals_are_goals_the_web_ui_can_force() {
+        for (name, kind) in [
+            ("guild", GoalKind::Guild),
+            ("gank", GoalKind::Gank),
+            ("warzone", GoalKind::Warzone),
+            ("event", GoalKind::Event),
+            ("companion", GoalKind::Companion),
+            ("farm", GoalKind::Farm),
+        ] {
+            assert_eq!(GoalKind::parse(name), Some(kind));
+            assert_eq!(kind.name(), name);
+            assert_eq!(GoalChoice::parse(name), Some(GoalChoice::Forced(kind)));
+            assert!(pb_web::Command::GOALS.contains(&name));
+        }
+        // the goal names are distinct and every goal has a bit in the mask
+        let mut mask: GoalMask = 0;
+        for g in GoalKind::ALL {
+            let bit: GoalMask = 1 << g.index();
+            assert_eq!(mask & bit, 0, "{g:?} shares a bit");
+            mask |= bit;
+        }
+        assert_eq!(mask.count_ones() as usize, GoalKind::COUNT);
     }
 
     #[test]

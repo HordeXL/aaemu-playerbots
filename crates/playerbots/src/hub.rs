@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 use pb_web::{
-    Activity, BotDetail, BotHub, BotSnapshot, Command, HubStats, IssueAction, IssueDetail,
-    IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind, QuestLine, WorldRect,
+    Activity, BotDetail, BotHub, BotSnapshot, Command, DirectorView, EconomyView, HubStats,
+    IssueAction, IssueDetail, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind,
+    PolicyPatch, QuestLine, WorldRect, WorldView,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
@@ -27,6 +28,8 @@ use crate::bot::nav::NavService;
 use crate::contest::Contest;
 use crate::issues::logtail::{words, LineHook};
 use crate::issues::{view, IssueReport, IssueTasks, Issues, LogLevel};
+use crate::population::select::{Selector, StopRule};
+use crate::population::Population;
 
 /// Entries of a bot's event log.
 pub const LOG_LINES: usize = 32;
@@ -67,6 +70,9 @@ pub struct SlotInner {
     /// The route the bot is walking, map-plane `[x, y]` points (empty when none). Written by the
     /// bot task (owned by the motion feature), shown as `BotDetail::path`.
     pub path: Vec<[f32; 2]>,
+    /// The bot's crops, refreshed with the extra rows (the farming goal), shown as
+    /// `BotDetail::plots`.
+    pub plots: Vec<pb_web::PlotLine>,
     /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
     pub social: SlotSocial,
 }
@@ -143,6 +149,7 @@ impl BotSlot {
         g.snap.partner = None;
         g.snap.online_secs = 0;
         g.path.clear();
+        g.plots.clear();
         self.obj_id.store(0, Ordering::Relaxed);
     }
 }
@@ -193,6 +200,16 @@ pub enum SupCmd {
     Spawn(u32),
     /// Stop `n` bots.
     Despawn(u32),
+    /// Start `n` bots that match `sel` (the roster grows with matching races when it has too few);
+    /// `owned`: the population director started them and may stop them again.
+    SpawnWhere { n: u32, sel: Selector, owned: bool },
+    /// Stop up to `n` bots that match `sel` and are safe to stop (see
+    /// [`crate::population::select::stop_rank`]).
+    DespawnWhere {
+        n: u32,
+        sel: Selector,
+        rule: StopRule,
+    },
 }
 
 #[derive(Debug)]
@@ -330,10 +347,21 @@ pub struct Hub {
     pub chat: ChatHub,
     /// Which bot works on which monster, doodad and spawn spot (so the bots spread out).
     pub contest: Contest,
+    /// The world events (rifts) that are running and the bots that take part, see
+    /// [`crate::events`].
+    pub events: crate::events::EventBoard,
     /// Navigation: the planner pool and the counters, see [`crate::bot::nav`].
     pub nav: NavService,
     /// What the leaders of dungeon parties tell their members (owned by the dungeons feature).
     pub board: crate::bot::party::PartyBoard,
+    /// What the bots share about guilds: who can be invited, the guilds, the foundings (owned by
+    /// the guild feature, see [`crate::bot::guild`]).
+    pub guilds: crate::bot::guild::GuildBook,
+    /// The bots of this process in the parties of real players (owned by the party feature, see
+    /// [`crate::bot::companion`]).
+    pub companions: crate::bot::companion::Board,
+    /// What the bots grow (owned by the farming feature, see [`crate::bot::farm`]).
+    pub farms: crate::bot::farm::board::FarmBoard,
     /// Server issue reports, see [`crate::issues`]; [`Hub::report_issue`] is the way in.
     issue_svc: Arc<Issues>,
     /// Server log lines handed to bots in the current second (second, lines).
@@ -347,6 +375,8 @@ pub struct Hub {
     map: MapAsset,
     supervisor: mpsc::Sender<SupCmd>,
     llm: Option<Arc<pb_llm::Llm>>,
+    /// What the bots know about the world's players and goods, and the population director.
+    pub pop: Population,
 }
 
 impl Hub {
@@ -364,8 +394,12 @@ impl Hub {
             bot_chars: RwLock::new(FxHashSet::default()),
             chat: ChatHub::default(),
             contest: Contest::new(),
+            events: Default::default(),
             nav: NavService::default(),
             board: Default::default(),
+            guilds: Default::default(),
+            companions: Default::default(),
+            farms: Default::default(),
             issue_svc: Arc::new(Issues::disabled()),
             log_feed: Mutex::new((0, 0)),
             counters: Counters::default(),
@@ -379,7 +413,22 @@ impl Hub {
             map,
             supervisor: p.supervisor,
             llm: p.llm,
+            pop: Population::inert(),
         }
+    }
+
+    /// Uses `pop` for the census, the economy board and the population director (the default does
+    /// nothing). Call before the hub is shared.
+    pub fn with_population(mut self, pop: Population) -> Hub {
+        self.pop = pop;
+        self
+    }
+
+    /// Hands an order to the supervisor without waiting.
+    pub(crate) fn order(&self, cmd: SupCmd) -> Result<(), String> {
+        self.supervisor
+            .try_send(cmd)
+            .map_err(|_| "the supervisor is busy, try again".to_string())
     }
 
     /// Adds a slot for a bot (or returns the existing one).
@@ -447,6 +496,40 @@ impl Hub {
         );
         self.rss.lock().refresh(false);
         self.nav.tick();
+        self.tick_events();
+        self.pop.tick(self);
+    }
+
+    /// While an event runs: tells the board how many bots are online and how high they are, and
+    /// files the issues its detectors found.
+    fn tick_events(&self) {
+        if !self.events.any() {
+            return;
+        }
+        let levels = self.slots().into_iter().filter_map(|s| {
+            s.with(|g| {
+                (!matches!(g.snap.activity, Activity::Offline | Activity::Connecting))
+                    .then_some(g.snap.level)
+            })
+        });
+        let pop = crate::events::Population::from_levels(levels);
+        for w in self.events.sweep_witnessed(Some(pop)) {
+            // The bots that stood in the event saw the problem: each files it with its own
+            // context, so one rift that goes wrong is an issue seen by several bots.
+            let mut filed = false;
+            for bot in w.bots {
+                if let Some(slot) = self.slot(bot) {
+                    let r = slot.with(|inner| {
+                        crate::issues::attach_context(w.report.clone(), inner, 0, None)
+                    });
+                    self.report_issue(r);
+                    filed = true;
+                }
+            }
+            if !filed {
+                self.report_issue(w.report);
+            }
+        }
     }
 
     /// Records (or replaces) the house marker of a bot.
@@ -528,6 +611,31 @@ impl Hub {
             return;
         }
         deliver_log_line(&self.chat.names, &|| self.slots(), level, line);
+    }
+
+    /// A filtered spawn needs a bot to start: a roster entry of a matching race, or a configured
+    /// race to create one with. Refuses early (and in words) what the supervisor could not do.
+    fn check_spawn_filter(&self, sel: &Selector) -> Result<(), String> {
+        if sel.is_all() || !sel.races(self.pop.races()).is_empty() {
+            return Ok(());
+        }
+        let every_race: Vec<u8> = (1..=8).collect();
+        if sel.races(&every_race).is_empty() {
+            return Err(
+                "no race matches that filter: the Nuia races start on the west continent, \
+                 the Haranya races on the east continent"
+                    .to_string(),
+            );
+        }
+        let has_entry = self.slots().iter().any(|s| {
+            s.with(|g| crate::config::race_id(&g.snap.race))
+                .is_some_and(|r| sel.matches_race(r))
+        });
+        if has_entry {
+            Ok(())
+        } else {
+            Err("no bot and no configured race (bots.races) matches that filter".to_string())
+        }
     }
 
     fn per_bot_bytes(rss: &Rss, online: u32) -> u64 {
@@ -672,6 +780,7 @@ impl BotHub for Hub {
             extra: g.extra.clone(),
             chat: g.social.chat_lines(),
             path: g.path.clone(),
+            plots: g.plots.clone(),
         }))
     }
 
@@ -755,6 +864,31 @@ impl BotHub for Hub {
         self.issue_svc.action(fingerprint, view::action(action))
     }
 
+    fn world(&self) -> WorldView {
+        self.pop.world_view(self)
+    }
+
+    fn economy(&self) -> EconomyView {
+        let totals = self.farms.totals();
+        let grown: Vec<u32> = totals.iter().map(|t| t.0).take(32).collect();
+        let mut view = self.pop.economy_view(&grown);
+        let growing: FxHashMap<u32, f32> = totals.into_iter().collect();
+        if !growing.is_empty() {
+            for row in &mut view.items {
+                row.growing = growing.get(&row.template).copied().unwrap_or(0.0);
+            }
+        }
+        view
+    }
+
+    fn director(&self) -> DirectorView {
+        self.pop.director_view(self)
+    }
+
+    fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {
+        self.pop.set_policy(patch)
+    }
+
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
         cmd.validate(bot)?;
         match bot {
@@ -771,6 +905,20 @@ impl BotHub for Hub {
                     .supervisor
                     .try_send(SupCmd::Despawn(count))
                     .map_err(|_| "the supervisor is busy, try again".to_string()),
+                Command::SpawnWhere { count, filter } => {
+                    let sel = Selector::from_filter(&filter)?;
+                    self.check_spawn_filter(&sel)?;
+                    self.order(SupCmd::SpawnWhere {
+                        n: count,
+                        sel,
+                        owned: false,
+                    })
+                }
+                Command::DespawnWhere { count, filter } => self.order(SupCmd::DespawnWhere {
+                    n: count,
+                    sel: Selector::from_filter(&filter)?,
+                    rule: StopRule::default(),
+                }),
                 other => {
                     // Pause, Resume and Goal reach every bot. A full queue only skips that bot.
                     let bot_cmd = to_bot_cmd(other)?;
@@ -804,7 +952,10 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
             to: to.trim().to_string(),
             text: text.trim().to_string(),
         },
-        Command::Spawn { .. } | Command::Despawn { .. } => {
+        Command::Spawn { .. }
+        | Command::Despawn { .. }
+        | Command::SpawnWhere { .. }
+        | Command::DespawnWhere { .. } => {
             return Err("spawn and despawn are global commands".into())
         }
     })
@@ -1029,6 +1180,12 @@ mod tests {
             ("sail", crate::bot::cmd::GoalKind::Sail),
             ("auction", crate::bot::cmd::GoalKind::Auction),
             ("market", crate::bot::cmd::GoalKind::Market),
+            ("guild", crate::bot::cmd::GoalKind::Guild),
+            ("gank", crate::bot::cmd::GoalKind::Gank),
+            ("warzone", crate::bot::cmd::GoalKind::Warzone),
+            ("event", crate::bot::cmd::GoalKind::Event),
+            ("companion", crate::bot::cmd::GoalKind::Companion),
+            ("farm", crate::bot::cmd::GoalKind::Farm),
         ] {
             assert_eq!(
                 to_bot_cmd(Command::Goal { goal: name.into() }),

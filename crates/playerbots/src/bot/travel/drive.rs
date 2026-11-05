@@ -999,6 +999,12 @@ fn calm(ctx: &Ctx<'_>, goal: Option<GoalKind>) -> bool {
                 | GoalKind::Sail
                 | GoalKind::Auction
                 | GoalKind::Market
+                | GoalKind::Guild
+                | GoalKind::Gank
+                | GoalKind::Warzone
+                | GoalKind::Event
+                | GoalKind::Companion
+                | GoalKind::Farm
         )
     );
     let st = &ctx.state;

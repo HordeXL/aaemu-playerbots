@@ -46,6 +46,7 @@ rustc-hash.workspace = true
 fastrand.workspace = true
 getrandom.workspace = true
 sysinfo.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

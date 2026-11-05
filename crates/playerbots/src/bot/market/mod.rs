@@ -9,6 +9,10 @@
 //!   with players. It hears the shout, trade and group-finding chat and the whispers through
 //!   [`MarketState::on_chat`], forwarded by the social duty.
 //!
+//! None of them deals in an item that is not tradable (not sellable, soul-bound or a quest item,
+//! see [`aa_world::ItemFacts::tradable`]) or in the part of an item the bot's active quests still
+//! need ([`needs`]).
+//!
 //! The per-bot budget is tight (`size_of::<Bot>() < 3200` is asserted): [`MarketState`] is one
 //! pointer, and the [`Inner`] behind it is allocated by the first thing that needs it (the ledger
 //! when the bot first gains an item it may sell), so a bot that never gained one costs eight
@@ -17,6 +21,7 @@
 pub mod ads;
 pub mod auction;
 pub mod ledger;
+pub mod needs;
 
 use aa_proto::sc::ServerEvent;
 use aa_world::World;
@@ -25,6 +30,8 @@ use rustc_hash::FxHashMap;
 use self::ads::AdState;
 use self::auction::AuctionMemory;
 use self::ledger::{Ledger, Touched};
+use self::needs::QuestNeeds;
+use super::farm::FarmMem;
 use super::state::{ChatIn, Item};
 
 /// Hands the chat lines the market features care about (see [`ads::hears`]: shouts, trade and
@@ -53,6 +60,9 @@ pub struct Inner {
     pub auction: AuctionMemory,
     /// What the trade-chat sales remember (owned by the market feature).
     pub ads: AdState,
+    /// What the farm goal remembers: the bot's plots (owned by the farming feature, see
+    /// [`crate::bot::farm`]); made by the first crop or farm run.
+    pub farm: Option<Box<FarmMem>>,
 }
 
 impl MarketState {
@@ -71,21 +81,72 @@ impl MarketState {
         self.0.get_or_insert_with(Default::default)
     }
 
+    /// The farm memory, if the bot has farmed or seen a crop of its own.
+    pub fn farm(&self) -> Option<&FarmMem> {
+        self.get().and_then(|i| i.farm.as_deref())
+    }
+
+    /// The farm memory, made on first use.
+    pub fn farm_mut(&mut self) -> &mut FarmMem {
+        self.inner_mut().farm.get_or_insert_with(Default::default)
+    }
+
+    /// Takes the farm memory out for the length of a tick (a new one when the bot has none), so
+    /// that the goal can read the rest of the bot's state while it changes the plots. Put it back
+    /// with [`MarketState::put_farm`].
+    pub fn take_farm(&mut self) -> Box<FarmMem> {
+        self.get_mut()
+            .and_then(|i| i.farm.take())
+            .unwrap_or_default()
+    }
+
+    /// Gives the farm memory back after [`MarketState::take_farm`].
+    pub fn put_farm(&mut self, farm: Box<FarmMem>) {
+        self.inner_mut().farm = Some(farm);
+    }
+
+    /// The farm goal starts a harvest: until [`MarketState::close_harvest`], what the bag gains
+    /// from a doodad counts as the bot's own when `honest` (the seeds were bought) and as nothing
+    /// otherwise, whatever reason the server names (see the ledger docs).
+    pub fn open_harvest(&mut self, honest: bool) {
+        self.farm_mut().harvest_honest = Some(honest);
+    }
+
+    /// The harvest is over.
+    pub fn close_harvest(&mut self) {
+        if let Some(f) = self.get_mut().and_then(|i| i.farm.as_deref_mut()) {
+            f.harvest_honest = None;
+        }
+    }
+
+    /// Whether a gain with this item task reason is the bot's own: the clean reasons, a harvest
+    /// of honest seeds, and nothing at all while a dishonest harvest is under way.
+    fn counts(&self, reason: u8) -> bool {
+        match self.farm().and_then(|f| f.harvest_honest) {
+            Some(false) => false,
+            Some(true) => {
+                reason == ledger::reason::DOODAD_INTERACTION || ledger::is_clean_reason(reason)
+            }
+            None => ledger::is_clean_reason(reason),
+        }
+    }
+
     /// How many of item `template` the bot may sell (see [`Ledger::clean_count`]).
     pub fn clean_count(&self, template: u32) -> u32 {
         self.get().map_or(0, |i| i.ledger.clean_count(template))
     }
 
     /// What the bot may offer for sale now, as `(template, count)`: see
-    /// [`Ledger::sellable_surplus`].
+    /// [`Ledger::sellable_surplus`]. `needs` is what its active quests still need.
     pub fn sellable_surplus<'a>(
         &'a self,
         world: &'a World,
         bag: &'a FxHashMap<u16, Item>,
+        needs: &'a QuestNeeds,
     ) -> impl Iterator<Item = (u32, u32)> + 'a {
         self.get()
             .into_iter()
-            .flat_map(move |i| i.ledger.sellable_surplus(world, bag))
+            .flat_map(move |i| i.ledger.sellable_surplus(world, bag, needs))
     }
 
     /// An item task was applied to the bag: `touched` holds the bag counts of the templates it
@@ -98,7 +159,7 @@ impl MarketState {
         for &(template, before) in touched.iter() {
             let now = ledger::bag_count(bag, template);
             if now > before {
-                if ledger::is_clean_reason(reason) {
+                if self.counts(reason) {
                     let gained = u32::try_from(now - before).unwrap_or(u32::MAX);
                     self.inner_mut().ledger.add(template, gained);
                 }
@@ -238,6 +299,51 @@ mod tests {
             grade: 0,
             count,
         }
+    }
+
+    #[test]
+    fn a_harvest_counts_as_the_bots_own_only_inside_an_honest_window() {
+        let gain = |m: &mut MarketState, reason: u8, before: i64, now: i64| {
+            let bag = bag_of(&[(0, 7992, now as i32)]);
+            let t = task(reason, &[added(0, 7992, now as i32)]);
+            let touched = Touched::before(&t, &bag_of(&[(0, 7992, before as i32)]));
+            m.on_item_task(t.reason, &touched, &bag);
+        };
+        let mut m = MarketState::default();
+        // a harvest outside a window adds nothing, the usual reasons still do
+        gain(&mut m, reason::DOODAD_INTERACTION, 0, 3);
+        assert_eq!(m.clean_count(7992), 0);
+        // an honest window counts the harvest reason
+        m.open_harvest(true);
+        gain(&mut m, reason::DOODAD_INTERACTION, 3, 6);
+        assert_eq!(m.clean_count(7992), 3);
+        gain(&mut m, reason::LOOT, 6, 7);
+        assert_eq!(
+            m.clean_count(7992),
+            4,
+            "the other clean reasons keep counting"
+        );
+        gain(&mut m, reason::GM, 7, 9);
+        assert_eq!(m.clean_count(7992), 4, "a GM item is never clean");
+        m.close_harvest();
+        gain(&mut m, reason::DOODAD_INTERACTION, 9, 12);
+        assert_eq!(m.clean_count(7992), 4, "the window is closed");
+        // a dishonest window counts nothing at all, whatever the reason says
+        m.open_harvest(false);
+        gain(&mut m, reason::DOODAD_INTERACTION, 12, 15);
+        gain(&mut m, reason::AUTO_LOOT_DOODAD_ITEM, 15, 17);
+        gain(&mut m, reason::LOOT, 17, 18);
+        assert_eq!(m.clean_count(7992), 4);
+        m.close_harvest();
+        gain(&mut m, reason::LOOT, 18, 19);
+        assert_eq!(m.clean_count(7992), 5);
+        // the farm memory can be taken out for a tick and put back with its window
+        m.open_harvest(true);
+        let farm = m.take_farm();
+        assert_eq!(farm.harvest_honest, Some(true));
+        assert!(m.farm().is_none());
+        m.put_farm(farm);
+        assert_eq!(m.farm().and_then(|f| f.harvest_honest), Some(true));
     }
 
     #[test]

@@ -260,6 +260,7 @@ fn gate_unit(obj: u32, owner: u32, pos: [f32; 3]) -> UnitInfo {
         yaw: 0,
         skills: Box::new([]),
         buffs: Box::new([]),
+        backpack: 0,
         complete: true,
     }
 }

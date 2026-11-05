@@ -246,6 +246,7 @@ impl Grind {
                 }
                 if self.visited.contains(&cell(p.x, p.y))
                     || ctx.state.avoids(0, template, ctx.now_ms)
+                    || ctx.in_war_zone(p.x, p.y)
                 {
                     return;
                 }

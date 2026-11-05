@@ -30,7 +30,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 
-pub use boat::{BoatScroll, Boats, SlaveTemplate};
+pub use boat::{
+    BoatScroll, Boats, ChildSlave, HullSize, ShipClass, ShipFamily, ShipModelData, SlaveTemplate,
+};
 pub use dungeon::{Dungeon, Dungeons, Entrance, DEFAULT_ENTER_COUNT, ENTRY_WINDOW_SECS};
 pub use instance::{
     InstanceDoodad, InstanceExit, InstanceNpc, InstanceSpawn, InstanceWorld, InstanceWorlds,

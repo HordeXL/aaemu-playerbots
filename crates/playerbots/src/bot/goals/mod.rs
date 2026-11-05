@@ -2,9 +2,10 @@
 //!
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
-//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`]
-//! and [`Market`]. A goal that reports [`FailReason::NotImplemented`] is switched off for good by
-//! the brain.
+//! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`],
+//! [`Market`], [`Guild`], [`Gank`], [`Warzone`], [`Event`], [`Companion`] and [`Farm`] (all are
+//! built; a goal added as a stub reports [`FailReason::NotImplemented`] and is switched off for
+//! good by the brain).
 //!
 //! # Writing a goal
 //!
@@ -20,9 +21,14 @@
 //! * Do not keep borrows of `ctx` between ticks and do not allocate per tick.
 
 pub mod auction;
+pub mod companion;
 pub mod duel;
 pub mod dungeon;
+pub mod event;
+pub mod farm;
+pub mod gank;
 pub mod grind;
+pub mod guild;
 pub mod housing;
 pub mod market;
 pub mod quest;
@@ -32,13 +38,19 @@ pub mod social;
 pub mod trade;
 pub mod trade_run;
 pub mod wander;
+pub mod warzone;
 
 use pb_web::Activity;
 
 pub use auction::Auction;
+pub use companion::Companion;
 pub use duel::Duel;
 pub use dungeon::Dungeon;
+pub use event::Event;
+pub use farm::Farm;
+pub use gank::Gank;
 pub use grind::Grind;
+pub use guild::Guild;
 pub use housing::Housing;
 pub use market::Market;
 pub use quest::Quest;
@@ -47,6 +59,7 @@ pub use sail::Sail;
 pub use trade::Trade;
 pub use trade_run::TradeRun;
 pub use wander::Wander;
+pub use warzone::Warzone;
 
 use super::cmd::{GoalKind, PairOrder};
 use super::combat::CombatStatus;
@@ -107,6 +120,18 @@ pub enum Goal {
     Auction(Auction),
     /// Advertise and sell goods.
     Market(Market),
+    /// Found, join and run an expedition.
+    Guild(Guild),
+    /// Ambush trade-pack carriers.
+    Gank(Gank),
+    /// Fight in zones at war.
+    Warzone(Warzone),
+    /// Join a world event.
+    Event(Event),
+    /// Follow a real player's party.
+    Companion(Companion),
+    /// Plant and harvest crops.
+    Farm(Farm),
 }
 
 impl Goal {
@@ -135,6 +160,12 @@ impl Goal {
             GoalKind::Sail => Goal::Sail(Sail::default()),
             GoalKind::Auction => Goal::Auction(Auction::default()),
             GoalKind::Market => Goal::Market(Market::default()),
+            GoalKind::Guild => Goal::Guild(Guild::new(party)),
+            GoalKind::Gank => Goal::Gank(Gank::with_order(party)),
+            GoalKind::Warzone => Goal::Warzone(Warzone::new()),
+            GoalKind::Event => Goal::Event(Event::new()),
+            GoalKind::Companion => Goal::Companion(Companion::new()),
+            GoalKind::Farm => Goal::Farm(Farm::new()),
         }
     }
 
@@ -153,6 +184,12 @@ impl Goal {
             Goal::Sail(_) => GoalKind::Sail,
             Goal::Auction(_) => GoalKind::Auction,
             Goal::Market(_) => GoalKind::Market,
+            Goal::Guild(_) => GoalKind::Guild,
+            Goal::Gank(_) => GoalKind::Gank,
+            Goal::Warzone(_) => GoalKind::Warzone,
+            Goal::Event(_) => GoalKind::Event,
+            Goal::Companion(_) => GoalKind::Companion,
+            Goal::Farm(_) => GoalKind::Farm,
         }
     }
 
@@ -165,6 +202,12 @@ impl Goal {
             Goal::Sail(g) => g.owns_combat(),
             Goal::Auction(g) => g.owns_combat(),
             Goal::Market(g) => g.owns_combat(),
+            Goal::Guild(g) => g.owns_combat(),
+            Goal::Gank(g) => g.owns_combat(),
+            Goal::Warzone(g) => g.owns_combat(),
+            Goal::Event(g) => g.owns_combat(),
+            Goal::Companion(g) => g.owns_combat(),
+            Goal::Farm(g) => g.owns_combat(),
             _ => false,
         }
     }
@@ -184,6 +227,12 @@ impl Goal {
             Goal::Sail(g) => g.start(ctx),
             Goal::Auction(g) => g.start(ctx),
             Goal::Market(g) => g.start(ctx),
+            Goal::Guild(g) => g.start(ctx),
+            Goal::Gank(g) => g.start(ctx),
+            Goal::Warzone(g) => g.start(ctx),
+            Goal::Event(g) => g.start(ctx),
+            Goal::Companion(g) => g.start(ctx),
+            Goal::Farm(g) => g.start(ctx),
         }
     }
 
@@ -205,12 +254,22 @@ impl Goal {
             Goal::Sail(g) => return g.tick(ctx),
             Goal::Auction(g) => return g.tick(ctx),
             Goal::Market(g) => return g.tick(ctx),
+            Goal::Guild(g) => return g.tick(ctx),
+            Goal::Gank(g) => match g.tick(ctx) {
+                GoalStatus::Done => g.resumes_run(ctx),
+                status => return status,
+            },
+            Goal::Warzone(g) => return g.tick(ctx),
+            Goal::Event(g) => return g.tick(ctx, combat),
+            Goal::Companion(g) => return g.tick(ctx),
+            Goal::Farm(g) => return g.tick(ctx),
         };
         if !resume {
             return GoalStatus::Done;
         }
-        // The rest cut a trade run short while the bot carried a pack: the run goes on.
-        ctx.log.say("goal: trade run (the pack is still carried)");
+        // The rest cut a trade run short while the bot carried a pack (or a gank took one): the
+        // run goes on and sells it.
+        ctx.log.say("goal: trade run (the pack is carried)");
         let mut run = TradeRun::default();
         run.start(ctx);
         *self = Goal::TradeRun(run);
@@ -232,6 +291,12 @@ impl Goal {
             Goal::Sail(g) => g.stop(ctx),
             Goal::Auction(g) => g.stop(ctx),
             Goal::Market(g) => g.stop(ctx),
+            Goal::Guild(g) => g.stop(ctx),
+            Goal::Gank(g) => g.stop(ctx),
+            Goal::Warzone(g) => g.stop(ctx),
+            Goal::Event(g) => g.stop(ctx),
+            Goal::Companion(g) => g.stop(ctx),
+            Goal::Farm(g) => g.stop(ctx),
         }
     }
 
@@ -262,6 +327,12 @@ impl Goal {
             Goal::Sail(g) => g.activity(moving, fighting),
             Goal::Auction(g) => g.activity(moving, fighting),
             Goal::Market(g) => g.activity(moving, fighting),
+            Goal::Guild(g) => g.activity(moving, fighting),
+            Goal::Gank(g) => g.activity(moving, fighting),
+            Goal::Warzone(g) => g.activity(moving, fighting),
+            Goal::Event(g) => g.activity(moving, fighting),
+            Goal::Companion(g) => g.activity(moving, fighting),
+            Goal::Farm(g) => g.activity(moving, fighting),
         }
     }
 
@@ -280,6 +351,12 @@ impl Goal {
             Goal::Sail(g) => g.describe(out),
             Goal::Auction(g) => g.describe(out),
             Goal::Market(g) => g.describe(out),
+            Goal::Guild(g) => g.describe(out),
+            Goal::Gank(g) => g.describe(out),
+            Goal::Warzone(g) => g.describe(out),
+            Goal::Event(g) => g.describe(out),
+            Goal::Companion(g) => g.describe(out),
+            Goal::Farm(g) => g.describe(out),
         }
     }
 }
@@ -398,5 +475,25 @@ mod tests {
             Goal::with_party(GoalKind::Sail, None, Some(Box::new(order))),
             Goal::Sail(_)
         ));
+    }
+
+    #[test]
+    fn the_wave_one_goals_start_idle_and_own_no_combat() {
+        for kind in [
+            GoalKind::Guild,
+            GoalKind::Event,
+            GoalKind::Companion,
+            GoalKind::Farm,
+        ] {
+            let g = Goal::new(kind, None);
+            assert_eq!(g.kind(), kind);
+            assert!(!g.owns_combat());
+            assert_eq!(g.activity(false, false), Activity::Idle);
+            assert_eq!(g.activity(true, false), Activity::Traveling);
+            assert_eq!(g.activity(true, true), Activity::Fighting);
+            let mut text = String::new();
+            g.describe(&mut text);
+            assert!(text.starts_with(kind.name()), "{text}");
+        }
     }
 }

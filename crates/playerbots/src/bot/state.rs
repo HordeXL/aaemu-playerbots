@@ -25,6 +25,7 @@ use super::travel::TravelState;
 use super::vehicle::VehicleState;
 use super::watch::classify;
 use super::watch::{Finding, Watch};
+use super::zones::ZoneStates;
 
 /// Most units kept in the view.
 pub const MAX_UNITS: usize = 1024;
@@ -48,6 +49,9 @@ pub const U_DEAD: u8 = 1;
 pub const U_LOOT: u8 = 2;
 /// Unit flag: the unit belongs to a player (summon, pet).
 pub const U_OWNED: u8 = 4;
+/// Unit flag: the backpack slot of the character is occupied (a carried trade pack, a glider);
+/// the template is in [`PvpMem`] (`BotState::pack_of`).
+pub const U_PACK: u8 = 8;
 
 /// What kind of unit the server shows. Houses, transfers, mates and shipyards are not tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +91,7 @@ pub struct Unit {
     pub faction: u32,
     /// Level.
     pub level: u8,
-    /// `U_DEAD | U_LOOT | U_OWNED`.
+    /// `U_DEAD | U_LOOT | U_OWNED | U_PACK`.
     pub flags: u8,
     /// Name, characters only.
     pub name: Option<Box<str>>,
@@ -107,6 +111,11 @@ impl Unit {
     /// Whether a player owns the unit.
     pub fn owned(&self) -> bool {
         self.flags & U_OWNED != 0
+    }
+
+    /// Whether the character's backpack slot is occupied (see [`U_PACK`]).
+    pub fn carries_pack(&self) -> bool {
+        self.flags & U_PACK != 0
     }
 
     /// Horizontal distance to `p`.
@@ -417,6 +426,16 @@ pub struct BotState {
     /// What the bot may sell and what the market features remember (the provenance ledger, see
     /// [`super::market`]); allocated when the bot first gains something it may sell.
     pub market: super::market::MarketState,
+    /// The conflict state of the zone groups the server announced (one pointer until the first
+    /// announcement), see [`BotState::zone_state`] and [`BotState::at_war`].
+    pub zone_states: ZoneStates,
+    /// What the bot knows about its guild (expedition) and what the guild duty plans (one pointer
+    /// until the first guild packet or duty tick), see [`super::guild`].
+    pub guild: super::guild::GuildState,
+    /// What the bot remembers of fights with characters: the carriers in view, the characters it
+    /// shuns, the run in progress, its kills (owned by the pvp feature, see [`super::pvp`]);
+    /// allocated by the first carrier in view or fight.
+    pub pvp: Option<Box<super::pvp::PvpMem>>,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -481,9 +500,33 @@ impl BotState {
 
     // ---- queries ------------------------------------------------------------------------
 
+    /// The conflict state of zone group `zone_group` (one of
+    /// [`conflict_state`](aa_proto::sc_world::conflict_state)) and the Unix second it ends;
+    /// `None` when the server has not announced the zone group.
+    pub fn zone_state(&self, zone_group: u16) -> Option<(u8, i64)> {
+        self.zone_states.get(zone_group)
+    }
+
+    /// Whether zone group `zone_group` is fought over (conflict or war). `false` when the server
+    /// has not announced it.
+    pub fn at_war(&self, zone_group: u16) -> bool {
+        self.zone_states.at_war(zone_group)
+    }
+
     /// The unit with object id `obj`.
     pub fn unit(&self, obj: u32) -> Option<&Unit> {
         self.units.get(&obj)
+    }
+
+    /// The template of the item in the backpack slot of character `obj` (a carried trade pack);
+    /// 0 when the slot is empty or the character is not in view.
+    pub fn pack_of(&self, obj: u32) -> u32 {
+        self.pvp.as_ref().map_or(0, |p| p.pack_of(obj))
+    }
+
+    /// The pvp memory, created on first use.
+    pub fn pvp_mut(&mut self) -> &mut super::pvp::PvpMem {
+        self.pvp.get_or_insert_with(Default::default)
     }
 
     /// The bag count of item `template` (all stacks).
@@ -629,6 +672,7 @@ impl BotState {
                 me.exp = own.exp;
                 me.labor = own.labor;
                 me.money = own.money;
+                self.guild.on_own_guild(own.expedition_id, self.now_ms);
                 self.equipment = own.equipment.to_vec();
                 // Saved with no hit points: the server sends no death event for it.
                 if own.hp <= 0 {
@@ -641,6 +685,31 @@ impl BotState {
                 for o in objs {
                     self.units.remove(o);
                     self.threats.retain(|t| t.0 != *o);
+                    if let Some(p) = self.pvp.as_mut() {
+                        p.forget(*o);
+                    }
+                }
+            }
+            WorldEvent::UnitEquipmentsChanged { obj, slots } => {
+                // (the own equipment follows the item tasks)
+                if *obj != self.me.obj {
+                    for &(slot, template) in slots.iter() {
+                        if slot == aa_proto::sc_world::BACKPACK_SLOT {
+                            self.note_pack(*obj, template);
+                        }
+                    }
+                }
+            }
+            WorldEvent::PvpPoints { obj, kind, points } => {
+                if *obj == self.me.obj && self.me.obj != 0 {
+                    let mem = self.pvp_mut();
+                    match *kind {
+                        aa_proto::sc_world::pvp_points::HONOR => mem.honor = *points,
+                        aa_proto::sc_world::pvp_points::HOSTILE_KILLS => {
+                            mem.hostile_kills = *points
+                        }
+                        _ => {}
+                    }
                 }
             }
             WorldEvent::UnitMoved { obj, pos, .. } => {
@@ -748,6 +817,15 @@ impl BotState {
                     self.me.faction = *faction;
                 } else if let Some(u) = self.units.get_mut(obj) {
                     u.faction = *faction;
+                }
+            }
+            WorldEvent::ConflictZoneState {
+                zone_group,
+                state,
+                end_unix_s,
+            } => {
+                if !self.zone_states.set(*zone_group, *state, *end_unix_s) {
+                    self.dropped = self.dropped.saturating_add(1);
                 }
             }
             WorldEvent::DoodadsCreated(list) => {
@@ -894,6 +972,27 @@ impl BotState {
             mem.team.member_targets.clear();
             mem.team.attackers.clear();
         }
+        if let Some(p) = self.pvp.as_mut() {
+            p.clear_view();
+        }
+    }
+
+    /// Notes that character `obj`'s backpack slot holds `template` (0 = nothing now).
+    fn note_pack(&mut self, obj: u32, template: u32) {
+        let Some(u) = self.units.get_mut(&obj) else {
+            return;
+        };
+        if u.kind != UnitKind::Character {
+            return;
+        }
+        if template != 0 {
+            u.flags |= U_PACK;
+        } else {
+            u.flags &= !U_PACK;
+        }
+        if template != 0 || self.pvp.is_some() {
+            self.pvp_mut().set_pack(obj, template);
+        }
     }
 
     fn apply_unit_state(&mut self, info: &UnitInfo) {
@@ -960,6 +1059,9 @@ impl BotState {
                 self.now_ms,
             );
         }
+        if kind == UnitKind::Character && info.backpack != 0 {
+            flags |= U_PACK;
+        }
         self.units.insert(
             info.obj,
             Unit {
@@ -973,6 +1075,10 @@ impl BotState {
                 name: (kind == UnitKind::Character).then(|| info.name.clone()),
             },
         );
+        if kind == UnitKind::Character && (info.backpack != 0 || self.pvp.is_some()) {
+            // (the server repeats the whole state of a unit that comes into view again)
+            self.pvp_mut().set_pack(info.obj, info.backpack);
+        }
     }
 
     /// The own hit points say the bot is dead although no death event told so (a character that
@@ -1014,11 +1120,30 @@ impl BotState {
             self.threats.clear();
             self.watch.death.death_packet();
             self.watch.tracker.clear();
+            if self
+                .units
+                .get(&killer)
+                .is_some_and(|u| u.kind == UnitKind::Character)
+            {
+                let now = self.now_ms;
+                let mem = self.pvp_mut();
+                mem.killed_by = Some((killer, now));
+                mem.deaths += 1;
+            }
             return;
         }
+        let mut was_character = false;
         if let Some(u) = self.units.get_mut(&obj) {
             u.flags |= U_DEAD;
             u.hp = 0;
+            was_character = u.kind == UnitKind::Character;
+            // (a dead carrier drops its pack: it is a doodad on the ground now)
+            u.flags &= !U_PACK;
+        }
+        if was_character {
+            if let Some(p) = self.pvp.as_mut() {
+                p.set_pack(obj, 0);
+            }
         }
         self.threats.retain(|t| t.0 != obj);
         if killer == self.me.obj && self.me.obj != 0 {
@@ -1026,6 +1151,9 @@ impl BotState {
                 self.kills.remove(0);
             }
             self.kills.push((obj, self.now_ms));
+            if was_character {
+                self.pvp_mut().kills += 1;
+            }
         }
     }
 
@@ -1197,6 +1325,9 @@ impl BotState {
         self.trade.apply(ev, self.now_ms);
         self.house_log.apply(ev, self.now_ms, self.me.char_id);
         super::party::observe(&mut self.party, ev, self.now_ms);
+        if let ActivityEvent::Guild(g) = ev {
+            self.guild.on_event(g, self.me.char_id, self.now_ms);
+        }
         match ev {
             ActivityEvent::Quests { list } => {
                 for row in list {
@@ -1366,6 +1497,7 @@ mod tests {
                 duration_ms: 0,
                 charge: 0,
             }]),
+            backpack: 0,
             complete: true,
         }
     }
@@ -1383,6 +1515,46 @@ mod tests {
             500,
         )))));
         s
+    }
+
+    #[test]
+    fn zone_conflict_packets_fill_the_zone_table() {
+        use aa_proto::sc_world::conflict_state as cs;
+        let zone = |zone_group, state, end_unix_s| {
+            world(WorldEvent::ConflictZoneState {
+                zone_group,
+                state,
+                end_unix_s,
+            })
+        };
+        let mut s = BotState::new();
+        assert_eq!(s.zone_state(7), None);
+        assert!(!s.at_war(7));
+        // one packet per zone group at world entry ...
+        s.apply(&zone(7, cs::TENSION, 1_700_000_000));
+        s.apply(&zone(8, cs::CONFLICT, 1_700_000_500));
+        s.apply(&zone(9, cs::PEACE, 0));
+        assert_eq!(s.zone_state(7), Some((cs::TENSION, 1_700_000_000)));
+        assert_eq!(s.zone_state(9), Some((cs::PEACE, 0)));
+        assert!(!s.at_war(7) && s.at_war(8) && !s.at_war(9));
+        // ... and one on each change
+        s.apply(&zone(7, cs::WAR, 1_700_003_600));
+        s.apply(&zone(8, cs::PEACE, 1_700_007_200));
+        assert_eq!(s.zone_state(7), Some((cs::WAR, 1_700_003_600)));
+        assert!(s.at_war(7) && !s.at_war(8));
+        assert_eq!(s.zone_state(8), Some((cs::PEACE, 1_700_007_200)));
+        assert_eq!(s.zone_states.len(), 3);
+        assert_eq!(s.dropped, 0);
+        // the table is bounded; what does not fit is counted like any other dropped event
+        for g in 100..(100 + crate::bot::zones::MAX_ZONE_STATES as u16) {
+            s.apply(&zone(g, cs::TENSION, 0));
+        }
+        assert_eq!(s.zone_states.len(), crate::bot::zones::MAX_ZONE_STATES);
+        assert!(s.dropped > 0);
+        // a new connection starts from scratch
+        s.reset();
+        assert_eq!(s.zone_state(7), None);
+        assert!(s.zone_states.is_empty());
     }
 
     #[test]

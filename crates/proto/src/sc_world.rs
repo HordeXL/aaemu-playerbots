@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::opcodes::{pp, sc};
 use crate::pos::convert_long_to_coord;
+use crate::sc_event::{self, EventId, TowerDefInfo};
 use crate::sc_travel::{self, MySlaveInfo, PortalEntry, ShipMotion};
 use crate::stream::{MarshalError, PacketStream};
 
@@ -55,6 +56,9 @@ pub mod unit_type {
 const EQUIPMENT_SLOTS: u8 = 28;
 /// Appearance slots (face .. beard) are written as the template id only (models/container.rs:66).
 const BODY_PART_SLOTS: std::ops::RangeInclusive<u8> = 19..=25;
+/// The backpack slot of the equipment (`equip_slot::BACKPACK`, models/container.rs:73): where a
+/// carried trade pack (or a glider) sits.
+pub const BACKPACK_SLOT: u8 = 26;
 
 /// Detail body lengths after the type byte, indexed by `ItemDetailType`
 /// (aaemu-game models/item.rs:158).
@@ -211,6 +215,9 @@ pub struct UnitInfo {
     pub skills: Box<[(u32, u8)]>,
     /// Active buffs.
     pub buffs: Box<[BuffInfo]>,
+    /// Template of the item in the backpack slot ([`BACKPACK_SLOT`]) of a character: a carried
+    /// trade pack, a glider; 0 when the slot is empty and for every other kind of unit.
+    pub backpack: u32,
     /// Whether the whole body was parsed.
     pub complete: bool,
 }
@@ -236,6 +243,23 @@ pub struct DoodadInfo {
     pub quest_glow: u32,
     /// The doodad has an item to loot.
     pub has_loot: bool,
+}
+
+/// One crop of `SCResponseCommonFarmListPacket`: a plant of the character on a public farm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommonFarmEntry {
+    /// Farm kind (`FarmGroupKind`: 1 farm, 2 nursery, 3 ranch, 4 stable).
+    pub farm_type: u32,
+    /// Doodad template of the crop.
+    pub template: u32,
+    /// Milliseconds until its current phase ends.
+    pub time_left: u32,
+    /// Its current phase (`func_group_id`).
+    pub phase: u32,
+    /// Position.
+    pub pos: Pos,
+    /// When it was planted, Unix seconds.
+    pub plant_time: i64,
 }
 
 /// One item slot of `SCCharacterInvenContentsPacket`.
@@ -613,6 +637,62 @@ pub enum WorldEvent {
         /// The change is temporary.
         temp: bool,
     },
+    /// `SCUnitEquipmentsChangedPacket` (systems/economy/item_packets.rs:64): equipment slots of
+    /// a unit changed; a trade pack picked up or dropped is a change of [`BACKPACK_SLOT`].
+    UnitEquipmentsChanged {
+        /// Object id of the unit.
+        obj: u32,
+        /// `(slot, item template)` per changed slot; template 0 = the slot is empty now.
+        slots: SmallVec<[(u8, u32); 2]>,
+    },
+    /// `SCUnitPvPPointsChangedPacket` (packets/g2c_misc.rs:104): a unit's honor or hostile
+    /// kills changed (broadcast to the unit's neighbours after a player kill).
+    PvpPoints {
+        /// Object id of the unit.
+        obj: u32,
+        /// 0 = honor gained in combat, 1 = hostile faction kills (see [`pvp_points`]).
+        kind: u8,
+        /// The new total.
+        points: i32,
+    },
+    /// `SCConflictZoneStatePacket` (packets/world.rs:334): the conflict state of a zone group,
+    /// sent once per zone group at world entry and again on every change. `state` is one of
+    /// [`conflict_state`].
+    ConflictZoneState {
+        /// Zone group id.
+        zone_group: u16,
+        /// Conflict state, see [`conflict_state`].
+        state: u8,
+        /// When the state ends, in Unix seconds (0 when it does not).
+        end_unix_s: i64,
+    },
+    /// `SCTowerDefListPacket` (systems/instances/packets.rs:735): every tower defence event
+    /// ("rift") running in the world instance, with its wave and the position of its target.
+    /// Sent on each start, wave and end and when the character changes zone.
+    TowerDefList(Box<[TowerDefInfo]>),
+    /// `SCTowerDefStartPacket` (systems/instances/packets.rs:756): an event started.
+    TowerDefStart {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+    },
+    /// `SCTowerDefEndPacket` (systems/instances/packets.rs:774): an event ended.
+    TowerDefEnd {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+    },
+    /// `SCTowerDefWaveStartPacket` (systems/instances/packets.rs:793): a wave of an event began.
+    TowerDefWave {
+        /// Which event.
+        id: EventId,
+        /// The zone key it was started in.
+        zone_key: u32,
+        /// The wave (from 1).
+        step: u32,
+    },
 
     // ---- doodads -----------------------------------------------------------------------
     /// `SCDoodadCreatedPacket` (one doodad, `Doodad.Write` models/doodad.rs:247) or
@@ -620,6 +700,10 @@ pub enum WorldEvent {
     DoodadsCreated(SmallVec<[DoodadInfo; 1]>),
     /// `SCDoodadRemovedPacket` (packets/world_objects.rs:44) or `SCDoodadsRemovedPacket` (:60).
     DoodadsRemoved(SmallVec<[u32; 4]>),
+    /// `SCResponseCommonFarmListPacket` (systems/npcs/public_farm.rs): the character's crops on
+    /// the public farms, the answer to `CSRequestCommonFarmList`. The doodad object ids are not
+    /// in it; a crop gets its object id when it comes into view.
+    CommonFarmList(Box<[CommonFarmEntry]>),
     /// `SCDoodadPhaseChangedPacket` (systems/npcs/doodad/packets.rs:53).
     DoodadPhase {
         /// Doodad object id.
@@ -1000,6 +1084,15 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCCombatEngagedPacket => |s| some(WorldEvent::CombatEngaged { obj: s.read_bc()? }),
         sc::SCCombatClearedPacket => |s| some(WorldEvent::CombatCleared { obj: s.read_bc()? }),
         sc::SCUnitFactionChangedPacket => read_faction_changed,
+        // zone conflicts, pvp
+        sc::SCConflictZoneStatePacket => read_conflict_zone_state,
+        sc::SCUnitEquipmentsChangedPacket => read_unit_equipments_changed,
+        sc::SCUnitPvPPointsChangedPacket => read_pvp_points,
+        // tower defence events (rifts)
+        sc::SCTowerDefListPacket => sc_event::read_list,
+        sc::SCTowerDefStartPacket => sc_event::read_start,
+        sc::SCTowerDefEndPacket => sc_event::read_end,
+        sc::SCTowerDefWaveStartPacket => sc_event::read_wave,
         // portals
         sc::SCCharacterPortalsPacket => sc_travel::read_portal_book,
         sc::SCCharacterReturnDistrictsPacket => sc_travel::read_return_districts,
@@ -1020,6 +1113,7 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCDoodadRemovedPacket => read_doodad_removed,
         sc::SCDoodadsRemovedPacket => read_doodads_removed,
         sc::SCDoodadPhaseChangedPacket => read_doodad_phase,
+        sc::SCResponseCommonFarmListPacket => read_common_farm_list,
         // own data
         sc::SCCharacterInvenInitPacket => read_inventory_init,
         sc::SCCharacterInvenContentsPacket => read_inventory,
@@ -1430,7 +1524,10 @@ fn equip_layout(unit_type: u8) -> EquipLayout {
     }
 }
 
-fn skip_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<()> {
+/// Reads (and mostly skips) the equipment block of a unit; returns the template in the backpack
+/// slot ([`BACKPACK_SLOT`]), 0 when it is empty or the layout has no such slot.
+fn read_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<u32> {
+    let mut backpack = 0;
     for slot in 0..EQUIPMENT_SLOTS {
         let body_part = BODY_PART_SLOTS.contains(&slot);
         if body_part && layout != EquipLayout::Slave {
@@ -1447,13 +1544,16 @@ fn skip_unit_equipment(s: &mut PacketStream, layout: EquipLayout) -> Res<()> {
         if template == 0 {
             continue;
         }
+        if slot == BACKPACK_SLOT && layout == EquipLayout::Full {
+            backpack = template;
+        }
         if layout == EquipLayout::Npc && slot != 27 {
             skip(s, 8 + 1)?; // id, grade
         } else {
             read_item_body(s, template)?;
         }
     }
-    Ok(())
+    Ok(backpack)
 }
 
 /// `SCUnitStatePacket` (world/unit_state.rs:108 characters, :413 other kinds).
@@ -1511,7 +1611,7 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     skip(s, 4)?; // scale
     let level = s.read_u8()?;
     skip(s, 4)?; // model id
-    skip_unit_equipment(s, equip_layout(ty))?;
+    let backpack = read_unit_equipment(s, equip_layout(ty))?;
     skip_model_params(s)?;
     skip(s, 3)?; // bc(0)
     let hp = s.read_i32()? / POINTS_SCALE;
@@ -1535,6 +1635,11 @@ fn read_unit_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         yaw: 0,
         skills: Box::default(),
         buffs: Box::default(),
+        backpack: if ty == unit_type::CHARACTER {
+            backpack
+        } else {
+            0
+        },
         complete: false,
     };
     // The tail is best effort: a character packet the server truncated, or a layout drift, keeps
@@ -1762,6 +1867,93 @@ fn read_faction_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     })
 }
 
+/// The values of the state byte of `SCConflictZoneStatePacket` (`ZoneConflictType`,
+/// data/world_data.rs:189). A zone starts at [`TENSION`](conflict_state::TENSION), climbs with
+/// the kills of the two factions through [`CONFLICT`](conflict_state::CONFLICT) to
+/// [`WAR`](conflict_state::WAR) and ends in [`PEACE`](conflict_state::PEACE).
+pub mod conflict_state {
+    /// Calm.
+    pub const TENSION: u8 = 0;
+    /// The first kills.
+    pub const DANGER: u8 = 1;
+    /// More kills.
+    pub const DISPUTE: u8 = 2;
+    /// More still.
+    pub const UNREST: u8 = 3;
+    /// The last step before the fighting.
+    pub const CRISIS: u8 = 4;
+    /// The factions fight in the zone.
+    pub const CONFLICT: u8 = 5;
+    /// The zone is at war (the tower is up).
+    pub const WAR: u8 = 6;
+    /// The loser of a war is protected for a while.
+    pub const PEACE: u8 = 7;
+
+    /// Whether the zone is fought over: [`CONFLICT`] or [`WAR`].
+    pub fn at_war(state: u8) -> bool {
+        state == CONFLICT || state == WAR
+    }
+
+    /// The name of `state` for logs; `"unknown"` for a value the server does not use.
+    pub fn name(state: u8) -> &'static str {
+        match state {
+            TENSION => "tension",
+            DANGER => "danger",
+            DISPUTE => "dispute",
+            UNREST => "unrest",
+            CRISIS => "crisis",
+            CONFLICT => "conflict",
+            WAR => "war",
+            PEACE => "peace",
+            _ => "unknown",
+        }
+    }
+}
+
+/// `SCConflictZoneStatePacket` (packets/world.rs:346): `u16 zone group, u8 state, i64 end time`.
+fn read_conflict_zone_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let zone_group = s.read_u16()?;
+    let state = s.read_u8()?;
+    let end_unix_s = s.read_i64()?;
+    some(WorldEvent::ConflictZoneState {
+        zone_group,
+        state,
+        end_unix_s,
+    })
+}
+
+/// `SCUnitEquipmentsChangedPacket` (systems/economy/item_packets.rs:64): `bc obj, u8 count`, then
+/// per slot `u8 slot` and an item (`Item.Write`, or the 4-byte empty form).
+fn read_unit_equipments_changed(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let obj = s.read_bc()?;
+    let count = usize::from(s.read_u8()?);
+    // (a slot is at least 5 bytes: the slot and the empty item)
+    check_count(s, count, 5, "equipment slot")?;
+    let mut slots = SmallVec::new();
+    for _ in 0..count {
+        let slot = s.read_u8()?;
+        let template = read_item(s)?.map_or(0, |i| i.template);
+        slots.push((slot, template));
+    }
+    some(WorldEvent::UnitEquipmentsChanged { obj, slots })
+}
+
+/// The `kind` values of `SCUnitPvPPointsChangedPacket` (systems/skills/combat.rs:749).
+pub mod pvp_points {
+    /// The honor gained in combat.
+    pub const HONOR: u8 = 0;
+    /// The kills of hostile-faction players.
+    pub const HOSTILE_KILLS: u8 = 1;
+}
+
+/// `SCUnitPvPPointsChangedPacket` (packets/g2c_misc.rs:104): `bc obj, u8 kind, i32 points`.
+fn read_pvp_points(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let obj = s.read_bc()?;
+    let kind = s.read_u8()?;
+    let points = s.read_i32()?;
+    some(WorldEvent::PvpPoints { obj, kind, points })
+}
+
 // ---- doodad readers ------------------------------------------------------------------------
 
 /// `Doodad.Write` (models/doodad.rs:247), a fixed 91-byte record.
@@ -1832,6 +2024,33 @@ fn read_doodad_phase(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let obj = s.read_bc()?;
     let phase = s.read_u32()?;
     some(WorldEvent::DoodadPhase { obj, phase })
+}
+
+/// One entry of `SCResponseCommonFarmListPacket`: four `u32`, a position (9 bytes), an `i64`.
+const FARM_ENTRY: usize = 4 * 4 + 9 + 8;
+
+fn read_common_farm_list(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    skip(s, 4)?; // the count is written twice
+    let count = usize::try_from(s.read_i32()?).unwrap_or(0);
+    check_count(s, count, FARM_ENTRY, "common farm entry")?;
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let farm_type = s.read_u32()?;
+        let template = s.read_u32()?;
+        let time_left = s.read_u32()?;
+        let phase = s.read_u32()?;
+        let pos = s.read_position()?;
+        let plant_time = s.read_i64()?;
+        list.push(CommonFarmEntry {
+            farm_type,
+            template,
+            time_left,
+            phase,
+            pos,
+            plant_time,
+        });
+    }
+    some(WorldEvent::CommonFarmList(list.into_boxed_slice()))
 }
 
 // ---- own data readers ----------------------------------------------------------------------

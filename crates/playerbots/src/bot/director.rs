@@ -65,6 +65,12 @@ pub fn option_text(kind: GoalKind) -> &'static str {
         GoalKind::Sail => "sail: summon a boat and sail across the water",
         GoalKind::Auction => "auction: list spare goods at the auction house",
         GoalKind::Market => "market: advertise spare goods and sell them to buyers",
+        GoalKind::Guild => "guild: found, join or run a guild",
+        GoalKind::Gank => "gank: ambush players carrying trade packs",
+        GoalKind::Warzone => "warzone: fight for the faction in a zone at war",
+        GoalKind::Event => "event: join a world event such as a rift",
+        GoalKind::Companion => "companion: follow a player's party",
+        GoalKind::Farm => "farm: plant and harvest crops",
         GoalKind::Rest => "rest: sit down and recover",
         GoalKind::Wander => "wander: stroll around and see the sights",
     }
@@ -324,10 +330,11 @@ impl Director {
 mod tests {
     use super::*;
     use crate::bot::brain::{base_weights, scores, ScoreInput};
+    use crate::bot::cmd::GoalMask;
     use crate::config::BehaviorCfg;
     use crate::roster::Temperament;
 
-    fn scores_for(blocked: u16) -> [f32; GoalKind::COUNT] {
+    fn scores_for(blocked: GoalMask) -> [f32; GoalKind::COUNT] {
         let base = base_weights(&BehaviorCfg::default(), &Temperament::NEUTRAL);
         scores(
             &base,
@@ -353,10 +360,21 @@ mod tests {
         // (the dungeon and sail goals score themselves from the whole context, see
         // `brain::own_scores`: this raw table leaves the sail goal at 0 and has the dungeon's
         // temperament weight, which `own_scores` replaces)
-        // (the auction and market goals do too, and are 0 until their features exist)
-        assert_eq!(with.len(), GoalKind::COUNT - 3);
+        // (the auction, market, guild, gank, warzone, event, companion and farm goals do too, and
+        // are 0 until their features exist)
+        assert_eq!(with.len(), GoalKind::COUNT - 9);
         assert!(!with.contains(&GoalKind::Sail));
         assert!(!with.contains(&GoalKind::Auction) && !with.contains(&GoalKind::Market));
+        for g in [
+            GoalKind::Guild,
+            GoalKind::Gank,
+            GoalKind::Warzone,
+            GoalKind::Event,
+            GoalKind::Companion,
+            GoalKind::Farm,
+        ] {
+            assert!(!with.contains(&g), "{g:?}");
+        }
     }
 
     #[test]

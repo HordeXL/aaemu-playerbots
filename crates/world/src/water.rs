@@ -19,8 +19,11 @@ use crate::terrain::Terrain;
 pub mod route;
 pub mod shore;
 
+pub use route::round_corners;
 pub use route::{route, Disc, Route, RouteCfg, RouteError};
-pub use shore::{find_shore, ShoreSpot};
+pub use shore::{
+    find_launch, find_shore, find_shore_with, launch_ok, moor_point, LaunchReq, ShoreSpot,
+};
 
 /// Edge of a mask cell in metres.
 pub const CELL_M: f32 = 16.0;

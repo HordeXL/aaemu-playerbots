@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p aa-bake --release --example bake -- --pak <client>/game_pak --out <data dir> \
-//!     --world main_world --step 4 --compact <AAEmu>/rust/crates/aaemu-game/app/Data/compact.sqlite3 [--only heights,zones,housing,spheres,map,nav,nav_instances]
+//!     --world main_world --step 4 --compact <AAEmu>/rust/crates/aaemu-game/app/Data/compact.sqlite3 [--only heights,zones,housing,farms,spheres,map,nav,nav_instances]
 //! ```
 
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
             "--compact" => compact = Some(PathBuf::from(value("--compact")?)),
             "--only" => only = Some(value("--only")?),
             other => anyhow::bail!(
-                "unknown argument {other}; usage: --pak <game_pak> --out <dir> [--world main_world] [--step 4] [--compact <compact.sqlite3>] [--only heights,zones,housing,spheres,map,nav,nav_instances]"
+                "unknown argument {other}; usage: --pak <game_pak> --out <dir> [--world main_world] [--step 4] [--compact <compact.sqlite3>] [--only heights,zones,housing,farms,spheres,map,nav,nav_instances]"
             ),
         }
     }
@@ -49,6 +49,7 @@ fn main() -> anyhow::Result<()> {
                 "heights" => steps.heights = true,
                 "zones" => steps.zones = true,
                 "housing" => steps.housing = true,
+                "farms" => steps.farms = true,
                 "spheres" => steps.spheres = true,
                 "map" => steps.map = true,
                 "nav" => steps.nav = true,

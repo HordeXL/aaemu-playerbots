@@ -34,11 +34,11 @@
 //! (the glue to the tick context). This file is the goal itself and its scoring.
 
 mod clear;
-mod entry;
+pub(crate) mod entry;
 mod machine;
 mod report;
 mod route;
-mod run;
+pub(crate) mod run;
 #[cfg(test)]
 mod sim;
 
@@ -256,7 +256,12 @@ pub fn score(ctx: &Ctx<'_>, base: f32) -> f32 {
 /// arrived before the party order did and was not answered. (A pending invitation blocks every
 /// other one to the same character on the server.)
 pub fn unsolicited(ctx: &mut Ctx<'_>, running: Option<GoalKind>) {
-    if running == Some(GoalKind::Dungeon) {
+    // (a founding team answers its own invitations: the guild goal)
+    if matches!(running, Some(GoalKind::Dungeon | GoalKind::Guild)) {
+        return;
+    }
+    // (a real player's invitation is the party feature's: it answers within seconds)
+    if crate::bot::companion::claims(ctx) {
         return;
     }
     let Some(inv) = ctx.state.team().and_then(|t| t.invite.as_ref()) else {

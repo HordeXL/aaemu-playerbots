@@ -12,6 +12,7 @@
 //!    │          │            ├─ Combat     (target, skills, loot)
 //!    │          │            └─ Brain      (goal choice) ── Goal (Wander, Rest, Grind, ...)
 //!    ├─ hub ──── web UI (pb_web::BotHub)
+//!    │    └─ population (census, economy, population director)
 //!    └─ coordinator (pairs bots for duels and trades)
 //! ```
 
@@ -19,10 +20,12 @@ pub mod archetype;
 pub mod bot;
 pub mod config;
 pub mod contest;
+pub mod events;
 pub mod gm;
 pub mod hub;
 pub mod issues;
 pub mod names;
+pub mod population;
 pub mod roster;
 pub mod secrets;
 pub mod supervisor;

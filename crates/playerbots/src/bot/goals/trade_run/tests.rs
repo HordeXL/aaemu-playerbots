@@ -293,6 +293,7 @@ fn npc(obj: u32, template: u32, x: f32, y: f32) -> UnitInfo {
         yaw: 0,
         skills: Box::new([]),
         buffs: Box::new([]),
+        backpack: 0,
         complete: true,
     }
 }

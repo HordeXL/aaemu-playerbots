@@ -41,6 +41,8 @@ use smallvec::SmallVec;
 
 use crate::bot::cmd::{GoalKind, PairKind, PairOrder, PairRole};
 use crate::bot::ctx::Ctx;
+use crate::bot::market::ledger::bag_count;
+use crate::bot::market::needs::QuestNeeds;
 use crate::bot::motion::{MotionStatus, Pace};
 use crate::bot::state::{dist2d, BotState, Item, StateError, Unit, UnitKind, SLOT_BAG};
 
@@ -138,18 +140,31 @@ impl Plan {
     }
 }
 
+/// How many units of `template` the bot keeps when it gives items away: `None` when the item
+/// must not be given away at all (it is not [`tradable`](aa_world::ItemFacts::tradable): unsellable,
+/// bound or a quest item; an unknown template counts as not tradable), else what its active quests
+/// still need of it (`needs`). The rule [`choose_offer`] takes.
+pub fn keep_of(world: &aa_world::World, needs: &QuestNeeds, template: u32) -> Option<u32> {
+    let facts = world.item_facts(template)?;
+    facts.tradable().then(|| needs.count(template))
+}
+
 /// A sensible offer from the bag and the purse: a few units of a tradable stack and/or a small
 /// part of the money. Items of [`GOODS`] come first; with `allow_other`, any other stack of two or
 /// more that is not known to be bound comes next (a bot that can mint goods does not gamble on
-/// loot that may be bound). `None` when there is nothing to offer.
+/// loot that may be bound). Only items `keep` allows are offered (`None`: never, else how many
+/// units the bot holds back, see [`keep_of`]), and never the units it holds back. `None` when
+/// there is nothing to offer.
 pub fn choose_offer(
     bag: &FxHashMap<u16, Item>,
     money: i64,
     allow_other: bool,
+    keep: &dyn Fn(u32) -> Option<u32>,
     rng: &mut fastrand::Rng,
 ) -> Option<Plan> {
-    let mut good: SmallVec<[(u16, Item); 8]> = SmallVec::new();
-    let mut other: SmallVec<[(u16, Item); 8]> = SmallVec::new();
+    // (slot, stack, units of the item that are free to give)
+    let mut good: SmallVec<[(u16, Item, i32); 8]> = SmallVec::new();
+    let mut other: SmallVec<[(u16, Item, i32); 8]> = SmallVec::new();
     for (slot, it) in bag {
         if *slot > u16::from(u8::MAX) || it.count <= 0 || KEEP.contains(&it.template) {
             continue;
@@ -157,24 +172,34 @@ pub fn choose_offer(
         if is_bound(it.template) {
             continue;
         }
+        let Some(held) = keep(it.template) else {
+            continue;
+        };
+        let free = bag_count(bag, it.template) - i64::from(held);
+        let Ok(free) = i32::try_from(free) else {
+            continue;
+        };
+        if free <= 0 {
+            continue;
+        }
         if GOODS.contains(&it.template) {
             if good.len() < 8 {
-                good.push((*slot, *it));
+                good.push((*slot, *it, free));
             }
         } else if allow_other && it.count >= 2 && other.len() < 8 {
-            other.push((*slot, *it));
+            other.push((*slot, *it, free));
         }
     }
     // the same bag always gives the same candidates in the same order
-    good.sort_by_key(|(slot, _)| *slot);
-    other.sort_by_key(|(slot, _)| *slot);
+    good.sort_by_key(|(slot, _, _)| *slot);
+    other.sort_by_key(|(slot, _, _)| *slot);
     let pool = if good.is_empty() { &other } else { &good };
     let mut plan = Plan::default();
     if !pool.is_empty() {
-        let (slot, it) = pool[rng.usize(..pool.len())];
+        let (slot, it, free) = pool[rng.usize(..pool.len())];
         plan.slot = slot as u8;
         plan.template = it.template;
-        plan.amount = rng.i32(1..=it.count.clamp(1, 5));
+        plan.amount = rng.i32(1..=it.count.clamp(1, 5).min(free));
     }
     if money >= MONEY_MIN && (plan.amount <= 0 || rng.u8(..100) < 40) {
         let cap = (money / 10).clamp(100, 5_000);
@@ -268,6 +293,10 @@ pub struct Io<'a> {
     pub identity: Identity,
     /// The partner is one of our bots (or was paired by the coordinator, which only pairs bots).
     pub partner_is_bot: bool,
+    /// What the bot keeps of an item template when it gives items away: `None` for an item it
+    /// must not give away (not tradable), else how many units its active quests need (see
+    /// [`keep_of`]).
+    pub keep: &'a dyn Fn(u32) -> Option<u32>,
     /// Copper one unit of an item template is worth (the vendor refund); 0 when unknown.
     pub worth: &'a dyn Fn(u32) -> i64,
     /// Packets to send.
@@ -558,10 +587,13 @@ impl Trade {
 
     fn prepare(&mut self, ctx: &mut Ctx<'_>) -> GoalStatus {
         let now = ctx.now_ms;
+        let needs = QuestNeeds::of(ctx.world, &ctx.state.quests);
+        let world = ctx.world;
         match choose_offer(
             &ctx.state.bag,
             ctx.state.me.money,
             !ctx.gm_allowed(),
+            &|template| keep_of(world, &needs, template),
             ctx.rng,
         ) {
             Some(plan) => self.plan = plan,
@@ -713,6 +745,8 @@ impl Trade {
         let allow_other = !ctx.gm_allowed();
         let (identity, partner_is_bot) = self.who_is_in_the_window(ctx);
         let world = ctx.world;
+        let needs = QuestNeeds::of(world, &ctx.state.quests);
+        let keep = |template: u32| keep_of(world, &needs, template);
         let worth = |template: u32| {
             world
                 .item_facts(template)
@@ -730,6 +764,7 @@ impl Trade {
             allow_other,
             identity,
             partner_is_bot,
+            keep: &keep,
             worth: &worth,
             out: &mut *ctx.out,
             rng: &mut *ctx.rng,
@@ -924,7 +959,7 @@ impl Trade {
                 );
             }
         } else {
-            match choose_offer(io.bag, io.money, io.allow_other, io.rng) {
+            match choose_offer(io.bag, io.money, io.allow_other, io.keep, io.rng) {
                 Some(plan) => self.plan = plan,
                 None => {
                     self.plan = Plan::default();
@@ -1279,6 +1314,10 @@ mod tests {
         allow_other: bool,
         identity: Identity,
         partner_is_bot: bool,
+        /// Templates the bot must not give away (not tradable).
+        untradable: Vec<u32>,
+        /// Units of a template its quests need.
+        held: Vec<(u32, u32)>,
     }
 
     impl Rig {
@@ -1295,10 +1334,17 @@ mod tests {
                 allow_other: true,
                 identity: Identity::Match,
                 partner_is_bot: true,
+                untradable: Vec::new(),
+                held: Vec::new(),
             }
         }
 
         fn step(&mut self, t: &mut Trade, now_ms: u64) -> Step {
+            let (untradable, held) = (&self.untradable, &self.held);
+            let keep = |template: u32| {
+                (!untradable.contains(&template))
+                    .then(|| held.iter().find(|h| h.0 == template).map_or(0, |h| h.1))
+            };
             let mut io = Io {
                 now_ms,
                 log: &mut self.log,
@@ -1310,6 +1356,7 @@ mod tests {
                 allow_other: self.allow_other,
                 identity: self.identity,
                 partner_is_bot: self.partner_is_bot,
+                keep: &keep,
                 worth: &|template| if template == 3411 { 20 } else { 5 },
                 out: &mut self.out,
                 rng: &mut self.rng,
@@ -1582,6 +1629,32 @@ mod tests {
     }
 
     #[test]
+    fn a_window_does_not_open_with_items_the_bot_must_keep() {
+        // the only stack is a quest item: the window is cancelled instead of putting it up
+        let mut r = Rig::new();
+        r.bag = bag(&[(4, item(900, 7716, 12))]);
+        r.untradable.push(7716);
+        let mut t = at(Phase::Invite, PairRole::Initiator);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        let s = r.step(&mut t, 1100);
+        assert_eq!(
+            s.status,
+            GoalStatus::Failed(FailReason::Other("nothing to offer"))
+        );
+        assert_eq!(r.sent(), [op(|| cs::cancel_trade(0))]);
+        // the same for goods the bot's quests need in full
+        let mut r = Rig::new();
+        r.held.push((3411, 12));
+        let mut t = at(Phase::Invite, PairRole::Initiator);
+        r.ev(ActivityEvent::TradeStarted { peer_obj: 77 }, 1000);
+        let s = r.step(&mut t, 1100);
+        assert_eq!(
+            s.status,
+            GoalStatus::Failed(FailReason::Other("nothing to offer"))
+        );
+    }
+
+    #[test]
     fn nothing_to_offer_cancels_the_window() {
         let mut r = Rig::new();
         r.bag.clear();
@@ -1755,42 +1828,93 @@ mod tests {
             (2, item(3, 3411, 3)),
         ]);
         for _ in 0..200 {
-            let p = choose_offer(&b, 0, true, &mut rng).unwrap();
+            let p = choose_offer(&b, 0, true, &any, &mut rng).unwrap();
             assert_eq!((p.slot, p.template), (2, 3411));
             assert!((1..=3).contains(&p.amount));
             assert_eq!(p.money, 0);
         }
         // without goods, a stack of two or more is acceptable
         let b = bag(&[(0, item(1, 5555, 1)), (1, item(2, 6666, 30))]);
-        let p = choose_offer(&b, 0, true, &mut rng).unwrap();
+        let p = choose_offer(&b, 0, true, &any, &mut rng).unwrap();
         assert_eq!((p.slot, p.template), (1, 6666));
         assert!((1..=5).contains(&p.amount));
         // a bot that can mint goods does not offer unknown stacks
-        assert_eq!(choose_offer(&b, 0, false, &mut rng), None);
+        assert_eq!(choose_offer(&b, 0, false, &any, &mut rng), None);
         // coins and tax certificates are never offered
         let b = bag(&[(0, item(1, 500, 100)), (1, item(2, 31891, 50))]);
-        assert_eq!(choose_offer(&b, 0, true, &mut rng), None);
+        assert_eq!(choose_offer(&b, 0, true, &any, &mut rng), None);
         // money: only with a purse, never more than a tenth (at least 100, at most 5000)
         let empty = FxHashMap::default();
-        assert_eq!(choose_offer(&empty, 999, true, &mut rng), None);
+        assert_eq!(choose_offer(&empty, 999, true, &any, &mut rng), None);
         for money in [1_000, 7_777, 1_000_000] {
-            let p = choose_offer(&empty, money, true, &mut rng).unwrap();
+            let p = choose_offer(&empty, money, true, &any, &mut rng).unwrap();
             assert_eq!(p.amount, 0);
             assert!(i64::from(p.money) <= money / 10 + 100 && p.money >= 100 && p.money <= 5_000);
         }
         // slots above 255 do not fit the packet
         let b = bag(&[(300, item(1, 3411, 5))]);
-        assert_eq!(choose_offer(&b, 0, true, &mut rng), None);
+        assert_eq!(choose_offer(&b, 0, true, &any, &mut rng), None);
+    }
+
+    /// The rule of a bot whose items are all tradable and no quest needs any.
+    fn any(_: u32) -> Option<u32> {
+        Some(0)
+    }
+
+    #[test]
+    fn untradable_items_are_never_offered() {
+        let mut rng = fastrand::Rng::with_seed(1);
+        // a quest item among the goods, and unsellable loot among the other stacks
+        let b = bag(&[
+            (0, item(1, 7716, 30)),
+            (1, item(2, 3411, 8)),
+            (2, item(3, 8888, 30)),
+        ]);
+        let rule = |t: u32| (t != 7716 && t != 8888).then_some(0);
+        for _ in 0..100 {
+            let p = choose_offer(&b, 0, true, &rule, &mut rng).unwrap();
+            assert_eq!((p.slot, p.template), (1, 3411));
+        }
+        // without the goods, nothing of the two is chosen either
+        let b = bag(&[(0, item(1, 7716, 30)), (2, item(3, 8888, 30))]);
+        assert_eq!(choose_offer(&b, 0, true, &rule, &mut rng), None);
+        // a good the rule does not allow is not offered, an unknown template (the rule says
+        // `None`) neither
+        let b = bag(&[(0, item(1, 3411, 30))]);
+        assert_eq!(choose_offer(&b, 0, true, &|_| None, &mut rng), None);
+        // money is still offered
+        assert!(choose_offer(&b, 5_000, true, &|_| None, &mut rng)
+            .is_some_and(|p| p.amount == 0 && p.money > 0));
+    }
+
+    #[test]
+    fn what_an_active_quest_needs_is_not_offered() {
+        let mut rng = fastrand::Rng::with_seed(1);
+        // 12 hay bales in two stacks, a quest needs 10: 2 are free, from either stack
+        let b = bag(&[(0, item(1, 3712, 7)), (1, item(2, 3712, 5))]);
+        let rule = |t: u32| Some(if t == 3712 { 10 } else { 0 });
+        for _ in 0..100 {
+            let p = choose_offer(&b, 0, true, &rule, &mut rng).unwrap();
+            assert_eq!(p.template, 3712);
+            assert!((1..=2).contains(&p.amount), "{}", p.amount);
+        }
+        // all of it needed: nothing to offer
+        let all = |t: u32| Some(if t == 3712 { 12 } else { 0 });
+        assert_eq!(choose_offer(&b, 0, true, &all, &mut rng), None);
+        // a bot whose goods are all needed offers another tradable stack instead
+        let b = bag(&[(0, item(1, 3712, 7)), (1, item(2, 6666, 30))]);
+        let p = choose_offer(&b, 0, true, &all, &mut rng).unwrap();
+        assert_eq!(p.template, 6666);
     }
 
     #[test]
     fn bound_templates_are_not_offered_again() {
         let mut rng = fastrand::Rng::with_seed(1);
         let b = bag(&[(0, item(1, 424_242, 9))]);
-        assert!(choose_offer(&b, 0, true, &mut rng).is_some());
+        assert!(choose_offer(&b, 0, true, &any, &mut rng).is_some());
         learn_bound(424_242);
         assert!(is_bound(424_242));
-        assert_eq!(choose_offer(&b, 0, true, &mut rng), None);
+        assert_eq!(choose_offer(&b, 0, true, &any, &mut rng), None);
     }
 
     #[test]

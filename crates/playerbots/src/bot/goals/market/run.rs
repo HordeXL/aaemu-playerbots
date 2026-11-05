@@ -17,6 +17,7 @@ use crate::bot::goals::{FailReason, GoalStatus};
 use crate::bot::market::ads::lines::{Meet, Speech};
 use crate::bot::market::ads::talk::{Closed, Role};
 use crate::bot::market::ads::{AdState, Agreed};
+use crate::bot::market::needs::QuestNeeds;
 use crate::bot::motion::{MotionStatus, Pace};
 use crate::bot::state::{StateError, UnitKind};
 
@@ -276,8 +277,14 @@ impl Run {
         let seller = d.role == Role::Seller;
         let unit = unit_named(ctx, &d.peer);
         let money = i32::try_from(total).ok();
+        // (a quest taken since the deal may need the goods: those are not for sale any more)
+        let free = count(ctx, template)
+            - i64::from(QuestNeeds::of(ctx.world, &ctx.state.quests).count(template));
         let plan = money.and_then(|money| {
             if seller {
+                if free < qty {
+                    return None;
+                }
                 let slot = ctx
                     .state
                     .bag

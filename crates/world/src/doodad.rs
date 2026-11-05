@@ -104,6 +104,10 @@ pub struct DoodadData {
     /// `(doodad template, is_pack, func row id)` of every `DoodadFuncLootItem` (false) /
     /// `DoodadFuncLootPack` (true) function.
     loot_funcs: Vec<(u32, bool, u32)>,
+    /// Sorted doodad templates a backpack turns into when it is put down or dropped on death
+    /// (`put_down_backpack_effects.backpack_doodad_id`): the doodads a pack can be picked up
+    /// from again (`DoodadFuncRecoverItem`).
+    pack_doodads: Vec<u32>,
 }
 
 const GATHER_FUNCS: [&str; 17] = [
@@ -233,6 +237,16 @@ pub fn load(conn: &Connection, texts: &Texts) -> Result<DoodadData> {
     bench_pairs.sort_unstable();
     bench_pairs.dedup();
 
+    // (the table is missing from a database without the put-down effect: no pack doodads then)
+    let mut pack_doodads: Vec<u32> = Vec::new();
+    let _ = each_row(
+        conn,
+        "SELECT backpack_doodad_id FROM put_down_backpack_effects WHERE backpack_doodad_id != 0",
+        |r| pack_doodads.push(r.u32(0)),
+    );
+    pack_doodads.sort_unstable();
+    pack_doodads.dedup();
+
     let templates = names
         .into_iter()
         .map(|(id, name)| {
@@ -251,10 +265,16 @@ pub fn load(conn: &Connection, texts: &Texts) -> Result<DoodadData> {
         templates: IdMap::build(templates),
         bench_pairs,
         loot_funcs,
+        pack_doodads,
     })
 }
 
 impl DoodadData {
+    /// Whether `template` is what a put-down or dropped backpack turns into.
+    pub fn is_pack_doodad(&self, template: u32) -> bool {
+        self.pack_doodads.binary_search(&template).is_ok()
+    }
+
     /// For each wanted item, the doodad templates that yield it (via `DoodadFuncLootItem` or
     /// `DoodadFuncLootPack`) and for which `keep(doodad)` holds (typically "has a spawn").
     pub fn item_sources(
@@ -330,6 +350,7 @@ impl DoodadData {
                 .sum::<usize>()
             + self.bench_pairs.capacity() * 8
             + self.loot_funcs.capacity() * std::mem::size_of::<(u32, bool, u32)>()
+            + self.pack_doodads.capacity() * 4
     }
 }
 

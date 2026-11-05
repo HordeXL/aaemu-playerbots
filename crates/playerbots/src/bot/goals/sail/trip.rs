@@ -5,9 +5,20 @@
 //! longer than the straight line; failing that the trip is a sightseeing loop out to a point at
 //! sea and back to the launch beach. Everything is computed on the shared sea map and the terrain
 //! grid, with the places hostile sea monsters spawn closed to the planner ([`danger_zones`]).
+//!
+//! The hull sets the rest ([`TripCfg::ship`]): a clipper or a cutter needs a launch with room for
+//! the hull ahead of the beach ([`find_launch`]), a wider margin of open water along the route (on
+//! the deep sea mask for the large hulls), rounded corners (the hull turns on a circle of 64 to
+//! 216 m) and a berth out at sea ([`Plan::moor`]) instead of the water point a rowboat can reach
+//! to within 12 m of the sand.
 
-use aa_world::water::{find_shore, route, Disc, RouteCfg, ShoreSpot, WaterMap};
+use aa_world::travel::{HullSize, ShipClass};
+use aa_world::water::{
+    find_launch, find_shore, moor_point, round_corners, route, Disc, RouteCfg, ShoreSpot, WaterMap,
+};
 use aa_world::World;
+
+use crate::bot::vehicle::follow::resample;
 
 /// How far from the chosen sea point a landing beach is looked for.
 pub const LANDING_SEARCH_M: f32 = 350.0;
@@ -24,8 +35,21 @@ const DETOUR: f32 = 2.2;
 /// A trip's water route is at most this much longer than the configured longest crossing (a boat
 /// does 3 m/s; the whole trip has 40 minutes).
 const MAX_ROUTE: f32 = 1.2;
-/// Cells of water a sea route keeps around its path.
+/// Cells of water a sea route keeps around its path (the rowboat's; see
+/// [`ShipClass::route_clear`]).
 pub const ROUTE_CLEAR: i32 = 2;
+/// Water (m) the footprint of a medium / large hull needs under it at the launch. The server
+/// tests the hull box against the terrain; the cutter's mass box reaches 13 m down, its
+/// authored model less (see `docs/OPERATING.md`).
+pub const LAUNCH_DEPTH_MEDIUM_M: f32 = 2.5;
+/// See [`LAUNCH_DEPTH_MEDIUM_M`].
+pub const LAUNCH_DEPTH_LARGE_M: f32 = 6.0;
+/// How far out to sea a berth is looked for.
+const MOOR_REACH_M: f32 = 260.0;
+/// Launch beaches tried before the planner gives up (a beach with no open sea in reach of its
+/// berth is skipped, with [`LAUNCH_SKIP_M`] metres around it).
+const LAUNCH_TRIES: u32 = 6;
+const LAUNCH_SKIP_M: f32 = 150.0;
 /// The search bound of the planning routes (cells reached).
 const PLAN_NODES: u32 = 30_000;
 
@@ -38,15 +62,52 @@ pub struct TripCfg {
     pub min_m: f32,
     /// Longest crossing.
     pub max_m: f32,
+    /// The hull that makes the trip.
+    pub ship: ShipClass,
 }
 
 impl Default for TripCfg {
     fn default() -> Self {
+        TripCfg::for_ship(ShipClass::ROWBOAT)
+    }
+}
+
+impl TripCfg {
+    /// The trip of a hull: 1 to 3 km for the rowboat, longer for the faster hulls (twice as far
+    /// for 6.4 m/s), and a wider search for a launch with room for the hull.
+    pub fn for_ship(ship: ShipClass) -> TripCfg {
+        let k = (ship.top_speed / ShipClass::ROWBOAT.top_speed).clamp(1.0, 2.0);
         TripCfg {
-            launch_m: 900.0,
-            min_m: 1000.0,
-            max_m: 3000.0,
+            launch_m: if ship.size == HullSize::Small {
+                900.0
+            } else {
+                1500.0
+            },
+            min_m: 1000.0 * k,
+            max_m: 3000.0 * k,
+            ship,
         }
+    }
+
+    /// The cells of open water the planning routes keep around the hull: narrower than the
+    /// sailing route's ([`ShipClass::route_clears`]), which may fall back as far as it must.
+    pub fn plan_clear(&self) -> i32 {
+        (self.ship.route_clear() - 2).max(ROUTE_CLEAR)
+    }
+}
+
+/// The route settings for `clear` cells of margin: the farther the open water begins from the
+/// shore, the farther a start or a goal may be moved to reach it and the longer the legs at the
+/// ends may run over any sea.
+fn route_cfg<'a>(clear: i32, max_nodes: u32, avoid: &'a [Disc]) -> RouteCfg<'a> {
+    let extra = (clear - ROUTE_CLEAR).max(0);
+    RouteCfg {
+        clear,
+        max_nodes,
+        avoid,
+        snap_cells: 6 + 3 * extra,
+        end_slack_m: 48.0 + 32.0 * extra as f32,
+        ..RouteCfg::default()
     }
 }
 
@@ -67,8 +128,11 @@ pub enum Kind {
 pub struct Plan {
     /// Where the bot stands, faces and summons.
     pub launch: ShoreSpot,
-    /// Where the boat is sailed to and the bot comes ashore.
+    /// Where the bot comes ashore.
     pub landing: ShoreSpot,
+    /// Where the boat is sailed to: the landing's water point for a rowboat, a berth out at sea
+    /// for the bigger hulls (see [`moor_point`]).
+    pub moor: (f32, f32),
     /// What kind of trip.
     pub kind: Kind,
     /// Length of the planned water route in metres.
@@ -97,13 +161,60 @@ pub fn plan_trip(
     cfg: &TripCfg,
     avoid: &[Disc],
 ) -> Result<Plan, PlanError> {
-    let launch = find_shore(map, ground, from, cfg.launch_m, avoid).ok_or(PlanError::NoCoast)?;
-    let rc = RouteCfg {
-        clear: ROUTE_CLEAR,
-        max_nodes: PLAN_NODES,
-        avoid,
-        ..RouteCfg::default()
+    let ship = &cfg.ship;
+    let clear = cfg.plan_clear();
+    let rc = route_cfg(clear, PLAN_NODES, avoid);
+    // the berth of a spot: its water point for a rowboat, open sea for the bigger hulls (none:
+    // the spot does not do)
+    let berth = |spot: &ShoreSpot| -> Option<(f32, f32)> {
+        if ship.size == HullSize::Small {
+            return Some(spot.water);
+        }
+        let p = moor_point(map, spot, clear, MOOR_REACH_M);
+        map.open_at(p.0, p.1, clear).then_some(p)
     };
+    // the launch beach: the nearest with room for the hull and, for the bigger hulls, open sea
+    // within reach of it; a beach without is left out of the next search (a bay too narrow for a
+    // yawl does not end the trip)
+    let mut skip: Vec<Disc> = avoid.to_vec();
+    let mut found: Option<(ShoreSpot, (f32, f32))> = None;
+    for _ in 0..LAUNCH_TRIES {
+        let launch = match ship.size {
+            HullSize::Small => find_shore(map, ground, from, cfg.launch_m, &skip),
+            HullSize::Medium => find_launch(
+                map,
+                ground,
+                from,
+                cfg.launch_m,
+                &skip,
+                &ship.launch_req(LAUNCH_DEPTH_MEDIUM_M),
+            ),
+            HullSize::Large => find_launch(
+                map,
+                ground,
+                from,
+                cfg.launch_m,
+                &skip,
+                &ship.launch_req(LAUNCH_DEPTH_LARGE_M),
+            ),
+        };
+        let Some(launch) = launch else {
+            if found.is_none() && skip.len() == avoid.len() {
+                return Err(PlanError::NoCoast);
+            }
+            break;
+        };
+        if let Some(b) = berth(&launch) {
+            found = Some((launch, b));
+            break;
+        }
+        skip.push(Disc {
+            x: launch.water.0,
+            y: launch.water.1,
+            r: LAUNCH_SKIP_M,
+        });
+    }
+    let (launch, launch_berth) = found.ok_or(PlanError::NoTrip)?;
     // a crossing to another beach
     for _ in 0..ATTEMPTS {
         let ang = rng.f32() * std::f32::consts::TAU;
@@ -112,21 +223,25 @@ pub fn plan_trip(
             launch.water.0 + ang.cos() * d,
             launch.water.1 + ang.sin() * d,
         );
-        if !map.open_at(t.0, t.1, ROUTE_CLEAR) {
+        if !map.open_at(t.0, t.1, clear) {
             continue;
         }
         let Some(landing) = find_shore(map, ground, t, LANDING_SEARCH_M, avoid) else {
             continue;
         };
-        let straight = dist(launch.water, landing.water);
+        let Some(moor) = berth(&landing) else {
+            continue;
+        };
+        let straight = dist(launch.water, moor);
         if straight < 0.6 * cfg.min_m {
             continue;
         }
-        if let Ok(r) = route(map, launch.water, landing.water, &rc) {
+        if let Ok(r) = route(map, launch.water, moor, &rc) {
             if r.length <= DETOUR * straight && r.length <= MAX_ROUTE * cfg.max_m {
                 return Ok(Plan {
                     launch,
                     landing,
+                    moor,
                     kind: Kind::Cross,
                     route_m: r.length,
                 });
@@ -141,12 +256,12 @@ pub fn plan_trip(
             launch.water.0 + ang.cos() * d,
             launch.water.1 + ang.sin() * d,
         );
-        if !map.open_at(via.0, via.1, ROUTE_CLEAR) {
+        if !map.open_at(via.0, via.1, clear) {
             continue;
         }
         let (Ok(out), Ok(back)) = (
             route(map, launch.water, via, &rc),
-            route(map, via, launch.water, &rc),
+            route(map, via, launch_berth, &rc),
         ) else {
             continue;
         };
@@ -154,6 +269,7 @@ pub fn plan_trip(
             return Ok(Plan {
                 launch,
                 landing: launch,
+                moor: launch_berth,
                 kind: Kind::Loop { via },
                 route_m: out.length + back.length,
             });
@@ -162,25 +278,38 @@ pub fn plan_trip(
     Err(PlanError::NoTrip)
 }
 
+/// Spacing (m) of the points of a sailing route for a hull that needs rounded corners.
+const ROUTE_STEP_M: f32 = 20.0;
+
+/// A sailing route is at most this much longer than the planned one (plus [`LONG_ROUTE_SLACK_M`])
+/// before a narrower margin to the shore is tried: a wide margin that closes a passage makes the
+/// route go round the whole bay.
+const LONG_ROUTE: f32 = 1.35;
+/// See [`LONG_ROUTE`].
+const LONG_ROUTE_SLACK_M: f32 = 300.0;
+
 /// The sea routes of `plan`, from `start` (the boat's position): the waypoints to sail, ending at
-/// the landing water. `None` when no route exists even with a narrower margin to the shore.
+/// the berth. The margin to the shore is the hull's ([`ShipClass::route_clears`]) and falls back
+/// to a narrower one when the wide one has no route or a route much longer than the planned one
+/// ([`LONG_ROUTE`]; the shortest found is used when none is short enough); `None` when none has a
+/// route. The route of a medium or large hull has its corners rounded to the hull's turn radius
+/// (where the water allows) and is cut into points [`ROUTE_STEP_M`] apart, so that the follower can
+/// see the curvature.
 pub fn sail_route(
     map: &WaterMap,
     start: (f32, f32),
     plan: &Plan,
     avoid: &[Disc],
+    ship: &ShipClass,
 ) -> Option<Vec<(f32, f32)>> {
-    for clear in [ROUTE_CLEAR, 1] {
-        let rc = RouteCfg {
-            clear,
-            max_nodes: PLAN_NODES * 2,
-            avoid,
-            ..RouteCfg::default()
-        };
+    let budget = plan.route_m * LONG_ROUTE + LONG_ROUTE_SLACK_M;
+    let mut best: Option<(f32, Vec<(f32, f32)>)> = None;
+    for clear in ship.route_clears() {
+        let rc = route_cfg(clear, PLAN_NODES * 2, avoid);
         let mut pts: Vec<(f32, f32)> = Vec::new();
         let legs: Vec<(f32, f32)> = match plan.kind {
-            Kind::Cross => vec![plan.landing.water],
-            Kind::Loop { via } => vec![via, plan.landing.water],
+            Kind::Cross => vec![plan.moor],
+            Kind::Loop { via } => vec![via, plan.moor],
         };
         let mut at = start;
         let mut ok = true;
@@ -197,11 +326,27 @@ pub fn sail_route(
                 }
             }
         }
-        if ok && pts.len() >= 2 {
-            return Some(pts);
+        if !ok || pts.len() < 2 {
+            continue;
+        }
+        let len: f32 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+        if len <= budget {
+            best = Some((len, pts));
+            break;
+        }
+        if best.as_ref().is_none_or(|b| len < b.0) {
+            best = Some((len, pts));
         }
     }
-    None
+    let (_, mut pts) = best?;
+    if ship.size != HullSize::Small {
+        // arcs need less room than the route's margin: half the hull and a cell
+        let arc_clear = (((ship.length / 2.0 + 8.0) / 16.0).ceil() as i32).max(1);
+        let ok = |x: f32, y: f32| map.open_at(x, y, arc_clear);
+        pts = round_corners(&pts, 1.15 * ship.radius, &ok);
+        pts = resample(&pts, ROUTE_STEP_M);
+    }
+    Some(pts)
 }
 
 /// Circles around the spawns of aggressive monsters that live on the water within `radius` of
@@ -282,6 +427,7 @@ mod tests {
         launch_m: 900.0,
         min_m: 700.0,
         max_m: 1300.0,
+        ship: ShipClass::ROWBOAT,
     };
 
     #[test]
@@ -336,7 +482,7 @@ mod tests {
         assert_eq!(p.landing, p.launch);
         assert!(p.route_m > 400.0, "{}", p.route_m);
         // the way back leads to the launch water
-        let r = sail_route(&map, p.launch.water, &p, &[]).unwrap();
+        let r = sail_route(&map, p.launch.water, &p, &[], &ShipClass::ROWBOAT).unwrap();
         assert!(dist(*r.last().unwrap(), p.launch.water) < 60.0);
     }
 
@@ -346,7 +492,7 @@ mod tests {
         let mut rng = fastrand::Rng::with_seed(11);
         let p = plan_trip(&map, &ground, &mut rng, (60.0, 480.0), &SHORT, &[]).unwrap();
         let start = (p.launch.water.0 + 8.0, p.launch.water.1 - 5.0);
-        let r = sail_route(&map, start, &p, &[]).unwrap();
+        let r = sail_route(&map, start, &p, &[], &ShipClass::ROWBOAT).unwrap();
         assert_eq!(r[0], start);
         let end = *r.last().unwrap();
         assert!(
@@ -379,7 +525,7 @@ mod tests {
         for seed in 0..6 {
             let mut rng = fastrand::Rng::with_seed(seed);
             let p = plan_trip(&map, &ground, &mut rng, (60.0, 480.0), &SHORT, &[disc]).unwrap();
-            let r = sail_route(&map, p.launch.water, &p, &[disc]).unwrap();
+            let r = sail_route(&map, p.launch.water, &p, &[disc], &ShipClass::ROWBOAT).unwrap();
             for w in r.windows(2) {
                 for s in 0..=40 {
                     let t = s as f32 / 40.0;
@@ -413,5 +559,36 @@ mod tests {
             .map(|p| p.landing.stand.1.round() as i32 / 32)
             .collect();
         assert!(landings.len() > 1, "{landings:?}");
+    }
+
+    #[test]
+    fn a_wide_margin_that_closes_a_passage_does_not_send_the_boat_round_the_bay() {
+        // a wall at column 50 from row 0 to row 109 with a gap of six cells (rows 20..=25) and open
+        // water above it: the clipper's widest margin (3 cells) closes the gap and would go round
+        // the wall's end, its planning margin (2 cells) fits through
+        let land =
+            |c: i32, r: i32| c <= 7 || c >= 92 || (c == 50 && r <= 109 && !(20..=25).contains(&r));
+        let map = WaterMap::from_cells((0.0, 0.0), 100, 120, |c, r| !land(c as i32, r as i32));
+        let spot = |x: f32| ShoreSpot {
+            stand: (x, 368.0),
+            water: (x, 368.0),
+            yaw: 0.0,
+        };
+        let plan = Plan {
+            launch: spot(200.0),
+            landing: spot(1300.0),
+            moor: (1300.0, 368.0),
+            kind: Kind::Cross,
+            route_m: 1110.0,
+        };
+        let r = sail_route(&map, (200.0, 368.0), &plan, &[], &ShipClass::CLIPPER).unwrap();
+        let len: f32 = r.windows(2).map(|w| dist(w[0], w[1])).sum();
+        assert!(len < 1.35 * plan.route_m, "{len} m");
+        // it went through the gap
+        assert!(
+            r.iter()
+                .any(|p| (p.0 - 808.0).abs() < 20.0 && (320.0..=410.0).contains(&p.1)),
+            "{r:?}"
+        );
     }
 }
