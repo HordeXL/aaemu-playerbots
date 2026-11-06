@@ -380,7 +380,15 @@ pub fn starts_with_name(text: &str, name: &str) -> bool {
     let n = normalize(name);
     let t = normalize(text);
     let n = n.trim();
-    !n.is_empty() && t.split_whitespace().next() == Some(n)
+    if n.is_empty() {
+        return false;
+    }
+    // A Chinese name has no spaces, so the punctuation that follows it ("李伟涛: 你好") must be
+    // cut off before the comparison; a Latin name keeps the whole-word rule.
+    match t.strip_prefix(n) {
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        None => t.split_whitespace().next() == Some(n),
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +634,15 @@ mod tests {
         assert!(!starts_with_name("Bobby: ok", "Bob"));
         assert!(!starts_with_name("ok bob", "Bob"));
         assert!(!starts_with_name("anything", ""));
+    }
+
+    #[test]
+    fn a_chinese_name_is_addressed_by_its_name() {
+        assert!(starts_with_name("李伟涛: 多少钱?", "李伟涛"));
+        assert!(starts_with_name("李伟涛, 好的", "李伟涛"));
+        assert!(starts_with_name("李伟涛 在吗", "李伟涛"));
+        assert!(!starts_with_name("李伟涛华: 在吗", "李伟涛"));
+        assert!(!starts_with_name("在吗 李伟涛", "李伟涛"));
     }
 
     #[test]
