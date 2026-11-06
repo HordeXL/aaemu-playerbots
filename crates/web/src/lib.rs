@@ -67,4 +67,5 @@ pub use types::{
     Activity, BotDetail, BotHub, BotSnapshot, Command, GuildInfo, GuildMember, HubStats,
     IssueAction, IssueActionRequest, IssueDetail, IssueSample, IssueSummary, LlmStats, LogLine,
     MapInfo, Marker, MarkerKind, NavStats, PartyInfo, PartyMember, PlotLine, QuestLine, WorldRect,
+    ZoneMap,
 };

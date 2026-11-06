@@ -125,6 +125,7 @@ impl BotHub for TestHub {
                 max_x: 49920.0,
                 max_y: 38911.0,
             },
+            zones: Vec::new(),
         }
     }
 

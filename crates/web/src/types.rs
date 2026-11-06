@@ -369,6 +369,18 @@ pub struct WorldRect {
     pub max_y: f32,
 }
 
+/// One zone's detailed map image (the client's own region map, with the place names painted in),
+/// and the rectangle of the world it covers.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ZoneMap {
+    /// Zone group name, e.g. `w_solzreed`.
+    pub name: String,
+    /// Where the image is served, e.g. `/zone/w_solzreed.png`.
+    pub image_url: String,
+    /// The world rectangle the image covers.
+    pub world: WorldRect,
+}
+
 /// Calibration of the map image.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct MapInfo {
@@ -379,6 +391,9 @@ pub struct MapInfo {
     pub width: u32,
     pub height: u32,
     pub world: WorldRect,
+    /// The zone detail maps, finest first. The map draws the one under the view when zoomed in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<ZoneMap>,
 }
 
 /// Something the operator asks a bot (or all bots) to do. JSON: `{"type":"goal","goal":"quest"}`.
@@ -665,6 +680,12 @@ pub trait BotHub: Send + Sync + 'static {
     /// PNG bytes of the world map, served at `/map.png`. Called at most every few minutes by the
     /// web layer, but the hub should still cache the encoded bytes.
     fn map_image(&self) -> Option<Vec<u8>>;
+    /// PNG bytes of one zone's detail map (a `MapInfo::zones` name), served at
+    /// `/zone/{name}.png`. The hub reads it from the baked data on demand; `None` when the
+    /// name is unknown or the file is missing.
+    fn zone_image(&self, _name: &str) -> Option<Vec<u8>> {
+        None
+    }
     /// Run a command. `bot` is `None` for global commands (spawn/despawn, pause all, …). The error
     /// text is shown to the operator.
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String>;

@@ -165,6 +165,8 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/population.js", get(population_js))
         .route("/style.css", get(style_css))
         .route(MAP_PATH, get(map_png))
+        // (axum 0.8's router only takes a parameter as a whole segment, so no ".png" suffix)
+        .route("/zone/{name}", get(zone_png))
         .route("/api/bots", get(api_bots))
         .route("/api/bots/{id}", get(api_bot))
         .route("/api/stats", get(api_stats))
@@ -419,6 +421,64 @@ async fn map_png(
 }
 
 // ---------------------------------------------------------------- JSON API (GET)
+
+/// PNG bytes of one zone's detail map. The name comes from `/api/map`, so anything that is not a
+/// plain file stem is refused before it reaches the hub.
+async fn zone_png(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !plain_zone_name(&name) {
+        return ApiError::bad_request("not a zone name").into_response();
+    }
+    // The hub may read a file; keep that off the async workers. A browser only asks for a zone
+    // image when the view moves into it, so no cache beyond the etag is needed.
+    let hub = st.hub.clone();
+    let zone = name.clone();
+    let bytes = tokio::task::spawn_blocking(move || hub.zone_image(&zone))
+        .await
+        .ok()
+        .flatten();
+    let Some(bytes) = bytes else {
+        return ApiError::new(StatusCode::NOT_FOUND, format!("no zone image {name:?}"))
+            .into_response();
+    };
+    let version = format!("{:x}-{:016x}", bytes.len(), fnv1a64(&bytes));
+    let etag = HeaderValue::from_str(&format!("\"{version}\"")).expect("etag is ascii");
+    if etag_matches(&headers, &version) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+        ],
+        Body::from(bytes),
+    )
+        .into_response()
+}
+
+/// A zone image name: only the characters the bake writes (`a-z0-9_`), no separators.
+fn plain_zone_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
 
 async fn api_bots(State(st): State<Arc<AppState>>) -> Response {
     json_response(&st.hub.snapshots())

@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use aa_world::baked::{
-    write_json, HousingAreaPoly, MapCalibration, QuestSphere, WorldRect, ZoneGrid,
+    write_json, HousingAreaPoly, MapCalibration, QuestSphere, WorldRect, ZoneGrid, ZoneMapEntry,
+    ZoneMaps,
 };
 use aa_world::terrain::{write_height_grid, Terrain};
 use anyhow::{bail, Context};
@@ -100,6 +101,8 @@ pub struct BakeSteps {
     /// The public farm polygons (`farm_areas.json`).
     pub farms: bool,
     pub spheres: bool,
+    /// The per-zone detail maps (`zones_map.json` and `zone_<name>.png`).
+    pub zone_maps: bool,
     pub map: bool,
     /// The navigation mesh of the world being baked (`nav_<world>.bin`).
     pub nav: bool,
@@ -116,6 +119,7 @@ impl BakeSteps {
             housing: true,
             farms: true,
             spheres: true,
+            zone_maps: true,
             map: true,
             nav: true,
             nav_instances: true,
@@ -129,6 +133,7 @@ impl BakeSteps {
             housing: false,
             farms: false,
             spheres: false,
+            zone_maps: false,
             map: false,
             nav: false,
             nav_instances: false,
@@ -157,6 +162,8 @@ pub struct BakeReport {
     pub housing_areas_dropped_unknown_id: usize,
     pub farm_areas: usize,
     pub quest_spheres: usize,
+    /// Zone detail maps written (`zone_<name>.png`).
+    pub zone_maps: usize,
     /// `"painted"` or `"relief"`: what `map_<world>.json` points at.
     pub map_source: Option<String>,
     pub map_rect: Option<WorldRect>,
@@ -395,6 +402,17 @@ pub fn bake_steps(opts: &BakeOptions, steps: &BakeSteps) -> anyhow::Result<BakeR
         report
             .timings
             .push(("zones".into(), t.elapsed().as_secs_f32()));
+    }
+
+    if steps.zone_maps {
+        let t = Instant::now();
+        match compact.as_ref() {
+            Some(c) => bake_zone_maps(pak.as_mut(), &world, c, opts, &mut report)?,
+            None => report.warn("zone maps need --compact: skipped".into()),
+        }
+        report
+            .timings
+            .push(("zone maps".into(), t.elapsed().as_secs_f32()));
     }
 
     if steps.housing {
@@ -636,6 +654,76 @@ fn finish_nav(report: &mut BakeReport, out: &Path, r: nav::NavReport) {
         };
         report.check(&format!("nav: path Nuian start -> {name}"), ok, detail);
     }
+}
+
+/// The client's per-zone detail maps: `game/ui/map/world/<lang>/<zone>.dds`, one per zone group
+/// of this world. They carry the place names and are about ten times finer than the world map, so
+/// the web UI draws the one under the view when the operator zooms in. Writes `zone_<name>.png`
+/// and `zones_map.json` (the rectangle each image covers).
+fn bake_zone_maps(
+    pak: &mut dyn ClientFiles,
+    world: &WorldDef,
+    compact: &Compact,
+    opts: &BakeOptions,
+    report: &mut BakeReport,
+) -> anyhow::Result<()> {
+    // Only the zone groups this world has zones for: the others belong to another world and their
+    // rectangles would land in the wrong place on this map.
+    let zone_names: Vec<&str> = world.zones.iter().map(|z| z.name.as_str()).collect();
+    let belongs = |group: &str| {
+        zone_names.iter().any(|n| {
+            *n == group
+                || n.strip_prefix(group)
+                    .is_some_and(|rest| rest.starts_with('_'))
+        })
+    };
+    let mut zones: Vec<ZoneMapEntry> = Vec::new();
+    let mut missing = 0usize;
+    for (name, rect) in compact.zone_group_rects()? {
+        if !belongs(&name) {
+            continue;
+        }
+        let mut image = None;
+        for path in [
+            format!("game/ui/map/world/zh_cn/{name}.dds"),
+            format!("game/ui/map/world/{name}.dds"),
+            format!("game/ui/map/world/en_us/{name}.dds"),
+        ] {
+            if let Some(bytes) = pak.read(&path)? {
+                image = Some(dds::decode_dds(&bytes).with_context(|| path.clone())?);
+                break;
+            }
+        }
+        let Some(img) = image else {
+            missing += 1;
+            continue;
+        };
+        let file = format!("zone_{name}.png");
+        let out = opts.out.join(&file);
+        map::write_rgba_png(&img, &out)?;
+        report.files.push((file.clone(), file_size(&out)));
+        zones.push(ZoneMapEntry {
+            name,
+            image: file,
+            world: rect_of(&rect),
+        });
+    }
+    if missing > 0 {
+        report.warn(format!(
+            "{missing} zone(s) have no detail map in the client"
+        ));
+    }
+    let path = opts.out.join("zones_map.json");
+    let maps = ZoneMaps {
+        world: world.name.clone(),
+        zones,
+    };
+    write_json(&path, &maps)?;
+    report
+        .files
+        .push(("zones_map.json".into(), file_size(&path)));
+    report.zone_maps = maps.zones.len();
+    Ok(())
 }
 
 /// Width of the relief fallback image in pixels.

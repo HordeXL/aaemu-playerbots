@@ -55,6 +55,9 @@ const TAU = Math.PI * 2;
 const MAX_SCALE = 80;
 const NAME_SCALE = 1.0;   // px per metre at which every bot gets a name label
 const NAME_MAX_BOTS = 30; // ...or when this few bots are on screen
+const ZONE_MIN_SCALE = 0.08; // px per metre at which the zone detail maps are drawn (a zone then
+                             // spans about half the screen, so its own image is worth showing)
+const zoneImgs = new Map();  // zone image url -> HTMLImageElement (loaded once, kept)
 
 // ------------------------------------------------------------------ helpers
 const $ = (id) => document.getElementById(id);
@@ -1503,6 +1506,18 @@ function frame(now) {
   if (S.vanim || S.posDirty || (S.flash && !reduceMotion.matches) || now < S.animUntil) requestDraw();
 }
 
+// The zone detail image for 'url', loaded on first use; redraws when it arrives.
+function zoneImage(url) {
+  let img = zoneImgs.get(url);
+  if (!img) {
+    img = new Image();
+    img.onload = () => requestDraw();
+    img.src = url;
+    zoneImgs.set(url, img);
+  }
+  return img;
+}
+
 function niceStep(minPx) {
   const raw = minPx / S.scale;
   const pow = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -1551,7 +1566,24 @@ function drawBackdrop() {
       ctx.fillText(nf.format(Math.round(y)), 4, (S.cy - y) * sc + H / 2 - 2);
     }
   }
-  // world border
+  // Zone detail maps: the client's own region images, about ten times finer than the world map
+  // and with the place names painted in. Draw every one that intersects the view, over the world
+  // image (bots and markers are drawn on top of this afterwards).
+  const zones = S.map.info && S.map.info.zones;
+  if (sc >= ZONE_MIN_SCALE && zones && zones.length) {
+    const xa = S.cx - W / 2 / sc, xb = S.cx + W / 2 / sc;
+    const ya = S.cy - H / 2 / sc, yb = S.cy + H / 2 / sc;
+    for (const z of zones) {
+      const r = z.world;
+      if (!r || !(r.max_x > r.min_x) || !(r.max_y > r.min_y)) continue;
+      if (r.max_x < xa || r.min_x > xb || r.max_y < ya || r.min_y > yb) continue;
+      const zi = zoneImage(z.image_url);
+      if (!zi.complete || !zi.naturalWidth) continue;
+      ctx.drawImage(zi, (r.min_x - S.cx) * sc + W / 2, (S.cy - r.max_y) * sc + H / 2,
+        (r.max_x - r.min_x) * sc, (r.max_y - r.min_y) * sc);
+    }
+  }
+  // world border  // world border
   ctx.strokeStyle = C.muted;
   ctx.lineWidth = 1;
   ctx.setLineDash([6, 4]);

@@ -33,6 +33,41 @@ pub struct MapCalibration {
     pub world: WorldRect,
 }
 
+/// `zones_map.json`: the detailed map of every zone of the world (the client's own region maps,
+/// which carry the place names), and where each one lies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneMaps {
+    /// The world the maps belong to, e.g. `main_world`.
+    pub world: String,
+    pub zones: Vec<ZoneMapEntry>,
+}
+
+/// One entry of `zones_map.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneMapEntry {
+    /// The zone group name, e.g. `w_solzreed` (the client's `{name}.dds`).
+    pub name: String,
+    /// File name of the image, relative to the data dir.
+    pub image: String,
+    /// Where the image lies in the world.
+    pub world: WorldRect,
+}
+
+impl ZoneMaps {
+    /// Reads `zones_map.json` from `data`, if the bake wrote one.
+    pub fn load(data: &Path) -> anyhow::Result<Option<ZoneMaps>> {
+        let path = data.join("zones_map.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let maps: ZoneMaps =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        Ok(Some(maps))
+    }
+}
+
 /// One entry of `housing_areas.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HousingAreaPoly {

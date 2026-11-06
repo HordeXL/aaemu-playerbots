@@ -684,6 +684,7 @@ impl BotHub for MockHub {
             width: 1024,
             height: 616,
             world: WORLD,
+            zones: Vec::new(),
         }
     }
 

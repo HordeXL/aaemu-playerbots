@@ -7,7 +7,7 @@
 //! the optional LLM budget, map markers and the world map.
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use parking_lot::{Mutex, RwLock};
 use pb_web::{
     Activity, BotDetail, BotHub, BotSnapshot, Command, DirectorView, EconomyView, HubStats,
     IssueAction, IssueDetail, IssueSummary, LlmStats, LogLine, MapInfo, Marker, MarkerKind,
-    PolicyPatch, QuestLine, WorldRect, WorldView,
+    PolicyPatch, QuestLine, WorldRect, WorldView, ZoneMap,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
@@ -387,6 +387,8 @@ pub struct Hub {
     started: Instant,
     markers: Mutex<Markers>,
     map: MapAsset,
+    /// The baked data dir (zone detail images are read from it on demand).
+    baked_dir: Option<PathBuf>,
     supervisor: mpsc::Sender<SupCmd>,
     llm: Option<Arc<pb_llm::Llm>>,
     /// What the bots know about the world's players and goods, and the population director.
@@ -408,6 +410,7 @@ impl Hub {
         tracing::info!(
             outlets = outlets.len(),
             map_image = map.png.is_some(),
+            zone_maps = map.info.zones.len(),
             "hub ready"
         );
         Hub {
@@ -432,6 +435,7 @@ impl Hub {
                 ..Markers::default()
             }),
             map,
+            baked_dir: p.baked_dir.map(Path::to_path_buf),
             supervisor: p.supervisor,
             llm: p.llm,
             pop: Population::inert(),
@@ -770,6 +774,7 @@ fn load_map(world: &aa_world::World, baked_dir: Option<&Path>) -> MapAsset {
                 width: 896,
                 height: 973,
                 world: DEFAULT_WORLD,
+                zones: Vec::new(),
             },
             png: None,
         };
@@ -803,6 +808,25 @@ fn load_map(world: &aa_world::World, baked_dir: Option<&Path>) -> MapAsset {
                 max_x: cal.world.max_x,
                 max_y: cal.world.max_y,
             },
+            zones: baked_dir
+                .and_then(|dir| aa_world::baked::ZoneMaps::load(dir).ok())
+                .flatten()
+                .map(|maps| {
+                    maps.zones
+                        .iter()
+                        .map(|z| ZoneMap {
+                            name: z.name.clone(),
+                            image_url: format!("/zone/{}", z.name),
+                            world: WorldRect {
+                                min_x: z.world.min_x,
+                                min_y: z.world.min_y,
+                                max_x: z.world.max_x,
+                                max_y: z.world.max_y,
+                            },
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         png,
     }
@@ -898,6 +922,27 @@ impl BotHub for Hub {
 
     fn map_image(&self) -> Option<Vec<u8>> {
         self.map.png.as_ref().map(|p| p.as_ref().clone())
+    }
+
+    fn zone_image(&self, name: &str) -> Option<Vec<u8>> {
+        // The web layer already refuses anything that is not a plain `a-z0-9_` stem; check again
+        // here because the hub is also used directly (tests, the mock).
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return None;
+        }
+        let dir = self.baked_dir.as_ref()?;
+        let path = dir.join(format!("zone_{name}.png"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!("zone image {}: {e}", path.display());
+                None
+            }
+        }
     }
 
     fn issues(&self) -> Vec<IssueSummary> {

@@ -39,6 +39,23 @@ the 4 surrounding samples, `h = raw * scale + offset`. Outside the grid: `None`.
 Pixel (0,0) is the top-left corner = world (`min_x`, `max_y`).
 `u = (x - min_x) / (max_x - min_x)`, `v = 1 - (y - min_y) / (max_y - min_y)`, pixel = (u·width, v·height).
 
+## `zones_map.json` + `zone_<name>.png` — per-zone detail maps (optional)
+
+```json
+{
+  "world": "main_world",
+  "zones": [
+    { "name": "w_solzreed", "image": "zone_w_solzreed.png",
+      "world": { "min_x": 11925.0, "min_y": 13266.0, "max_x": 16735.0, "max_y": 16148.0 } }
+  ]
+}
+```
+
+The client's own region maps (`game/ui/map/world/<lang>/<zone>.dds`, one per `zone_groups` row of
+this world), each covering exactly the rectangle compact gives for the zone group. They carry the
+place names and are about ten times finer than the world map; the web UI draws the one under the
+view when the operator zooms in, served at `/zone/<name>`. Written by the full bake.
+
 ## `housing_areas.json` — housing area polygons
 
 ```json
