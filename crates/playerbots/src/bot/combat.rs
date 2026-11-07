@@ -312,6 +312,20 @@ pub fn must_approach(dist: f32, preferred: f32) -> bool {
     dist > preferred + 1.0
 }
 
+/// A chase is aimed again when the target stands this far (metres) from the point the bot runs
+/// to. Farther, a bot that chases a moving target stops where the target was, short of it, and
+/// starts again at once: a stutter for whoever watches.
+pub const CHASE_RETARGET_M: f32 = 1.0;
+
+/// Whether the chase of a target at `target` has to be started, or aimed again: the bot stands
+/// (`moving` false), or the target is more than [`CHASE_RETARGET_M`] from `last_goto`, the
+/// point the chase runs to.
+pub fn chase_again(last_goto: Option<(f32, f32)>, target: [f32; 3], moving: bool) -> bool {
+    !moving
+        || last_goto
+            .is_none_or(|g| dist2d([g.0, g.1, 0.0], [target[0], target[1], 0.0]) > CHASE_RETARGET_M)
+}
+
 /// Skills the server refused, with growing pauses.
 #[derive(Debug, Default, Clone)]
 pub struct Backoffs {
@@ -1143,11 +1157,7 @@ impl Combat {
                 ctx.motion.stop();
                 return Self::lose(ctx, LostReason::Blocked);
             }
-            let moved_target = ctx
-                .combat
-                .last_goto
-                .is_none_or(|g| dist2d([g.0, g.1, 0.0], [upos[0], upos[1], 0.0]) > 2.0);
-            if moved_target || !ctx.motion.is_moving() {
+            if chase_again(ctx.combat.last_goto, upos, ctx.motion.is_moving()) {
                 ctx.motion
                     .chase_to(upos[0], upos[1], arrival_radius(preferred), Pace::Run, now);
                 ctx.combat.last_goto = Some((upos[0], upos[1]));

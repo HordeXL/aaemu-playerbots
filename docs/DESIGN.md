@@ -45,7 +45,8 @@ aa-world` (only for shared baked file types); nothing else depends on anything i
   channels.
 - Ticks are adaptive with jitter (combat 250 ms, moving 250 ms, idle 1–3 s, far from any real
   player and idle: 5 s), which avoids the C# version's 10-phase thundering herd and its serial
-  loop over all bots.
+  loop over all bots. A walker that a real player can see also gets movement-only ticks between
+  them, every `bots.move_update_ms` (see [Movement updates](#movement-updates-botmotionrs)).
 - Bounded everything: entity view (only what the server shows), event log ring (32 lines),
   channels (small capacities).
 
@@ -1044,8 +1045,10 @@ Bots walk routes on the navigation mesh (`aa_world::nav`) instead of straight li
 
 A bot that only walks and stands still looks like a bot. With `[behavior] lifelike` (default on) the
 movement controller adds what a person does, **for the eyes of a real player only**: nothing happens
-unless a character that is not one of our bots is within the watch radius (the same signal that
-raises the movement update rate), and nothing while the bot fights, loots, casts, trades, sails, is in
+unless a character that is not one of our bots is within the watch radius (150 m; the movement
+update rate goes up for every real player who can see the bot, see
+[Movement updates](#movement-updates-botmotionrs)), and nothing while the bot fights, loots, casts,
+trades, sails, is in
 an instance, dead or loading (`Bot::life_busy`). `jump_rate` scales the jumps (0 = none), `emotes`
 switches the emotes.
 
@@ -1076,8 +1079,9 @@ switches the emotes.
 - **Mannerisms.** After a trip a standing bot turns in place one to three times (30 to 120 degrees,
   2 to 6 s apart) and sometimes shuffles 0.5 to 1.5 m at walk pace; at some corners of a long route it
   stops for 0.3 to 1 s; in a town (the peace aura or a crowd of eight) a quarter of the short trips
-  are walked; every bot runs within 3 % of the configured speed; in front of a player the tick period
-  varies by 20 % either way (the mean, so the packet rate, does not change).
+  are walked; every bot runs within 3 % of the configured speed. (The tick period no longer
+  varies in front of a player: uneven updates looked like stutter, see
+  [Movement updates](#movement-updates-botmotionrs).)
 - **Emotes** (`CSExpressEmotion`, `SCEmotionExpressed`). Greeting (a player within 6 m, 60 % of the
   time, once per player per 10 min), an answer to an emote of a real player (90 % when played at the
   bot, 30 % nearby, at most one per player per 30 s), ambient emotes in towns (at most one per 45 s
@@ -1101,6 +1105,39 @@ switches the emotes.
   run-to-run noise (1.6 to 1.9 a second with it on, 1.7 off, in the same place); the server log had no
   speed-audit or landing lines. The relayed packets (`pb_move`) showed every jump as the sequence
   above, the take-off and the touchdown always in pairs.
+
+## Movement updates (`bot/motion.rs`)
+
+What another player sees of a bot is the stream of its `CSMoveUnit` updates, which the server
+passes on unchanged (`SCOneUnitMovement`). The real 1.2 client sends about seven updates a second
+while it walks, the server's own NPCs ten (one per AI tick), both at an even pace.
+
+- **The pace.** A walking bot that a real player can see sends an update every
+  `bots.move_update_ms` (125 ms, about eight a second), evenly: between two brain ticks
+  (`bots.tick_ms`) the bot loop wakes for a movement-only tick (`Bot::on_motion_tick`; the
+  schedule is the pure `bot::next_wake_ms`) that moves the bot on and sends the update, nothing
+  else. A moving update is due within 20 ms of its gap (`SEND_SLACK_MS`), so a timer that wakes a
+  little early does not skip one. A bot nobody can see sends one update a second.
+- **Who can see it.** The server shows a unit to the players in its own 64 m region and the eight
+  around it, up to about 181 m away; a real character within `VIEW_RADIUS` (190 m) counts. The
+  watch radius of the life-like movement and the chat stays 150 m.
+- **Chases.** The combat controller aims a chase again when the target stands more than
+  `CHASE_RETARGET_M` (1 m) from the point the bot runs to (`combat::chase_again`; it was 2 m). With
+  2 m a bot chasing a moving target stopped where the target had been, short of it, and started
+  again at once.
+- **Measured** (`tests/movement_real_data.rs`, ignored, needs the real data with the navigation
+  mesh: one bot with the mesh, the planner pool and the life-like movement, ticked like the bot
+  task; every update decoded and compared with where the one before said the bot would be). Before,
+  in view of a player: 3.9 updates a second, 210 to 300 ms apart on purpose (the tick period varied
+  by 20 % either way); out of the 150 m watch radius but still in view: one a second, and at a
+  corner the bot was up to 10.7 m from where its last update put it. After: 7.7 to 8.0 updates a
+  second, every one 125 ms after the one before (140 ms at most, a jump), at most 0.06 m off the
+  dead reckoning of the update before on 99 % of the updates of a trip (1.3 m at the worst corner,
+  from 2.9 m). A melee chase of a target that keeps moving at 4 m/s stopped and started again 115
+  times in three minutes with the 2 m rule, 46 times with 1 m: what is left is the stop of a
+  fighter that caught up with a slower target and stands in reach until it is out of reach again.
+  The update `time` stays the bot clock in milliseconds: the server only requires it to grow
+  (`move_verify.rs`, reason 0).
 
 ## Portal travel (`bot/travel/`)
 

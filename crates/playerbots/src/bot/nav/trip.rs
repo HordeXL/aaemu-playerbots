@@ -431,6 +431,14 @@ impl NavState {
             .is_some_and(|t| matches!(t.phase, Phase::Planning { .. } | Phase::Unplanned))
     }
 
+    /// Whether an answer of the planner pool is awaited: the first route of the trip, or the
+    /// piece after the route being walked.
+    pub fn awaits_answer(&self) -> bool {
+        self.trip.as_ref().is_some_and(|t| {
+            matches!(t.phase, Phase::Planning { .. }) || matches!(t.chain, Chain::Pending { .. })
+        })
+    }
+
     /// Whether the trip walks the controller's straight line.
     pub fn is_legacy(&self) -> bool {
         self.trip.as_ref().is_none_or(|t| t.phase == Phase::Legacy)

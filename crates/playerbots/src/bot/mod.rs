@@ -93,8 +93,15 @@ const MAX_NAME_RETRIES: u32 = 6;
 const LEAVE_WAIT: Duration = Duration::from_secs(2);
 /// Interval of the temple resurrection request while dead.
 const RESURRECT_RETRY_MS: u64 = 5_000;
-/// A real player within this many metres makes the bot send movement at the full tick rate.
+/// A real player within this many metres is an audience: the bot shows off (life-like movement)
+/// and chats.
 const WATCH_RADIUS: f32 = 150.0;
+/// A real player within this many metres can see the bot, and the bot sends its movement at the
+/// client's pace (`bots.move_update_ms`). The server shows a unit to the players in its own 64 m
+/// region and the eight around it, so up to about 181 m away.
+const VIEW_RADIUS: f32 = 190.0;
+/// Gap between two movement updates of a bot that no real player can see (ms).
+const UNSEEN_SEND_GAP_MS: u64 = 1_000;
 /// The shortest sleep (ms) the movement controller may ask the bot loop for (the packets of a
 /// jump).
 const MIN_WAKE_MS: u64 = 15;
@@ -191,6 +198,10 @@ struct Bot {
     clock: Instant,
     paused: bool,
     real_near: bool,
+    /// A real player can see the bot (within [`VIEW_RADIUS`]).
+    watched: bool,
+    /// When the next brain tick is due (bot clock, ms); the loop may wake sooner to move on.
+    next_brain_ms: u64,
     online_since: Option<Instant>,
     next_rez_ms: u64,
     /// The combat target was a character at the last look: when that fight ends the server-side
@@ -263,6 +274,8 @@ impl Bot {
             clock: Instant::now(),
             paused: false,
             real_near: false,
+            watched: false,
+            next_brain_ms: 0,
             online_since: None,
             next_rez_ms: 0,
             char_target: false,
@@ -562,6 +575,7 @@ impl Bot {
             .update(self.entry.id, |j| j.sessions.login(unix));
         self.paused = false;
         self.secs = 0;
+        self.next_brain_ms = 0;
         self.publish(conn);
         let mut housekeeping = tokio::time::interval(Duration::from_secs(1));
         housekeeping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -573,13 +587,18 @@ impl Bot {
                 biased;
                 _ = cancel.cancelled() => return WorldEnd::Shutdown,
                 _ = &mut tick => {
-                    if let Some(end) = self.on_tick() {
-                        return end;
+                    let brain = self.now_ms() >= self.next_brain_ms;
+                    if brain {
+                        if let Some(end) = self.on_tick() {
+                            return end;
+                        }
+                    } else {
+                        self.on_motion_tick();
                     }
                     if let Some(end) = self.flush(conn, cancel).await {
                         return end;
                     }
-                    tick.as_mut().reset(Instant::now() + self.tick_period());
+                    tick.as_mut().reset(Instant::now() + self.next_wake(brain));
                 }
                 _ = housekeeping.tick() => {
                     if let Some(quiet) = watch.expired(Instant::now()) {
@@ -649,7 +668,9 @@ impl Bot {
         }
     }
 
-    fn tick_period(&mut self) -> Duration {
+    /// The time from one brain tick to the next: `bots.tick_ms` while the bot moves, fights or
+    /// is busy, `bots.idle_tick_ms` otherwise.
+    fn brain_period_ms(&self) -> u64 {
         let b = &self.shared.cfg.bots;
         let active = self.motion.busy()
             || self.combat.busy()
@@ -658,14 +679,28 @@ impl Bot {
             || self.state.travel.busy()
             || self.state.vehicle.fast_tick()
             || !self.state.me.spawned;
-        let ms = if active { b.tick_ms } else { b.idle_tick_ms };
-        // life-like: a walk in front of a player has an uneven pace, and a jump in progress
-        // wakes the bot for its next packet
-        let mut ms = (ms as f32 * self.motion.period_scale(&mut self.rng)) as u64;
-        if let Some(wake) = self.motion.wake_in(self.now_ms()) {
-            ms = ms.min(wake.max(MIN_WAKE_MS));
+        if active {
+            b.tick_ms
+        } else {
+            b.idle_tick_ms
         }
-        Duration::from_millis(ms)
+    }
+
+    /// How long the loop sleeps after a tick (`brain`: it was a brain tick, which schedules the
+    /// next one). See [`next_wake_ms`].
+    fn next_wake(&mut self, brain: bool) -> Duration {
+        let now = self.now_ms();
+        if brain {
+            self.next_brain_ms = now + self.brain_period_ms();
+        }
+        let walking_in_view = self.watched && self.motion.is_moving();
+        let at = next_wake_ms(
+            now,
+            self.next_brain_ms,
+            walking_in_view.then_some(self.shared.cfg.bots.move_update_ms),
+            self.motion.wake_in(now),
+        );
+        Duration::from_millis(at - now)
     }
 
     fn on_packet(&mut self, p: &Packet) {
@@ -963,10 +998,27 @@ impl Bot {
             self.brain.tick(&mut ctx);
         }
         self.pin_position(queued, now_ms);
-        let send_gap_ms = if self.real_near {
-            self.shared.cfg.bots.tick_ms
+        self.motion_tick(now_ms);
+        self.clear_target_after_player_fight();
+        self.drain_findings();
+        None
+    }
+
+    /// A tick between two brain ticks: the bot walks on and sends its movement update (a walker a
+    /// real player can see gets one every `bots.move_update_ms`, as the client sends them), or
+    /// the next packet of a jump. Nothing else runs.
+    fn on_motion_tick(&mut self) {
+        let now_ms = self.now_ms();
+        self.state.now_ms = now_ms;
+        self.motion_tick(now_ms);
+    }
+
+    /// Moves the bot by the time since the last movement tick and queues its updates.
+    fn motion_tick(&mut self, now_ms: u64) {
+        let send_gap_ms = if self.watched {
+            self.shared.cfg.bots.move_update_ms
         } else {
-            1000
+            UNSEEN_SEND_GAP_MS
         };
         let mut env = MotionEnv {
             ground: self.state.place.ground(&self.shared.world),
@@ -978,9 +1030,6 @@ impl Bot {
         };
         self.motion.tick(&mut env);
         self.state.me.pos = self.motion.pos();
-        self.clear_target_after_player_fight();
-        self.drain_findings();
-        None
     }
 
     /// Whether the bot must not show off now: it fights, loots, trades, travels by portal, sails,
@@ -1061,6 +1110,10 @@ impl Bot {
         self.real_near = self
             .state
             .any_character_within(WATCH_RADIUS, |id| hub.is_bot_char(id));
+        self.watched = self.real_near
+            || self
+                .state
+                .any_character_within(VIEW_RADIUS, |id| hub.is_bot_char(id));
         self.feed_population();
         self.watch_server();
         self.publish(conn);
@@ -1312,6 +1365,26 @@ fn failed(e: SessionError, online: Duration, phase: Phase) -> SessionEnd {
     }
 }
 
+/// When the bot loop wakes next (bot clock, ms) after a tick at `now`: at the next brain tick
+/// (`next_brain_ms`), sooner every `move_every_ms` while the bot walks in view of a real player
+/// (the movement update between brain ticks), and for the next packet of a jump (`jump_in`, at
+/// least [`MIN_WAKE_MS`] away). Always after `now`.
+pub fn next_wake_ms(
+    now: u64,
+    next_brain_ms: u64,
+    move_every_ms: Option<u64>,
+    jump_in: Option<u64>,
+) -> u64 {
+    let mut at = next_brain_ms;
+    if let Some(every) = move_every_ms {
+        at = at.min(now + every);
+    }
+    if let Some(wait) = jump_in {
+        at = at.min(now + wait.max(MIN_WAKE_MS));
+    }
+    at.max(now + 1)
+}
+
 /// `d` scaled by a random factor in `0.5..1.5`, so a restart (or a server coming back) does not
 /// reconnect everyone in the same second.
 fn jittered(d: Duration, rng: &mut fastrand::Rng) -> Duration {
@@ -1369,6 +1442,32 @@ mod tests {
             size_of::<BotCmd>()
         );
         assert!(size_of::<state::Unit>() <= 64);
+    }
+
+    #[test]
+    fn a_walker_in_view_wakes_evenly_between_brain_ticks() {
+        // brain ticks every 250 ms, movement every 125 ms: the wakes are 125 ms apart
+        let (mut now, mut next_brain) = (1_000u64, 1_000u64);
+        let mut wakes = Vec::new();
+        for _ in 0..8 {
+            if now >= next_brain {
+                next_brain = now + 250;
+            }
+            let at = next_wake_ms(now, next_brain, Some(125), None);
+            wakes.push(at - now);
+            now = at;
+        }
+        assert!(wakes.iter().all(|&w| w == 125), "{wakes:?}");
+        // nobody sees it: the brain tick only
+        assert_eq!(next_wake_ms(1_000, 1_250, None, None), 1_250);
+        // a jump wakes it for its next packet, but never sooner than the shortest wake
+        assert_eq!(next_wake_ms(1_000, 1_250, Some(125), Some(40)), 1_040);
+        assert_eq!(
+            next_wake_ms(1_000, 1_250, None, Some(0)),
+            1_000 + MIN_WAKE_MS
+        );
+        // an overdue brain tick is the next moment, never now
+        assert_eq!(next_wake_ms(1_000, 900, None, None), 1_001);
     }
 
     #[test]
