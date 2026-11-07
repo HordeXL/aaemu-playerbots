@@ -44,6 +44,9 @@ ramp_ms = 750
 # The persistent roster: accounts, character names, classes and personas of all bots.
 # Created on the first run; keep it, it ties the bots to their characters.
 roster = "roster.json"
+# The bots' journal: what each bot remembers between runs (places it has seen, wild plots, its play
+# sessions, notes). Empty = journal.json next to the roster. Keep it with the roster.
+journal = ""
 # Races for new characters: nuian, elf, hariharan, ferre (the ones 1.2 lets a player create).
 races = ["nuian", "elf", "hariharan", "ferre"]
 # Let bots use GM chat commands (/item add, /gold add, /labor, /move) to get what trade runs and
@@ -262,6 +265,109 @@ replant = true
 # The farthest a bot walks to a farm, a vendor or a plot, in metres. With bots.gm_bootstrap and
 # bots.long_travel_teleport_m a longer trip is a GM /move.
 max_trip_m = 4000.0
+# Bots with a shady streak also plant "illegal" farms: crops on unprotected land out in the wild,
+# away from roads, towns and people. Planting there costs labor (the seed's use skill, usually 1 or
+# 10 points) and nothing protects such a crop: anybody may take it. The plots are kept in the
+# journal (no server packet lists them); a crop that is gone when the bot comes back was stolen,
+# and the bot plants its next patch elsewhere.
+wild = false
+# One bot keeps at most this many wild plots (part of max_plots) ...
+wild_plots = 3
+# ... and plants them of its own accord from this outlaw trait (0 to 1) on.
+wild_outlaw = 0.6
+# Outlaw bots harvest ripe wild crops that are not theirs: only the crops of this process's other
+# bots, unless steal_from_players. The server lets anybody harvest a crop in the wild; for a day
+# after the planting the thief leaves footprints (crime evidence a player can report).
+steal = false
+# With steal: real players' crops too. Never while bots.gm_bootstrap is on.
+steal_from_players = false
+
+[gear]
+# Bots put on the best gear they have for their level, socket gems and tier up as they progress
+# (goal "gear"). The equip duty compares the bag with what the bot wears every check_secs and puts
+# on the better piece (item level, grade, gems and how well it suits the class build; never above
+# the bot's level requirement); quest rewards are picked the same way.
+enabled = true
+# The goal buys better pieces from merchants (copper only).
+buy = true
+# The goal mints the pieces and lunagems of the bot's tier with GM commands (needs
+# bots.gm_bootstrap).
+mint = true
+# The goal sockets lunagems into free sockets: always when the chance is 100 %, a riskier gem only
+# for bots with much gearhead (a failed socketing takes every gem of the piece out).
+socket = true
+# The goal regrades worn pieces with scrolls (needs bots.gm_bootstrap). Only grades a failure cannot
+# destroy; still a gamble, so off by default.
+regrade = false
+# The most a purchase may cost, in percent of the bot's money (1-100).
+max_spend_pct = 30
+# Seconds between two looks of the equip duty at the bag (1-3600).
+check_secs = 20
+# The farthest a bot goes to a merchant, in metres.
+max_trip_m = 3000.0
+
+[personality]
+# Every bot has a personality beside its temperament: how chatty, crude and funny it is, whether it
+# explores, does shady things or obsesses over gear, and when and how long it plays. Stored in the
+# roster. Off: every bot behaves like the neutral profile, and its chat stays clean.
+#
+# In chat a chatty bot answers more of what it overhears, says more unasked and waits less between
+# lines (a quiet one hardly speaks); a jokey one tells ArcheAge jokes (labor, gankers, regrades,
+# the queue, lag ...); a crude one swears now and then, within the cap below. All of it stays
+# inside the process-wide rates ([social] replies_per_min and chatter_per_min, and the two below)
+# and the per-bot limits (at most 1 to 5 unasked lines in 10 minutes, by chattiness).
+enabled = true
+# The coarsest language any bot may use in chat: "off" (none), "mild" (damn, hell, crap, wtf, ffs)
+# or "strong" (harsher exclamations too). Only ever an exclamation about the game, never aimed at
+# a player; slurs, hate, sexual words, insults and threats are refused at every level. The cap
+# filters every line, canned or written by the LLM: a word above it is softened ("damn" becomes
+# "dang") or the line is not sent.
+profanity = "mild"
+# With [llm] enabled, the model may write some of the ambient lines too (at most 2 a minute for
+# all bots together; the canned line is the fallback). Without [llm] it does nothing.
+llm_chatter = true
+# All bots together say at most this many ambient lines per minute: remarks and jokes in local
+# chat while a real player is near (0 = none; at most 60). A chatterbox says one every few
+# minutes, a quiet bot hardly ever.
+ambient_per_min = 2
+# All bots together say at most this many lines per hour on the shout, trade and group-finding
+# channels (0 = none; at most 120). Only the chattier bots use them, and never to advertise.
+channel_lines_per_hour = 4
+
+[presence]
+# Bots log in and out on schedules of their own, so the population rises and falls like a real
+# server's: when in the day a bot plays follows its chronotype (early bird, daytime, evening, night
+# owl), how long and how often its dedication (a casual plays 20 to 60 minutes and skips days, a
+# no-lifer plays for hours with breaks). On: nobody is started at launch, bots.count only sizes the
+# roster and the schedules log the bots in through the ramp. Bots you start by hand are never
+# logged out by the schedules; a bot you stop by hand stays offline until its schedule ends that
+# session; the population director's bots are its own. Off: every bot stays online.
+enabled = false
+# Bots online at least, all together (sessions are brought forward to keep it) ...
+min_online = 0
+# ... and at most (0 = no limit but the roster). Every bot online counts, whoever started it.
+max_online = 0
+# The schedules log in at most this many bots per minute ...
+max_starts_per_min = 20
+# ... and log out at most this many. A bot is only logged out when that is safe (not in a trade, a
+# duel, a dungeon, a market meeting, on a boat or in the party of a real player).
+max_stops_per_min = 3
+# Chance (0 to 1) that a bot says a short goodbye before it logs out (only with [social] enabled).
+goodbye_chance = 0.1
+# The schedules go by the machine's local time; set this to use UTC plus so many hours instead.
+# utc_offset_hours = 1.0
+
+[explore]
+# Bots go and see places they have not been (goal "explore"): zones they never stood in, the
+# recall points, hills with a view and the coast of the zones they know. What they saw is kept in
+# the journal.
+enabled = true
+# The farthest an exploring trip goes, in metres (portals and the GM /move work as for any trip).
+max_trip_m = 6000.0
+# A destination with monsters this many levels above the bot is left out.
+level_gap = 5
+# Minutes a bot of average curiosity waits between two trips (an explorer at heart half as long).
+trip_gap_mins = 45
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.
@@ -317,11 +423,26 @@ daily_token_budget = 200000
 temperature = 0.8
 max_reply_tokens = 80
 # The director: every `director_interval_secs` (per bot, jittered by +-30 %) a bot asks the model
-# which of the goals it may pick right now to do next. The pick is applied only if the goal is
-# still eligible (never a goal that is switched off, cooling down, or needs gm_bootstrap when that
-# is off); otherwise, or when the request fails, the bot's own scoring decides. Minimum 30.
+# what to do next. It is offered at most ten options: the goals it may pick right now (never one
+# that is switched off, cooling down, or needs gm_bootstrap when that is off) and concrete
+# variants of them it can do now ("explore <zone>" for a zone it has never been in that is not
+# deadly for its level, "wander to the town of <zone>", "wander home", "farm wild" with
+# [farm] wild and a shady streak). The answer is a short plan; each step starts when the goal
+# before it ends, and only if it is still allowed. When a request fails the bot's own scoring
+# decides. director_interval_secs: minimum 30.
 director = false
 director_interval_secs = 600
+# Steps the model may plan ahead in one answer (1..=5).
+director_plan_steps = 3
+# Ask sooner than the interval after a level-up, a death, a failed goal, a zone the bot has never
+# been in, or when the plan runs out.
+director_triggers = true
+# Never two director requests of one bot within this many seconds (also for the triggers;
+# minimum 30).
+director_min_gap_secs = 120
+# The answer may carry a short note the bot keeps in its journal (filtered like a chat line); the
+# model sees the last notes again as the bot's own memories.
+director_notes = true
 
 [issues]
 # Server issue reports: while they play, the bots notice problems with the SERVER (a quest that

@@ -6,7 +6,8 @@
 //!   farmed pays eight bytes more and the size budget of [`Bot`](super::Bot) stays where it was.
 //! * [`plan`]: which crop to grow (what is wished for, what is scarce, what pays) and what the
 //!   plan needs (seeds to buy, a vendor, a place).
-//! * [`site`]: where to plant: the land of the bot's houses and the public farms.
+//! * [`site`]: where to plant: the land of the bot's houses, the public farms and (for an outlaw
+//!   with `[farm] wild`) a small patch out in the wild.
 //! * [`board`]: what all bots are growing (one board on the hub), so that thirty bots do not all
 //!   plant the one scarce item.
 //!
@@ -49,6 +50,42 @@ pub const SAME_SPOT_M: f32 = 0.75;
 /// Land type of a plot on the land of one of the bot's houses; the public farms use their
 /// [`FarmKind`] as `u8`.
 pub const OWN_LAND: u8 = 0;
+/// Land type of a plot out in the open, on nobody's land (a wild, "illegal" farm): it costs the
+/// seed's labor, and anybody may harvest it.
+pub const WILD_LAND: u8 = 9;
+/// Land type of a crop of somebody else the bot is taking (`[farm] steal`): never planted again,
+/// never honest, forgotten when the run ends.
+pub const STOLEN_LAND: u8 = 10;
+/// Plots that left the memory kept for the goal at most (see [`FarmMem::take_gone`]).
+pub const MAX_GONE: usize = 4;
+/// Crops of others out in the wild kept in view at most (see [`FarmMem::foreign`]).
+pub const MAX_FOREIGN: usize = 4;
+
+/// A crop of somebody else, out in the wild, in the bot's view (for `[farm] steal`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Foreign {
+    /// Its object id.
+    pub obj: u32,
+    /// The crop's doodad.
+    pub doodad: u32,
+    /// The character that planted it.
+    pub owner: u32,
+    /// Where it stands.
+    pub pos: [f32; 3],
+    /// Its phase.
+    pub phase: u32,
+}
+
+/// A plot that left the memory: harvested by the bot, or gone without it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gone {
+    /// Where it stood.
+    pub pos: [f32; 3],
+    /// Its land type.
+    pub land: u8,
+    /// The bot harvested it (else it vanished: taken by somebody, withered, destroyed).
+    pub harvested: bool,
+}
 
 /// The crops the memory can tell apart (the world's [`Farming`], or a table in tests).
 pub trait CropBook {
@@ -139,6 +176,11 @@ pub struct FarmMem {
     pub last_crop: u32,
     /// Crops the bot just harvested, whose removal is expected (not a loss).
     reaped: SmallVec<[u32; 4]>,
+    /// Plots that left the memory since the goal last looked, at most [`MAX_GONE`].
+    gone: SmallVec<[Gone; 2]>,
+    /// Crops of others out in the wild in view, newest last, at most [`MAX_FOREIGN`]; kept only
+    /// by a bot that already farms.
+    pub foreign: SmallVec<[Foreign; 2]>,
 }
 
 impl FarmMem {
@@ -182,6 +224,38 @@ impl FarmMem {
         if i < self.plots.len() {
             self.plots.remove(i);
         }
+    }
+
+    /// The bot stood at the place of plot `i` and its crop was not there: it is forgotten and
+    /// counts as lost.
+    pub fn lose_plot(&mut self, i: usize) {
+        if i < self.plots.len() {
+            let p = self.plots.remove(i);
+            self.note_gone(p.pos, p.land, false);
+            self.lost = self.lost.saturating_add(1);
+        }
+    }
+
+    fn note_gone(&mut self, pos: [f32; 3], land: u8, harvested: bool) {
+        if self.gone.len() >= MAX_GONE {
+            self.gone.remove(0);
+        }
+        self.gone.push(Gone {
+            pos,
+            land,
+            harvested,
+        });
+    }
+
+    /// Whether plots left the memory since the last [`FarmMem::take_gone`].
+    pub fn has_gone(&self) -> bool {
+        !self.gone.is_empty()
+    }
+
+    /// The plots that left the memory since the last call (the farm goal writes the wild ones
+    /// to the journal).
+    pub fn take_gone(&mut self) -> SmallVec<[Gone; 2]> {
+        std::mem::take(&mut self.gone)
     }
 
     /// The bot harvested crop `obj`: its removal from the world is no loss.
@@ -249,27 +323,39 @@ impl FarmMem {
                 if w.char_id == 0 {
                     return;
                 }
-                for d in list.iter().filter(|d| d.owner_id == w.char_id) {
-                    if let Some(crop) = w.book.by_doodad(d.template) {
-                        self.on_created(w, crop, d.obj, [d.pos.0, d.pos.1, d.pos.2], d.phase);
+                for d in list.iter().filter(|d| d.owner_id != 0) {
+                    let Some(crop) = w.book.by_doodad(d.template) else {
+                        continue;
+                    };
+                    let pos = [d.pos.0, d.pos.1, d.pos.2];
+                    if d.owner_id == w.char_id {
+                        self.on_created(w, crop, d.obj, pos, d.phase);
+                    } else if (w.land)(pos[0], pos[1]) == WILD_LAND {
+                        self.on_foreign(d.obj, crop.doodad, d.owner_id, pos, d.phase);
                     }
                 }
             }
             WorldEvent::DoodadsRemoved(objs) => {
                 for &obj in objs.iter() {
                     self.on_removed(w, obj);
+                    self.foreign.retain(|f| f.obj != obj);
                 }
             }
-            WorldEvent::DoodadPhase { obj, phase } => self.on_phase(w, *obj, *phase),
+            WorldEvent::DoodadPhase { obj, phase } => {
+                if let Some(f) = self.foreign.iter_mut().find(|f| f.obj == *obj) {
+                    f.phase = *phase;
+                }
+                self.on_phase(w, *obj, *phase)
+            }
             WorldEvent::CommonFarmList(list) => {
                 for e in list.iter() {
                     self.on_listed(w, e);
                 }
                 // the list is every crop of the character on the public farms: the ones missing
-                // from it are gone
+                // from it are gone (the gardens and the wild plots are not on it)
                 let now = w.now_ms;
                 self.plots.retain(|p| {
-                    p.land == OWN_LAND
+                    p.kind().is_none()
                         || (p.planted_ms != 0 && p.planted_ms + FRESH_MS > now)
                         || list.iter().any(|e| {
                             e.template == p.doodad
@@ -279,6 +365,25 @@ impl FarmMem {
             }
             _ => {}
         }
+    }
+
+    fn on_foreign(&mut self, obj: u32, doodad: u32, owner: u32, pos: [f32; 3], phase: u32) {
+        self.foreign.retain(|f| f.obj != obj);
+        if self.foreign.len() >= MAX_FOREIGN {
+            self.foreign.remove(0);
+        }
+        self.foreign.push(Foreign {
+            obj,
+            doodad,
+            owner,
+            pos,
+            phase,
+        });
+    }
+
+    /// Forgets the crops of others the bot took on for a run ([`STOLEN_LAND`]).
+    pub fn drop_stolen(&mut self) {
+        self.plots.retain(|p| p.land != STOLEN_LAND);
     }
 
     fn on_created(&mut self, w: &Watcher<'_>, crop: &Crop, obj: u32, pos: [f32; 3], phase: u32) {
@@ -323,13 +428,18 @@ impl FarmMem {
             return;
         };
         if dist2d(self.plots[i].pos, w.pos) <= VANISH_M {
-            self.plots.remove(i);
-            match self.reaped.iter().position(|&o| o == obj) {
+            let p = self.plots.remove(i);
+            let harvested = match self.reaped.iter().position(|&o| o == obj) {
                 Some(k) => {
                     self.reaped.remove(k);
+                    true
                 }
-                None => self.lost = self.lost.saturating_add(1),
-            }
+                None => {
+                    self.lost = self.lost.saturating_add(1);
+                    false
+                }
+            };
+            self.note_gone(p.pos, p.land, harvested);
         } else {
             self.plots[i].obj = 0;
         }
@@ -400,16 +510,20 @@ pub fn observe(state: &mut BotState, world: &World, ev: &WorldEvent) -> bool {
         return false;
     }
     let char_id = state.me.char_id;
+    // (a bot that farms already also keeps an eye on the crops of others out in the wild)
+    let farms = state.market.farm().is_some();
     let relevant = match ev {
         WorldEvent::DoodadsCreated(list) => {
             char_id != 0
-                && list
-                    .iter()
-                    .any(|d| d.owner_id == char_id && farm.is_crop_doodad(d.template))
+                && list.iter().any(|d| {
+                    (d.owner_id == char_id || (farms && d.owner_id != 0))
+                        && farm.is_crop_doodad(d.template)
+                })
         }
-        WorldEvent::DoodadsRemoved(_) | WorldEvent::DoodadPhase { .. } => {
-            state.market.farm().is_some_and(|f| !f.plots.is_empty())
-        }
+        WorldEvent::DoodadsRemoved(_) | WorldEvent::DoodadPhase { .. } => state
+            .market
+            .farm()
+            .is_some_and(|f| !f.plots.is_empty() || !f.foreign.is_empty()),
         WorldEvent::CommonFarmList(_) => true,
         _ => false,
     };
@@ -418,7 +532,13 @@ pub fn observe(state: &mut BotState, world: &World, ev: &WorldEvent) -> bool {
     }
     let (pos, now_ms) = (state.me.pos, state.now_ms);
     let areas = farm.areas();
-    let land = |x: f32, y: f32| site::land_at(areas, x, y);
+    let gardens = site::gardens(&state.houses, |t| {
+        world
+            .housing_design(t)
+            .map_or(4.0, crate::bot::goals::housing::garden_radius)
+    });
+    let housing = |x: f32, y: f32| world.housing_area_at(x, y).is_some();
+    let land = |x: f32, y: f32| site::land_of(areas, &gardens, &housing, x, y);
     let watcher = Watcher {
         char_id,
         pos,
@@ -469,13 +589,21 @@ pub fn plot_lines(state: &BotState, world: &World, now_ms: u64, out: &mut Vec<pb
             crop: crop.to_owned(),
             state,
             honest: p.honest,
-            land: p.kind().map_or("own land", |k| k.name()).to_owned(),
+            land: match p.kind() {
+                Some(k) => k.name(),
+                None if p.land == WILD_LAND => "wild",
+                None => "own land",
+            }
+            .to_owned(),
         });
     }
 }
 
-/// The server's refusals of a planting (the `ErrorMessageType` ids the doodad placement sends).
+/// The server's refusals of a planting (the `ErrorMessageType` ids the doodad placement sends,
+/// `systems/economy/error_message.rs` and `systems/npcs/doodad/placement.rs` of the server).
 pub mod refusal {
+    /// The land belongs to a house whose owner does not let the character plant there.
+    pub const NO_PERM: i16 = 2;
     /// The spot is outside what the doodad's area rules allow.
     pub const AREA: i16 = 276;
     /// Another doodad is too close.
@@ -488,8 +616,9 @@ pub mod refusal {
     pub const FARM_COUNT: i16 = 493;
     /// The public farm does not take this crop.
     pub const FARM_TYPE: i16 = 494;
-    /// Not enough labor points.
-    pub const NO_LABOR: i16 = 29;
+    /// Not enough labor points (`LABOR_POWER_NEEDED`; a seed out in the open costs the labor of
+    /// its use skill).
+    pub const NO_LABOR: i16 = 9;
     /// The seed could not be used.
     pub const BAD_ITEM: i16 = 207;
     /// The zone forbids the item.

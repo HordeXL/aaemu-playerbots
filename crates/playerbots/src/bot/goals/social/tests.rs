@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 
 use super::gate::ChatGate;
 use super::*;
+use crate::config::PersonalityCfg;
 
 // ---- fakes -----------------------------------------------------------------------------------
 
@@ -49,6 +50,9 @@ const BOT_POS: [f32; 3] = [100.0, 100.0, 10.0];
 struct Env {
     units: FxHashMap<u32, Unit>,
     cfg: SocialCfg,
+    pcfg: PersonalityCfg,
+    style: Style,
+    zone: Option<&'static str>,
     rng: fastrand::Rng,
     now_ms: u64,
     now: Instant,
@@ -62,6 +66,15 @@ impl Env {
         Env {
             units: FxHashMap::default(),
             cfg: SocialCfg::default(),
+            // (the tests of the replies and the remarks count every line: no ambient or channel
+            // lines unless a test asks for them)
+            pcfg: PersonalityCfg {
+                ambient_per_min: 0,
+                channel_lines_per_hour: 0,
+                ..PersonalityCfg::default()
+            },
+            style: Style::NEUTRAL,
+            zone: Some("Solzreed"),
             rng: fastrand::Rng::with_seed(seed),
             now_ms: 1_000,
             now: Instant::now(),
@@ -103,12 +116,14 @@ impl Env {
             pos: BOT_POS,
             units: &self.units,
             cfg: &self.cfg,
+            pcfg: &self.pcfg,
+            style: self.style,
             facts: Facts {
                 name: "Aria",
                 race: "Nuian",
                 class: "Darkrunner",
                 dominant: self.dominant,
-                zone: Some("Solzreed"),
+                zone: self.zone,
             },
             rng: &mut self.rng,
         };
@@ -571,13 +586,25 @@ fn a_line_that_starts_with_a_slash_is_never_put_on_the_wire() {
         assert!(say_packet(bad).is_none(), "say {bad:?}");
         assert!(whisper_packet("Bob", bad).is_none(), "whisper {bad:?}");
         if bad.chars().count() < 200 {
-            assert!(finalize(bad).is_none(), "finalize {bad:?}");
+            assert!(
+                finalize(bad, Profanity::Strong).is_none(),
+                "finalize {bad:?}"
+            );
         }
     }
     // a long model line is cut, not refused; a line break is folded; a command inside is not
-    assert!(finalize(&"x".repeat(201)).unwrap().chars().count() <= 120);
-    assert_eq!(finalize("two\nlines").as_deref(), Some("two lines"));
-    assert!(finalize("fine\n/gm").is_none());
+    assert!(
+        finalize(&"x".repeat(201), Profanity::Off)
+            .unwrap()
+            .chars()
+            .count()
+            <= 120
+    );
+    assert_eq!(
+        finalize("two\nlines", Profanity::Off).as_deref(),
+        Some("two lines")
+    );
+    assert!(finalize("fine\n/gm", Profanity::Strong).is_none());
     assert!(say_packet("two\nlines").is_none());
     let ok = say_packet("  hello there ").unwrap();
     assert_eq!(
@@ -605,6 +632,8 @@ fn an_unsafe_line_that_reaches_the_send_stage_is_dropped() {
             action: Action::Say("/gold add self 5".into()),
             how: Sent::Canned,
             who: "Bob".into(),
+            told: 0,
+            joke: false,
         }),
         ..Social::default()
     };
@@ -886,4 +915,447 @@ async fn a_dead_endpoint_never_blocks_the_bot() {
         matches!(out.as_slice(), [Action::Whisper { .. }]),
         "{out:?}"
     );
+}
+
+// ---- personalities ---------------------------------------------------------------------------
+
+/// A style with these traits under the strongest cap.
+fn talker(chatty: f32, crude: f32, joker: f32) -> Style {
+    Style {
+        chatty,
+        crude,
+        joker,
+        cap: Profanity::Strong,
+    }
+}
+
+/// Steps every `step_ms` for `ms` and returns every action with the bot clock it came out at.
+fn simulate(
+    env: &mut Env,
+    social: &mut Social,
+    svc: &dyn Services,
+    ms: u64,
+    step_ms: u64,
+) -> Vec<(u64, Action)> {
+    let mut out = Vec::new();
+    for _ in 0..ms / step_ms {
+        env.advance(step_ms);
+        for a in env.step(social, svc, Vec::new()) {
+            out.push((env.now_ms, a));
+        }
+    }
+    out
+}
+
+fn text_of(a: &Action) -> &str {
+    match a {
+        Action::Say(t) | Action::Whisper { text: t, .. } | Action::Channel { text: t, .. } => t,
+    }
+}
+
+/// With the ambient and channel lines on, as the config has them by default.
+fn lively(env: &mut Env) {
+    env.pcfg = PersonalityCfg::default();
+}
+
+#[test]
+fn a_chatterbox_talks_far_more_than_a_quiet_bot_and_stays_under_its_own_cap() {
+    let run = |chatty: f32, seed: u64| {
+        let svc = Fake::default();
+        let mut env = Env::new(seed);
+        lively(&mut env);
+        env.style = talker(chatty, 0.3, 0.7);
+        let mut social = Social::default();
+        let out = simulate(&mut env, &mut social, &svc, 2 * 3_600_000, 1_000);
+        (out, svc)
+    };
+    let (loud, loud_svc) = run(1.0, 1);
+    let (quiet, _) = run(0.05, 2);
+    // two hours with a real player around: a chatterbox says a line every few minutes, a quiet
+    // bot one or two
+    assert!((20..=60).contains(&loud.len()), "{} lines", loud.len());
+    assert!(quiet.len() <= 6, "{} lines from a quiet bot", quiet.len());
+    assert!(loud.len() >= 5 * quiet.len().max(1));
+    // the chatterbox never says more than five unasked lines in any ten minutes, and keeps a
+    // gap of at least half a minute between two
+    for (i, (t, _)) in loud.iter().enumerate() {
+        let window = loud[i..].iter().filter(|(u, _)| *u < t + 600_000).count();
+        assert!(window <= 5, "{window} lines in ten minutes");
+        if let Some((next, _)) = loud.get(i + 1) {
+            assert!(next - t >= 30_000, "{} ms apart", next - t);
+        }
+    }
+    // jokes, small talk and a channel line or two, all counted
+    let stats = &loud_svc.gate.stats;
+    assert!(stats.jokes.load(Ordering::Relaxed) > 5);
+    let ambient = stats.ambient.load(Ordering::Relaxed);
+    let channel = stats.channel.load(Ordering::Relaxed);
+    assert_eq!((ambient + channel) as usize, loud.len());
+    assert!((1..=8).contains(&channel), "{channel} channel lines");
+    // nothing is said unasked without an audience
+    let svc = Fake::default();
+    let mut env = Env::new(3);
+    lively(&mut env);
+    env.style = talker(1.0, 0.3, 0.7);
+    env.real_near = false;
+    let mut social = Social::default();
+    assert!(simulate(&mut env, &mut social, &svc, 3_600_000, 5_000).is_empty());
+}
+
+#[test]
+fn a_crowd_of_chatterboxes_stays_within_the_process_wide_limits() {
+    let svc = Fake::default();
+    let t0 = Instant::now();
+    let mut bots: Vec<(Env, Social)> = (0..50)
+        .map(|i| {
+            let mut env = Env::new(1000 + i);
+            lively(&mut env);
+            env.style = talker(1.0, 0.5, 0.8);
+            env.now = t0;
+            (env, Social::default())
+        })
+        .collect();
+    let mut said = Vec::new();
+    for _ in 0..600 {
+        for (env, social) in bots.iter_mut() {
+            env.advance(1_000);
+            said.extend(env.step(social, &svc, Vec::new()));
+        }
+    }
+    let stats = &svc.gate.stats;
+    let ambient = stats.ambient.load(Ordering::Relaxed);
+    let channel = stats.channel.load(Ordering::Relaxed);
+    // ten minutes: two ambient lines a minute and four channel lines an hour for all of them
+    assert!((10..=22).contains(&ambient), "{ambient} ambient lines");
+    assert!(channel <= 4, "{channel} channel lines");
+    assert_eq!(said.len() as u64, ambient + channel);
+}
+
+#[test]
+fn a_chatterbox_answers_more_overheard_lines_than_a_quiet_bot() {
+    let count = |chatty: f32| {
+        (0..300)
+            .filter(|seed| {
+                let svc = Fake::default();
+                let mut env =
+                    Env::new(2000 + seed).with_unit(7, UnitKind::Character, 700, 10.0, "Bob");
+                env.style = talker(chatty, 0.0, 0.5);
+                let mut social = Social::default();
+                env.step(
+                    &mut social,
+                    &svc,
+                    vec![say_from(7, "Bob", "the wolves are everywhere today")],
+                );
+                !env.run(&mut social, &svc, 6_000).is_empty()
+            })
+            .count()
+    };
+    let (loud, quiet) = (count(1.0), count(0.05));
+    assert!(
+        loud > 170 && quiet < 70 && loud > 3 * quiet,
+        "{loud} vs {quiet}"
+    );
+}
+
+fn spawned(level: u8) -> Tally {
+    Tally {
+        spawned: true,
+        level,
+        ..Tally::default()
+    }
+}
+
+#[test]
+fn the_chat_notices_what_happened_and_remarks_on_it() {
+    let svc = Fake::default();
+    let mut env = Env::new(21);
+    env.style = talker(1.0, 0.0, 0.5);
+    let mut social = Social::default();
+    let mut t = spawned(10);
+    social.observe(&t, env.now_ms);
+    // a level up
+    env.advance(40_000);
+    t.level = 11;
+    social.observe(&t, env.now_ms);
+    let out = env.run(&mut social, &svc, 8_000);
+    assert!(only_text(&out).contains("ding"), "{out:?}");
+    // a death to a character: nothing while dead, the remark after the resurrection
+    env.advance(60_000);
+    t.dead = true;
+    t.pvp_deaths = 1;
+    social.observe(&t, env.now_ms);
+    env.active = false;
+    assert!(env.run(&mut social, &svc, 10_000).is_empty());
+    env.active = true;
+    t.dead = false;
+    social.observe(&t, env.now_ms);
+    let out = env.run(&mut social, &svc, 8_000);
+    let text = only_text(&out).to_lowercase();
+    assert!(
+        ["gank", "road", "travel", "coming"]
+            .iter()
+            .any(|w| text.contains(w)),
+        "{text}"
+    );
+    // a plain death is no gank
+    env.advance(60_000);
+    t.dead = true;
+    social.observe(&t, env.now_ms);
+    t.dead = false;
+    social.observe(&t, env.now_ms);
+    assert_eq!(social.event.as_ref().map(|e| &e.0), Some(&ChatEvent::Died));
+    let out = env.run(&mut social, &svc, 8_000);
+    assert!(!only_text(&out).contains("gank"), "{out:?}");
+    // a duel the bot won colours the remark the duel goal's end asks for
+    env.advance(60_000);
+    t.duel = Some((Outcome::Won, env.now_ms));
+    social.observe(&t, env.now_ms);
+    social.note(ChatEvent::DuelDone(Some("Bob".into())), env.now_ms);
+    let out = env.run(&mut social, &svc, 8_000);
+    let text = only_text(&out);
+    assert!(
+        lines::Chatter::DuelWon
+            .table()
+            .iter()
+            .any(|l| canned::render(l.text, "Bob") == text),
+        "{text}"
+    );
+    assert_eq!(svc.gate.stats.chatter.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn counters_that_jump_or_change_at_login_are_no_achievement() {
+    let mut social = Social::default();
+    let mut t = spawned(20);
+    t.houses_done = 1;
+    t.bag_units = Some(10);
+    social.observe(&t, 1_000);
+    // inside the settle time a quest is not remarked on
+    t.quests_done = 1;
+    social.observe(&t, 5_000);
+    assert!(social.event.is_none());
+    // a reload of the quest log after the settle time is not either
+    t.quests_done = 31;
+    social.observe(&t, 60_000);
+    assert!(social.event.is_none());
+    // one more quest is
+    t.quests_done = 32;
+    social.observe(&t, 61_000);
+    assert_eq!(
+        social.event.as_ref().map(|e| &e.0),
+        Some(&ChatEvent::QuestDone)
+    );
+    // a level up beats the quest that gave it
+    t.level = 21;
+    social.observe(&t, 61_100);
+    t.quests_done = 33;
+    social.observe(&t, 61_200);
+    assert_eq!(
+        social.event.as_ref().map(|e| &e.0),
+        Some(&ChatEvent::LevelUp(21))
+    );
+    // a house counts when it was being built and is finished now
+    social.event = None;
+    t.houses_building = 1;
+    social.observe(&t, 62_000);
+    assert!(social.event.is_none());
+    t.houses_building = 0;
+    t.houses_done = 2;
+    social.observe(&t, 63_000);
+    assert_eq!(
+        social.event.as_ref().map(|e| &e.0),
+        Some(&ChatEvent::HouseDone)
+    );
+    // a bag that filled up between two counts
+    social.event = None;
+    t.bag_units = None;
+    social.observe(&t, 64_000);
+    t.bag_units = Some(30);
+    social.observe(&t, 65_000);
+    assert_eq!(social.event.as_ref().map(|e| &e.0), Some(&ChatEvent::Loot));
+    // a reconnect starts over: the first counts after the new spawn are the baseline, and a
+    // death of the old session is not told
+    social.event = None;
+    t.dead = true;
+    social.observe(&t, 69_000);
+    assert!(social.died.is_some());
+    social.observe(&Tally::default(), 70_000);
+    let mut back = spawned(25);
+    back.quests_done = 40;
+    social.observe(&back, 80_000);
+    back.level = 26;
+    social.observe(&back, 80_100);
+    assert_eq!(
+        social.event.as_ref().map(|e| &e.0),
+        Some(&ChatEvent::LevelUp(26))
+    );
+    assert!(social.died.is_none());
+}
+
+#[test]
+fn no_line_is_coarser_than_the_bots_level_and_the_coarse_lines_are_used() {
+    use pb_llm::persona::profanity_of;
+    for cap in Profanity::ALL {
+        let mut worst = Profanity::Off;
+        for seed in 0..30 {
+            let svc = Fake::default();
+            let mut env = Env::new(3000 + seed);
+            lively(&mut env);
+            env.pcfg.ambient_per_min = 60;
+            env.style = Style {
+                cap,
+                ..talker(1.0, 1.0, 0.0)
+            };
+            let mut social = Social::default();
+            social.note(ChatEvent::Died, env.now_ms);
+            for (_, a) in simulate(&mut env, &mut social, &svc, 30 * 60_000, 2_000) {
+                let p = profanity_of(text_of(&a));
+                assert!(p <= cap, "{a:?} under {cap:?}");
+                worst = worst.max(p);
+            }
+        }
+        assert_eq!(worst, cap, "a crude bot uses what the cap allows");
+    }
+    // a polite bot under the strongest cap stays clean
+    let svc = Fake::default();
+    let mut env = Env::new(9);
+    lively(&mut env);
+    env.style = talker(1.0, 0.0, 0.5);
+    let mut social = Social::default();
+    for (_, a) in simulate(&mut env, &mut social, &svc, 60 * 60_000, 2_000) {
+        assert_eq!(profanity_of(text_of(&a)), Profanity::Off, "{a:?}");
+    }
+}
+
+#[test]
+fn only_chatty_bots_speak_on_the_public_channels_and_never_advertise() {
+    use crate::bot::market::ads::grammar::parse;
+    let channel_lines = |chatty: f32, seed: u64, hours: u64| {
+        let svc = Fake::default();
+        let mut env = Env::new(seed);
+        lively(&mut env);
+        env.style = talker(chatty, 0.5, 0.5);
+        let mut social = Social::default();
+        simulate(&mut env, &mut social, &svc, hours * 3_600_000, 5_000)
+            .into_iter()
+            .filter_map(|(_, a)| match a {
+                Action::Channel { kind, text } => Some((kind, text)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(channel_lines(0.05, 41, 6).is_empty());
+    assert!(channel_lines(0.25, 42, 6).is_empty());
+    let loud = channel_lines(1.0, 43, 3);
+    assert!((3..=12).contains(&loud.len()), "{loud:?}");
+    for (kind, text) in &loud {
+        assert!(lines::CHANNELS.contains(kind));
+        assert!(!parse(text).is_market(), "{text}");
+        assert!(channel_packet(*kind, text).is_some());
+    }
+    // the channel builder refuses everything but the three public channels and unsafe lines
+    assert!(channel_packet(cs::chat_type::PARTY, "hi").is_none());
+    assert!(channel_packet(cs::chat_type::SAY, "hi").is_none());
+    assert!(channel_packet(cs::chat_type::SHOUT, "/gm").is_none());
+    let ok = channel_packet(cs::chat_type::SHOUT, "anyone lagging?").unwrap();
+    assert_eq!(decode_chat(&ok).0, cs::chat_type::SHOUT);
+}
+
+#[test]
+fn the_wire_refuses_slurs_whoever_wrote_the_line() {
+    for bad in ["you fag", "kys", "nice b00bs", "heil hitler"] {
+        assert!(wire_text(bad).is_none(), "{bad}");
+        assert!(say_packet(bad).is_none() && whisper_packet("Bob", bad).is_none());
+    }
+    assert!(
+        say_packet("damn, the lag").is_some(),
+        "swearing is the cap's business"
+    );
+}
+
+#[tokio::test]
+async fn a_foul_model_reply_is_softened_to_the_bots_level_and_a_slur_never_sent() {
+    let foul = mock("fuck this lag, damn").await;
+    let svc = Fake {
+        llm: Some(llm_for(&foul, 1000)),
+        ..Fake::default()
+    };
+    let mut env = Env::new(31);
+    env.style = Style {
+        cap: Profanity::Off,
+        ..talker(0.5, 1.0, 0.5)
+    };
+    let mut social = Social::default();
+    env.step(&mut social, &svc, vec![whisper("Bob", "how is it going")]);
+    let out = run_async(&mut env, &mut social, &svc).await;
+    assert_eq!(only_text(&out), "frick this lag, dang");
+    assert_eq!(svc.gate.stats.softened.load(Ordering::Relaxed), 1);
+    // the prompt told the model to keep it clean
+    let body: serde_json::Value = serde_json::from_str(&foul.bodies.lock()[0]).unwrap();
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("no swearing at all"), "{system}");
+
+    let slur = mock("lol you f4g").await;
+    let svc = Fake {
+        llm: Some(llm_for(&slur, 1000)),
+        ..Fake::default()
+    };
+    let mut env = Env::new(32);
+    let mut social = Social::default();
+    env.step(&mut social, &svc, vec![whisper("Bob", "hello there")]);
+    let out = run_async(&mut env, &mut social, &svc).await;
+    let text = only_text(&out);
+    assert!(!pb_llm::persona::blocked(text), "{text}");
+    assert_eq!(svc.gate.stats.canned_replies.load(Ordering::Relaxed), 1);
+    assert_eq!(svc.gate.stats.llm_replies.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn the_llm_writes_some_ambient_lines_and_the_table_is_the_fallback() {
+    let m = mock("the kraken is up again, of course").await;
+    let svc = Fake {
+        llm: Some(llm_for(&m, 1000)),
+        ..Fake::default()
+    };
+    let mut asked = false;
+    for seed in 0..20 {
+        let mut env = Env::new(4000 + seed);
+        lively(&mut env);
+        env.style = talker(1.0, 0.0, 0.5);
+        let mut social = Social::default();
+        for _ in 0..400 {
+            env.advance(1_000);
+            let out = env.step(&mut social, &svc, Vec::new());
+            if social.pending.is_some() || !out.is_empty() {
+                break;
+            }
+        }
+        if social.pending.is_none() {
+            continue;
+        }
+        asked = true;
+        let out = run_async(&mut env, &mut social, &svc).await;
+        assert_eq!(
+            out,
+            vec![Action::Say("the kraken is up again, of course".into())]
+        );
+        break;
+    }
+    assert!(asked, "no ambient line was ever asked of the model");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(svc.gate.stats.llm_ambient.load(Ordering::Relaxed), 1);
+    let body: serde_json::Value = serde_json::from_str(&m.bodies.lock()[0]).unwrap();
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("Nobody asked you anything"), "{system}");
+    assert!(system.contains("chatterbox"), "{system}");
+    // switched off: the lines come from the table and the model is never asked
+    let mut env = Env::new(4100);
+    lively(&mut env);
+    env.pcfg.llm_chatter = false;
+    env.style = talker(1.0, 0.0, 0.5);
+    let mut social = Social::default();
+    let said = simulate(&mut env, &mut social, &svc, 20 * 60_000, 1_000);
+    assert!(!said.is_empty());
+    assert!(social.pending.is_none());
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
 }

@@ -34,10 +34,15 @@ whatever it is doing. Most features have a switch in `[behavior]`, `[social]`, `
 | **Trade runs** | Crafts a trade pack at a specialty workbench, carries it to the NPC that buys it, sells it and collects the payment mail. |
 | **Auction house** | Walks to the nearest auctioneer now and then, lists whole stacks of honestly gathered goods at a price under the going rate, buys a bargain when the bot has gold of its own, and collects the sale, refund and won-lot mails. |
 | **Housing** | Picks a design and a free spot in a housing area, quotes the tax, places the house, builds it and goes home to rest there. |
+| **Gear** | On with `[gear] enabled`. Bots put on the best piece of their bag for their level (item level, grade, gems, the class build's armor and weapons; never above the level requirement), buy better pieces from merchants, mint the gear of their tier with GM commands, socket lunagems when the odds suit them, regrade if allowed, and choose the quest reward that suits them. The web UI shows what a bot wears. See `docs/OPERATING.md`. |
 | **Farming** | Off unless `[farm] enabled`. Buys seeds from a vendor with the bot's own money, plants them in the garden of its house or on a public farm, remembers the plots, comes back when they are ripe, harvests and replants. It grows what is wished for (the director or the Economy view) or scarce before what merely pays, and the produce counts as the bot's own to sell only when the seeds were bought (never when they were minted with a GM command). Public farm polygons (`farm_areas.json`) come from `playerbots bake`; the web UI lists a bot's plots and the Economy view what is being grown. See `docs/OPERATING.md`. |
 | **Guilds** | Off unless `[guild] enabled`. Five bots of one faction found a guild together (team, charter, a generated name), then the officers recruit unguilded bots of the faction, the owner appoints one or two officers, the members greet newcomers and chat now and then, and a member leaves now and then (an owner hands the guild over first). A real player gets an invitation by whispering "ginv" or "can i join" to an officer; bots never expel or demote a real player, and accept a player's invitation only with `accept_player_invites` (see `docs/OPERATING.md`). |
 | **World events** | With `[events] enabled`, bots join a running rift (tower defence event): they walk to the defended target, hold within 40 m of it, kill the monsters of the current wave next to each other (a few at a time, `max_bots_per_event` and `max_share`) and leave when it ends or they are hurt. Bots keep out of zone groups at war (`avoid_war_zones`), and a rift whose waves never show, never advance or never end is filed as a server issue. |
+| **Wild farms** | Off unless `[farm] wild`. Outlaw bots keep a few crops on a secluded patch out in the open (it costs labor), come back for them after a restart (the journal) and notice when somebody took them; with `steal` they take ripe crops of the other bots themselves. |
+| **Exploring** | Bots go and see zones they have never been to, hills, the coast and recall points that are reachable and safe for their level, look around and remember where they have been; born explorers go more often (`[explore]`). |
+| **Presence** | Off unless `[presence] enabled`. Bots log in and out on schedules of their own (early birds, evening players, night owls; casual and dedicated), never in the middle of a trade, a dungeon or a real player's party, within `min_online` and `max_online`; the Director view shows who plays when. |
 | **Rest, wander, chat** | Recovers hit points and mana, strolls around, answers whispers and nearby players (canned lines or, optionally, an LLM in character). |
+| **Personalities** | Every bot has its own way of talking (`[personality]`): chatterboxes and quiet ones, clowns who joke about labor, gankers, regrades, the queue and the Kraken, and potty mouths who swear now and then about the game under an operator cap (`profanity = "off" / "mild" / "strong"`). Bots say "ding", "rip" or "gg", remark on a sold pack or a finished house, chat near real players and now and then on shout, trade or group finding, all within per-bot and process-wide rate limits; slurs, hate, sexual words, insults and threats are refused for every line. |
 | **Life-like movement** | In front of a real player a bot jumps now and then (on a straight run, at a step, to cheer a level), turns on the spot, pauses at corners, runs at its own pace, greets passers-by, answers an emote and sits down to rest. Each bot has its own temperament (some never jump); nothing happens without an audience or while the bot fights, trades or sails. Switch: `[behavior] lifelike`, `jump_rate`, `emotes`. |
 
 Bots survive death (they ask for the resurrection), disconnects (reconnect with back-off) and name
@@ -125,10 +130,16 @@ How the detectors judge, what is reportable, the queue file and the privacy rule
   Spawn and despawn by side, race and continent. Optional use of the game server's web API for exact
   counts. See [docs/OPERATING.md](docs/OPERATING.md#world-metrics-and-the-population-director).
 * **Optional LLM** (DeepSeek, or any OpenAI-compatible `chat/completions` endpoint): bots answer
-  players with a short in-character line and, with the director on, now and then choose a goal. It is
-  off by default, never on the tick path, rate limited and budgeted per UTC day, and its output is
-  filtered (no commands, links or "I am an AI"). Everything works without it. See
-  [docs/OPERATING.md](docs/OPERATING.md#chat-and-the-llm).
+  players with a short in-character line and, with the director on, plan their next few steps
+  (explore a zone they have never seen, wander to a town, farm wild land, ...) now and then and
+  after a level-up, a death or a failure, keeping short notes in their journal. It is off by
+  default, never on the tick path, rate limited and budgeted per UTC day, picks only among what the
+  bot may do, and its output is filtered (no commands, links or "I am an AI"). Everything works
+  without it. See [docs/OPERATING.md](docs/OPERATING.md#chat-and-the-llm).
+* **Agent API and MCP**: an LLM outside the process can drive the bots too: `GET /api/agent/tools`
+  describes every action with a JSON schema, `GET /api/agent/observe/{id}` shows one bot in a few
+  dozen lines, and `playerbots mcp` offers the same tools to Claude Code, Claude Desktop or any
+  other MCP client. See [docs/OPERATING.md](docs/OPERATING.md#agent-api-and-mcp).
 
 ## How it works
 

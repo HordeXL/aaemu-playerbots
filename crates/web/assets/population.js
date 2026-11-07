@@ -2,7 +2,8 @@
  *
  * Runs after app.js and borrows its helpers through window.pbHost. Polls /api/world (3 s, only while
  * the World view or the heat overlay is on screen), /api/economy (5 s, Economy view) and
- * /api/director (2 s on the Director and Economy views, 5 s otherwise, for the mode badge).
+ * /api/director (2 s on the Director and Economy views, 5 s otherwise, for the mode badge; it
+ * carries the presence schedules too).
  * Changes go out as POST /api/command (spawn_where / despawn_where) and POST /api/director/policy.
  * Every string that comes from the bot process is inserted with textContent, never innerHTML.
  */
@@ -459,7 +460,7 @@ function renderEconomy() {
     const tb = mkTable('items', [{ t: 'Item' }, { t: 'Scarcity' }, { t: 'Lots', n: true, title: 'on the auction house' },
       { t: 'Price', n: true, title: 'market price per item and how many times the vendor price' },
       { t: '30 min', n: true, title: 'price change' }, { t: 'Chat', n: true, title: 'want to buy / want to sell lines' },
-      { t: 'Growing', n: true, title: 'how many the bots' crops will give (the farming goal)' }, { t: '' }]);
+      { t: 'Growing', n: true, title: "what the bots' crops will give (the farming goal)" }, { t: '' }]);
     for (const it of items) {
       const sc = num(it.scarcity);
       const price = it.unit_price ? fmtMoney(it.unit_price) + (it.price_ratio ? ' (' + it.price_ratio.toFixed(1) + 'x)' : '') : '-';
@@ -680,6 +681,7 @@ function renderDirector(force) {
   add('Logging in', num(hl.connecting));
   if (hl.holding) add('On hold', hl.holding);
   E.dHealth.replaceChildren(kv);
+  renderPresence(d.presence);
 
   // forms: do not overwrite what the operator is typing
   for (const [key] of POLICY_NUMBERS) {
@@ -711,6 +713,69 @@ function renderDirector(force) {
     }
     E.dLog.replaceChildren(lt);
   }
+}
+
+// ------------------------------------------------------------------ presence (the log-in schedules)
+// One block: the panel is made on the first render, below "Process health", from d.presence.
+const CHRONO_LABEL = { early_bird: 'Early birds', daytime: 'Daytime', evening: 'Evening', night_owl: 'Night owls' };
+function presenceCurve(values, localTime) {
+  const v = (values || []).map(num);
+  const top = Math.max(1, ...v);
+  const hour = parseInt(String(localTime || '').slice(0, 2), 10);
+  const box = h('div');
+  box.style.cssText = 'display:flex;align-items:flex-end;gap:1px;height:44px;margin-top:4px';
+  box.title = 'Bots scheduled at each hour of the day (before the bounds)';
+  v.forEach((n, i) => {
+    const b = h('div');
+    b.style.cssText = 'flex:1 1 0;min-width:2px;border-radius:2px 2px 0 0;background:var(--'
+      + (i === hour ? 'warn' : 'accent') + ');height:' + Math.max(1, Math.round((n / top) * 40)) + 'px';
+    b.title = String(i).padStart(2, '0') + ':30 · ' + n + ' bots';
+    box.append(b);
+  });
+  const axis = h('div', 'muted pop-note', '00:00 … 23:59 · now = ' + (localTime || '?'));
+  const out = h('div');
+  out.append(box, axis);
+  return out;
+}
+function renderPresence(pv) {
+  if (!E.pBlock) {
+    E.pHead = section('Presence', '(log-in schedules)');
+    E.pBlock = h('div', 'pop-block');
+    E.dHealth.after(E.pHead, E.pBlock);
+  }
+  E.pHead.hidden = E.pBlock.hidden = !pv;
+  if (!pv) return;
+  if (!pv.enabled) {
+    E.pBlock.replaceChildren(empty('Switched off ([presence] enabled = false): every bot stays online.'));
+    return;
+  }
+  const off = num(pv.utc_offset_hours);
+  const tiles = h('div', 'pop-tiles');
+  tiles.append(
+    tile('Local time', pv.local_time || '?', 'UTC' + (off >= 0 ? '+' : '') + off),
+    tile('Online', fmtCount(pv.online), fmtCount(pv.own_online) + ' by schedule, pool ' + fmtCount(pv.pool)),
+    tile('Scheduled now', fmtCount(pv.scheduled), 'aiming for ' + fmtCount(pv.target) + ' online'),
+    tile('Last hour', num(pv.logins_last_hour) + ' in', num(pv.logouts_last_hour) + ' out'),
+    tile('Bounds', num(pv.min_online) + ' – ' + (num(pv.max_online) ? num(pv.max_online) : '∞'), 'bots online, all together'),
+    tile('Waiting', num(pv.waiting) + ' busy', num(pv.leaving) + ' said goodbye, ' + num(pv.held) + ' held'),
+  );
+  const next = mkTable('presence-next', [{ t: 'When' }, { t: 'Bot' }, { t: 'Change' }]);
+  for (const c of pv.next || []) {
+    next.tBodies[0].append(row([{ t: 'in ' + fmtAge(c.in_secs) }, { t: (c.name || '#' + c.id) + ' (' + c.id + ')' },
+      { t: c.login ? 'logs in' : 'logs out', cls: c.login ? 'bt' : '' }]));
+  }
+  const chrono = mkTable('presence-chrono', [{ t: 'Chronotype' }, { t: 'Bots', n: true }, { t: 'Online', n: true },
+    { t: 'Scheduled', n: true }, { t: '' }]);
+  for (const r of pv.chronotypes || []) {
+    chrono.tBodies[0].append(row([{ t: CHRONO_LABEL[r.chronotype] || label(r.chronotype) }, { t: num(r.bots), n: true },
+      { t: num(r.online), n: true }, { t: num(r.scheduled), n: true }, { el: bar(num(r.online) / Math.max(1, num(r.bots))) }]));
+  }
+  E.pBlock.replaceChildren(
+    tiles,
+    presenceCurve(pv.curve, pv.local_time),
+    (pv.next || []).length ? next : empty('No change within a day.'),
+    chrono,
+  );
 }
 
 // ------------------------------------------------------------------ the heat overlay

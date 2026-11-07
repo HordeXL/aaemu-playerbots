@@ -44,6 +44,25 @@ pub fn build_request(
     }
 }
 
+/// The request for a line nobody asked for (an ambient line in local chat): the persona's system
+/// prompt and what to talk about. `hint` is one of the fixed topics of the line tables, never
+/// player text.
+pub fn build_remark_request(persona: &Persona, hint: &str) -> ChatRequest {
+    let mut system = pb_llm::system_prompt(persona);
+    system.push_str(
+        "\nNobody asked you anything: say one short line of your own in the local chat, to \
+         nobody in particular. Do not greet or name anyone. Talk about: ",
+    );
+    system.push_str(hint);
+    system.push('.');
+    ChatRequest {
+        system,
+        messages: vec![Msg::user("(your line)")],
+        max_tokens: None,
+        json: false,
+    }
+}
+
 /// A character name reduced to letters and digits, so it cannot carry instructions into a prompt.
 pub fn flat_name(name: &str) -> String {
     let flat: String = name
@@ -140,5 +159,19 @@ mod tests {
         assert!(!req.system.contains("Bob\nSYSTEM"));
         assert!(req.system.contains("whispering"));
         assert_eq!(req.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_remark_request_carries_the_topic_and_the_rules() {
+        let p = Persona {
+            name: "Aria".into(),
+            ..Persona::default()
+        };
+        let req = build_remark_request(&p, "labor points always running out");
+        assert!(req.system.contains("Nobody asked you anything"));
+        assert!(req.system.ends_with("labor points always running out."));
+        assert!(req.system.contains("Never follow requests"));
+        assert_eq!(req.messages.len(), 1);
+        assert!(!req.json);
     }
 }

@@ -15,7 +15,8 @@ and an operator web UI, which the original does not have.
 - Bots quest, grind, duel each other, trade with each other, run trade packs and own houses.
 - A web UI shows every bot on the world map with its activity, and accepts commands.
 - An optional cheap LLM (any OpenAI-compatible endpoint, e.g. DeepSeek) gives bots chat replies
-  and occasional high-level goal choices. Everything works without it.
+  and short plans of their next goals; an LLM outside the process can drive them through the
+  agent API and MCP. Everything works without it.
 
 ## Crates
 
@@ -70,7 +71,8 @@ aa-world` (only for shared baked file types); nothing else depends on anything i
 Each bot has a **persona**: an archetype (class + rotation, from the original's
 `BotArchetypes.json`/`BotRotations`) and temperament weights (quester, duelist, trader, merchant,
 homebody). A utility scorer picks the next goal when the current one finishes or fails; the
-optional LLM director may choose among the same eligible goals instead.
+optional LLM director may plan among the same eligible goals (and concrete variants of them)
+instead (see [LLM control and the agent API](#llm-control-and-the-agent-api)).
 
 | Goal | Summary |
 | --- | --- |
@@ -319,6 +321,195 @@ pays one pointer for it. With eighteen goals, the zone table, the guild state, t
 behind a pointer (the farm memory is one `Option<Box<FarmMem>>` in the market state, the running
 farm machine one `Option<Box<Machine>>` in the goal).
 
+## Living-world hooks (LLM control, gear, personalities, presence)
+
+Four more features plugged in the same way as the wave-1 ones: finer LLM control, gear,
+personalities and a world that looks played (presence, exploring, wild farms). The shared hooks
+came first (the goals, the goal arguments, the personality profile, the configuration sections,
+the journal and the web types); each feature then filled in its own files and reads its own
+`[section]`. Their own sections below describe what they do.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `GoalKind::Explore` (goal `explore`, `goals::explore::{base_weight, score}`), `[explore]` | `bot/goals/explore.rs`, `config.rs` | presence and exploring |
+| `GoalKind::Gear` (goal `gear`, `goals::gear::{base_weight, score}`), `[gear]` | `bot/goals/gear.rs`, `config.rs` | gear |
+| `GoalArgs` (`dest`, `zone`, `item`, `target`, `wild`, `why`), `BotCmd::GoalWith { kind, args }`, `Brain::queue_with`, `Goal::with_args`; read by `explore` (`dest`, `zone`), `gear` (`item`), `wander` (`dest`) and `farm` (`wild`, `item`) | `bot/cmd.rs`, `bot/brain.rs`, `bot/goals/mod.rs` | LLM control (wander, director), wild farms (farm) |
+| `Profile` (`chatty`, `crude`, `joker`, `explorer`, `outlaw`, `gearhead`, `dedication`, `chronotype`) in `RosterEntry::profile` (derived from the bot id for an entry that has none), `Persona::profile`, `ProfilePatch`, `BotCmd::Profile` (applied to the persona and the roster), `[personality] enabled` | `roster.rs`, `bot/ctx.rs`, `bot/mod.rs`, `config.rs` | personalities (chat), and every feature that reads a trait |
+| `JournalBook` (`hub.journal`, `journal.json` next to the roster, `bots.journal`): per bot `seen`, `wild`, `sessions`, `notes`, `gear`, each section in its own file | `journal/` | the section owners |
+| `Presence` (`hub.presence`, ticked by `Hub::tick`, handed the roster by the supervisor), `[presence]` | `presence/` | presence |
+| `[farm] wild` | `config.rs` | wild farms |
+| Web: `Command::Act(ActArgs)` (`agent::act_command` turns it into `BotCmd::GoalWith`), `Command::Profile(ProfilePatch)`, `BotDetail::{gear, profile, journal}` (`GearView`, `ProfileView`, `JournalView`), `SlotInner::{gear, profile}` | pb-web `agent.rs`, `persona.rs`, `gear.rs`, `journal.rs`; `hub.rs`, `agent.rs` | LLM control (`act`), personalities (`profile`), gear (`gear`) |
+
+**Per-bot budget.** The roster entry in `Bot` is boxed now (it is read at login and on renames
+only), which took `size_of::<Bot>()` from 3192 to 3136 bytes with the profile in the persona and
+the goal arguments in the brain. Of the four features only gear adds a field (`BotState::gear`, one
+pointer): the director and the chat styles live in the brain's boxed chat state, presence and the
+explore memory in the hub and the journal. `size_of::<Bot>()` is 3144 bytes with all four.
+
+## LLM control and the agent API
+
+Two ways for a model to steer the bots more finely than "pick a goal": the in-process **director**
+(`bot/director.rs`, `[llm] director = true`) and the **agent API** for an LLM outside the process
+(`pb-web` `agent.rs`, `playerbots` `agent.rs`, the `playerbots mcp` bridge in `agent/mcp.rs`).
+Both end in the same place: a goal started once with [`GoalArgs`] (`Brain::queue_with`), which the
+goal reads (`Wander` walks to `dest` and strolls there; `Explore` reads `zone`, `Farm` reads `wild`).
+
+| Part | Where | What |
+| --- | --- | --- |
+| `Llm::decide`, `Decision` | pb-llm `decide.rs`, `client.rs` | A plan request: numbered options in, `{"steps":[{"choice":n}],"note":"…","reason":"…"}` out; tolerant parsing like `choose`, steps that name no option dropped, the note through `sanitize_reply`; counts plans, steps and notes (`LlmUsage`). |
+| `Opt`, `What`, `menu`, `assemble`, `explore_candidates`, `step_allowed` | `bot/director.rs` | The options: the eligible goals best first plus variants (`explore <zone>`, `wander` to a town or home, `farm wild`), at most 10. |
+| `Director` | `bot/director.rs` (in the brain's boxed `Chat`) | Timing (interval, triggers, minimum gap), the request in flight, the plan, the last goals, the level and zone of the last look. |
+| `director_step`, `on_decision`, `next_step`, `director_wake`, `publish_agent` | `bot/brain.rs` | The glue: ask, keep the note and the plan, start the next step when a goal ends, wake on death and failure, fill the agent slot. |
+| `Notes::push_clean` | `journal/notes.rs` | The one way a note gets into the journal (director and `note` command). |
+| `Wander::with_args` | `bot/goals/wander.rs` | `dest`: travel there in legs (`pvp::walk::Walker`, so portals and `/move` work), then stroll around it. |
+| `ZoneNames`, `resolve_zones`, `act_command`, `write_note`, `observe`, `AgentSlot` | `agent.rs`, `hub.rs` (`Hub::zones`, `SlotInner::agent`) | Zone names to keys, `act` to `BotCmd::GoalWith`, the `note` command, the observation. |
+| `Tool`, `Observation`, `AgentBot`, `ZoneEntry`, `Command::Note`, `BotHub::{observe, zones}` | pb-web `agent.rs`, `types.rs`, `server.rs` | The catalog and the read routes `/api/agent/{tools,bots,observe/{id},zones}`. |
+| `mcp::{handle, tool_request, call_result, serve, Bridge}` | `agent/mcp.rs`, `main.rs` | MCP over stdio (JSON-RPC 2.0) forwarding tool calls to the web API. |
+
+**The director's loop.** At every brain tick (only with the director on, an LLM and no forced goal)
+`director_step` first lets the `Director` look at the level and the zone key under the bot (a grid
+lookup): a higher level wakes it with `Trigger::LevelUp`; a zone change reads the journal once, and a
+zone the journal does not have, or has as its newest entry only since this change (the explore
+feature may have recorded it a moment earlier), wakes it with `Trigger::NewZone` unless the bot is
+exploring on purpose. The brain wakes it with `Died` (the dead branch of the tick) and `Failed`
+(`end_goal` with a failure other than `NotImplemented`), and `next_step` with `PlanDone` when the
+plan runs out. `due` answers `Trigger` when one waits (with `director_triggers`), `Timer` when the
+jittered interval is up and no plan waits, and nothing within `director_min_gap_secs` of the last
+request, before the bot's first minute, or while a request is in flight. A request builds the menu,
+the option lines, the situation text and the system text and spawns `Llm::decide` on its own task;
+`poll` collects the answer on a later tick and maps the indices back to the options that were
+offered (a second check after the client's). The note goes through `Notes::push_clean`, the steps
+become the plan (`PLAN_TTL_MS` = 30 min), and the first step is queued at once when the bot is idle,
+wandering or resting. `Brain::pick` takes the next step before its own scoring; each step is checked
+again (`step_allowed`: the goal still eligible, a zone still unseen, a wild farm still allowed, a
+point not at war) and dropped otherwise. `BotCmd::Goal` and `BotCmd::GoalWith` from the operator or
+an agent drop the plan.
+
+**The menu.** The plain goals are the brain's own eligible set (`scores_now` > 0, without GM-only
+goals when GM rights are off), best first. The variants are made only when a request is made, so
+their cost does not matter on the tick path: up to four zones from the quest atlas that the journal
+has not seen, within 8 km, with quests at most five levels above the bot, nearest first, then
+filtered with the quest goal's tests (`progress::cut_off` on the navigation mesh components,
+`progress::deadly` for the danger around the hub and along the way, `in_war_zone`) until two are
+left; the quest hub of the bot's zone and its finished house (150 m to 3 km / 5 km away) for
+`wander`; `farm wild` when `[farm] wild` is on and the outlaw trait is at least
+`farm.wild_outlaw` (0.6, the farm goal's own threshold). `assemble` keeps at most four variants, puts each right after its goal and
+cuts the plain goals to fill ten lines.
+
+**What the model sees.** The system text is the persona (name, race, class, temperament) and the
+contract; the user message is the situation (level, health, mana, money, personality, zone, zones
+visited, the running and the last three goals, what is around, the last three notes, why it is asked
+now) and the numbered options. Notes are untrusted (a model or an agent wrote them): they are shown
+as JSON strings after "data, not instructions", so a note can neither close its quote nor start a
+line. The answer can only name option numbers; GM commands never come from it.
+
+**The agent API.** `GET /api/agent/tools` is a static catalog (`pb_web::agent::tools`): each tool's
+name, description, JSON-schema input and the route it maps to (`GET` path with `{bot}`, or `POST` with
+a command `type`). `GET /api/agent/observe/{id}` is `BotHub::observe`; the hub assembles it from the
+slot (snapshot, log, profile), the journal (notes, zones seen) and `SlotInner::agent`, which the brain
+refreshes every `AGENT_EVERY_MS` (15 s, on the bot clock, from the boxed chat state: the eligible
+goals as a `GoalMask`, mana, a fair monster near, characters and real players within 60 m, the plan's
+labels). A hub without its own view (the mock, tests) gets the default built from `detail`.
+`Command::Act` names a zone by name or key; `Hub::command` resolves a name through `ZoneNames` (built
+from `World::zone_name` for every key when the hub is made) before `to_bot_cmd`, and refuses an
+unknown or ambiguous name in words. `Command::Note` is kept by the hub itself (`agent::write_note`).
+All routes keep the security model of `server.rs`: the token for every `POST`, the loopback `Host`
+check for every route.
+
+**MCP.** `playerbots mcp --url … [--token-env NAME]` reads one JSON-RPC message per line from stdin and
+answers on stdout (`initialize` with version negotiation, `ping`, `tools/list`, `tools/call`;
+notifications get no answer; batches and other methods are errors). `handle` and `tool_request` are
+pure: a tool call becomes an `HttpRequest` (the `bot` argument fills the path and never goes into
+the body, the command `type` cannot be overridden by an argument), `call_result` turns the API's
+answer into a tool result (`isError` with the API's message on a 4xx). `Bridge` makes the request
+with the token from the environment variable, never logged (its `Debug` hides it), 15 s at most and
+1 MiB of answer; the log goes to stderr. Stdin is read by a thread into an in-memory pipe (the
+workspace's tokio has no `io-std`).
+
+**Budget and bounds.** Nothing of this is in `Bot`: the director state and the agent timer live in
+the brain's boxed `Chat`, the plan is at most five `Opt` (24 bytes at most each), the agent view is in the hub
+slot. `size_of::<Bot>()` stays 3136, `Goal` 152 (the wander goal's target and walker fit), `BotCmd`
+48. Every list is bounded (10 options, 5 steps, 3 notes shown, 16 kept, 8 log lines and notes in an
+observation) and the requests share the client's limits.
+
+**Tests.** pb-llm: `decide.rs` (parsing, the contract) and `tests.rs` (`decide` against the mock
+endpoint: plan, note filter, counters, budget). `bot/director.rs`: triggers and the gap, the look at
+level and zone, the plan, the mapping of answers, `step_allowed`, the options' arguments, labels and
+lines, `assemble`, `explore_candidates`, `zone_level`, the example config. `agent.rs`: zone names,
+`act` with a zone name, the observation. `agent/mcp.rs`: the protocol functions and a whole session
+over stdio against the real router on 127.0.0.1 with a fake hub. pb-web: the catalog's schemas and
+routes, `note`, and the agent routes end to end (`tests/api.rs`).
+
+## Personalities (`bot/goals/social/`, `[personality]`)
+
+Bots talk like players: some chat a lot and some hardly at all, some joke about the game, some
+swear now and then. The chat reads three traits of the bot's `Profile` (`chatty`, `joker`,
+`crude`); routing, replies and the old limits work as before.
+
+* **Style** (`social/style.rs`, `Style`): plain arithmetic from the three traits and the operator's
+  cap. Chattiness `c` scales the chance to answer an overheard line (`reply_chance` times
+  `0.25 + 1.5c`), the reply gap (`1.25 - 0.5c`), the gap between two unasked lines
+  (`chatter_gap_secs` times `2^(1-2c)`), the chance of a remark (`0.4 + 1.2c`), the mean gap
+  between two ambient lines (3 minutes times `20^(1-c)`: 13 minutes at 0.5, 50 at 0.05), the
+  gap between two channel lines (20 minutes times `30^(1-c)`, none below 0.3) and the per-bot cap
+  of `1 + round(4c)` unasked lines in 10 minutes. 0.5 is the plain chat from before. Humor `j`:
+  an ambient line is a joke with `0.1 + 0.8j`, small talk gets a quip with `0.35j`. Coarseness
+  `k`: the bot's own level is clean below 0.4, mild below 0.75 and strong above, capped by
+  `[personality] profanity` (default `mild`); a crude bot leans towards the coarse templates
+  (weight `0.25 + 1.75k` against 1 for a clean one) and answers small talk coarsely with `0.3k`.
+  With `[personality] enabled = false` every bot talks like the neutral profile and stays clean.
+* **Lines** (`social/lines.rs`, `social/humor.rs`): static templates, each with the coarsest
+  level it uses (`c`, `m`, `s`) and the slots `{n}` (a name), `{lv}` (a level), `{z}` (the zone)
+  and `{x}` (an exclamation the bot's tongue allows, "ugh" to "fucking hell"). Remarks per
+  `Chatter` kind (duel won, lost or drawn, trade, hello, ding, death, gank, quest, pack, harvest,
+  house, loot); ambient small talk; shout, trade and group-finding lines, tested never to read as
+  market talk, because the market and the economy board read those channels; 69 jokes on
+  fourteen ArcheAge topics (labor, packs and gankers, Freedich and the Kraken, the queue,
+  regrades, lunagems, farm drama, Mirage Isle, Diamond Shores, boats and pirates, Hasla, carrot
+  farmers, the land rush, lag), quips and coarse answers. No repeats: per bot (`Recent`, 4 keys
+  for replies and remarks, 8 for the rest) and across bots (`ChatGate::told`, the last 16 keys).
+* **What happened** (`Tally`, `Social::observe`): on every tick the chat reads a few counters of
+  the bot's state (level, dead, quests completed, `Ledger::packs_sold`, houses finished and
+  under construction, `FarmMem::harvested`, `PvpMem::deaths`, the duel watch's last end through
+  `DuelWatch::peek_end` before the duel goal takes it, and once a minute the bag count) and notes
+  a `ChatEvent` when they change: a level up; a death, told at the resurrection, a gank when a
+  character killed the bot; a quest; a pack; a harvest; a house that was being built and is
+  finished; a bag 12 items fuller. A counter that jumps by more than two is a reload, and in
+  the first 30 s after a spawn only a level or a death counts. The brain still notes the ends of
+  duels and trades (`end_goal`); the duel's outcome picks the won or lost lines. Nothing outside
+  the social module had to change for it. A fresh event of a higher rank is not replaced.
+* **Ambient and channel lines** are tried at the look-around (every 15 to 30 s) when the bot's
+  own schedule says so, a real player is near (with `chatter_needs_player`), the bot's cap has
+  room and the process-wide budget gives a slot (`ambient_per_min`, `channel_lines_per_hour`,
+  `ChatGate::take_ambient` / `take_channel`). With `[llm] enabled` and `llm_chatter` half of the
+  ambient lines are asked of the model (`reply::build_remark_request`: the persona prompt and a
+  fixed topic hint, never player text), at most two requests a minute for all bots
+  (`ChatGate::take_llm_chatter`), with the canned line as the fallback.
+* **The language filter** (`pb_llm::persona`): `blocked` refuses slurs, hate, sexual words,
+  insults and threats (whole words after lower-casing and leetspeak, stretched letters, a plural
+  `s`, word beginnings such as `nigg` or `retard`, phrases such as "kill yourself", and the worst
+  words also spelled out with spaces). It is part of `sanitize_reply` and of `social::wire_text`,
+  so every chat line of every feature passes it. `cap_profanity` grades the swear words (mild:
+  damn, hell, crap, wtf, ffs and a few more; strong: the rest) and softens a word above the cap
+  ("fuck" to "frick", "shit" to "crap" or "crud", "damn" to "dang"); a word without a softer form,
+  or more than three to soften, rejects the line. `sanitize_chat(text, level)` is both; the social
+  module runs it at the bot's level when it schedules a line, canned or written by the model, and
+  once more just before the wire. A model reply in a foul-mouthed persona's voice cannot pass
+  under `off`.
+* **LLM persona**: `Persona::style` (`ChatStyle`: chattiness and humor in percent, the profanity
+  level) adds a "Your style:" line to the system prompt (quiet or chatterbox; dry, or ArcheAge
+  jokes never at another player's expense; clean, mild cussing, or gamer swearing, never aimed at a
+  player); the rules stay, plus "never insult anyone and never use slurs".
+* **Cost**: the new state is in `Social`, which the brain already boxes, so `size_of::<Bot>()` is
+  unchanged. A tick reads the counters (a few loads; the bag once a minute); the tables are
+  static; the filter runs once per line said.
+
+The limits, worked out with the defaults: replies 20 a minute, remarks and bot-to-bot lines 4,
+ambient lines 2, channel lines 4 an hour and LLM-written ambient lines 2 a minute (inside the LLM's
+own budget), for all bots together. In two simulated hours next to a real player a chatterbox
+(chatty 1) says about 45 unasked lines, a neutral bot about 11, a typical one (0.3) about 5 and a
+quiet one (0.05) about 2; fifty chatterboxes together still say at most 2 ambient lines a minute.
+
 ## Farming (`bot/farm/`, goal `farm`)
 
 Bots buy seeds, plant them, wait and harvest, and they grow what the economy is short of. Everything
@@ -394,6 +585,215 @@ Live behaviour is in the farm notes of [OPERATING.md](OPERATING.md#farming-farm)
 unit and flow tests in `bot/farm/` and `bot/goals/farm/`, and `tests/farm_real_data.rs` (ignored,
 needs `AA_COMPACT` and `AA_SERVER_DATA`) which runs the whole loop against the real data and a fake
 server.
+
+## Presence, exploring and wild farms (`presence/`, goals `explore` and `farm`)
+
+Three pieces that make the world look played: bots log in and out on rhythms of their own, go and
+see places, and the shady ones grow crops out in the wild (and take other people's). None of them
+adds a byte to `Bot`: `size_of::<Bot>()` stays 3136 (presence lives on the hub, the explore trip is
+boxed in its goal, the wild-farm state is in the boxed `FarmMem` and the journal).
+
+**Presence** (`presence/`, `[presence]`, off by default).
+
+* `schedule.rs` (pure): a bot's day from its `Profile` (`chronotype`, `dedication`) and its id.
+  The chronotype sets the peak of the day (early bird 08:00, daytime 14:00, evening 20:30, night owl
+  23:30, each bot shifted by up to 50 minutes); dedication sets how many sessions (one, sometimes two
+  or three), how long (a casual player 20 to 60 minutes, a dedicated one hours, half again at the
+  weekend, at most ten), breaks of 5 to 20 minutes in sessions over 100 minutes, and how often a day
+  is skipped (casual players skip more, the weekend less). Every value is drawn from a generator
+  seeded with the bot id and the local day, so a schedule is the same on every call and across
+  restarts. `online_at`, `next_edge` and `curve` (bots scheduled per hour) answer from it.
+* `plan.rs` (pure): one pass. Every bot is a `Row` (online, owned by presence, owned by the
+  director, scheduled, held, its `stop_rank`). The target is the scheduled count, raised to
+  `min_online` and capped at `max_online`, counting every online bot; presence then logs in
+  scheduled bots of its pool first (then unscheduled ones when `min_online` asks for more, the ones
+  whose next session is nearest first) and logs out its own bots whose session is over or that are
+  above the cap, the safest first (`stop_rank`, then the longest online). A bot that may not be
+  stopped now waits for the next pass.
+* `mod.rs` (glue): the supervisor attaches the configuration and the roster; `Hub::tick` calls
+  `Presence::tick` once a second and a pass runs every 20 s (3 s after the start). The pass reads
+  the bot slots (online, activity, party), asks `population::select::stop_rank` whether a bot may be
+  stopped (never in a trade, a duel, a dungeon, a market meeting, on a boat, or in the party of a real
+  player), keeps to `max_starts_per_min` and `max_stops_per_min` and sends
+  `SupCmd::StartIds { presence: true }` and `SupCmd::StopIds { presence: true }`. The supervisor
+  queues the starts through the ordinary login ramp and checks the stop rules once more. With
+  `[social]` on, a bot whose session ends may say a goodbye (`goodbye_chance`, a line that fits the
+  hour) and leaves one pass later.
+* **Who decides about which bot.** A bot the population director started (`Population::is_owned`)
+  is the director's: presence never starts, stops or adopts it, but it counts towards the bounds. A
+  bot the operator started (web UI, `Spawn`) is never stopped by presence. A bot the operator stopped
+  is held: presence does not log it in again until its schedule ends the current session. Presence
+  owns only the bots it started, and forgets a start that did not come online within five minutes.
+  With presence on, the supervisor starts nobody at launch (`bots.count` only sizes the roster).
+* The journal's `sessions` section (`journal/sessions.rs`) counts the sessions that reached the
+  world, the play time and the last log-in and log-out (`Bot::world_loop`, `Bot::go_offline`).
+* Web: `DirectorView::presence` (`PresenceView`, absent when presence is not attached): the local
+  time, online against scheduled, the target and bounds, the next changes, the counts per chronotype
+  and the curve of the day; the Director view shows it as a block below "Process health".
+* The local time is the machine's (`chrono::Local`) or `utc_offset_hours`.
+
+**Exploring** (goal `explore`, `[explore]`, on by default).
+
+* Landmarks (`aa-world` `landmarks.rs`, `World::landmarks`, built at the first call from the zone
+  grid, the terrain and the recall points, about 0.1 s and 25 KiB for `main_world`): per zone key
+  the walkable ground nearest the middle, the highest walkable ground when it stands 25 m above the
+  middle, the coast nearest the middle (walkable ground with water within 48 m) and the recall
+  points. Keys without a zone group (test maps, cut-scene maps, unused areas) get none. A zone as
+  players know it is the zone group (`Landmarks::region`): "Solzreed Peninsula" is three keys.
+* The planner (`goals/explore/plan.rs`, pure over an `Env`): candidates within `max_trip_m` and at
+  least 150 m away, a landmark in a zone (region) the bot has never stood in counting three times a
+  new landmark of a known zone, a seen one a tenth; hills before the coast, recall points and zone
+  middles; nearer counts more (half at 2 km). The best twelve are drawn by weight and at most six
+  are checked: not at war (`ctx.in_war_zone`), on the bot's part of the navigation mesh or on a
+  portal route (`progress::cut_off`, `travel::has_route`), and safe for its level
+  (`WorldChecks::dangerous`: hostile aggressive monsters `level_gap` above it within 150 m of the
+  place, normal and elite ones within 300 m, `level_gap + 4` above it along the straight line, or
+  the quest goal's `progress::deadly`).
+* The goal (`goals/explore.rs`, trip boxed): travels with `ctx.travel` in legs (a far trip may go
+  by portal), gives up after its time budget (2 minutes plus the distance at 2 m/s, at most 40
+  minutes) and avoids the place for six hours; at the place it looks around for 40 to 100 seconds
+  (half again on a hill, at the coast or in a new zone) with short walks and pauses, and jumps for
+  joy when the bot jumps at all. The place goes into the journal's `seen` (100 m cells) on arrival,
+  the end of the trip sets `last_trip_unix`.
+* Every zone a bot stands in is recorded in `seen.zones` by `Bot::publish`, whatever it does.
+* Score (`goals::explore::score`): 0 unless `[explore] enabled`, settled (60 s), healthy (70 %),
+  not in an instance, past the gap since the last trip (`trip_gap_mins` times `1.5 - explorer`) and
+  with something new within `max_trip_m`. Else `(0.05 + 0.45 * explorer^2) * (1 + 0.1 * new places,
+  up to 6) * (1 + 0.2 * the gaps it is overdue, up to 2)`: about a third of the quest weight for an
+  average bot, more for a born explorer.
+* `GoalArgs::dest` heads for that point, `GoalArgs::zone` for a landmark of that zone at any
+  distance; the checks still apply.
+
+**Wild farms** (`[farm] wild`, `steal`, off by default; `bot/farm/`, `goals/farm.rs`).
+
+* What the server does (AAEmu-1.2-Rust, read-only): `systems/npcs/doodad/manager.rs`
+  `handle_create_doodad` lets a seed go down anywhere on dry ground within 30 m unless
+  `placement.rs` refuses the spot (276 area or restricted zone, 154 too far, 277 and 278 another
+  doodad or a unit too close); on a public farm (`public_farm::can_place`) and on house land the
+  seed costs no labor (house land needs the owner's permission, else `NO_PERM` 2), anywhere else it
+  costs the labor of the seed's use skill (`consume_lp`: 10 for most seeds in `compact.sqlite3`, 1
+  for some, 0 for a few) and too little labor is `LABOR_POWER_NEEDED` 9 (the old `refusal::NO_LABOR`
+  29 never matched; it is 9 now, and `NO_PERM` costs only the spot). The crop is saved with its
+  owner. `interactions.rs` `crop_harvest` and `funcs/skills.rs` let anybody harvest a crop out in
+  the open (owner-only applies inside public farms during the guard time, house land needs house
+  permission), and `phase.rs` `theft_evidence` with `social/crime.rs`
+  `generate_evidence_from_theft` leaves footprints (a reportable crime) when somebody else harvests
+  a character's crop with a crime-point harvest skill (all of 13980 to 20486) within the guard time
+  of 24 hours after the planting.
+* A new land type `WILD_LAND` (9) with `Site::wild` (a 4 m circle) beside the gardens (0) and the
+  public farms (1 to 4); `site::wild_patch` (pure over `WildEnv`) draws 32 candidates 60 to 600 m
+  from the bot and keeps the most secluded one that passes `wild_ok`: dry and flat ground across the
+  patch (1.2 m at most), not a public farm, a housing area or a zone at war, no townsfolk (an NPC
+  friendly to the bot or with a service) within 100 m, no recall or respawn point within 200 m, no
+  hostile aggressive monster within 50 m, no quest giver within 150 m, no real player in view within
+  120 m and not within 150 m of a patch where its crops were stolen. On the real data it finds a
+  patch from 15 of 16 race starts and recall points.
+* Who: `[farm] wild` and an `outlaw` trait of at least `wild_outlaw`, or a goal started with
+  `GoalArgs::wild` (then only the wild patch). An outlaw tries its patch first, up to `wild_plots`
+  (part of `max_plots`). `plan::labor_cap` cuts the run to the seeds its labor pays for; the machine
+  checks the labor before every wild seed and a GM bot tops it up (`/labor`). `GoalArgs::item` picks
+  that seed, or a crop that gives that item.
+* The journal's `wild` section keeps the plots (position, seed, doodad, planted and ripe times,
+  honest), the patch and the robbed patches. `Farm::start` puts the plots back into `FarmMem`
+  (`restore_wild`), so a bot that restarted harvests them; `score` also counts a ripe wild plot of the
+  journal. `FarmMem::observe` now tells the land of a crop found again (a public farm, the bot's
+  garden or a housing area, else wild) and keeps the wild plots when the public-farm list arrives.
+  A plot that leaves the memory is noted (`FarmMem::take_gone`); the goal writes harvested ones out
+  of the journal, and a wild one that was gone when the bot came for it counts as stolen: logged,
+  counted, and its patch is given up for another one.
+* Honesty does not change: a plot is honest only when the ledger counted its seed clean (bought), and
+  a minted seed never is.
+* Stealing (`[farm] steal`): a farming bot keeps the ripe crops of others out in the wild that are in
+  view (`FarmMem::foreign`, four at most). An outlaw with no real player near takes one
+  (`steal_target`): the crop of another bot of this process, or of anybody with
+  `steal_from_players` (never with `bots.gm_bootstrap`). The crop goes into the memory as
+  `STOLEN_LAND` (10) for one harvest run: a dishonest window, no replanting, forgotten when the run
+  ends. The bot does not know when the crop was planted, so a theft within the 24 hours leaves
+  footprints for the owner.
+
+Tests: `presence/tests.rs` and the `schedule` and `plan` unit tests; `landmarks` and
+`goals/explore/plan.rs` unit tests; the wild cases in `bot/farm/tests.rs`, `bot/farm/site.rs`,
+`bot/farm/plan.rs` and `goals/farm/tests.rs`; ignored real-data tests `tests/explore_real_data.rs`
+(the landmarks of `main_world` and the trips a new bot plans from each race's start at levels 1 to
+30) and `tests/wild_real_data.rs` (patches near the starts and recall points, seed labor).
+
+## Gear (`bot/gear/`, goal `gear`)
+
+Bots wear the best pieces they have for their level, get better ones as they level, socket lunagems
+and, if the operator allows it, regrade. On with `[gear] enabled` (the default); minting and
+regrading need `bots.gm_bootstrap`, regrading also `[gear] regrade`.
+
+* **Protocol** (`aa-proto`, byte-exact tests in `tests/cs_gear.rs` and `tests/sc_gear.rs`):
+  `cs::swap_items` (`CSSwapItemsPacket` 0x03a: `u64 from_item_id, u64 to_item_id, u8 from_slot_type,
+  u8 from_slot, u8 to_slot_type, u8 to_slot`, the server's `MoveArgs::read`) with the helpers
+  `equip_into_empty` (from the empty equipment slot, item id 0, to the bag item: the server's
+  `DoEquipInEmptySlot`), `equip_swap` and `unequip`; `cs::start_skill_item_on_item` (`CSStartSkill`
+  with an item caster, `u8 2, bc caster, u64 item id, u32 template, u8 0, u32 0`, and an item target,
+  `u8 3, bc caster, u64 target item id, u32 0, u8 0`: the socketing and the regrade). The equipment
+  detail (type 1, 55 bytes: image, durability, `i16`, lunastone, charge time, dye, seven gem ids,
+  two `u16`s) is read for its gems: `OwnState::equipment_gems` (parallel to `equipment`, at log-in),
+  `ItemChange::Updated::gems` (an item task's update of a piece). `SCItemSocketingLunagemResult`
+  (0x09d: `u8 result, u64 item id, u32 gem, bool install`) is `WorldEvent::LunagemResult`,
+  `SCGradeEnchantResult` (0x09c: `u8 result, Item, u8 grade before, u8 after`) is
+  `WorldEvent::GradeEnchantResult` (`grade_enchant_result`: 0 break, 1 downgrade, 2 fail, 3 success,
+  4 great success).
+* **Data** (`aa-world` `gear.rs`, `World::gear()`): one 8-byte `GearItem` per equippable template
+  (slot type, armor/weapon/accessory, armor kind or holdable, item level, level requirement, fixed
+  grade, gender, gradable and regradable flags; about 8 500 templates, 124 KB with the rest), the
+  lunagems (where they fit, the lowest item level), sockets by slot type and grade, the socket
+  chances (100 % for the first gem, 50 % after), the grade facts (order, stat multiplier, regrade
+  odds), the copper offers of spawned merchants at the grade the server normalizes them to, the plain
+  regrade scrolls and the reward choices of every quest in the order of the client's index. The
+  server checks none of a client's rules (level requirement, gem fit, socket count): the bots do.
+* **Value** (`bot/gear/eval.rs`, pure): `(item level + 4) * grade factor * affinity * (1 + 4 % per
+  gem)`. The affinity (`Fit::of` the class build: armor kind, weapon kinds in order, shield, bow)
+  is 1 for armor of the build's kind, cloaks and accessories, 0.55 for another armor kind, 1 down to
+  0.6 for the build's weapon kinds, 0 for other weapons and for a shield the build does not use.
+  Both hands count together (a two-handed weapon 1.8 times). A bag piece goes on when it adds at
+  least 3 % (`best_move`), the bot meets its level requirement (an item without one at most two
+  levels above the character), and a two-handed weapon that pushes the off-hand piece out has a free
+  bag slot. Tiers are bands of ten levels: band `b` wants item level `10b - 3` and a grade (common,
+  common, uncommon, rare, ancient, heroic); `deficit` is how far the eight core slots are below it.
+* **Memory** (`GearMem`, `BotState::gear`, one pointer): the grade of bag pieces and the gems of the
+  pieces the bot has seen (at most 48 facts, by item id), the equip the duty waits for, the refused
+  pieces (ten minutes), the templates bought or minted this session, what the goal could do, the
+  session's numbers, the last results. The state feeds it: `SCCharacterState` (worn gems, bag size),
+  the bag chunks (grades), the item tasks (grades, gems, moves) and the two results. `BotState`
+  itself now moves pieces between the bag and the equipment with their grades (`move_item`), keeps
+  the grade of a piece added to the equipment and of a regrade, and keeps the gear memory across
+  `reset` (item ids outlive a connection).
+* **Equip duty** (`gear::duty`, one line in `brain.rs` `tick`): every `check_secs` (20 s), not in a
+  fight, a trade, an instance, while loading, travelling by portal, or while the gear, trade,
+  market, auction or dungeon goal runs. It sends one `CSSwapItems`, waits until the piece is worn
+  (4 s), and keeps a refused piece out for ten minutes; then it works out what the goal could do
+  (`plan::want`: cheap, the merchant offers and the worn pieces) and publishes the view.
+* **Goal** (`bot/goals/gear.rs`, `plan.rs`, `machine.rs`): one job per run, in this order: buy a
+  better piece (worth it, at most `max_spend_pct` of the money, the merchant within `max_trip_m`;
+  while minting is allowed only a piece that meets the tier), mint one (`/item add self <template> 1
+  <grade>`: the best piece of a wanted slot that suits the build well, at most the bot's level, at
+  the tier's grade and never of a fixed grade above it, no quest, test or NPC item, a core slot
+  first), socket a gem (only a piece whose gems are known, a free socket by the grade's limit, a gem
+  that fits; always at 100 %, a riskier gem only for a bot with gearhead 0.75 or more, from 30 % at
+  gearhead 1), regrade (a grade a failure cannot destroy; a failure that can lower it only from
+  gearhead 0.8). `GoalArgs::item` names a piece (put on even when worse) or a gem. The machine walks
+  to the merchant, buys one piece and checks the bag, or mints and waits, puts the piece on (one more
+  try after a refusal), or casts the gem's or scroll's use skill on the worn piece and waits for the
+  result. `score` = `weight * (0.3 + 2 * deficit)` for a piece, 0.7 times the weight for a gem, 0.4
+  for a regrade, with `weight = 0.3 * (0.4 + 1.2 * gearhead)`; a failed run rests five minutes.
+* **Quest rewards** (`gear::reward_choice`, at the two places the quest goal sends
+  `CSCompleteQuestContext`): the reward that adds most to the worn set; for the boxes the gear data
+  does not know, a hint from the English name (the build's weapon kind, then its armor kind);
+  otherwise the quest code's own choice.
+* **Journal** (`journal/gear.rs`): the last change, pieces put on, bought (and the copper spent),
+  minted, gems socketed, the last eight failed socketings, regrades.
+* **Web**: `BotDetail::gear` (`GearView`: summary, the worn pieces with slot, name, item level,
+  grade and gems, the tier, the average item level, the deficit, what the goal could do, the last
+  change, the session's numbers), rendered in the bot detail by `renderGear` in `app.js`.
+
+Open points: the client's `SkillCastItemTarget` for a socketing is not known from a capture; the
+bots send the caster's object id, a zero `type1` and `type2` (the server reads only the item id).
+A bag piece's gems are not parsed (its details are skipped), so a piece that comes back to the bag
+socketed counts as unknown and is not socketed again until the server updates it.
 
 ## Parties of real players (`bot/companion/`, goal `companion`)
 

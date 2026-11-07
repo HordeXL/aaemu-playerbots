@@ -595,6 +595,70 @@ pub struct DirectorView {
     pub auto_wishes: Vec<u32>,
     /// Newest first.
     pub log: Vec<ActionRecord>,
+    /// The presence schedules (`[presence]`), when the process has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresenceView>,
+}
+
+/// The presence schedules: who is online now, who is scheduled, what changes next. Part of
+/// [`DirectorView`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PresenceView {
+    /// `[presence] enabled`: off, every bot stays online and the rest is empty.
+    pub enabled: bool,
+    /// The time of day the schedules go by (`HH:MM`).
+    pub local_time: String,
+    /// Its offset from UTC in hours.
+    pub utc_offset_hours: f32,
+    /// Bots in the world or logging in, all together.
+    pub online: u32,
+    /// Of those, the ones the schedules logged in.
+    pub own_online: u32,
+    /// Bots whose schedule says they play now.
+    pub scheduled: u32,
+    /// Bots the schedules aim for now, all together, after the bounds.
+    pub target: u32,
+    pub min_online: u32,
+    /// 0: no limit.
+    pub max_online: u32,
+    /// Bots the schedules manage (the roster without the director's bots).
+    pub pool: u32,
+    /// Bots stopped by hand, left offline until their schedule ends the session.
+    pub held: u32,
+    /// Bots that said goodbye and log out at the next pass.
+    pub leaving: u32,
+    /// Bots due to log out that are busy (a trade, a dungeon, a boat, a player's party).
+    pub waiting: u32,
+    /// Log-ins and log-outs the schedules asked for in the last hour.
+    pub logins_last_hour: u32,
+    pub logouts_last_hour: u32,
+    /// The next log-ins and log-outs, soonest first.
+    pub next: Vec<PresenceChange>,
+    /// Bots, online and scheduled per chronotype.
+    pub chronotypes: Vec<ChronotypeRow>,
+    /// Bots scheduled at each hour of the day (24 values, at half past), before the bounds.
+    pub curve: Vec<u32>,
+}
+
+/// One coming log-in or log-out.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PresenceChange {
+    pub id: u32,
+    pub name: String,
+    /// Seconds from now.
+    pub in_secs: u32,
+    /// Logs in (else out).
+    pub login: bool,
+}
+
+/// The bots of one chronotype.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChronotypeRow {
+    /// `early_bird`, `daytime`, `evening`, `night_owl`.
+    pub chronotype: String,
+    pub bots: u32,
+    pub online: u32,
+    pub scheduled: u32,
 }
 
 #[cfg(test)]
@@ -681,6 +745,33 @@ mod tests {
         // an empty patch changes nothing and is fine
         assert_eq!(patch("{}"), PolicyPatch::default());
         assert!(PolicyPatch::default().validate(&GOALS).is_ok());
+    }
+
+    #[test]
+    fn a_director_view_without_presence_reads_and_writes_as_before() {
+        let v = DirectorView::default();
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("presence"), "{text}");
+        let back: DirectorView = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, v);
+        let with = DirectorView {
+            presence: Some(PresenceView {
+                enabled: true,
+                local_time: "20:15".into(),
+                next: vec![PresenceChange {
+                    id: 3,
+                    name: "Ann".into(),
+                    in_secs: 120,
+                    login: true,
+                }],
+                curve: vec![0; 24],
+                ..PresenceView::default()
+            }),
+            ..DirectorView::default()
+        };
+        let back: DirectorView =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
     }
 
     #[test]

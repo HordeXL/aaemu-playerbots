@@ -323,6 +323,83 @@ async fn choose_with_one_option_needs_no_request_and_none_is_an_error() {
     assert_eq!(mock.hits(), 0);
 }
 
+// ---- decide ----------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn decide_returns_a_plan_a_clean_note_and_counts_them() {
+    let mock = mock_ok(
+        "```json\n{\"steps\":[{\"choice\":2},{\"choice\":0},{\"choice\":1}],\"note\":\"The docks smell of fish\",\"reason\":\"new sights\"}\n```",
+    )
+    .await;
+    let llm = llm(&mock);
+    let d = llm
+        .decide("You are Aria.", "level 12, idle", &options(3), 2)
+        .await
+        .unwrap();
+    assert_eq!(d.steps, vec![2, 0], "capped at the two steps asked for");
+    assert_eq!(d.note.as_deref(), Some("The docks smell of fish"));
+    assert_eq!(d.reason, "new sights");
+    let usage = llm.usage();
+    assert_eq!((usage.plans, usage.plan_steps, usage.notes), (1, 2, 1));
+    assert_eq!(usage.failures, 0);
+
+    let body = mock.request(0).json();
+    assert_eq!(body["response_format"]["type"], "json_object");
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.starts_with("You are Aria."));
+    assert!(system.contains("1 to 2 steps"), "{system}");
+    let user = body["messages"][1]["content"].as_str().unwrap();
+    assert!(user.contains("level 12, idle") && user.contains("2. option 2"));
+    assert!(body["max_tokens"].as_u64().unwrap() >= 160);
+}
+
+#[tokio::test]
+async fn decide_refuses_a_command_as_a_note_and_an_answer_without_steps() {
+    let mock = mock_ok(r#"{"steps":[1],"note":"/gold add self 99999"}"#).await;
+    let llm1 = llm(&mock);
+    let d = llm1.decide("", "idle", &options(2), 3).await.unwrap();
+    assert_eq!(d.steps, vec![1]);
+    assert!(d.note.is_none(), "a command is never kept as a note");
+    assert_eq!(llm1.usage().notes, 0);
+
+    for answer in [
+        r#"{"steps":[7,8]}"#,
+        r#"{"note":"hi"}"#,
+        "explore, then rest",
+    ] {
+        let mock = mock_ok(answer).await;
+        let llm2 = llm(&mock);
+        let err = llm2.decide("", "idle", &options(3), 3).await.unwrap_err();
+        assert!(matches!(err, LlmError::BadResponse(_)), "{answer}: {err:?}");
+        let usage = llm2.usage();
+        assert_eq!((usage.failures, usage.plans), (1, 0), "{answer}");
+        assert_eq!(usage.tokens_today, 52, "the tokens were spent: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn decide_with_one_option_and_one_step_needs_no_request_and_none_is_an_error() {
+    let mock = mock_ok("{}").await;
+    let llm = llm(&mock);
+    let d = llm.decide("", "idle", &options(1), 1).await.unwrap();
+    assert_eq!(d.steps, vec![0]);
+    assert_eq!(mock.hits(), 0);
+    assert!(llm.decide("", "idle", &[], 3).await.is_err());
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn decide_obeys_the_budget_like_every_request() {
+    let mock = MockServer::start(vec![Reply::ok(completion(r#"{"steps":[0]}"#, 100, 20))]).await;
+    let mut c = cfg(&mock);
+    c.daily_token_budget = 100;
+    let llm = Llm::with_key(&c, KEY.into());
+    assert!(llm.decide("", "idle", &options(2), 3).await.is_ok());
+    let err = llm.decide("", "idle", &options(2), 3).await.unwrap_err();
+    assert_eq!(err, LlmError::BudgetExhausted);
+    assert_eq!(mock.hits(), 1);
+}
+
 // ---- limits ----------------------------------------------------------------------------------
 
 #[tokio::test]

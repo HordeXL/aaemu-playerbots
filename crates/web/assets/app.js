@@ -37,7 +37,8 @@ const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 const GOALS = [['auto', 'Auto'], ['quest', 'Quest'], ['grind', 'Grind'], ['duel', 'Duel'], ['trade', 'Trade'],
   ['trade_run', 'Trade run'], ['housing', 'Housing'], ['dungeon', 'Dungeon'], ['sail', 'Sail'],
   ['auction', 'Auction'], ['market', 'Market'], ['guild', 'Guild'], ['gank', 'Gank'], ['warzone', 'Warzone'],
-  ['event', 'Event'], ['companion', 'Companion'], ['farm', 'Farm'], ['rest', 'Rest'], ['wander', 'Wander']];
+  ['event', 'Event'], ['companion', 'Companion'], ['farm', 'Farm'], ['explore', 'Explore'], ['gear', 'Gear'],
+  ['rest', 'Rest'], ['wander', 'Wander']];
 
 const MARKER = {
   house:        { label: 'House',        color: '#a0693a', minScale: 0 },
@@ -293,6 +294,8 @@ function renderStats() {
     if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' throttled');
     if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' chat replies');
     if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' director picks');
+    if (num(l.plans)) extra.push(nf.format(l.plans) + ' plans (' + nf.format(l.plan_steps) + ' steps)');
+    if (num(l.notes)) extra.push(nf.format(l.notes) + ' notes');
     setTile('st-llm', nf.format(l.requests) + ' requests, ' + nf.format(l.failures) + ' failed',
       fmtCount(l.tokens_today) + ' tokens today, ' + (unlimited ? 'no budget limit' : fmtCount(l.budget_left) + ' left') +
       (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));
@@ -571,6 +574,7 @@ function renderDetail() {
   setText(D.pause, b.paused ? 'Resume' : 'Pause');
   renderPartner(b);
   fillPartnerSelects();
+  renderProfile(d);
 
   if (!d) return;
   // quests
@@ -603,6 +607,7 @@ function renderDetail() {
     pf.append(li);
   }
   D.plots.replaceChildren(pf);
+  renderGear(d);
   // chat the bot heard and said, newest first
   const chat = (d.chat || []).slice().sort((a, b) => b.t - a.t).slice(0, 8);
   D.chatWrap.hidden = chat.length === 0;
@@ -624,6 +629,64 @@ function renderDetail() {
     lf.append(li);
   }
   D.log.replaceChildren(lf);
+}
+
+// ------------------------------------------------------------------ gear (the gear feature)
+// What the bot wears, its tier and what its gear goal could do. The block makes its own section
+// of the detail panel (after the plots) the first time it is needed.
+function renderGear(d) {
+  let wrap = $('d-gear-wrap');
+  if (!wrap) {
+    const anchor = $('d-plots-wrap');
+    if (!anchor) return;
+    wrap = h('div');
+    wrap.id = 'd-gear-wrap';
+    wrap.append(h('h3', null, 'Gear'), h('p', 'muted'), h('ul', 'plain'));
+    anchor.after(wrap);
+  }
+  const g = d && d.gear;
+  wrap.hidden = !g;
+  if (!g) return;
+  setText(wrap.children[1], g.summary || '');
+  const f = document.createDocumentFragment();
+  for (const ln of g.lines || []) {
+    const li = h('li');
+    const gems = ln.gems ? ' · ' + ln.gems + (ln.gems === 1 ? ' gem' : ' gems') : '';
+    li.append(h('span', null, ln.slot + ': ' + ln.item), h('span', null, 'lv ' + ln.level + ' ' + ln.grade + gems));
+    f.append(li);
+  }
+  if (!(g.lines || []).length) f.append(h('li', 'empty', 'Wears nothing.'));
+  const st = g.stats || {};
+  const did = [['equipped', 'put on'], ['bought', 'bought'], ['minted', 'minted'], ['socketed', 'socketed'],
+    ['socket_fails', 'sockets failed'], ['regraded', 'regraded']].filter(([k]) => st[k]).map(([k, l]) => l + ' ' + st[k]);
+  if (st.spent) did.push('spent ' + nf.format(st.spent) + ' copper');
+  if (did.length) f.append(h('li', 'empty', 'This session: ' + did.join(', ')));
+  if (g.last_change) f.append(h('li', 'empty', 'Last: ' + g.last_change));
+  wrap.children[2].replaceChildren(f);
+}
+
+// ---- personality: the bot's profile in the detail panel (owned by the personality feature) ----
+const PROFILE_TRAITS = [
+  ['chatty', 'Chatty'], ['joker', 'Jokes'], ['crude', 'Crude'], ['explorer', 'Explorer'],
+  ['outlaw', 'Shady'], ['gearhead', 'Gear'], ['dedication', 'Plays'],
+];
+// Made on first use above the chat of the detail panel; hidden while there is no profile.
+function renderProfile(d) {
+  let wrap = $('d-profile-wrap');
+  if (!wrap) {
+    const chat = $('d-chat-wrap');
+    if (!chat) return;
+    wrap = h('div');
+    wrap.id = 'd-profile-wrap';
+    wrap.append(h('h3', null, 'Personality'), h('p', 'muted'), h('dl', 'kv'));
+    chat.before(wrap);
+  }
+  const p = d && d.profile;
+  wrap.hidden = !p;
+  if (!p) return;
+  const [, summary, dl] = wrap.children;
+  setText(summary, [p.summary, words(p.chronotype)].filter(Boolean).join(' · '));
+  fillKv(dl, PROFILE_TRAITS.map(([k, label]) => [label, Math.round(clamp(num(p[k]), 0, 1) * 100) + '%']));
 }
 
 function snapshotToView(s) {

@@ -60,6 +60,21 @@ const BODY_PART_SLOTS: std::ops::RangeInclusive<u8> = 19..=25;
 /// carried trade pack (or a glider) sits.
 pub const BACKPACK_SLOT: u8 = 26;
 
+/// `GradeEnchantResult`: the `result` of [`WorldEvent::GradeEnchantResult`]
+/// (systems/economy/item_effect_packets.rs:15).
+pub mod grade_enchant_result {
+    /// The item broke (it is gone).
+    pub const BREAK: u8 = 0;
+    /// The grade went down.
+    pub const DOWNGRADE: u8 = 1;
+    /// Nothing changed (the scroll is used up).
+    pub const FAIL: u8 = 2;
+    /// One grade up.
+    pub const SUCCESS: u8 = 3;
+    /// Two grades up (lucky scrolls).
+    pub const GREAT_SUCCESS: u8 = 4;
+}
+
 /// Detail body lengths after the type byte, indexed by `ItemDetailType`
 /// (aaemu-game models/item.rs:158).
 const DETAIL_BODY_LENS: [usize; 10] = [0, 55, 29, 6, 9, 24, 16, 16, 8, 4];
@@ -149,6 +164,9 @@ pub struct OwnState {
     pub bank_slots: i16,
     /// Occupied equipment slots.
     pub equipment: Box<[EquipSlot]>,
+    /// The number of lunagems socketed in each piece of [`OwnState::equipment`] (same order; 0
+    /// for appearance parts).
+    pub equipment_gems: Box<[u8]>,
 }
 
 /// One buff of a unit, as listed in `SCUnitStatePacket`.
@@ -364,7 +382,8 @@ pub enum ItemChange {
         /// New grade.
         grade: u8,
     },
-    /// Item details changed (action 9); the details are not decoded.
+    /// Item details changed (action 9: a socketing, a lunastone, durability); of the details
+    /// only the socketed gems of gear are decoded.
     Updated {
         /// `SlotType` of the container.
         slot_type: u8,
@@ -372,6 +391,9 @@ pub enum ItemChange {
         slot: u8,
         /// Item instance id.
         id: u64,
+        /// Lunagems socketed in it when the details are gear's (`ItemDetailType.Equipment`),
+        /// `None` for other details.
+        gems: Option<u8>,
     },
     /// Item flag bits changed (action 10) or security state changed (action 11).
     FlagsUpdated {
@@ -828,6 +850,34 @@ pub enum WorldEvent {
     /// `SCItemTaskSuccessPacket` (systems/economy/item_packets.rs:15, tasks
     /// models/item_task.rs:385): every item, money and bank change.
     ItemTask(Box<ItemTaskInfo>),
+    /// `SCItemSocketingLunagemResultPacket` (systems/economy/item_effect_packets.rs:91): the end
+    /// of a lunagem cast. A failure (`result` 0 with `installed`) took every gem out of the item;
+    /// the item task that follows has the item's details.
+    LunagemResult {
+        /// 1 = the gem went in, 0 = it did not.
+        result: u8,
+        /// The piece of gear.
+        item_id: u64,
+        /// The gem's template (the dawnstone's for a removal).
+        gem: u32,
+        /// A gem was tried (false for the dawnstone).
+        installed: bool,
+    },
+    /// `SCGradeEnchantResultPacket` (systems/economy/item_effect_packets.rs:51): the end of a
+    /// regrade (`result`: [`grade_enchant_result`]). A broken item is gone (an item task removes
+    /// it), the others carry their new grade.
+    GradeEnchantResult {
+        /// [`grade_enchant_result`].
+        result: u8,
+        /// The piece of gear.
+        item_id: u64,
+        /// Its template.
+        template: u32,
+        /// The grade before.
+        before: u8,
+        /// The grade after.
+        after: u8,
+    },
     /// `SCCharacterLaborPowerChangedPacket` (systems/skills/progress.rs:35).
     LaborChanged {
         /// Labor delta (negative = spent).
@@ -1118,6 +1168,8 @@ fn game_reader(opcode: u16) -> Option<Reader> {
         sc::SCCharacterInvenInitPacket => read_inventory_init,
         sc::SCCharacterInvenContentsPacket => read_inventory,
         sc::SCItemTaskSuccessPacket => read_item_task,
+        sc::SCItemSocketingLunagemResultPacket => read_lunagem_result,
+        sc::SCGradeEnchantResultPacket => read_grade_enchant_result,
         sc::SCCharacterLaborPowerChangedPacket => read_labor_changed,
         sc::SCSkillLearnedPacket => |s| read_skill_learned(s, false),
         sc::SCSkillUpgradedPacket => |s| read_skill_learned(s, true),
@@ -1223,6 +1275,43 @@ struct ItemRec {
     id: u64,
     grade: u8,
     count: i32,
+    /// Lunagems socketed (equipment details only, else 0).
+    gems: u8,
+}
+
+/// `ItemDetailType.Equipment`: the detail block of gear (models/item.rs:24).
+const DETAIL_EQUIPMENT: u8 = 1;
+/// Where the seven gem template ids start in the equipment detail body (after the image item,
+/// durability, an `i16`, the lunastone, the charge time and the dye: `4 + 1 + 2 + 4 + 8 + 4`,
+/// models/item.rs:603 `write_details`).
+const GEMS_AT: usize = 23;
+/// Gem slots of an equipment detail (`gem_ids: [u32; 7]`).
+const GEM_SLOTS: usize = 7;
+
+/// The number of socketed gems in an equipment detail body (the non-zero gem ids); 0 when the
+/// body is too short.
+fn gems_in(body: &[u8]) -> u8 {
+    body.get(GEMS_AT..GEMS_AT + GEM_SLOTS * 4).map_or(0, |b| {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|c| c.iter().any(|&x| x != 0))
+            .count() as u8
+    })
+}
+
+/// Reads the detail body of `detail` type and returns the gems of an equipment detail.
+fn read_detail_body(s: &mut PacketStream, detail: u8) -> Res<u8> {
+    let Some(&len) = DETAIL_BODY_LENS.get(usize::from(detail)) else {
+        return invalid(format!("unknown item detail type {detail}"));
+    };
+    if detail != DETAIL_EQUIPMENT {
+        skip(s, len)?;
+        return Ok(0);
+    }
+    let at = s.pos();
+    skip(s, len)?;
+    Ok(gems_in(&s.as_bytes()[at..at + len]))
 }
 
 /// `Item.Write` (models/item.rs:1061) after the template id: id, grade, flags, count, the typed
@@ -1233,16 +1322,14 @@ fn read_item_body(s: &mut PacketStream, template: u32) -> Res<ItemRec> {
     s.read_u8()?; // flags
     let count = s.read_i32()?;
     let detail = s.read_u8()?;
-    match DETAIL_BODY_LENS.get(usize::from(detail)) {
-        Some(&len) => skip(s, len)?,
-        None => return invalid(format!("unknown item detail type {detail}")),
-    }
+    let gems = read_detail_body(s, detail)?;
     skip(s, 8 + 4 + 4 + 1 + 8 + 8)?; // create time, lifespan, made unit, world id, unsecure, unpack
     Ok(ItemRec {
         template,
         id,
         grade,
         count,
+        gems,
     })
 }
 
@@ -1255,27 +1342,35 @@ fn read_item(s: &mut PacketStream) -> Res<Option<ItemRec>> {
     read_item_body(s, template).map(Some)
 }
 
+/// The occupied equipment slots of a character record and the gems in each (same order).
+#[derive(Default)]
+struct EquipOut {
+    slots: Vec<EquipSlot>,
+    gems: Vec<u8>,
+}
+
 /// The equipment block of `Character.Write` (models/character.rs:449): 28 slots, appearance
 /// parts (19..=25) carry the template only.
-fn read_character_equipment(s: &mut PacketStream, mut out: Option<&mut Vec<EquipSlot>>) -> Res<()> {
+fn read_character_equipment(s: &mut PacketStream, mut out: Option<&mut EquipOut>) -> Res<()> {
     for slot in 0..EQUIPMENT_SLOTS {
         let template = s.read_u32()?;
         if template == 0 {
             continue;
         }
-        let (id, grade) = if BODY_PART_SLOTS.contains(&slot) {
-            (0, 0)
+        let (id, grade, gems) = if BODY_PART_SLOTS.contains(&slot) {
+            (0, 0, 0)
         } else {
             let item = read_item_body(s, template)?;
-            (item.id, item.grade)
+            (item.id, item.grade, item.gems)
         };
         if let Some(out) = out.as_deref_mut() {
-            out.push(EquipSlot {
+            out.slots.push(EquipSlot {
                 slot,
                 template,
                 id,
                 grade,
             });
+            out.gems.push(gems);
         }
     }
     Ok(())
@@ -1311,7 +1406,7 @@ const MIN_CHAR_RECORD: usize = 150;
 /// must be consumed: stopping after the name would parse the next character from equipment bytes.
 fn read_character_record(
     s: &mut PacketStream,
-    equipment: Option<&mut Vec<EquipSlot>>,
+    equipment: Option<&mut EquipOut>,
 ) -> Res<CharRecord> {
     let id = s.read_u32()?;
     let name = s.read_string()?;
@@ -1420,7 +1515,7 @@ fn read_character_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let instance_id = s.read_u32()?;
     skip_sized(s)?; // guid
     skip(s, 4)?; // rwd
-    let mut equipment = Vec::new();
+    let mut equipment = EquipOut::default();
     let c = read_character_record(s, Some(&mut equipment))?;
     s.read_f32()?; // rot x
     s.read_f32()?; // rot y
@@ -1456,7 +1551,8 @@ fn read_character_state(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
         loyalty: c.loyalty,
         bag_slots,
         bank_slots,
-        equipment: equipment.into_boxed_slice(),
+        equipment: equipment.slots.into_boxed_slice(),
+        equipment_gems: equipment.gems.into_boxed_slice(),
     })))
 }
 
@@ -2100,6 +2196,19 @@ fn skip_task_details(s: &mut PacketStream) -> Res<()> {
     skip(s, len)
 }
 
+/// Reads the `(short)128`-prefixed detail block of an item task (`write_padded_details`,
+/// models/item_task.rs:374: the detail type, the details, zero padding): the gems of an equipment
+/// detail, `None` for other details.
+fn read_task_detail_gems(s: &mut PacketStream) -> Res<Option<u8>> {
+    let len = usize::try_from(s.read_i16()?).unwrap_or(0);
+    let at = s.pos();
+    skip(s, len)?;
+    Ok(match s.as_bytes()[at..at + len].split_first() {
+        Some((&DETAIL_EQUIPMENT, body)) => Some(gems_in(body)),
+        _ => None,
+    })
+}
+
 fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
     let action = s.read_u8()?;
     Ok(match action {
@@ -2192,11 +2301,12 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
             let slot_type = s.read_u8()?;
             let slot = s.read_u8()?;
             let id = s.read_u64()?;
-            skip_task_details(s)?;
+            let gems = read_task_detail_gems(s)?;
             ItemChange::Updated {
                 slot_type,
                 slot,
                 id,
+                gems,
             }
         }
         10 => {
@@ -2237,6 +2347,34 @@ fn read_item_change(s: &mut PacketStream) -> Res<ItemChange> {
             }
         }
         other => return invalid(format!("unknown item task action {other}")),
+    })
+}
+
+fn read_lunagem_result(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let result = s.read_u8()?;
+    let item_id = s.read_u64()?;
+    let gem = s.read_u32()?;
+    let installed = s.read_bool()?;
+    some(WorldEvent::LunagemResult {
+        result,
+        item_id,
+        gem,
+        installed,
+    })
+}
+
+fn read_grade_enchant_result(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
+    let result = s.read_u8()?;
+    let item = read_item(s)?;
+    let before = s.read_u8()?;
+    let after = s.read_u8()?;
+    let (item_id, template) = item.map_or((0, 0), |i| (i.id, i.template));
+    some(WorldEvent::GradeEnchantResult {
+        result,
+        item_id,
+        template,
+        before,
+        after,
     })
 }
 

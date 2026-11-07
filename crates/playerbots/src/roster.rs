@@ -102,6 +102,227 @@ impl Temperament {
     }
 }
 
+/// When in the day a bot likes to play (the presence feature's log-in schedule reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Chronotype {
+    /// Mornings and lunch breaks.
+    EarlyBird,
+    /// Spread over the day.
+    #[default]
+    Daytime,
+    /// After work, the evening peak.
+    Evening,
+    /// Late evening into the small hours.
+    NightOwl,
+}
+
+impl Chronotype {
+    /// Every chronotype, in a fixed order.
+    pub const ALL: [Chronotype; 4] = [
+        Chronotype::EarlyBird,
+        Chronotype::Daytime,
+        Chronotype::Evening,
+        Chronotype::NightOwl,
+    ];
+
+    /// The name the roster file and the web UI use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Chronotype::EarlyBird => "early_bird",
+            Chronotype::Daytime => "daytime",
+            Chronotype::Evening => "evening",
+            Chronotype::NightOwl => "night_owl",
+        }
+    }
+
+    /// The chronotype called `name` ([`Chronotype::name`]).
+    pub fn parse(name: &str) -> Option<Chronotype> {
+        Chronotype::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
+/// A change to a [`Profile`]: every trait that is `Some` replaces the old value (the web UI's and
+/// the agent API's `profile` command).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProfilePatch {
+    pub chatty: Option<f32>,
+    pub crude: Option<f32>,
+    pub joker: Option<f32>,
+    pub explorer: Option<f32>,
+    pub outlaw: Option<f32>,
+    pub gearhead: Option<f32>,
+    pub dedication: Option<f32>,
+    pub chronotype: Option<Chronotype>,
+}
+
+impl ProfilePatch {
+    /// `base` with the patch applied, clamped.
+    pub fn apply(&self, base: Profile) -> Profile {
+        Profile {
+            chatty: self.chatty.unwrap_or(base.chatty),
+            crude: self.crude.unwrap_or(base.crude),
+            joker: self.joker.unwrap_or(base.joker),
+            explorer: self.explorer.unwrap_or(base.explorer),
+            outlaw: self.outlaw.unwrap_or(base.outlaw),
+            gearhead: self.gearhead.unwrap_or(base.gearhead),
+            dedication: self.dedication.unwrap_or(base.dedication),
+            chronotype: self.chronotype.unwrap_or(base.chronotype),
+        }
+        .clamped()
+    }
+}
+
+/// The personality of a bot beside its [`Temperament`]: how it talks and plays (0..=1 each). Who
+/// reads which trait:
+///
+/// * `chatty`, `crude`, `joker`: the chat (how often it speaks unasked, how coarse and how funny
+///   it is; the operator caps profanity in `[personality]`).
+/// * `explorer`: the explore goal, `outlaw`: wild ("illegal") farms and other shady business,
+///   `gearhead`: how much the gear goal cares about upgrades and how much risk it takes on
+///   sockets and regrades.
+/// * `dedication` and `chronotype`: the presence feature (how long and how often it plays, and
+///   when in the day).
+///
+/// Stored in the roster; an entry written before profiles existed gets one derived from its bot id
+/// ([`Profile::derived`]), so every restart gives that bot the same personality.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    /// Speaks unasked: 0 hardly ever, 1 never shuts up.
+    pub chatty: f32,
+    /// Coarse language: 0 polite, 1 swears like a sailor.
+    pub crude: f32,
+    /// Jokes and banter: 0 dry, 1 the class clown.
+    pub joker: f32,
+    /// Likes to see new places.
+    pub explorer: f32,
+    /// Does shady things: wild farms on unprotected land, grabbing what lies around.
+    pub outlaw: f32,
+    /// Cares about gear: upgrades, gems, regrades, and the risk it takes for them.
+    pub gearhead: f32,
+    /// How much it plays: 0 a casual who drops in now and then, 1 a no-lifer.
+    pub dedication: f32,
+    /// When in the day it plays.
+    pub chronotype: Chronotype,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Profile::NEUTRAL
+    }
+}
+
+impl Profile {
+    /// Every trait at 0.5, daytime.
+    pub const NEUTRAL: Profile = Profile {
+        chatty: 0.5,
+        crude: 0.5,
+        joker: 0.5,
+        explorer: 0.5,
+        outlaw: 0.5,
+        gearhead: 0.5,
+        dedication: 0.5,
+        chronotype: Chronotype::Daytime,
+    };
+
+    /// A random profile. The traits are skewed the way a server's players are: most bots are
+    /// quiet and polite, a few are chatterboxes, clowns or potty mouths.
+    pub fn random(rng: &mut fastrand::Rng) -> Profile {
+        // (a square pulls most values low and leaves a long tail towards 1)
+        let skew = |rng: &mut fastrand::Rng| {
+            let x = rng.f32();
+            x * x
+        };
+        let even = |rng: &mut fastrand::Rng| 0.1 + rng.f32() * 0.8;
+        let r = |x: f32| (x.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+        let chronotype = match rng.u32(0..100) {
+            0..15 => Chronotype::EarlyBird,
+            15..45 => Chronotype::Daytime,
+            45..80 => Chronotype::Evening,
+            _ => Chronotype::NightOwl,
+        };
+        Profile {
+            chatty: r(0.05 + skew(rng) * 0.95),
+            crude: r(skew(rng)),
+            joker: r(0.05 + skew(rng) * 0.95),
+            explorer: r(even(rng)),
+            outlaw: r(skew(rng)),
+            gearhead: r(even(rng)),
+            dedication: r(even(rng)),
+            chronotype,
+        }
+    }
+
+    /// The profile of bot `id` when the roster has none: [`Profile::random`] seeded by the id, so
+    /// the same bot always gets the same one.
+    pub fn derived(id: u32) -> Profile {
+        let mut rng = fastrand::Rng::with_seed(0x9e37_79b9_7f4a_7c15 ^ u64::from(id));
+        Profile::random(&mut rng)
+    }
+
+    /// The traits clamped to 0..=1 (a hand-edited roster or a web command may say anything).
+    pub fn clamped(self) -> Profile {
+        let c = |x: f32| {
+            if x.is_finite() {
+                x.clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        };
+        Profile {
+            chatty: c(self.chatty),
+            crude: c(self.crude),
+            joker: c(self.joker),
+            explorer: c(self.explorer),
+            outlaw: c(self.outlaw),
+            gearhead: c(self.gearhead),
+            dedication: c(self.dedication),
+            chronotype: self.chronotype,
+        }
+    }
+
+    /// The web UI's view of the profile.
+    pub fn view(&self) -> pb_web::ProfileView {
+        pb_web::ProfileView {
+            chatty: self.chatty,
+            crude: self.crude,
+            joker: self.joker,
+            explorer: self.explorer,
+            outlaw: self.outlaw,
+            gearhead: self.gearhead,
+            dedication: self.dedication,
+            chronotype: self.chronotype.name().to_string(),
+            summary: self.describe(),
+        }
+    }
+
+    /// A few words for the log, the web UI and the LLM persona: the traits that stand out.
+    pub fn describe(&self) -> String {
+        let mut words: Vec<&str> = Vec::new();
+        let pick = |v: f32, hi: &'static str, lo: &'static str| -> Option<&'static str> {
+            if v >= 0.7 {
+                Some(hi)
+            } else if v <= 0.15 && !lo.is_empty() {
+                Some(lo)
+            } else {
+                None
+            }
+        };
+        words.extend(pick(self.chatty, "chatty", "quiet"));
+        words.extend(pick(self.crude, "foul-mouthed", ""));
+        words.extend(pick(self.joker, "jokey", "dry"));
+        words.extend(pick(self.explorer, "explorer", ""));
+        words.extend(pick(self.outlaw, "shady", ""));
+        words.extend(pick(self.gearhead, "gear-obsessed", ""));
+        words.extend(pick(self.dedication, "no-lifer", "casual"));
+        if words.is_empty() {
+            words.push("easygoing");
+        }
+        words.join(", ")
+    }
+}
+
 /// One bot of the roster.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RosterEntry {
@@ -122,6 +343,18 @@ pub struct RosterEntry {
     /// Character id on the server, known once the character exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub char_id: Option<u32>,
+    /// Personality; `None` in a roster written before profiles existed (see
+    /// [`RosterEntry::profile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Profile>,
+}
+
+impl RosterEntry {
+    /// The bot's personality: the stored one, else the one derived from its id.
+    pub fn profile(&self) -> Profile {
+        self.profile
+            .map_or_else(|| Profile::derived(self.id), Profile::clamped)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -292,6 +525,7 @@ impl Roster {
                 archetype: arch.name.clone(),
                 temperament: Temperament::random(rng),
                 char_id: None,
+                profile: Some(Profile::random(rng)),
             });
             added += 1;
         }
@@ -346,6 +580,18 @@ impl Roster {
         match self.get_mut(id) {
             Some(e) if e.char_id != Some(char_id) => {
                 e.char_id = Some(char_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replaces the personality of bot `id` (clamped); returns whether anything changed.
+    pub fn set_profile(&mut self, id: u32, profile: Profile) -> bool {
+        let profile = profile.clamped();
+        match self.get_mut(id) {
+            Some(e) if e.profile != Some(profile) => {
+                e.profile = Some(profile);
                 true
             }
             _ => false,
@@ -598,6 +844,70 @@ mod tests {
     }
 
     #[test]
+    fn profiles_are_stored_for_new_bots_and_derived_for_old_entries() {
+        let arch = Archetypes::builtin().unwrap();
+        let any = |_: u8, _: u8| true;
+        let mut roster = Roster::new();
+        let mut rng = fastrand::Rng::with_seed(21);
+        roster
+            .ensure(40, &spec(&arch, &[1], &any), &mut rng)
+            .unwrap();
+        assert!(roster.entries().iter().all(|e| e.profile.is_some()));
+        // the skew: most bots are polite, a few are not
+        let crude = roster
+            .entries()
+            .iter()
+            .filter(|e| e.profile().crude >= 0.5)
+            .count();
+        assert!((1..20).contains(&crude), "{crude} of 40 are crude");
+        // an entry of an old roster file has none and gets the same derived one every time
+        let old = r#"{"version":1,"bots":[{"id":7,"account":"pb7","char_name":"Old","race":1,
+            "gender":1,"archetype":"Darkrunner","temperament":{"quester":0.5,"duelist":0.5,
+            "trader":0.5,"merchant":0.5,"homebody":0.5}}]}"#;
+        let r = Roster::from_json(old).unwrap();
+        let e = r.get(7).unwrap();
+        assert_eq!(e.profile, None);
+        assert_eq!(e.profile(), Profile::derived(7));
+        assert_eq!(Profile::derived(7), Profile::derived(7));
+        assert_ne!(Profile::derived(7), Profile::derived(8));
+        // the file of an old entry does not grow a profile by itself
+        assert!(!r.to_json().contains("chatty"));
+    }
+
+    #[test]
+    fn a_profile_is_clamped_and_round_trips() {
+        let mut roster = Roster::from_json(
+            r#"{"version":1,"bots":[{"id":1,"account":"pb1","char_name":"A","race":1,"gender":1,
+            "archetype":"Darkrunner","temperament":{"quester":0.5,"duelist":0.5,"trader":0.5,
+            "merchant":0.5,"homebody":0.5},"profile":{"chatty":3.0,"crude":-1.0,
+            "chronotype":"night_owl"}}]}"#,
+        )
+        .unwrap();
+        let p = roster.get(1).unwrap().profile();
+        assert_eq!(p.chatty, 1.0);
+        assert_eq!(p.crude, 0.0);
+        assert_eq!(p.joker, 0.5, "missing traits are neutral");
+        assert_eq!(p.chronotype, Chronotype::NightOwl);
+        let wild = Profile {
+            joker: f32::NAN,
+            ..Profile::NEUTRAL
+        };
+        assert!(roster.set_profile(1, wild));
+        assert!(!roster.set_profile(1, wild), "no change the second time");
+        assert_eq!(roster.get(1).unwrap().profile().joker, 0.5);
+        let back = Roster::from_json(&roster.to_json()).unwrap();
+        assert_eq!(
+            back.get(1).unwrap().profile(),
+            roster.get(1).unwrap().profile()
+        );
+        assert!(!Profile::NEUTRAL.describe().is_empty());
+        for c in Chronotype::ALL {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(json.trim_matches('"'), c.name());
+        }
+    }
+
+    #[test]
     fn ensure_fails_when_no_race_can_be_created() {
         let arch = Archetypes::builtin().unwrap();
         let none = |_: u8, _: u8| false;
@@ -794,6 +1104,7 @@ mod tests {
                 archetype: "X".into(),
                 temperament: Temperament::NEUTRAL,
                 char_id: None,
+                profile: None,
             });
             ((), true)
         });

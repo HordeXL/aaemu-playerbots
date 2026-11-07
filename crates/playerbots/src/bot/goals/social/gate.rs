@@ -60,6 +60,10 @@ const CLAIM_TTL: Duration = Duration::from_secs(15);
 const MAX_CLAIMS: usize = 32;
 /// Cap on the per-minute queues (a limit above this is clamped).
 const MAX_PER_MIN: usize = 600;
+/// Cap on the per-hour queue.
+const MAX_PER_HOUR: usize = 600;
+/// Jokes (and other unasked lines) the hub remembers, so another bot does not tell the same one.
+pub const TOLD: usize = 16;
 
 /// Counters of the chat add-ons, shown in the web UI next to the LLM budget.
 #[derive(Debug, Default)]
@@ -68,10 +72,22 @@ pub struct ChatStats {
     pub llm_replies: AtomicU64,
     /// Replies from the canned table and sent.
     pub canned_replies: AtomicU64,
-    /// Unsolicited bot-to-bot lines sent.
+    /// Unsolicited bot-to-bot lines and remarks on what happened to a bot, sent.
     pub chatter: AtomicU64,
     /// Goals the LLM director chose and the brain started.
     pub director_picks: AtomicU64,
+    /// Ambient lines sent in local chat (canned and LLM-written).
+    pub ambient: AtomicU64,
+    /// Ambient lines the LLM wrote.
+    pub llm_ambient: AtomicU64,
+    /// Lines sent on the shout, trade and group-finding channels.
+    pub channel: AtomicU64,
+    /// Jokes and quips sent.
+    pub jokes: AtomicU64,
+    /// Lines sent with a swear word softened to the cap.
+    pub softened: AtomicU64,
+    /// Lines the language filter refused.
+    pub refused: AtomicU64,
 }
 
 /// Process-wide limits: lines per minute across all bots, and who answers a line of a player.
@@ -79,7 +95,11 @@ pub struct ChatStats {
 pub struct ChatGate {
     chatter: Mutex<VecDeque<Instant>>,
     replies: Mutex<VecDeque<Instant>>,
+    ambient: Mutex<VecDeque<Instant>>,
+    channel: Mutex<VecDeque<Instant>>,
+    llm_chatter: Mutex<VecDeque<Instant>>,
     claims: Mutex<VecDeque<(u64, Instant)>>,
+    told: Mutex<[u16; TOLD]>,
     /// Counters.
     pub stats: ChatStats,
 }
@@ -93,6 +113,41 @@ impl ChatGate {
     /// Takes one of the `per_min` replies to players of the current minute.
     pub fn take_reply(&self, now: Instant, per_min: u32) -> bool {
         take(&self.replies, now, per_min)
+    }
+
+    /// Takes one of the `per_min` ambient lines of the current minute.
+    pub fn take_ambient(&self, now: Instant, per_min: u32) -> bool {
+        take(&self.ambient, now, per_min)
+    }
+
+    /// Takes one of the `per_hour` channel lines of the current hour.
+    pub fn take_channel(&self, now: Instant, per_hour: u32) -> bool {
+        take_within(
+            &self.channel,
+            now,
+            (per_hour as usize).min(MAX_PER_HOUR),
+            Duration::from_secs(3600),
+        )
+    }
+
+    /// Takes one of the `per_min` LLM requests for unasked lines of the current minute.
+    pub fn take_llm_chatter(&self, now: Instant, per_min: u32) -> bool {
+        take(&self.llm_chatter, now, per_min)
+    }
+
+    /// The keys of the lines (jokes above all) the bots said lately, newest first.
+    pub fn told(&self) -> [u16; TOLD] {
+        *self.told.lock()
+    }
+
+    /// Notes that a bot said the line with `key`.
+    pub fn note_told(&self, key: u16) {
+        if key == 0 {
+            return;
+        }
+        let mut told = self.told.lock();
+        told.rotate_right(1);
+        told[0] = key;
     }
 
     /// Whether a bot may answer the line with this `key`: true for the first bot that asks within
@@ -118,14 +173,28 @@ impl ChatGate {
 }
 
 fn take(queue: &Mutex<VecDeque<Instant>>, now: Instant, per_min: u32) -> bool {
-    let limit = (per_min as usize).min(MAX_PER_MIN);
+    take_within(
+        queue,
+        now,
+        (per_min as usize).min(MAX_PER_MIN),
+        Duration::from_secs(60),
+    )
+}
+
+/// Takes one of `limit` events within any `span`.
+fn take_within(
+    queue: &Mutex<VecDeque<Instant>>,
+    now: Instant,
+    limit: usize,
+    span: Duration,
+) -> bool {
     if limit == 0 {
         return false;
     }
     let mut q = queue.lock();
     while q
         .front()
-        .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60))
+        .is_some_and(|t| now.saturating_duration_since(*t) >= span)
     {
         q.pop_front();
     }
@@ -206,6 +275,38 @@ mod tests {
         // replies and chatter are separate budgets
         assert!(gate.take_reply(t0, 1));
         assert!(!gate.take_reply(t0, 1));
+    }
+
+    #[test]
+    fn ambient_channel_and_llm_lines_have_budgets_of_their_own() {
+        let gate = ChatGate::default();
+        let t0 = Instant::now();
+        assert!(gate.take_ambient(t0, 2) && gate.take_ambient(t0, 2));
+        assert!(!gate.take_ambient(t0 + Duration::from_secs(59), 2));
+        assert!(gate.take_ambient(t0 + Duration::from_secs(60), 2));
+        // the channel budget is per hour
+        for _ in 0..4 {
+            assert!(gate.take_channel(t0, 4));
+        }
+        assert!(!gate.take_channel(t0 + Duration::from_secs(3599), 4));
+        assert!(gate.take_channel(t0 + Duration::from_secs(3600), 4));
+        assert!(!gate.take_channel(t0, 0), "zero means none");
+        assert!(gate.take_llm_chatter(t0, 1) && !gate.take_llm_chatter(t0, 1));
+        // none of them takes from the replies or the chatter
+        assert!(gate.take_reply(t0, 1) && gate.take_chatter(t0, 1));
+    }
+
+    #[test]
+    fn the_hub_remembers_the_last_lines_told() {
+        let gate = ChatGate::default();
+        gate.note_told(0);
+        assert!(gate.told().iter().all(|k| *k == 0));
+        for k in 1..=(TOLD as u16 + 3) {
+            gate.note_told(k);
+        }
+        let told = gate.told();
+        assert_eq!(told[0], TOLD as u16 + 3);
+        assert!(!told.contains(&3) && told.contains(&4));
     }
 
     #[test]

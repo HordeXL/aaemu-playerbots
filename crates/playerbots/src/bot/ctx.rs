@@ -15,7 +15,7 @@ use crate::archetype::Archetype;
 use crate::config::Config;
 use crate::hub::{Hub, Logger};
 use crate::issues::IssueReport;
-use crate::roster::Temperament;
+use crate::roster::{Profile, Temperament};
 
 /// Who a bot is: fixed for the life of its task (a rename only changes the name).
 #[derive(Debug, Clone)]
@@ -28,6 +28,9 @@ pub struct Persona {
     pub archetype: Arc<Archetype>,
     /// Temperament with the configured spread applied.
     pub temper: Temperament,
+    /// Personality (chat style, exploring, shady business, gear, play time), see
+    /// [`crate::roster::Profile`].
+    pub profile: Profile,
 }
 
 /// Everything one tick works with. Built by the bot task around its own fields; goals receive

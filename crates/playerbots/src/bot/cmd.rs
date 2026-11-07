@@ -43,6 +43,10 @@ pub enum GoalKind {
     Companion,
     /// Plant and harvest crops (owned by the farming feature).
     Farm,
+    /// See new places (owned by the presence and exploring feature).
+    Explore,
+    /// Get, equip, socket and upgrade gear for the bot's level (owned by the gear feature).
+    Gear,
 }
 
 /// A set of goals, one bit per [`GoalKind::index`] (the brain's `disabled`, `blocked` and gate
@@ -54,7 +58,7 @@ const _: () = assert!(GoalKind::COUNT <= GoalMask::BITS as usize);
 
 impl GoalKind {
     /// Every goal.
-    pub const ALL: [GoalKind; 18] = [
+    pub const ALL: [GoalKind; 20] = [
         GoalKind::Wander,
         GoalKind::Rest,
         GoalKind::Grind,
@@ -73,6 +77,8 @@ impl GoalKind {
         GoalKind::Event,
         GoalKind::Companion,
         GoalKind::Farm,
+        GoalKind::Explore,
+        GoalKind::Gear,
     ];
 
     /// Number of goals.
@@ -104,6 +110,8 @@ impl GoalKind {
             GoalKind::Event => "event",
             GoalKind::Companion => "companion",
             GoalKind::Farm => "farm",
+            GoalKind::Explore => "explore",
+            GoalKind::Gear => "gear",
         }
     }
 
@@ -111,6 +119,29 @@ impl GoalKind {
     pub fn parse(name: &str) -> Option<GoalKind> {
         GoalKind::ALL.into_iter().find(|g| g.name() == name)
     }
+}
+
+/// What a goal is started with when somebody other than the bot's own scoring picks it (the LLM
+/// director, the web UI's `act` command, the agent API). Every field is optional and a goal reads
+/// only the ones it understands; a goal started by the brain's own choice gets none. Boxed in
+/// [`BotCmd::GoalWith`] and in the goals that keep it, so it costs nothing while unused.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GoalArgs {
+    /// A point to go to or work at (x, y): the wander goal walks there, the explore goal heads
+    /// for it.
+    pub dest: Option<[f32; 2]>,
+    /// A zone (zone key, `World::zone_key_at`) to head for: the explore goal, the quest and
+    /// grind goals where they support it.
+    pub zone: Option<u16>,
+    /// An item template the goal is about: the seed of a crop, a piece of gear, goods to sell.
+    pub item: Option<u32>,
+    /// A character the goal is about: a duel partner, a player to follow, a buyer.
+    pub target: Option<Box<str>>,
+    /// The farm goal plants on unprotected land (a wild, "illegal" farm) instead of a garden or a
+    /// public farm.
+    pub wild: bool,
+    /// Who asked and why, for the bot's log ("director: needs gold", "agent: ...").
+    pub why: Option<Box<str>>,
 }
 
 /// What the operator chose with `Command::Goal`.
@@ -173,6 +204,15 @@ pub struct PairOrder {
 pub enum BotCmd {
     /// `Command::Goal`.
     Goal(GoalChoice),
+    /// Start `kind` once, with `args` (the LLM director, the web UI's `act`, the agent API). It
+    /// replaces the running goal at the next tick; afterwards the bot chooses again as before
+    /// (an operator's forced goal comes back). Boxed so that the command stays small.
+    GoalWith {
+        /// The goal.
+        kind: GoalKind,
+        /// Its arguments.
+        args: Box<GoalArgs>,
+    },
     /// `Command::Pause`: stop acting (keep the connection alive).
     Pause,
     /// `Command::Resume`.
@@ -186,6 +226,9 @@ pub enum BotCmd {
         /// The line.
         text: String,
     },
+    /// `Command::Profile`: change the bot's personality (and its roster entry). Boxed so that the
+    /// command stays small.
+    Profile(Box<crate::roster::ProfilePatch>),
     /// `Command::DuelWith`: duel the bot with this id.
     DuelWith(u32),
     /// `Command::TradeWith`: trade with the bot with this id.
@@ -256,6 +299,8 @@ mod tests {
             ("event", GoalKind::Event),
             ("companion", GoalKind::Companion),
             ("farm", GoalKind::Farm),
+            ("explore", GoalKind::Explore),
+            ("gear", GoalKind::Gear),
         ] {
             assert_eq!(GoalKind::parse(name), Some(kind));
             assert_eq!(kind.name(), name);

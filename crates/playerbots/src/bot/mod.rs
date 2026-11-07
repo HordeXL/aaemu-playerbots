@@ -28,6 +28,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod director;
 pub mod farm;
+pub mod gear;
 pub mod goals;
 pub mod guild;
 pub mod manner;
@@ -176,7 +177,9 @@ struct Bot {
     shared: Arc<Shared>,
     slot: Arc<crate::hub::BotSlot>,
     log: Logger,
-    entry: RosterEntry,
+    /// The roster entry (boxed: it is read at login and on renames only, and inline it would cost
+    /// the per-bot budget about 140 bytes).
+    entry: Box<RosterEntry>,
     persona: Persona,
     state: BotState,
     motion: Motion,
@@ -209,11 +212,19 @@ impl Bot {
         let temper = entry.temperament.with_spread(cfg.behavior.persona_spread);
         let slot = shared.hub.register(initial_snapshot(&entry, &archetype));
         let cmd_rx = slot.attach();
+        // (`[personality] enabled = false`: every bot plays the neutral profile)
+        let profile = if cfg.personality.enabled {
+            entry.profile()
+        } else {
+            crate::roster::Profile::NEUTRAL
+        };
+        slot.with(|g| g.profile = Some(profile.view()));
         let persona = Persona {
             id: entry.id,
             name: entry.char_name.clone().into_boxed_str(),
             archetype,
             temper,
+            profile,
         };
         let brain = Brain::new(&cfg.behavior, &persona.temper);
         let mut motion = Motion::new(MotionCfg {
@@ -240,7 +251,7 @@ impl Bot {
         Bot {
             log: Logger::new(slot.clone()),
             slot,
-            entry,
+            entry: Box::new(entry),
             persona,
             state: BotState::new(),
             motion,
@@ -335,7 +346,14 @@ impl Bot {
     }
 
     fn go_offline(&mut self) {
-        self.online_since = None;
+        // (the journal's sessions: the time of a session that reached the world)
+        if let Some(since) = self.online_since.take() {
+            let (secs, now) = (since.elapsed().as_secs(), crate::hub::unix_ms() / 1000);
+            self.shared
+                .hub
+                .journal
+                .update(self.entry.id, |j| j.sessions.logout(now, secs));
+        }
         self.shared.hub.contest.release_bot(self.entry.id);
         self.shared.hub.events.release_bot(self.entry.id);
         self.shared.hub.farms.release_bot(self.entry.id);
@@ -519,7 +537,7 @@ impl Bot {
         });
         if changed {
             if let Some(e) = self.shared.roster.entry(id) {
-                self.entry = e;
+                *self.entry = e;
                 self.persona.name = self.entry.char_name.clone().into_boxed_str();
             }
         }
@@ -537,6 +555,11 @@ impl Bot {
         self.motion
             .enter_world(self.state.me.obj, self.state.me.pos, self.state.me.yaw, now);
         self.online_since = Some(Instant::now());
+        let unix = crate::hub::unix_ms() / 1000;
+        self.shared
+            .hub
+            .journal
+            .update(self.entry.id, |j| j.sessions.login(unix));
         self.paused = false;
         self.secs = 0;
         self.publish(conn);
@@ -819,12 +842,29 @@ impl Bot {
             BotCmd::Whisper { to, text } => {
                 self.out.extend(goals::social::whisper_packet(to, text))
             }
+            BotCmd::Profile(patch) => self.set_profile(patch),
             BotCmd::DuelWith(other) => self.pair_with(*other, PairKind::Duel),
             BotCmd::TradeWith(other) => self.pair_with(*other, PairKind::Trade),
             BotCmd::ServerLogLine { level, line } => self.on_server_log_line(*level, line),
-            BotCmd::Goal(_) | BotCmd::Pair(_) | BotCmd::Party(_) => self.brain.command(&cmd),
+            BotCmd::Goal(_) | BotCmd::GoalWith { .. } | BotCmd::Pair(_) | BotCmd::Party(_) => {
+                self.brain.command(&cmd)
+            }
             BotCmd::PathReady { .. } => {}
         }
+    }
+
+    /// The operator (or the agent API) changed the bot's personality: it takes effect at once and
+    /// is kept in the roster.
+    fn set_profile(&mut self, patch: &crate::roster::ProfilePatch) {
+        let profile = patch.apply(self.persona.profile);
+        self.persona.profile = profile;
+        self.entry.profile = Some(profile);
+        let id = self.entry.id;
+        self.shared
+            .roster
+            .update(|r| ((), r.set_profile(id, profile)));
+        self.slot.with(|g| g.profile = Some(profile.view()));
+        self.log.say(format!("personality: {}", profile.describe()));
     }
 
     /// The operator asked this bot to duel or trade with bot `other`.
@@ -1130,6 +1170,13 @@ impl Bot {
         let zone_key = world.zone_key_at(me.pos[0], me.pos[1]);
         let zone_changed = zone_key != self.zone_key;
         self.zone_key = zone_key;
+        // (every zone the bot stands in goes into the journal's `seen`, whatever it does)
+        if let Some(k) = zone_key.filter(|_| zone_changed) {
+            let (journal, id) = (&self.shared.hub.journal, self.entry.id);
+            if !journal.read(id, |j| j.seen.has_zone(k)) {
+                journal.update(id, |j| j.seen.add_zone(k));
+            }
+        }
         let online_secs = self
             .online_since
             .map_or(0, |t| t.elapsed().as_secs() as u32);
@@ -1355,6 +1402,7 @@ mod tests {
             archetype: "Darkrunner".into(),
             temperament: crate::roster::Temperament::NEUTRAL,
             char_id: None,
+            profile: None,
         };
         let s = initial_snapshot(&entry, arch);
         assert_eq!(

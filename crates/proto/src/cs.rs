@@ -1451,6 +1451,106 @@ pub fn take_attachment_sequentially(mail_id: i64) -> Out {
     })
 }
 
+// ---- gear: equipping, socketing, regrading --------------------------------------------------
+
+/// `SlotType` of the equipment container (the server's `slot_type::EQUIPMENT`).
+pub const SLOT_EQUIPMENT: u8 = 1;
+/// `SlotType` of the bag (the server's `slot_type::INVENTORY`).
+pub const SLOT_BAG: u8 = 2;
+
+/// `CSSwapItemsPacket`: moves the item `from_item_id` from `(from_slot_type, from_slot)` to
+/// `(to_slot_type, to_slot)`, swapping it with `to_item_id` when that slot holds one. The server
+/// checks only that the equipment slot takes the piece's slot type (not the level requirement),
+/// answers a refusal with `SCErrorMsgPacket` 203 (`INVALID_SLOT`) and a move with an item task
+/// (reason 5, `SwapItems`) that echoes the request as an `ItemMove`. A two-handed weapon put into
+/// the main hand sends the off-hand piece to a free bag slot first. Server read:
+/// `systems/economy/item_handlers.rs:91` (`MoveArgs::read`), handler `:135`,
+/// `systems/economy/inventory.rs:811` (`split_or_move_item_ex`).
+///
+/// Body: `u64 from_item_id, u64 to_item_id, u8 from_slot_type, u8 from_slot, u8 to_slot_type,
+/// u8 to_slot`.
+pub fn swap_items(
+    from_item_id: u64,
+    to_item_id: u64,
+    from_slot_type: u8,
+    from_slot: u8,
+    to_slot_type: u8,
+    to_slot: u8,
+) -> Out {
+    game(cs::CSSwapItemsPacket, |s| {
+        s.write_u64(from_item_id)
+            .write_u64(to_item_id)
+            .write_u8(from_slot_type)
+            .write_u8(from_slot)
+            .write_u8(to_slot_type)
+            .write_u8(to_slot);
+    })
+}
+
+/// [`swap_items`] that puts the bag item `item_id` (in bag slot `bag_slot`) into the empty
+/// equipment slot `equip_slot`. The client sends this FROM the empty equipment slot (item id 0)
+/// TO the bag item (the server's `DoEquipInEmptySlot`, `systems/economy/inventory.rs:893`).
+///
+/// Body: `u64 0, u64 item_id, u8 1, u8 equip_slot, u8 2, u8 bag_slot`.
+pub fn equip_into_empty(equip_slot: u8, bag_slot: u8, item_id: u64) -> Out {
+    swap_items(0, item_id, SLOT_EQUIPMENT, equip_slot, SLOT_BAG, bag_slot)
+}
+
+/// [`swap_items`] that swaps the worn piece `worn_id` (in `equip_slot`) with the bag item `bag_id`
+/// (in `bag_slot`): the bag item is equipped, the worn piece takes its bag slot (`DoSwap`).
+///
+/// Body: `u64 worn_id, u64 bag_id, u8 1, u8 equip_slot, u8 2, u8 bag_slot`.
+pub fn equip_swap(worn_id: u64, equip_slot: u8, bag_id: u64, bag_slot: u8) -> Out {
+    swap_items(
+        worn_id,
+        bag_id,
+        SLOT_EQUIPMENT,
+        equip_slot,
+        SLOT_BAG,
+        bag_slot,
+    )
+}
+
+/// [`swap_items`] that takes the worn piece `worn_id` off `equip_slot` into the free bag slot
+/// `bag_slot` (`DoMoveAllToEmpty`).
+///
+/// Body: `u64 worn_id, u64 0, u8 1, u8 equip_slot, u8 2, u8 bag_slot`.
+pub fn unequip(worn_id: u64, equip_slot: u8, bag_slot: u8) -> Out {
+    swap_items(worn_id, 0, SLOT_EQUIPMENT, equip_slot, SLOT_BAG, bag_slot)
+}
+
+/// `CSStartSkillPacket`: a skill cast by an inventory item on another item (`SkillCastItemTarget`):
+/// a lunagem socketed into a piece of gear (the gem's use skill, 23728 in 1.2, with the
+/// `ItemSocketing` effect), a regrade scroll on a piece (`GradeEnchant`). The caster block is the
+/// one of [`start_skill_item`]; the target block is `u8 3` and the item target (`ObjId`, `Id`,
+/// `Type1`, `Type2`). The server only reads the target item id (`item_target`,
+/// `systems/economy/bridges.rs:137`); the object id is the caster's own, as in the server's tests,
+/// and the two type fields are 0. Server read: `systems/skills/handlers.rs:36`,
+/// `SkillCastTarget::read` `systems/skills/types.rs:256`.
+///
+/// Body: `u32 skill, u8 2, bc caster, u64 item id, u32 item template, u8 0, u32 0, u8 3 target
+/// type, bc caster, u64 target item id, u32 0, u8 0, u8 0 flag`.
+pub fn start_skill_item_on_item(
+    skill_id: u32,
+    caster: u32,
+    item_id: u64,
+    item_template: u32,
+    target_item_id: u64,
+) -> Out {
+    start_skill(
+        skill_id,
+        item_caster(caster, item_id, item_template),
+        |s| {
+            s.write_u8(3)
+                .write_bc(caster)
+                .write_u64(target_item_id)
+                .write_u32(0)
+                .write_u8(0);
+        },
+        &SkillObject::None,
+    )
+}
+
 // ---- travel: portals, instances, boats -------------------------------------------------------
 
 /// Skill 11215 "Entering location in Teleport Book": records the caster's position as a new book
