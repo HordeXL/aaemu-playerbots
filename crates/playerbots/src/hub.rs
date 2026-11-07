@@ -454,12 +454,6 @@ impl Hub {
         self
     }
 
-    /// The hub with the presence schedules (the presence feature builds them from the config).
-    pub fn with_presence(mut self, presence: crate::presence::Presence) -> Hub {
-        self.presence = presence;
-        self
-    }
-
     /// Hands an order to the supervisor without waiting.
     pub(crate) fn order(&self, cmd: SupCmd) -> Result<(), String> {
         self.supervisor

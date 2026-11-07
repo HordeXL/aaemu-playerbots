@@ -9,8 +9,8 @@
 //!   when those are off) and, next to them, concrete variants the bot can do now: `explore` a
 //!   zone it has never been in (from the quest atlas and its journal; reachable, not in a zone at
 //!   war and not deadly for its level, the danger test of [`progress::deadly`]), `wander` to the
-//!   town of its zone or to its house, `farm wild` (only with `[farm] wild` and an
-//!   [`WILD_OUTLAW_MIN`] outlaw streak). A choice maps to [`GoalArgs`] and is started with
+//!   town of its zone or to its house, `farm wild` (only with `[farm] wild` and an outlaw trait
+//!   of at least `farm.wild_outlaw`, the farm goal's own threshold). A choice maps to [`GoalArgs`] and is started with
 //!   [`Brain::queue_with`](super::brain::Brain::queue_with).
 //! * **A plan.** The answer ([`pb_llm::Llm::decide`]) is up to `llm.director_plan_steps` steps.
 //!   The brain keeps them here and starts the next one whenever a goal ends; each step is checked
@@ -56,8 +56,6 @@ pub type Steps = SmallVec<[Opt; MAX_PLAN]>;
 pub const MAX_OPTIONS: usize = 10;
 /// Steps a plan may have at most (`llm.director_plan_steps` is clamped to it).
 pub const MAX_PLAN: usize = 5;
-/// The outlaw trait (`Profile::outlaw`) a bot needs before `farm wild` is offered.
-pub const WILD_OUTLAW_MIN: f32 = 0.6;
 /// A plan is forgotten this long after the answer came.
 pub const PLAN_TTL_MS: u64 = 30 * 60_000;
 /// A request that has not answered after this long is forgotten.
@@ -353,9 +351,11 @@ pub fn step_allowed(
         }
 }
 
-/// Whether this bot may farm wild land: `[farm] wild` is on and its outlaw streak is strong enough.
+/// Whether this bot may farm wild land: `[farm] wild` is on and its outlaw trait reaches
+/// `farm.wild_outlaw` (the same threshold the farm goal uses).
 pub fn wild_ok(ctx: &Ctx<'_>) -> bool {
-    ctx.cfg.farm.enabled && ctx.cfg.farm.wild && ctx.persona.profile.outlaw >= WILD_OUTLAW_MIN
+    let f = &ctx.cfg.farm;
+    f.enabled && f.wild && ctx.persona.profile.outlaw >= f.wild_outlaw
 }
 
 /// The options for this tick: the eligible goals (`scored`, best first) and the variants the bot

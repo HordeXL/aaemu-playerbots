@@ -248,6 +248,42 @@ async fn system_lines_stay_readable_and_a_whisper_gets_a_whisper_back() {
 
 /// A local chat-completions endpoint that always answers `content`.
 async fn mock(content: &'static str) -> (String, Arc<AtomicUsize>) {
+    mock_with(Arc::new(move |_| content.to_string())).await
+}
+
+/// What a mock model answers, from the request body.
+type Answer = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// The answer of a model that plans the one option starting with `label` (the request lists the
+/// options as `i. text`), so the test does not hang on how many options come before it.
+fn pick(label: &'static str) -> Answer {
+    Arc::new(move |body| {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let text = v["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let i = text
+            .lines()
+            .find_map(|l| {
+                let (n, option) = l.split_once(". ")?;
+                option
+                    .starts_with(label)
+                    .then(|| n.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(99);
+        format!(r#"{{"steps": [{{"choice": {i}}}], "reason": "feels like a break"}}"#)
+    })
+}
+
+/// A local chat-completions endpoint that answers what `answer` makes of the request body.
+async fn mock_with(answer: Answer) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
@@ -258,6 +294,7 @@ async fn mock(content: &'static str) -> (String, Arc<AtomicUsize>) {
                 return;
             };
             let h = h.clone();
+            let answer = answer.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -285,6 +322,7 @@ async fn mock(content: &'static str) -> (String, Arc<AtomicUsize>) {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 h.fetch_add(1, Ordering::SeqCst);
+                let content = answer(&String::from_utf8_lossy(&buf[head_end..]));
                 let body = serde_json::json!({
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}],
                     "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
@@ -327,8 +365,10 @@ async fn the_director_starts_the_goal_the_model_picks() {
         eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
         return;
     };
-    // only wander and rest are switched on, so the options are [wander, rest] and 1 is "rest"
-    let (base, hits) = mock(r#"{"choice": 1, "reason": "feels like a break"}"#).await;
+    // the quest, grind, duel, trade and housing goals are off; the options are wander and rest
+    // and what the director adds next to them (a walk to the zone's town, a zone to explore), so
+    // the model answers with the number of the line "rest: ..."
+    let (base, hits) = mock_with(pick("rest:")).await;
     let (mut cfg, llm) = director_config(base);
     cfg.behavior = BehaviorCfg {
         quest: 0.0,
