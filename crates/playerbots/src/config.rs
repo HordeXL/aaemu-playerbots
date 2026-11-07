@@ -746,16 +746,58 @@ impl Default for GearCfg {
 /// `[personality]`: every bot has a [`Profile`](crate::roster::Profile) (how chatty, crude and
 /// funny it is, whether it explores, does shady things, cares about gear, and when and how much it
 /// plays). Off: every bot behaves like the neutral profile.
+///
+/// The chat keys: how coarse any bot may be (`profanity`, a hard cap on every line, canned or
+/// model-written), whether the LLM writes some of the unasked lines, and the process-wide rates of
+/// the ambient lines and the channel lines (the bots' own chattiness only decides who of them
+/// speaks within these).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PersonalityCfg {
-    /// Master switch of the personalities.
+    /// Master switch of the personalities. Off: every bot plays the neutral profile, and its chat
+    /// stays clean.
     pub enabled: bool,
+    /// The coarsest language any bot may use in chat: `off`, `mild` (damn, hell, crap, wtf, ffs)
+    /// or `strong` (harsher exclamations too). Slurs, hate, sexual words, insults and threats are
+    /// refused at every level.
+    pub profanity: pb_llm::persona::Profanity,
+    /// With `[llm] enabled`: the model may write some of the ambient lines too (at most two a
+    /// minute for all bots together; the canned line is the fallback).
+    pub llm_chatter: bool,
+    /// All bots together say at most this many ambient lines per minute (remarks and jokes in
+    /// local chat while a real player is near; 0 = none).
+    pub ambient_per_min: u32,
+    /// All bots together say at most this many lines per hour on the shout, trade and
+    /// group-finding channels (0 = none).
+    pub channel_lines_per_hour: u32,
 }
 
 impl Default for PersonalityCfg {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            profanity: pb_llm::persona::Profanity::Mild,
+            llm_chatter: true,
+            ambient_per_min: 2,
+            channel_lines_per_hour: 4,
+        }
+    }
+}
+
+impl PersonalityCfg {
+    /// Checks the chat rates (a typo must not open the floodgates).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.ambient_per_min <= 60,
+            "personality.ambient_per_min {} is above the limit of 60",
+            self.ambient_per_min
+        );
+        ensure!(
+            self.channel_lines_per_hour <= 120,
+            "personality.channel_lines_per_hour {} is above the limit of 120",
+            self.channel_lines_per_hour
+        );
+        Ok(())
     }
 }
 
@@ -1343,6 +1385,7 @@ impl Config {
             c.reply_chance.is_finite() && (0.0..=1.0).contains(&c.reply_chance),
             "social.reply_chance must be in 0..=1"
         );
+        self.personality.validate()?;
         ensure!(
             self.llm.director_interval_secs >= 30,
             "llm.director_interval_secs must be at least 30"
@@ -2367,6 +2410,51 @@ emote = true
             "[gear]\nmax_trip_m = 10.0\n",
             "[gear]\nmax_trip_m = nan\n",
             "[gear]\nregrade = 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_personality_keys_default_to_mild_and_low_rates() {
+        use pb_llm::persona::Profanity;
+        let p = Config::default().personality;
+        assert!(p.enabled && p.llm_chatter);
+        assert_eq!(p.profanity, Profanity::Mild);
+        assert_eq!((p.ambient_per_min, p.channel_lines_per_hour), (2, 4));
+        let ex = Config::parse(Config::example()).unwrap().personality;
+        assert!(ex.enabled && ex.llm_chatter);
+        assert_eq!(ex.profanity, Profanity::Mild);
+        assert_eq!((ex.ambient_per_min, ex.channel_lines_per_hour), (2, 4));
+        assert_documented(
+            "personality",
+            &[
+                "enabled = true",
+                "profanity = \"mild\"",
+                "llm_chatter = true",
+                "ambient_per_min = 2",
+                "channel_lines_per_hour = 4",
+            ],
+        );
+        for (text, want) in [
+            ("off", Profanity::Off),
+            ("mild", Profanity::Mild),
+            ("strong", Profanity::Strong),
+        ] {
+            let cfg = Config::parse(&format!("[personality]\nprofanity = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.personality.profanity, want);
+        }
+        let cfg = Config::parse("[personality]\nambient_per_min = 0\nchannel_lines_per_hour = 0\n")
+            .unwrap();
+        assert_eq!(cfg.personality.ambient_per_min, 0);
+        for bad in [
+            "[personality]\nprofanity = \"extreme\"\n",
+            "[personality]\nprofanity = true\n",
+            "[personality]\nprofanity = \"Mild\"\n",
+            "[personality]\nambient_per_min = 61\n",
+            "[personality]\nchannel_lines_per_hour = 121\n",
+            "[personality]\nambient_per_min = -1\n",
+            "[personality]\njokes = true\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

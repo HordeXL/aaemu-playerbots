@@ -309,8 +309,30 @@ max_trip_m = 3000.0
 [personality]
 # Every bot has a personality beside its temperament: how chatty, crude and funny it is, whether it
 # explores, does shady things or obsesses over gear, and when and how long it plays. Stored in the
-# roster. Off: every bot behaves like the neutral profile.
+# roster. Off: every bot behaves like the neutral profile, and its chat stays clean.
+#
+# In chat a chatty bot answers more of what it overhears, says more unasked and waits less between
+# lines (a quiet one hardly speaks); a jokey one tells ArcheAge jokes (labor, gankers, regrades,
+# the queue, lag ...); a crude one swears now and then, within the cap below. All of it stays
+# inside the process-wide rates ([social] replies_per_min and chatter_per_min, and the two below)
+# and the per-bot limits (at most 1 to 5 unasked lines in 10 minutes, by chattiness).
 enabled = true
+# The coarsest language any bot may use in chat: "off" (none), "mild" (damn, hell, crap, wtf, ffs)
+# or "strong" (harsher exclamations too). Only ever an exclamation about the game, never aimed at
+# a player; slurs, hate, sexual words, insults and threats are refused at every level. The cap
+# filters every line, canned or written by the LLM: a word above it is softened ("damn" becomes
+# "dang") or the line is not sent.
+profanity = "mild"
+# With [llm] enabled, the model may write some of the ambient lines too (at most 2 a minute for
+# all bots together; the canned line is the fallback). Without [llm] it does nothing.
+llm_chatter = true
+# All bots together say at most this many ambient lines per minute: remarks and jokes in local
+# chat while a real player is near (0 = none; at most 60). A chatterbox says one every few
+# minutes, a quiet bot hardly ever.
+ambient_per_min = 2
+# All bots together say at most this many lines per hour on the shout, trade and group-finding
+# channels (0 = none; at most 120). Only the chattier bots use them, and never to advertise.
+channel_lines_per_hour = 4
 
 [presence]
 # Bots log in and out on schedules of their own, so the population rises and falls like a real

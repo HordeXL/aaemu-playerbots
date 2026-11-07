@@ -1,6 +1,7 @@
-//! Canned chat lines for when the LLM is off (or busy): a small table of short templates per
-//! kind of remark, flavoured by the bot's dominant trait, picked so that a bot does not repeat
-//! itself. `{n}` stands for the name of the player spoken to.
+//! Canned chat replies for when the LLM is off (or busy): a small table of short templates per
+//! kind of line heard, flavoured by the bot's dominant trait, picked so that a bot does not repeat
+//! itself. `{n}` stands for the name of the player spoken to. What a bot says unasked is in
+//! [`super::lines`] and [`super::humor`].
 
 /// What a heard line is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,29 +22,35 @@ pub enum Intent {
     Other,
 }
 
-/// What a bot says on its own.
+/// The keys of the last `N` templates used: category in the high byte, template in the low (0
+/// marks a free slot; no category is 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Chatter {
-    /// After a duel.
-    DuelDone,
-    /// After a trade.
-    TradeDone,
-    /// Meeting another bot.
-    Hello,
+pub struct Recent<const N: usize = 4>([u16; N]);
+
+impl<const N: usize> Default for Recent<N> {
+    fn default() -> Self {
+        Recent([0; N])
+    }
 }
 
-/// Index of a template that was used lately: category in the high bits, template in the low.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Recent([u16; 4]);
-
-impl Recent {
-    fn has(&self, key: u16) -> bool {
-        self.0.contains(&key)
+impl<const N: usize> Recent<N> {
+    /// Whether `key` was used lately.
+    pub fn has(&self, key: u16) -> bool {
+        key != 0 && self.0.contains(&key)
     }
 
-    fn push(&mut self, key: u16) {
+    /// Notes `key` as used, forgetting the oldest.
+    pub fn push(&mut self, key: u16) {
+        if N == 0 {
+            return;
+        }
         self.0.rotate_right(1);
         self.0[0] = key;
+    }
+
+    /// The key used last (0 for none).
+    pub fn last(&self) -> u16 {
+        self.0.first().copied().unwrap_or(0)
     }
 }
 
@@ -202,29 +209,6 @@ fn generic(intent: Intent) -> &'static [&'static str] {
     }
 }
 
-const DUEL_DONE: &[&str] = &[
-    "gg",
-    "gg {n}",
-    "gg, good fight",
-    "well fought {n}",
-    "nice one {n}",
-];
-const TRADE_DONE: &[&str] = &[
-    "thx {n}",
-    "thanks for the trade {n}",
-    "pleasure doing business",
-    "deal, cheers {n}",
-];
-const HELLO: &[&str] = &["hey {n}", "o/ {n}", "hi {n}", "yo {n}", "hello {n}"];
-
-fn chatter_table(kind: Chatter) -> &'static [&'static str] {
-    match kind {
-        Chatter::DuelDone => DUEL_DONE,
-        Chatter::TradeDone => TRADE_DONE,
-        Chatter::Hello => HELLO,
-    }
-}
-
 /// What the line is about, from keywords. Order matters: a farewell beats a thank-you beats a
 /// request for help beats a greeting ("hi, can you help?" is a request).
 pub fn classify(text: &str) -> Intent {
@@ -303,12 +287,6 @@ pub fn reply(
     fill(generic(intent), generic_cat, who, recent, rng)
 }
 
-/// A line a bot says on its own.
-pub fn chatter(kind: Chatter, who: &str, recent: &mut Recent, rng: &mut fastrand::Rng) -> String {
-    let cat = 0x40 | kind as u16;
-    fill(chatter_table(kind), cat, who, recent, rng)
-}
-
 /// How many lines of `table` were not used lately.
 fn fresh(table: &[&str], cat: u16, recent: &Recent) -> usize {
     (0..table.len())
@@ -334,7 +312,7 @@ fn fill(
             .unwrap_or(0)
     } else {
         let mut idx = rng.usize(..table.len());
-        if table.len() > 1 && key(idx) == recent.0[0] {
+        if table.len() > 1 && key(idx) == recent.last() {
             idx = (idx + 1) % table.len();
         }
         idx
@@ -344,7 +322,7 @@ fn fill(
 }
 
 /// Fills `{n}`; with no name the placeholder (and the space before it) disappears.
-fn render(template: &str, who: &str) -> String {
+pub fn render(template: &str, who: &str) -> String {
     if template.contains("{n}") {
         if who.is_empty() {
             return template
@@ -401,9 +379,6 @@ mod tests {
                 assert!(l.chars().count() <= 60, "{l}");
             }
         }
-        for k in [Chatter::DuelDone, Chatter::TradeDone, Chatter::Hello] {
-            assert!(chatter_table(k).len() >= 4);
-        }
     }
 
     #[test]
@@ -439,15 +414,5 @@ mod tests {
         // an unknown trait falls back to the generic table
         let line = reply(Intent::Greet, "balanced", "Bob", &mut recent, &mut rng);
         assert!(!line.is_empty());
-    }
-
-    #[test]
-    fn chatter_lines_come_from_their_own_tables() {
-        let mut rng = fastrand::Rng::with_seed(1);
-        let mut recent = Recent::default();
-        for _ in 0..20 {
-            let l = chatter(Chatter::DuelDone, "Bob", &mut recent, &mut rng);
-            assert!(l.contains("gg") || l.contains("well fought") || l.contains("nice one"));
-        }
     }
 }

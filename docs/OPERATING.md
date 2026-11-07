@@ -38,6 +38,7 @@ reads it (default `playerbots.toml`).
 | `[gear]` | Gear that follows progression, on by default: `enabled`, `buy`, `mint`, `socket`, `regrade` (off), `max_spend_pct`, `check_secs` and `max_trip_m` (see [Gear](#gear-gear)). |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
+| `[personality]` | Personalities, on by default: `enabled`, the profanity cap `profanity` (`off`, `mild` default, `strong`), `llm_chatter`, `ambient_per_min` and `channel_lines_per_hour` (see [Personalities](#personalities)). |
 | `[llm]` | The optional chat and director add-on. |
 | `[issues]` | The server issue reports (see [ISSUES.md](ISSUES.md)). |
 
@@ -835,10 +836,55 @@ Social chat is on by default (`[social]`) and needs no LLM:
   that it does not repeat itself, after a human-like pause.
 * Bots also chat with each other, rarely: "gg" after a duel, a thanks after a trade, now and then
   a hello to a bot standing close by. By default only while a real player is within 150 m.
+* They remark on what happens to them, say things unasked near a real player and, the chattier
+  ones, now and then on the shout, trade or group-finding channel: see
+  [Personalities](#personalities).
 * Everything is rate limited per bot (a pause between replies, a burst cap, a cap per
-  conversation) and for all bots together (`social.replies_per_min`, `social.chatter_per_min`).
+  conversation, a cap on unasked lines) and for all bots together (`social.replies_per_min`,
+  `social.chatter_per_min`, `personality.ambient_per_min`, `personality.channel_lines_per_hour`).
+  `social.bot_chatter = false` silences every unasked line; `social.enabled = false` all chat.
 * System and notice lines the server sends (for example the answer to a GM command) are not
   dropped: they are kept in a small ring per bot that goals read.
+
+### Personalities
+
+Every bot has a personality in the roster (`chatty`, `joker`, `crude` and the traits of the other
+features; the web UI shows it in the bot's detail and the `profile` command changes it). In chat:
+
+* **Chattiness.** A chatterbox answers more of what it overhears (up to 1.75 times
+  `social.reply_chance`), waits less between lines, remarks on more of what happens and says an
+  ambient line every few minutes; a quiet bot answers a third as often and hardly says anything
+  unasked. Each bot says at most 1 (quiet) to 5 (chatterbox) unasked lines in 10 minutes, with a
+  gap of 30 s (chatterbox) to 2 minutes (quiet) between two.
+* **Remarks.** "ding" at a level up, "rip" after a death, a sigh about gankers after a death to a
+  character, a word after a quest, a sold trade pack, a harvest, a finished house, a bag full of
+  loot, a duel won or lost, a trade. Nothing is said while dead; the remark about a death comes
+  after the resurrection.
+* **Ambient lines.** While a real player is near, small talk and jokes in local chat. All bots
+  together say at most `personality.ambient_per_min` (2) a minute. A jokey bot tells ArcheAge jokes
+  (labor that always runs out, gankers on the trade routes, Freedich and the Kraken, the login
+  queue, regrades that break weapons, lunagems, stolen crops and thunderstruck trees, Mirage Isle,
+  Diamond Shores, pirates, Hasla, carrot farmers, the land rush, lag), and no bot tells a joke
+  another bot told lately.
+* **Channels.** The chattier bots (chattiness 0.3 and up) now and then say a line on shout, trade
+  or group finding; all bots together at most `personality.channel_lines_per_hour` (4) an hour.
+  These lines are banter, never advertisements or requests the bot would not follow up.
+* **Profanity.** A crude bot swears now and then, only as an exclamation about the game, never at
+  a player. `personality.profanity` caps every line, canned or written by the LLM: `off` (none),
+  `mild` (damn, hell, crap, wtf, ffs; the default) or `strong` (harsher words too). A word above
+  the cap is softened ("damn" becomes "dang", "fuck" becomes "frick") or the line is not sent.
+  Slurs, hate, sexual words, insults and threats are refused at every level, for the lines of
+  every feature (also behind leetspeak or stretched letters).
+* **With the LLM** (`[llm] enabled`): the model gets the bot's style (quiet or chatty, dry or
+  jokey, how coarse it may be) in its prompt, and with `personality.llm_chatter` (on by default)
+  it writes about half of the ambient lines, at most 2 a minute for all bots together, inside the
+  LLM's own budget; the canned line is the fallback.
+* `personality.enabled = false`: every bot talks like the neutral profile and stays clean.
+
+The worked-out numbers in two simulated hours next to a real player: a chatterbox says about 45
+unasked lines, a neutral bot about 11, a typical bot about 5, a quiet one about 2. However many
+bots there are, the process says at most `chatter_per_min + ambient_per_min` (6) unasked lines a
+minute plus `channel_lines_per_hour` (4) an hour.
 
 ### Chat and decisions with an LLM (optional)
 
@@ -865,8 +911,8 @@ export DEEPSEEK_API_KEY=sk-...        # PowerShell: $env:DEEPSEEK_API_KEY = "sk-
 playerbots run --config playerbots.toml
 ```
 
-* **Replies.** The bot builds a persona from its roster entry (name, race, class, temperament, the
-  zone it is in) and asks the model for one short chat line in character, with the last four lines
+* **Replies.** The bot builds a persona from its roster entry (name, race, class, temperament,
+  personality, the zone it is in) and asks the model for one short chat line in character, with the last four lines
   of its conversation with that player as context. The request runs on its own task; the bot never
   waits for the network. Whispers come back as whispers.
 * **Director.** With `llm.director = true` each bot asks, about every `director_interval_secs`
@@ -912,8 +958,10 @@ playerbots run --config playerbots.toml
   and set the budget to taste.
 * **Safety.** Model output is untrusted. Every reply goes through `pb_llm::sanitize_reply`, which
   rejects (rather than repairs) anything that starts with `/` or a look-alike of it (the server
-  would run it as a GM command), contains a link or an address, or gives away that the speaker is
-  an AI, and cuts the rest to 120 characters. The send path checks again and refuses any chat line
+  would run it as a GM command), contains a link or an address, a slur, hate, a sexual word, an
+  insult or a threat, or gives away that the speaker is an AI, and cuts the rest to 120
+  characters; then the bot's profanity level caps the swearing (see
+  [Personalities](#personalities)). The send path checks again and refuses any chat line
   whose first visible character is a slash, empty or too long. Other players' words only ever
   appear as chat messages, never in the instructions, and names are reduced to letters and digits
   before they reach a prompt. The director's options are made by the bot from its own eligibility

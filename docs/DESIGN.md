@@ -438,6 +438,76 @@ lines, `assemble`, `explore_candidates`, `zone_level`, the example config. `agen
 over stdio against the real router on 127.0.0.1 with a fake hub. pb-web: the catalog's schemas and
 routes, `note`, and the agent routes end to end (`tests/api.rs`).
 
+## Personalities (`bot/goals/social/`, `[personality]`)
+
+Bots talk like players: some chat a lot and some hardly at all, some joke about the game, some
+swear now and then. The chat reads three traits of the bot's `Profile` (`chatty`, `joker`,
+`crude`); routing, replies and the old limits work as before.
+
+* **Style** (`social/style.rs`, `Style`): plain arithmetic from the three traits and the operator's
+  cap. Chattiness `c` scales the chance to answer an overheard line (`reply_chance` times
+  `0.25 + 1.5c`), the reply gap (`1.25 - 0.5c`), the gap between two unasked lines
+  (`chatter_gap_secs` times `2^(1-2c)`), the chance of a remark (`0.4 + 1.2c`), the mean gap
+  between two ambient lines (3 minutes times `20^(1-c)`: 13 minutes at 0.5, 50 at 0.05), the
+  gap between two channel lines (20 minutes times `30^(1-c)`, none below 0.3) and the per-bot cap
+  of `1 + round(4c)` unasked lines in 10 minutes. 0.5 is the plain chat from before. Humor `j`:
+  an ambient line is a joke with `0.1 + 0.8j`, small talk gets a quip with `0.35j`. Coarseness
+  `k`: the bot's own level is clean below 0.4, mild below 0.75 and strong above, capped by
+  `[personality] profanity` (default `mild`); a crude bot leans towards the coarse templates
+  (weight `0.25 + 1.75k` against 1 for a clean one) and answers small talk coarsely with `0.3k`.
+  With `[personality] enabled = false` every bot talks like the neutral profile and stays clean.
+* **Lines** (`social/lines.rs`, `social/humor.rs`): static templates, each with the coarsest
+  level it uses (`c`, `m`, `s`) and the slots `{n}` (a name), `{lv}` (a level), `{z}` (the zone)
+  and `{x}` (an exclamation the bot's tongue allows, "ugh" to "fucking hell"). Remarks per
+  `Chatter` kind (duel won, lost or drawn, trade, hello, ding, death, gank, quest, pack, harvest,
+  house, loot); ambient small talk; shout, trade and group-finding lines, tested never to read as
+  market talk, because the market and the economy board read those channels; 69 jokes on
+  fourteen ArcheAge topics (labor, packs and gankers, Freedich and the Kraken, the queue,
+  regrades, lunagems, farm drama, Mirage Isle, Diamond Shores, boats and pirates, Hasla, carrot
+  farmers, the land rush, lag), quips and coarse answers. No repeats: per bot (`Recent`, 4 keys
+  for replies and remarks, 8 for the rest) and across bots (`ChatGate::told`, the last 16 keys).
+* **What happened** (`Tally`, `Social::observe`): on every tick the chat reads a few counters of
+  the bot's state (level, dead, quests completed, `Ledger::packs_sold`, houses finished and
+  under construction, `FarmMem::harvested`, `PvpMem::deaths`, the duel watch's last end through
+  `DuelWatch::peek_end` before the duel goal takes it, and once a minute the bag count) and notes
+  a `ChatEvent` when they change: a level up; a death, told at the resurrection, a gank when a
+  character killed the bot; a quest; a pack; a harvest; a house that was being built and is
+  finished; a bag 12 items fuller. A counter that jumps by more than two is a reload, and in
+  the first 30 s after a spawn only a level or a death counts. The brain still notes the ends of
+  duels and trades (`end_goal`); the duel's outcome picks the won or lost lines. Nothing outside
+  the social module had to change for it. A fresh event of a higher rank is not replaced.
+* **Ambient and channel lines** are tried at the look-around (every 15 to 30 s) when the bot's
+  own schedule says so, a real player is near (with `chatter_needs_player`), the bot's cap has
+  room and the process-wide budget gives a slot (`ambient_per_min`, `channel_lines_per_hour`,
+  `ChatGate::take_ambient` / `take_channel`). With `[llm] enabled` and `llm_chatter` half of the
+  ambient lines are asked of the model (`reply::build_remark_request`: the persona prompt and a
+  fixed topic hint, never player text), at most two requests a minute for all bots
+  (`ChatGate::take_llm_chatter`), with the canned line as the fallback.
+* **The language filter** (`pb_llm::persona`): `blocked` refuses slurs, hate, sexual words,
+  insults and threats (whole words after lower-casing and leetspeak, stretched letters, a plural
+  `s`, word beginnings such as `nigg` or `retard`, phrases such as "kill yourself", and the worst
+  words also spelled out with spaces). It is part of `sanitize_reply` and of `social::wire_text`,
+  so every chat line of every feature passes it. `cap_profanity` grades the swear words (mild:
+  damn, hell, crap, wtf, ffs and a few more; strong: the rest) and softens a word above the cap
+  ("fuck" to "frick", "shit" to "crap" or "crud", "damn" to "dang"); a word without a softer form,
+  or more than three to soften, rejects the line. `sanitize_chat(text, level)` is both; the social
+  module runs it at the bot's level when it schedules a line, canned or written by the model, and
+  once more just before the wire. A model reply in a foul-mouthed persona's voice cannot pass
+  under `off`.
+* **LLM persona**: `Persona::style` (`ChatStyle`: chattiness and humor in percent, the profanity
+  level) adds a "Your style:" line to the system prompt (quiet or chatterbox; dry, or ArcheAge
+  jokes never at another player's expense; clean, mild cussing, or gamer swearing, never aimed at a
+  player); the rules stay, plus "never insult anyone and never use slurs".
+* **Cost**: the new state is in `Social`, which the brain already boxes, so `size_of::<Bot>()` is
+  unchanged. A tick reads the counters (a few loads; the bag once a minute); the tables are
+  static; the filter runs once per line said.
+
+The limits, worked out with the defaults: replies 20 a minute, remarks and bot-to-bot lines 4,
+ambient lines 2, channel lines 4 an hour and LLM-written ambient lines 2 a minute (inside the LLM's
+own budget), for all bots together. In two simulated hours next to a real player a chatterbox
+(chatty 1) says about 45 unasked lines, a neutral bot about 11, a typical one (0.3) about 5 and a
+quiet one (0.05) about 2; fifty chatterboxes together still say at most 2 ambient lines a minute.
+
 ## Farming (`bot/farm/`, goal `farm`)
 
 Bots buy seeds, plant them, wait and harvest, and they grow what the economy is short of. Everything

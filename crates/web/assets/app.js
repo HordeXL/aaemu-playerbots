@@ -574,6 +574,7 @@ function renderDetail() {
   setText(D.pause, b.paused ? 'Resume' : 'Pause');
   renderPartner(b);
   fillPartnerSelects();
+  renderProfile(d);
 
   if (!d) return;
   // quests
@@ -662,6 +663,30 @@ function renderGear(d) {
   if (did.length) f.append(h('li', 'empty', 'This session: ' + did.join(', ')));
   if (g.last_change) f.append(h('li', 'empty', 'Last: ' + g.last_change));
   wrap.children[2].replaceChildren(f);
+}
+
+// ---- personality: the bot's profile in the detail panel (owned by the personality feature) ----
+const PROFILE_TRAITS = [
+  ['chatty', 'Chatty'], ['joker', 'Jokes'], ['crude', 'Crude'], ['explorer', 'Explorer'],
+  ['outlaw', 'Shady'], ['gearhead', 'Gear'], ['dedication', 'Plays'],
+];
+// Made on first use above the chat of the detail panel; hidden while there is no profile.
+function renderProfile(d) {
+  let wrap = $('d-profile-wrap');
+  if (!wrap) {
+    const chat = $('d-chat-wrap');
+    if (!chat) return;
+    wrap = h('div');
+    wrap.id = 'd-profile-wrap';
+    wrap.append(h('h3', null, 'Personality'), h('p', 'muted'), h('dl', 'kv'));
+    chat.before(wrap);
+  }
+  const p = d && d.profile;
+  wrap.hidden = !p;
+  if (!p) return;
+  const [, summary, dl] = wrap.children;
+  setText(summary, [p.summary, words(p.chronotype)].filter(Boolean).join(' · '));
+  fillKv(dl, PROFILE_TRAITS.map(([k, label]) => [label, Math.round(clamp(num(p[k]), 0, 1) * 100) + '%']));
 }
 
 function snapshotToView(s) {
