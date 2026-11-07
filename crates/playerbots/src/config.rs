@@ -152,6 +152,10 @@ pub struct BotsCfg {
     pub tick_ms: u64,
     /// Brain tick while a bot stands still.
     pub idle_tick_ms: u64,
+    /// Milliseconds between two movement updates of a walking bot that a real player can see
+    /// (the 1.2 client sends about seven a second, the server's NPCs ten). Between brain ticks
+    /// the bot only moves on and sends the update.
+    pub move_update_ms: u64,
     /// Run speed in m/s (the client's base run speed is about 5.4).
     pub move_speed: f32,
     /// Walk speed in m/s.
@@ -178,6 +182,7 @@ impl Default for BotsCfg {
             gm_bootstrap: false,
             tick_ms: 250,
             idle_tick_ms: 1500,
+            move_update_ms: 125,
             move_speed: 5.4,
             walk_speed: 1.8,
             long_travel_teleport_m: 0.0,
@@ -1165,6 +1170,10 @@ impl Config {
             "bots.idle_tick_ms must not be below bots.tick_ms"
         );
         ensure!(
+            (50..=b.tick_ms).contains(&b.move_update_ms),
+            "bots.move_update_ms must be between 50 and bots.tick_ms"
+        );
+        ensure!(
             b.move_speed.is_finite() && b.move_speed > 0.0 && b.move_speed <= 25.0,
             "bots.move_speed must be in (0, 25] m/s"
         );
@@ -1451,6 +1460,7 @@ mod tests {
         assert_eq!(cfg.server.account_prefix, "pb");
         assert_eq!(cfg.bots.tick_ms, def.bots.tick_ms);
         assert_eq!(cfg.bots.idle_tick_ms, def.bots.idle_tick_ms);
+        assert_eq!(cfg.bots.move_update_ms, def.bots.move_update_ms);
         assert_eq!(cfg.bots.races, def.bots.races);
         assert!(!cfg.bots.gm_bootstrap);
         assert_eq!(cfg.web.bind.to_string(), "127.0.0.1:8790");
@@ -1482,6 +1492,9 @@ mod tests {
         assert!(Config::parse("[nope]\nx = 1\n").is_err());
         assert!(Config::parse("[bots]\ntick_ms = 10\n").is_err());
         assert!(Config::parse("[bots]\ntick_ms = 500\nidle_tick_ms = 100\n").is_err());
+        assert!(Config::parse("[bots]\nmove_update_ms = 20\n").is_err());
+        assert!(Config::parse("[bots]\nmove_update_ms = 300\n").is_err());
+        assert!(Config::parse("[bots]\nmove_update_ms = 250\n").is_ok());
         assert!(Config::parse("[bots]\nraces = [\"gnome\"]\n").is_err());
         assert!(Config::parse("[bots]\nraces = []\n").is_err());
         assert!(Config::parse("[bots]\nmove_speed = 0\n").is_err());

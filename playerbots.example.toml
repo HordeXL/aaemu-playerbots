@@ -55,6 +55,10 @@ gm_bootstrap = false
 # Brain tick while a bot moves or fights, and while it stands still (milliseconds).
 tick_ms = 250
 idle_tick_ms = 1500
+# Milliseconds between two movement updates of a walking bot that a real player can see (the
+# 1.2 client sends about seven a second, the server's NPCs ten). Between brain ticks the bot only
+# moves on and sends the update. 50 to tick_ms; a bot nobody can see sends one a second.
+move_update_ms = 125
 # Run and walk speed in metres per second.
 move_speed = 5.4
 walk_speed = 1.8

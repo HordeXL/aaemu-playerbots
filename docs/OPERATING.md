@@ -23,7 +23,7 @@ reads it (default `playerbots.toml`).
 | --- | --- |
 | `[server]` | The login server's public address (`login`), the world to enter (`world_id`), the bot account prefix and the shared password. |
 | `[data]` | Paths of the server's `compact.sqlite3` and `app/Data` directory, the baked data directory (`baked`) and the world name. |
-| `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings, reconnect back-off. |
+| `[bots]` | How many bots, the login ramp, the roster file, the races for new characters, `gm_bootstrap`, tick and speed settings (`move_update_ms`: the movement updates of a walker a real player can see, 125 ms), reconnect back-off. |
 | `[behavior]` | The weights of the goals (0 switches a goal off), the personas' spread, the switches `trade_with_players`, `portals`, `dungeons`, `dungeon_level_up`, `sailing` and `navmesh`, and the life-like movement settings `lifelike`, `jump_rate` and `emotes`. |
 | `[sail]` | The boat the sailing goal uses: `ship` = `rowboat` (default), `clipper`, `cutter`, `junk`, `yawl`, `schooner` or `auto` (see [Sailing](#sailing)). |
 | `[market]` | Selling: `enabled`, `auction`, `chat_ads`, `sell_to_players`, `meet_at`, `max_ads_per_hour` and `ad_interval_secs` (see [Selling](#selling-market)). |
@@ -1219,6 +1219,10 @@ director state is allocated at a bot's first tick (well under 1 KB). The terrain
 memory-mapped and shared by all bots, so only the pages around the bots are resident. The web UI
 shows the resident memory of the process and the bytes per online bot; the design target is under
 256 KiB of bot-side state per bot. Ticks are adaptive with jitter (250 ms while moving or
-fighting, longer when idle) so hundreds of bots do not wake up together.
+fighting, longer when idle) so hundreds of bots do not wake up together. A walking bot that a real
+player can see (within 190 m) also wakes between them, every `bots.move_update_ms` (125 ms), to move
+on and send its position, as the client does about seven times a second; the server passes each
+update to the players around, so the bots in view of players cost about twice the movement
+traffic of before. Raise `move_update_ms` (up to `tick_ms`) to trade smoothness for traffic.
 
 Measured numbers are in the [README](../README.md#memory-and-scale).

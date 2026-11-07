@@ -7,10 +7,12 @@
 //! [`STUCK_WINDOW_MS`]) inserts side steps and finally reports [`MoveFailure::Stuck`]; every trip
 //! also has a [`TRIP_TIMEOUT_MS`] limit.
 //!
-//! The server only knows the position of the last `CSMoveUnit`, and the update gap grows to a
-//! second when no player is near, so the server can see the bot a run-second (5 m) behind. Before
-//! a packet whose range the server checks (loot, talk, sell, craft, cast) the caller asks
-//! [`Motion::pin`] for an exact update.
+//! While a real player can see the bot, the bot loop ticks the controller every
+//! `bots.move_update_ms` (125 ms) and every tick of a walk sends an update, at an even pace like
+//! the client's own; a bot nobody can see sends one a second. The server only knows the position
+//! of the last `CSMoveUnit`, so it can see such a bot a run-second (5 m) behind. Before a packet
+//! whose range the server checks (loot, talk, sell, craft, cast) the caller asks [`Motion::pin`]
+//! for an exact update.
 //!
 //! A bot that has a [`NavLink`] ([`Motion::attach_nav`]) does not walk the straight line when the
 //! navigation mesh knows the way: its [`NavState`] plans the trip and the controller integrates
@@ -53,6 +55,10 @@ const MAX_STEP_MS: u64 = 1000;
 const FACE_EPSILON: f32 = 0.09;
 /// The server's idea of the position may be this far off before [`Motion::pin`] corrects it.
 const PIN_EPSILON_M: f32 = 0.15;
+/// A moving update is due this many ms before its gap is over: the timer of the bot loop wakes a
+/// little late or early, and a tick that just misses the gap must not skip an update (which
+/// would double the next gap).
+const SEND_SLACK_MS: u64 = 20;
 
 /// Where the ground is. [`aa_world::World`] answers from the baked height grid.
 pub trait Ground {
@@ -158,8 +164,8 @@ pub struct MotionEnv<'a> {
     pub out: &'a mut Vec<Out>,
     /// Randomness for side steps.
     pub rng: &'a mut fastrand::Rng,
-    /// Minimum time between two "moving" updates (the tick time, or a second when nobody is
-    /// watching).
+    /// Minimum time between two "moving" updates (`bots.move_update_ms` while a real player can
+    /// see the bot, a second otherwise).
     pub send_gap_ms: u64,
     /// The bot is fighting: weapons drawn.
     pub combat: bool,
@@ -334,15 +340,6 @@ impl Motion {
             .map(|t| t.saturating_sub(now_ms))
     }
 
-    /// The factor on the tick period of a bot that walks in front of a player: the movement
-    /// updates then come at an uneven pace, 20 % either way, like a person's.
-    pub fn period_scale(&self, rng: &mut fastrand::Rng) -> f32 {
-        match self.life.as_deref() {
-            Some(l) if l.gate.show() && self.is_moving() => 0.8 + 0.4 * rng.f32(),
-            _ => 1.0,
-        }
-    }
-
     /// The idle mannerisms of a bot that stands and may show off: a turn on the spot, now and
     /// then a small shuffle at walk pace. Called every tick by the goals that stand (rest,
     /// wander pauses); it does nothing while the bot walks, has no audience or is busy.
@@ -386,6 +383,11 @@ impl Motion {
                 }
             }
         }
+    }
+
+    /// Whether the trip waits for an answer of the planner pool (`BotCmd::PathReady`).
+    pub fn awaits_path(&self) -> bool {
+        self.nav.as_ref().is_some_and(|n| n.awaits_answer())
     }
 
     /// Lets this controller walk navmesh routes (see [`super::nav`]). Without it every trip is
@@ -918,14 +920,10 @@ impl Motion {
             }
             return;
         }
-        // (in front of a player the updates go out every tick, which is uneven by design)
-        let gap = if self.life.as_deref().is_some_and(|l| l.gate.show()) {
-            env.send_gap_ms * 3 / 4
-        } else {
-            env.send_gap_ms
-        };
+        // (the loop ticks a walker in view every gap, so every such tick sends: evenly paced)
+        let since = now.saturating_sub(self.last_send_ms);
         let due =
-            self.force_send || !self.moving_sent || now.saturating_sub(self.last_send_ms) >= gap;
+            self.force_send || !self.moving_sent || since + SEND_SLACK_MS >= env.send_gap_ms.max(1);
         if due {
             self.send(env, true, vel);
         }
@@ -1617,6 +1615,43 @@ mod tests {
         let quiet = count(1000);
         assert_eq!(busy, 40);
         assert!((10..=11).contains(&quiet), "{quiet}");
+    }
+
+    /// A walker a real player can see is ticked every `move_update_ms` and sends an update on
+    /// every tick, evenly, also when the timer wakes it a few ms early or late; the position of
+    /// each update is where the one before said the bot would be.
+    #[test]
+    fn a_walker_in_view_sends_evenly_paced_updates_that_agree_with_each_other() {
+        let t = ramp();
+        let mut rig = Rig::new([10.0, 10.0, 121.0]);
+        rig.motion.go_to(400.0, 10.0, 0.0, Pace::Run, rig.now);
+        let mut times = Vec::new();
+        for i in 0..80u64 {
+            // 125 ms on average, the timer off by up to 8 ms either way
+            let dt = 125 + (i % 3) * 8 - 8;
+            rig.tick(&t, dt, 125);
+            times.push(rig.now);
+        }
+        let moving: Vec<&Out> = rig.out.iter().filter(|p| flags(p) == 0x02).collect();
+        assert_eq!(moving.len(), 80, "an update on every tick");
+        let read = |p: &Out| {
+            let mut s = aa_proto::PacketStream::from_bytes(p.body.clone());
+            s.read_bc().unwrap();
+            s.read_u8().unwrap();
+            let time = s.read_u32().unwrap();
+            s.read_u8().unwrap();
+            let (x, y, _) = s.read_position().unwrap();
+            let vx = f32::from(s.read_i16().unwrap()) * 60.0 / 32767.0;
+            (time, x, y, vx)
+        };
+        for w in moving.windows(2) {
+            let (t0, x0, _, vx) = read(w[0]);
+            let (t1, x1, _, _) = read(w[1]);
+            let dt = (t1 - t0) as f32 / 1000.0;
+            assert!((117..=133).contains(&(t1 - t0)), "{}", t1 - t0);
+            // (dead reckoning from the update before: within the position's wire precision)
+            assert!((x0 + vx * dt - x1).abs() < 0.05, "{x0} {vx} {dt} {x1}");
+        }
     }
 
     #[test]
