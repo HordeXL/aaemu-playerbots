@@ -343,11 +343,26 @@ daily_token_budget = 200000
 temperature = 0.8
 max_reply_tokens = 80
 # The director: every `director_interval_secs` (per bot, jittered by +-30 %) a bot asks the model
-# which of the goals it may pick right now to do next. The pick is applied only if the goal is
-# still eligible (never a goal that is switched off, cooling down, or needs gm_bootstrap when that
-# is off); otherwise, or when the request fails, the bot's own scoring decides. Minimum 30.
+# what to do next. It is offered at most ten options: the goals it may pick right now (never one
+# that is switched off, cooling down, or needs gm_bootstrap when that is off) and concrete
+# variants of them it can do now ("explore <zone>" for a zone it has never been in that is not
+# deadly for its level, "wander to the town of <zone>", "wander home", "farm wild" with
+# [farm] wild and a shady streak). The answer is a short plan; each step starts when the goal
+# before it ends, and only if it is still allowed. When a request fails the bot's own scoring
+# decides. director_interval_secs: minimum 30.
 director = false
 director_interval_secs = 600
+# Steps the model may plan ahead in one answer (1..=5).
+director_plan_steps = 3
+# Ask sooner than the interval after a level-up, a death, a failed goal, a zone the bot has never
+# been in, or when the plan runs out.
+director_triggers = true
+# Never two director requests of one bot within this many seconds (also for the triggers;
+# minimum 30).
+director_min_gap_secs = 120
+# The answer may carry a short note the bot keeps in its journal (filtered like a chat line); the
+# model sees the last notes again as the bot's own memories.
+director_notes = true
 
 [issues]
 # Server issue reports: while they play, the bots notice problems with the SERVER (a quest that

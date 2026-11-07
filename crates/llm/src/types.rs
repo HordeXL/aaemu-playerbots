@@ -106,6 +106,19 @@ pub struct Choice {
     pub reason: String,
 }
 
+/// Result of [`Llm::decide`](crate::Llm::decide): a short plan made of the offered options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// Zero-based indices into the options that were offered, in the order the model wants them
+    /// done: at least one, at most the steps asked for, each in range.
+    pub steps: Vec<usize>,
+    /// One short line the character wants to remember, already filtered like a chat line
+    /// ([`sanitize_reply`](crate::sanitize_reply)); `None` when there is none or it was refused.
+    pub note: Option<String>,
+    /// The model's short justification (may be empty).
+    pub reason: String,
+}
+
 /// Counters for the operator UI. All token numbers are what the endpoint reported (or an
 /// estimate when it reported none).
 #[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,4 +137,10 @@ pub struct LlmUsage {
     pub tokens_today: u64,
     /// Tokens left today; `u64::MAX` when the budget is disabled.
     pub budget_left: u64,
+    /// Plans ([`Llm::decide`](crate::Llm::decide)) that came back with at least one usable step.
+    pub plans: u64,
+    /// Steps in those plans, all together.
+    pub plan_steps: u64,
+    /// Plans that came with a usable note.
+    pub notes: u64,
 }

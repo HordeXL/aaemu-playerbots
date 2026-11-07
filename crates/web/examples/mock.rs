@@ -663,6 +663,9 @@ impl BotHub for MockHub {
                 rate_limited: inner.tick / 90,
                 chat_replies: 3 + inner.tick / 40,
                 director_picks: 2 + inner.tick / 120,
+                plans: 1 + inner.tick / 150,
+                plan_steps: 2 + inner.tick / 60,
+                notes: inner.tick / 300,
             }),
             open_issues,
             queued_issues,
@@ -686,6 +689,20 @@ impl BotHub for MockHub {
 
     fn map_image(&self) -> Option<Vec<u8>> {
         self.png.clone()
+    }
+
+    fn zones(&self) -> Vec<pb_web::ZoneEntry> {
+        [
+            (129, "Solzreed Peninsula"),
+            (133, "Gweonid Forest"),
+            (144, "Arcum Iris"),
+        ]
+        .into_iter()
+        .map(|(key, name)| pb_web::ZoneEntry {
+            key,
+            name: name.into(),
+        })
+        .collect()
     }
 
     fn issues(&self) -> Vec<IssueSummary> {
@@ -859,6 +876,10 @@ impl BotHub for MockHub {
             Command::Profile(_) => {
                 let i = idx.ok_or("needs a bot")?;
                 inner.bots[i].say_log("personality changed");
+            }
+            Command::Note { text } => {
+                let i = idx.ok_or("needs a bot")?;
+                inner.bots[i].say_log(format!("note: {text}"));
             }
             Command::Whisper { to, text } => {
                 let i = idx.ok_or("needs a bot")?;

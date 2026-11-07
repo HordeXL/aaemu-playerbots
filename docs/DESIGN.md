@@ -15,7 +15,8 @@ and an operator web UI, which the original does not have.
 - Bots quest, grind, duel each other, trade with each other, run trade packs and own houses.
 - A web UI shows every bot on the world map with its activity, and accepts commands.
 - An optional cheap LLM (any OpenAI-compatible endpoint, e.g. DeepSeek) gives bots chat replies
-  and occasional high-level goal choices. Everything works without it.
+  and short plans of their next goals; an LLM outside the process can drive them through the
+  agent API and MCP. Everything works without it.
 
 ## Crates
 
@@ -70,7 +71,8 @@ aa-world` (only for shared baked file types); nothing else depends on anything i
 Each bot has a **persona**: an archetype (class + rotation, from the original's
 `BotArchetypes.json`/`BotRotations`) and temperament weights (quester, duelist, trader, merchant,
 homebody). A utility scorer picks the next goal when the current one finishes or fails; the
-optional LLM director may choose among the same eligible goals instead.
+optional LLM director may plan among the same eligible goals (and concrete variants of them)
+instead (see [LLM control and the agent API](#llm-control-and-the-agent-api)).
 
 | Goal | Summary |
 | --- | --- |
@@ -341,6 +343,100 @@ types. A feature fills in its own files and reads its own `[section]`.
 only), which took `size_of::<Bot>()` from 3192 to 3136 bytes with the profile in the persona and
 the goal arguments in the brain: the four features have 56 bytes to spend, so their per-bot state
 belongs behind one pointer each (or in the journal, or the hub).
+
+## LLM control and the agent API
+
+Two ways for a model to steer the bots more finely than "pick a goal": the in-process **director**
+(`bot/director.rs`, `[llm] director = true`) and the **agent API** for an LLM outside the process
+(`pb-web` `agent.rs`, `playerbots` `agent.rs`, the `playerbots mcp` bridge in `agent/mcp.rs`).
+Both end in the same place: a goal started once with [`GoalArgs`] (`Brain::queue_with`), which the
+goal reads (`Wander` walks to `dest` and strolls there; `Explore` reads `zone`, `Farm` reads `wild`).
+
+| Part | Where | What |
+| --- | --- | --- |
+| `Llm::decide`, `Decision` | pb-llm `decide.rs`, `client.rs` | A plan request: numbered options in, `{"steps":[{"choice":n}],"note":"…","reason":"…"}` out; tolerant parsing like `choose`, steps that name no option dropped, the note through `sanitize_reply`; counts plans, steps and notes (`LlmUsage`). |
+| `Opt`, `What`, `menu`, `assemble`, `explore_candidates`, `step_allowed` | `bot/director.rs` | The options: the eligible goals best first plus variants (`explore <zone>`, `wander` to a town or home, `farm wild`), at most 10. |
+| `Director` | `bot/director.rs` (in the brain's boxed `Chat`) | Timing (interval, triggers, minimum gap), the request in flight, the plan, the last goals, the level and zone of the last look. |
+| `director_step`, `on_decision`, `next_step`, `director_wake`, `publish_agent` | `bot/brain.rs` | The glue: ask, keep the note and the plan, start the next step when a goal ends, wake on death and failure, fill the agent slot. |
+| `Notes::push_clean` | `journal/notes.rs` | The one way a note gets into the journal (director and `note` command). |
+| `Wander::with_args` | `bot/goals/wander.rs` | `dest`: travel there in legs (`pvp::walk::Walker`, so portals and `/move` work), then stroll around it. |
+| `ZoneNames`, `resolve_zones`, `act_command`, `write_note`, `observe`, `AgentSlot` | `agent.rs`, `hub.rs` (`Hub::zones`, `SlotInner::agent`) | Zone names to keys, `act` to `BotCmd::GoalWith`, the `note` command, the observation. |
+| `Tool`, `Observation`, `AgentBot`, `ZoneEntry`, `Command::Note`, `BotHub::{observe, zones}` | pb-web `agent.rs`, `types.rs`, `server.rs` | The catalog and the read routes `/api/agent/{tools,bots,observe/{id},zones}`. |
+| `mcp::{handle, tool_request, call_result, serve, Bridge}` | `agent/mcp.rs`, `main.rs` | MCP over stdio (JSON-RPC 2.0) forwarding tool calls to the web API. |
+
+**The director's loop.** At every brain tick (only with the director on, an LLM and no forced goal)
+`director_step` first lets the `Director` look at the level and the zone key under the bot (a grid
+lookup): a higher level wakes it with `Trigger::LevelUp`; a zone change reads the journal once, and a
+zone the journal does not have, or has as its newest entry only since this change (the explore
+feature may have recorded it a moment earlier), wakes it with `Trigger::NewZone` unless the bot is
+exploring on purpose. The brain wakes it with `Died` (the dead branch of the tick) and `Failed`
+(`end_goal` with a failure other than `NotImplemented`), and `next_step` with `PlanDone` when the
+plan runs out. `due` answers `Trigger` when one waits (with `director_triggers`), `Timer` when the
+jittered interval is up and no plan waits, and nothing within `director_min_gap_secs` of the last
+request, before the bot's first minute, or while a request is in flight. A request builds the menu,
+the option lines, the situation text and the system text and spawns `Llm::decide` on its own task;
+`poll` collects the answer on a later tick and maps the indices back to the options that were
+offered (a second check after the client's). The note goes through `Notes::push_clean`, the steps
+become the plan (`PLAN_TTL_MS` = 30 min), and the first step is queued at once when the bot is idle,
+wandering or resting. `Brain::pick` takes the next step before its own scoring; each step is checked
+again (`step_allowed`: the goal still eligible, a zone still unseen, a wild farm still allowed, a
+point not at war) and dropped otherwise. `BotCmd::Goal` and `BotCmd::GoalWith` from the operator or
+an agent drop the plan.
+
+**The menu.** The plain goals are the brain's own eligible set (`scores_now` > 0, without GM-only
+goals when GM rights are off), best first. The variants are made only when a request is made, so
+their cost does not matter on the tick path: up to four zones from the quest atlas that the journal
+has not seen, within 8 km, with quests at most five levels above the bot, nearest first, then
+filtered with the quest goal's tests (`progress::cut_off` on the navigation mesh components,
+`progress::deadly` for the danger around the hub and along the way, `in_war_zone`) until two are
+left; the quest hub of the bot's zone and its finished house (150 m to 3 km / 5 km away) for
+`wander`; `farm wild` when `[farm] wild` is on and the outlaw trait is at least
+`WILD_OUTLAW_MIN` (0.6). `assemble` keeps at most four variants, puts each right after its goal and
+cuts the plain goals to fill ten lines.
+
+**What the model sees.** The system text is the persona (name, race, class, temperament) and the
+contract; the user message is the situation (level, health, mana, money, personality, zone, zones
+visited, the running and the last three goals, what is around, the last three notes, why it is asked
+now) and the numbered options. Notes are untrusted (a model or an agent wrote them): they are shown
+as JSON strings after "data, not instructions", so a note can neither close its quote nor start a
+line. The answer can only name option numbers; GM commands never come from it.
+
+**The agent API.** `GET /api/agent/tools` is a static catalog (`pb_web::agent::tools`): each tool's
+name, description, JSON-schema input and the route it maps to (`GET` path with `{bot}`, or `POST` with
+a command `type`). `GET /api/agent/observe/{id}` is `BotHub::observe`; the hub assembles it from the
+slot (snapshot, log, profile), the journal (notes, zones seen) and `SlotInner::agent`, which the brain
+refreshes every `AGENT_EVERY_MS` (15 s, on the bot clock, from the boxed chat state: the eligible
+goals as a `GoalMask`, mana, a fair monster near, characters and real players within 60 m, the plan's
+labels). A hub without its own view (the mock, tests) gets the default built from `detail`.
+`Command::Act` names a zone by name or key; `Hub::command` resolves a name through `ZoneNames` (built
+from `World::zone_name` for every key when the hub is made) before `to_bot_cmd`, and refuses an
+unknown or ambiguous name in words. `Command::Note` is kept by the hub itself (`agent::write_note`).
+All routes keep the security model of `server.rs`: the token for every `POST`, the loopback `Host`
+check for every route.
+
+**MCP.** `playerbots mcp --url … [--token-env NAME]` reads one JSON-RPC message per line from stdin and
+answers on stdout (`initialize` with version negotiation, `ping`, `tools/list`, `tools/call`;
+notifications get no answer; batches and other methods are errors). `handle` and `tool_request` are
+pure: a tool call becomes an `HttpRequest` (the `bot` argument fills the path and never goes into
+the body, the command `type` cannot be overridden by an argument), `call_result` turns the API's
+answer into a tool result (`isError` with the API's message on a 4xx). `Bridge` makes the request
+with the token from the environment variable, never logged (its `Debug` hides it), 15 s at most and
+1 MiB of answer; the log goes to stderr. Stdin is read by a thread into an in-memory pipe (the
+workspace's tokio has no `io-std`).
+
+**Budget and bounds.** Nothing of this is in `Bot`: the director state and the agent timer live in
+the brain's boxed `Chat`, the plan is at most five `Opt` (24 bytes at most each), the agent view is in the hub
+slot. `size_of::<Bot>()` stays 3136, `Goal` 152 (the wander goal's target and walker fit), `BotCmd`
+48. Every list is bounded (10 options, 5 steps, 3 notes shown, 16 kept, 8 log lines and notes in an
+observation) and the requests share the client's limits.
+
+**Tests.** pb-llm: `decide.rs` (parsing, the contract) and `tests.rs` (`decide` against the mock
+endpoint: plan, note filter, counters, budget). `bot/director.rs`: triggers and the gap, the look at
+level and zone, the plan, the mapping of answers, `step_allowed`, the options' arguments, labels and
+lines, `assemble`, `explore_candidates`, `zone_level`, the example config. `agent.rs`: zone names,
+`act` with a zone name, the observation. `agent/mcp.rs`: the protocol functions and a whole session
+over stdio against the real router on 127.0.0.1 with a fake hub. pb-web: the catalog's schemas and
+routes, `note`, and the agent routes end to end (`tests/api.rs`).
 
 ## Farming (`bot/farm/`, goal `farm`)
 

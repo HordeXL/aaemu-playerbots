@@ -37,7 +37,7 @@ pub(crate) fn user_prompt(situation: &str, options: &[String]) -> String {
 }
 
 /// Collapses all whitespace (including newlines) and caps the length on a char boundary.
-fn one_line(text: &str, max_chars: usize) -> String {
+pub(crate) fn one_line(text: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_chars * 4));
     for word in text.split_whitespace() {
         if !out.is_empty() {
@@ -98,7 +98,8 @@ fn find_choice_object(text: &str) -> Option<serde_json::Map<String, Value>> {
     None
 }
 
-fn as_index(value: &Value) -> Option<i64> {
+/// An option number: an integer, a float without a fraction or a numeric string.
+pub(crate) fn as_index(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => n.as_i64().or_else(|| {
             let f = n.as_f64()?;

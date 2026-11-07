@@ -22,6 +22,10 @@
 //! POST /api/command            Command as JSON (global commands: spawn, despawn, pause all, …)
 //! POST /api/issues/{fp}/action {"action":"queue"|"ignore"|"resolve"|"reopen"} -> {"ok":true} or 400
 //! POST /api/director/policy    PolicyPatch as JSON  -> {"ok":true} or 400 {"error":"…"}
+//! GET  /api/agent/tools        [Tool]               every action an agent may take (see `agent`)
+//! GET  /api/agent/bots         [AgentBot]           one short row per bot
+//! GET  /api/agent/observe/{id} Observation          one bot for an LLM to read (404 if unknown)
+//! GET  /api/agent/zones        [ZoneEntry]          zone names and keys an `act` may name
 //! ```
 //!
 //! With [`WebConfig::token`] set, `POST`s need the header `x-playerbots-token: <token>` (401
@@ -48,7 +52,7 @@ mod population;
 mod server;
 mod types;
 
-pub use agent::ActArgs;
+pub use agent::{ActArgs, AgentBot, Nearby, Observation, Tool, ToolHttp, ZoneEntry};
 pub use gear::{GearLine, GearView};
 pub use journal::JournalView;
 pub use persona::{ProfilePatch, ProfileView, CHRONOTYPES};

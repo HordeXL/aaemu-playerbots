@@ -294,6 +294,8 @@ function renderStats() {
     if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' throttled');
     if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' chat replies');
     if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' director picks');
+    if (num(l.plans)) extra.push(nf.format(l.plans) + ' plans (' + nf.format(l.plan_steps) + ' steps)');
+    if (num(l.notes)) extra.push(nf.format(l.notes) + ' notes');
     setTile('st-llm', nf.format(l.requests) + ' requests, ' + nf.format(l.failures) + ' failed',
       fmtCount(l.tokens_today) + ' tokens today, ' + (unlimited ? 'no budget limit' : fmtCount(l.budget_left) + ' left') +
       (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));

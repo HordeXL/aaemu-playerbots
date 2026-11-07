@@ -125,10 +125,16 @@ How the detectors judge, what is reportable, the queue file and the privacy rule
   Spawn and despawn by side, race and continent. Optional use of the game server's web API for exact
   counts. See [docs/OPERATING.md](docs/OPERATING.md#world-metrics-and-the-population-director).
 * **Optional LLM** (DeepSeek, or any OpenAI-compatible `chat/completions` endpoint): bots answer
-  players with a short in-character line and, with the director on, now and then choose a goal. It is
-  off by default, never on the tick path, rate limited and budgeted per UTC day, and its output is
-  filtered (no commands, links or "I am an AI"). Everything works without it. See
-  [docs/OPERATING.md](docs/OPERATING.md#chat-and-the-llm).
+  players with a short in-character line and, with the director on, plan their next few steps
+  (explore a zone they have never seen, wander to a town, farm wild land, ...) now and then and
+  after a level-up, a death or a failure, keeping short notes in their journal. It is off by
+  default, never on the tick path, rate limited and budgeted per UTC day, picks only among what the
+  bot may do, and its output is filtered (no commands, links or "I am an AI"). Everything works
+  without it. See [docs/OPERATING.md](docs/OPERATING.md#chat-and-the-llm).
+* **Agent API and MCP**: an LLM outside the process can drive the bots too: `GET /api/agent/tools`
+  describes every action with a JSON schema, `GET /api/agent/observe/{id}` shows one bot in a few
+  dozen lines, and `playerbots mcp` offers the same tools to Claude Code, Claude Desktop or any
+  other MCP client. See [docs/OPERATING.md](docs/OPERATING.md#agent-api-and-mcp).
 
 ## How it works
 

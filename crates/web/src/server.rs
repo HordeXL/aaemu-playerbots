@@ -175,6 +175,10 @@ pub fn router(hub: Arc<dyn BotHub>, cfg: &WebConfig) -> Router {
         .route("/api/world", get(api_world))
         .route("/api/economy", get(api_economy))
         .route("/api/director", get(api_director))
+        .route("/api/agent/tools", get(api_agent_tools))
+        .route("/api/agent/bots", get(api_agent_bots))
+        .route("/api/agent/observe/{id}", get(api_agent_observe))
+        .route("/api/agent/zones", get(api_agent_zones))
         .route("/api/bots/{id}/command", post(api_bot_command))
         .route("/api/command", post(api_command))
         .route("/api/issues/{fp}/action", post(api_issue_action))
@@ -483,6 +487,37 @@ async fn api_economy(State(st): State<Arc<AppState>>) -> Response {
 
 async fn api_director(State(st): State<Arc<AppState>>) -> Response {
     json_response(&st.hub.director())
+}
+
+// ---------------------------------------------------------------- the agent API (GET)
+
+async fn api_agent_tools() -> Response {
+    json_response(&crate::agent::tools())
+}
+
+async fn api_agent_bots(State(st): State<Arc<AppState>>) -> Response {
+    let mut rows: Vec<crate::agent::AgentBot> = st
+        .hub
+        .snapshots()
+        .iter()
+        .map(crate::agent::AgentBot::from_snapshot)
+        .collect();
+    rows.sort_by_key(|r| r.id);
+    json_response(&rows)
+}
+
+async fn api_agent_observe(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Ok(id) = id.parse::<u32>() else {
+        return ApiError::bad_request(format!("bot id {id:?} is not a number")).into_response();
+    };
+    match st.hub.observe(id) {
+        Some(o) => json_response(&o),
+        None => ApiError::new(StatusCode::NOT_FOUND, format!("no bot {id}")).into_response(),
+    }
+}
+
+async fn api_agent_zones(State(st): State<Arc<AppState>>) -> Response {
+    json_response(&st.hub.zones())
 }
 
 // ---------------------------------------------------------------- commands (POST)

@@ -79,6 +79,9 @@ pub struct SlotInner {
     pub profile: Option<pb_web::ProfileView>,
     /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
     pub social: SlotSocial,
+    /// What the agent API shows that only the bot knows (the goals it may start now, the
+    /// director's plan, what is around it), filled in by its brain (owned by the agent feature).
+    pub agent: crate::agent::AgentSlot,
 }
 
 /// The public face of one bot.
@@ -386,6 +389,8 @@ pub struct Hub {
     /// The log-in and log-out schedules of the bots (owned by the presence feature, see
     /// [`crate::presence`]).
     pub presence: crate::presence::Presence,
+    /// The zone names an `act` of the agent API may use (owned by the agent feature).
+    pub zones: crate::agent::ZoneNames,
 }
 
 impl Hub {
@@ -425,6 +430,7 @@ impl Hub {
             pop: Population::inert(),
             journal: Arc::new(crate::journal::JournalBook::memory()),
             presence: crate::presence::Presence::default(),
+            zones: crate::agent::ZoneNames::from_world(p.world),
         }
     }
 
@@ -862,6 +868,9 @@ impl BotHub for Hub {
                     rate_limited: u.rate_limited,
                     chat_replies: s.llm_replies.load(Ordering::Relaxed),
                     director_picks: s.director_picks.load(Ordering::Relaxed),
+                    plans: u.plans,
+                    plan_steps: u.plan_steps,
+                    notes: u.notes,
                 }
             }),
             activity_counts: Activity::ALL
@@ -927,10 +936,23 @@ impl BotHub for Hub {
         self.pop.set_policy(patch)
     }
 
+    fn observe(&self, id: u32) -> Option<pb_web::Observation> {
+        crate::agent::observe(self, id)
+    }
+
+    fn zones(&self) -> Vec<pb_web::ZoneEntry> {
+        self.zones.entries()
+    }
+
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
         cmd.validate(bot)?;
+        // (an `act` may name its zone; the bots only know zone keys)
+        let cmd = crate::agent::resolve_zones(&self.zones, cmd)?;
         match bot {
             Some(id) => {
+                if let Command::Note { text } = &cmd {
+                    return crate::agent::write_note(self, id, text);
+                }
                 let slot = self.slot(id).ok_or_else(|| format!("no bot {id}"))?;
                 slot.send(to_bot_cmd(cmd)?)
             }
@@ -998,6 +1020,8 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
         }
         Command::Act(args) => crate::agent::act_command(&args)?,
         Command::Profile(patch) => BotCmd::Profile(Box::new(profile_patch(&patch))),
+        // (the hub writes a note into the journal itself, see `BotHub::command`)
+        Command::Note { .. } => return Err("a note is kept by the hub, not sent to the bot".into()),
     })
 }
 

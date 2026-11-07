@@ -247,6 +247,15 @@ pub struct LlmStats {
     /// Goals the model chose and the bots started.
     #[serde(default)]
     pub director_picks: u64,
+    /// Director plans the model made (each one or more steps).
+    #[serde(default)]
+    pub plans: u64,
+    /// Steps in those plans, all together.
+    #[serde(default)]
+    pub plan_steps: u64,
+    /// Director answers that came with a note the bot keeps.
+    #[serde(default)]
+    pub notes: u64,
 }
 
 /// Process-wide numbers for the header of the UI.
@@ -427,6 +436,12 @@ pub enum Command {
     Act(crate::agent::ActArgs),
     /// Change the bot's personality (see [`crate::persona`]): `{"type":"profile","chatty":0.9}`.
     Profile(crate::persona::ProfilePatch),
+    /// Write a short memory into the bot's journal (see [`crate::agent`]):
+    /// `{"type":"note","text":"Bob owes us a duel"}`. The LLM director shows it to the model as
+    /// the bot's own notes, quoted as data.
+    Note {
+        text: String,
+    },
 }
 
 impl Command {
@@ -541,6 +556,12 @@ impl Command {
                     return Err("this command needs a bot: POST /api/bots/<id>/command".into());
                 }
                 patch.validate()
+            }
+            Command::Note { text } => {
+                if bot.is_none() {
+                    return Err("this command needs a bot: POST /api/bots/<id>/command".into());
+                }
+                crate::agent::validate_note(text)
             }
         }
     }
@@ -677,6 +698,33 @@ pub trait BotHub: Send + Sync + 'static {
     /// the operator.
     fn set_policy(&self, _patch: PolicyPatch) -> Result<(), String> {
         Err("the population director is not available".into())
+    }
+
+    /// One bot as the agent API shows it (`GET /api/agent/observe/{id}`), `None` if the id is
+    /// unknown. The default takes what the snapshot has.
+    fn observe(&self, id: u32) -> Option<crate::agent::Observation> {
+        self.detail(id).map(|d| {
+            let mut o = crate::agent::Observation::from_snapshot(&d.snapshot);
+            o.log = d
+                .log
+                .iter()
+                .rev()
+                .take(8)
+                .rev()
+                .map(|l| l.text.clone())
+                .collect();
+            o.profile = d.profile;
+            if let Some(j) = d.journal {
+                o.notes = j.notes;
+                o.zones_seen = j.zones_seen;
+            }
+            o
+        })
+    }
+
+    /// The zones an `act` may name, by name (`GET /api/agent/zones`). Empty by default.
+    fn zones(&self) -> Vec<crate::agent::ZoneEntry> {
+        Vec::new()
     }
 }
 
@@ -889,6 +937,7 @@ mod tests {
             }
         }
         assert!(Bare.issues().is_empty());
+        assert!(Bare.observe(1).is_none() && Bare.zones().is_empty());
         assert!(Bare.issue("pb:00000000").is_none());
         assert!(Bare
             .issue_action("pb:00000000", IssueAction::Queue)
@@ -904,6 +953,7 @@ mod tests {
             (stats.rate_limited, stats.chat_replies, stats.director_picks),
             (0, 0, 0)
         );
+        assert_eq!((stats.plans, stats.plan_steps, stats.notes), (0, 0, 0));
         let detail: BotDetail = serde_json::from_str(
             r#"{"snapshot":{"id":1,"name":"A","race":"","class":"","level":1,"hp_pct":1,"x":0,"y":0,"z":0,"zone":null,"activity":"idle","goal":"","detail":"","partner":null,"gold":0,"has_house":false,"online_secs":0,"paused":false},"log":[],"quests":[],"extra":[]}"#,
         )

@@ -20,8 +20,11 @@
 //!
 //! The brain also calls the combat controller on every tick, so a bot defends itself whatever it is
 //! doing, runs the chat duty ([`Social::tick`]) and, when `llm.director` is on, asks the LLM
-//! director for a goal now and then ([`director`]): the model picks among the goals the scoring
-//! itself would allow, and the pick is dropped silently if it is no longer eligible.
+//! director for a short plan now and then and after a level-up, a death, a failed goal or a new
+//! zone ([`director`]): the model picks among the goals (and concrete variants of them) the
+//! scoring itself would allow, the brain starts the plan's next step whenever a goal ends, and a
+//! step that is no longer eligible is dropped silently. Every [`crate::agent::AGENT_EVERY_MS`] it
+//! also tells the agent API which goals it may start ([`crate::agent::AgentSlot`]).
 
 use std::cell::Cell;
 
@@ -30,7 +33,7 @@ use smallvec::SmallVec;
 use super::cmd::{BotCmd, GoalArgs, GoalChoice, GoalKind, GoalMask, PairKind, PairOrder};
 use super::combat::Combat;
 use super::ctx::Ctx;
-use super::director::{self, Director, Pick, Situation};
+use super::director::{self, Ask, AskRequest, Decided, Director, Situation, Trigger, What};
 use super::goals::social::{self, ChatEvent, Social};
 use super::goals::{FailReason, Goal, GoalStatus};
 use super::party::{PartyOrder, PartyPurpose};
@@ -242,6 +245,8 @@ impl Cooldowns {
 struct Chat {
     social: Social,
     director: Director,
+    /// When the agent API's view of the bot is refreshed next (bot clock).
+    agent_next_ms: u64,
 }
 
 /// Chooses and runs goals for one bot. See the module docs.
@@ -298,6 +303,7 @@ impl Brain {
             Box::new(Chat {
                 social: Social::new(rng),
                 director: Director::new(rng, director_interval_secs),
+                agent_next_ms: 0,
             })
         })
     }
@@ -335,6 +341,8 @@ impl Brain {
             BotCmd::Goal(choice) => {
                 self.choice = *choice;
                 self.forced_fails = 0;
+                // (somebody else decides now: the director's plan is dropped)
+                self.drop_plan();
                 match choice {
                     GoalChoice::Forced(kind) => self.queue(*kind, None),
                     GoalChoice::Auto => {}
@@ -358,6 +366,7 @@ impl Brain {
             }
             BotCmd::GoalWith { kind, args } => {
                 self.forced_fails = 0;
+                self.drop_plan();
                 self.queue_with(*kind, args.clone());
             }
             BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) | BotCmd::Whisper { .. } => {}
@@ -388,6 +397,7 @@ impl Brain {
         let interval = ctx.cfg.llm.director_interval_secs;
         self.chat(&mut *ctx.rng, interval).social.tick(ctx);
         if ctx.state.me.dead {
+            self.director_wake(ctx, Trigger::Died);
             // Dead bots drop their goal (a dungeon run goes on inside the dungeon); the bot task
             // asks for the resurrection.
             let keep = match self.goal.as_mut() {
@@ -410,6 +420,7 @@ impl Brain {
         let now = ctx.now_ms;
 
         self.director_step(ctx);
+        self.publish_agent(ctx);
         if let Some((kind, order)) = self.queued.take() {
             let args = self.args.take();
             self.start_goal_with(ctx, kind, order, args);
@@ -559,6 +570,7 @@ impl Brain {
                 ctx.log
                     .debug(format!("goal {} failed: {other:?}", kind.name()));
                 self.cooldown_until.set(kind, ctx.now_ms + FAIL_COOLDOWN_MS);
+                self.director_wake(ctx, Trigger::Failed(kind));
                 if self.choice == GoalChoice::Forced(kind) {
                     self.forced_fails += 1;
                     if self.forced_fails >= MAX_FORCED_FAILS {
@@ -587,9 +599,8 @@ impl Brain {
             self.start_goal(ctx, filler, None);
             return;
         }
-        if let Some(pick) = self.take_held_pick(ctx) {
-            self.apply_pick(ctx, &pick);
-            self.start_goal(ctx, pick.kind, None);
+        if let Some((kind, args)) = self.next_step(ctx) {
+            self.start_goal_with(ctx, kind, None, Some(args));
             return;
         }
         let s = self.scores_now(ctx);
@@ -654,10 +665,38 @@ impl Brain {
         director::eligible_goals(&self.scores_now(ctx), ctx.gm_allowed())
     }
 
+    /// [`Brain::eligible`] with the scores, best first.
+    fn eligible_scored(&self, ctx: &Ctx<'_>) -> director::Scored {
+        director::eligible_scored(&self.scores_now(ctx), ctx.gm_allowed())
+    }
+
     // ---- the director ------------------------------------------------------------------
 
-    /// Collects the model's answer and, when it is time, asks again. Never blocks: the request
-    /// runs on its own task.
+    /// The director state, created with the chat state on first use.
+    fn director(&mut self, rng: &mut fastrand::Rng, interval_secs: u64) -> &mut Director {
+        &mut self.chat(rng, interval_secs).director
+    }
+
+    /// Forgets the director's plan (somebody else chose the bot's goal).
+    fn drop_plan(&mut self) {
+        if let Some(ext) = self.ext.as_mut() {
+            ext.director.clear_plan();
+        }
+    }
+
+    /// Tells the director that something happened, when it and its triggers are on.
+    fn director_wake(&mut self, ctx: &Ctx<'_>, t: Trigger) {
+        let llm = &ctx.cfg.llm;
+        if !llm.director || !llm.director_triggers {
+            return;
+        }
+        if let Some(ext) = self.ext.as_mut() {
+            ext.director.wake(t);
+        }
+    }
+
+    /// Looks at what happened, collects the model's answer and, when it is time, asks again.
+    /// Never blocks: the request runs on its own task.
     fn director_step(&mut self, ctx: &mut Ctx<'_>) {
         if !ctx.cfg.llm.director || matches!(self.choice, GoalChoice::Forced(_)) {
             return;
@@ -665,25 +704,50 @@ impl Brain {
         let Some(llm) = ctx.hub.llm().cloned() else {
             return;
         };
-        let now = ctx.now_ms;
-        let interval = ctx.cfg.llm.director_interval_secs;
-        if let Some(pick) = self.chat(&mut *ctx.rng, interval).director.poll(now) {
-            self.on_pick(ctx, pick);
+        let cfg = &ctx.cfg.llm;
+        let (now, interval) = (ctx.now_ms, cfg.director_interval_secs);
+        let (level, pos) = (ctx.state.me.level, ctx.state.me.pos);
+        let zone = ctx.world.zone_key_at(pos[0], pos[1]);
+        let exploring = self.goal.as_ref().map(Goal::kind) == Some(GoalKind::Explore);
+        let (hub, id) = (ctx.hub, ctx.persona.id);
+        self.director(&mut *ctx.rng, interval)
+            .observe(level, zone, exploring, |z| {
+                hub.journal
+                    .read(id, |j| (j.seen.has_zone(z), j.seen.zones.last().copied()))
+            });
+        if let Some(decided) = self.director(&mut *ctx.rng, interval).poll(now) {
+            self.on_decision(ctx, decided);
         }
-        if !self.chat(&mut *ctx.rng, interval).director.due(now) {
+        let d = self.director(&mut *ctx.rng, interval);
+        let Some(ask) = d.due(now, cfg.min_gap_ms(), cfg.director_triggers) else {
+            return;
+        };
+        // Whatever comes of it, the next question is a gap (and an interval) away.
+        d.asked(now, &mut *ctx.rng, interval);
+        let recent: SmallVec<[(GoalKind, bool); 3]> = d.recent().into();
+        let scored = self.eligible_scored(ctx);
+        let menu = director::menu(ctx, &scored);
+        if menu.len() < 2 {
             return;
         }
-        // Whatever comes of it, the next question is an interval away.
-        self.chat(&mut *ctx.rng, interval)
-            .director
-            .schedule(now, &mut *ctx.rng, interval);
-        let offered = self.eligible(ctx);
-        if offered.len() < 2 {
-            return;
-        }
+        let zone_name = |k: u16| ctx.world.zone_name(k).map(str::to_owned);
+        let lines: Vec<String> = menu
+            .iter()
+            .map(|o| o.line(&zone_name, [pos[0], pos[1]]))
+            .collect();
+        let (notes, zones_seen) = hub.journal.read(id, |j| {
+            (director::notes_shown(&j.notes), j.seen.zones.len())
+        });
+        let why_now = match ask {
+            Ask::Trigger(t) => Some(t.text(&zone_name)),
+            Ask::Timer => None,
+        };
+        let personality = if ctx.cfg.personality.enabled {
+            ctx.persona.profile.describe()
+        } else {
+            String::new()
+        };
         let current = self.goal.as_ref().map(Goal::kind);
-        let recent: SmallVec<[(GoalKind, bool); 3]> =
-            self.chat(&mut *ctx.rng, interval).director.recent().into();
         let me = &ctx.state.me;
         let characters_near = ctx
             .state
@@ -703,58 +767,136 @@ impl Brain {
             monsters_near: monsters_near(ctx),
             characters_near,
             real_player_near: ctx.real_player_near,
+            personality: &personality,
+            zones_seen,
+            notes: &notes,
+            why_now: why_now.as_deref(),
         });
         let system = director::system_prompt(&facts);
-        self.chat(&mut *ctx.rng, interval)
-            .director
-            .ask(now, llm, system, situation, offered);
+        let steps = ctx.cfg.llm.plan_steps();
+        self.director(&mut *ctx.rng, interval).ask(AskRequest {
+            now_ms: now,
+            llm,
+            system,
+            situation,
+            offered: menu,
+            lines,
+            steps,
+        });
     }
 
-    /// The model picked `pick`: start it now if the bot is between things, else keep it for the
-    /// next goal change; drop it when the goal is no longer eligible.
-    fn on_pick(&mut self, ctx: &mut Ctx<'_>, pick: Pick) {
-        if !self.eligible(ctx).contains(&pick.kind) {
-            ctx.log.debug(format!(
-                "director: {} is no longer eligible",
-                pick.kind.name()
-            ));
-            return;
-        }
-        let between = self
-            .goal
-            .as_ref()
-            .is_none_or(|g| matches!(g.kind(), GoalKind::Wander | GoalKind::Rest));
-        if between {
-            self.apply_pick(ctx, &pick);
-            if self.goal.as_ref().map(Goal::kind) != Some(pick.kind) {
-                self.queue(pick.kind, None);
+    /// The model answered: keep its note, keep its steps as the plan, and start the first step
+    /// now if the bot is between things (else it waits for the next goal change).
+    fn on_decision(&mut self, ctx: &mut Ctx<'_>, d: Decided) {
+        if let Some(note) = d.note.as_deref().filter(|_| ctx.cfg.llm.director_notes) {
+            let at = crate::hub::unix_ms() / 1000;
+            if let Some(kept) = ctx
+                .hub
+                .journal
+                .update(ctx.persona.id, |j| j.notes.push_clean(at, note))
+            {
+                ctx.log.debug(format!("director note: {kept}"));
             }
-        } else {
-            let interval = ctx.cfg.llm.director_interval_secs;
-            let now = ctx.now_ms;
-            self.chat(&mut *ctx.rng, interval).director.hold(pick, now);
+        }
+        let zone_name = |k: u16| ctx.world.zone_name(k).map(str::to_owned);
+        let labels: Vec<String> = d.steps.iter().map(|s| s.label(&zone_name)).collect();
+        ctx.log.say(format!(
+            "director: {} ({})",
+            labels.join(", then "),
+            d.reason
+        ));
+        let (now, interval) = (ctx.now_ms, ctx.cfg.llm.director_interval_secs);
+        self.director(&mut *ctx.rng, interval)
+            .set_plan(&d.steps, now);
+        let running = self.goal.as_ref().map(Goal::kind);
+        let between = running.is_none_or(|k| matches!(k, GoalKind::Wander | GoalKind::Rest));
+        if between && self.queued.is_none() {
+            if let Some((kind, args)) = self.next_step(ctx) {
+                // (a plain stroll or rest the bot is already on goes on as it is)
+                let plain = args.dest.is_none() && args.zone.is_none() && !args.wild;
+                if running != Some(kind) || !plain {
+                    self.queue_with(kind, args);
+                }
+            }
         }
     }
 
-    fn apply_pick(&self, ctx: &Ctx<'_>, pick: &Pick) {
+    /// The next step of the director's plan that may still start (the ones that may not are
+    /// dropped), with its arguments; counted as a director pick. Wakes the director when the
+    /// plan runs out.
+    fn next_step(&mut self, ctx: &mut Ctx<'_>) -> Option<(GoalKind, Box<GoalArgs>)> {
+        let now = ctx.now_ms;
+        if !self.ext.as_ref().is_some_and(|e| e.director.has_plan(now)) {
+            return None;
+        }
+        let eligible = self.eligible(ctx);
+        let wild_ok = director::wild_ok(ctx);
+        let (hub, id) = (ctx.hub, ctx.persona.id);
+        let zone_name = |k: u16| ctx.world.zone_name(k).map(str::to_owned);
+        let ext = self.ext.as_mut()?;
+        let mut found = None;
+        while let Some((step, n, total)) = ext.director.pop_step(now) {
+            let seen = |z| hub.journal.read(id, |j| j.seen.has_zone(z));
+            let at_war =
+                matches!(step.what, What::Point { at, .. } if ctx.in_war_zone(at[0], at[1]));
+            if !at_war && director::step_allowed(&step, &eligible, seen, wild_ok) {
+                found = Some((step, n, total));
+                break;
+            }
+            ctx.log.debug(format!(
+                "director: {} is no longer allowed; dropped",
+                step.label(&zone_name)
+            ));
+        }
+        if !ext.director.has_plan(now) && ctx.cfg.llm.director_triggers {
+            ext.director.wake(Trigger::PlanDone);
+        }
+        let (step, n, total) = found?;
         ctx.hub
             .chat
             .gate
             .stats
             .director_picks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ctx.log
-            .say(format!("director: {} ({})", pick.kind.name(), pick.reason));
+        Some((step.kind, step.args(&format!("director {n}/{total}"))))
     }
 
-    /// A held pick, if the goal change it waited for has come and it is still eligible.
-    fn take_held_pick(&mut self, ctx: &mut Ctx<'_>) -> Option<Pick> {
-        if !self.ext.as_ref().is_some_and(|e| e.director.has_ready()) {
-            return None;
+    /// Refreshes what the agent API shows about the bot: the goals it may start now, the
+    /// director's plan, what is around it (every [`crate::agent::AGENT_EVERY_MS`]).
+    fn publish_agent(&mut self, ctx: &mut Ctx<'_>) {
+        let (now, interval) = (ctx.now_ms, ctx.cfg.llm.director_interval_secs);
+        let chat = self.chat(&mut *ctx.rng, interval);
+        if now < chat.agent_next_ms {
+            return;
         }
-        let eligible = self.eligible(ctx);
-        let now = ctx.now_ms;
-        self.ext.as_mut()?.director.take_ready(now, &eligible)
+        chat.agent_next_ms = now + crate::agent::AGENT_EVERY_MS;
+        let plan: SmallVec<[director::Opt; director::MAX_PLAN]> =
+            chat.director.plan().iter().copied().collect();
+        let eligible = self
+            .eligible(ctx)
+            .iter()
+            .fold(0 as GoalMask, |m, g| m | (1 << g.index()));
+        let me = &ctx.state.me;
+        let (mut characters, mut players) = (0u16, 0u16);
+        for u in ctx.state.units.values() {
+            if u.kind == UnitKind::Character && u.dist2d(me.pos) <= 60.0 {
+                characters = characters.saturating_add(1);
+                if !ctx.hub.is_bot_char(u.id) {
+                    players = players.saturating_add(1);
+                }
+            }
+        }
+        let zone_name = |k: u16| ctx.world.zone_name(k).map(str::to_owned);
+        let view = crate::agent::AgentSlot {
+            at_unix_ms: crate::hub::unix_ms(),
+            eligible,
+            mp_pct: me.mp_pct(),
+            monsters_near: monsters_near(ctx),
+            characters_near: characters,
+            players_near: players,
+            plan: plan.iter().map(|s| s.label(&zone_name)).collect(),
+        };
+        ctx.log.with_slot(|g| g.agent = view);
     }
 }
 

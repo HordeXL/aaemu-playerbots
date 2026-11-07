@@ -5,6 +5,7 @@
 //! playerbots bake --pak <client>/game_pak --out <dir> --compact <compact.sqlite3>
 //! playerbots run --config playerbots.toml [--count N] [--duration-secs S]
 //! playerbots grant-gm-sql --config playerbots.toml [--game-db aaemu_game] [--login-db aaemu_login]
+//! playerbots mcp [--url http://127.0.0.1:8790] [--token-env PLAYERBOTS_WEB_TOKEN]
 //! ```
 
 use std::path::PathBuf;
@@ -84,16 +85,35 @@ enum Command {
     },
     /// Print the commented example configuration.
     ExampleConfig,
+    /// Serve MCP (the Model Context Protocol) on stdin and stdout and forward the tool calls to
+    /// the web API of a running `playerbots run`, so that an MCP client (Claude Code, Claude
+    /// Desktop) can read and drive the bots. The log goes to stderr.
+    Mcp {
+        /// The address of the web UI.
+        #[arg(long, default_value = "http://127.0.0.1:8790")]
+        url: String,
+        /// The NAME of the environment variable that holds the web token (`[web] token`); the
+        /// token itself never goes on the command line.
+        #[arg(long)]
+        token_env: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,playerbots=info")),
-        )
-        .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,playerbots=info"));
+    if matches!(cli.command, Command::Mcp { .. }) {
+        // (stdout carries the protocol: the log must not end up there)
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+    match cli.command {
         Command::ExampleConfig => {
             print!("{}", Config::example());
             Ok(())
@@ -130,6 +150,15 @@ fn main() -> anyhow::Result<()> {
             step,
             compact,
         } => bake(pak, out, world, step, compact),
+        Command::Mcp { url, token_env } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("playerbots-mcp")
+                .build()
+                .context("starting the async runtime")?;
+            rt.block_on(playerbots::agent::mcp::run(&url, token_env.as_deref()))
+        }
         Command::Run {
             config,
             count,

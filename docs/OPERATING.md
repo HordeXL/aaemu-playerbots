@@ -83,7 +83,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Farm** | Off until `[farm] enabled`. Plants, waits and harvests crops, and grows what the server is short of; see [Farming](#farming-farm). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
-| **LLM director** (optional) | Now and then asks the LLM which of the currently eligible goals to do next (see [Chat and the LLM](#chat-and-the-llm)). |
+| **LLM director** (optional) | Now and then, and sooner after a level-up, a death, a failure or a new zone, asks the LLM for a short plan among the currently eligible goals and concrete variants of them (explore a zone, wander to a town, farm wild); keeps the notes it makes (see [Chat and the LLM](#chat-and-the-llm)). |
 
 Bots survive death (they request the resurrection), disconnects (reconnect with backoff), name
 rejections (a new name is picked) and restarts (the roster remembers accounts and characters).
@@ -715,6 +715,10 @@ max_requests_per_minute = 30
 daily_token_budget = 200000           # prompt + completion tokens per UTC day, all bots together
 director = true                       # optional, see below
 director_interval_secs = 600
+director_plan_steps = 3               # steps the model may plan ahead
+director_triggers = true              # ask sooner after a level-up, a death, a failure, a new zone
+director_min_gap_secs = 120           # never two requests of one bot closer than this
+director_notes = true                 # let the answer carry a note for the bot's journal
 ```
 
 ```sh
@@ -727,16 +731,44 @@ playerbots run --config playerbots.toml
   of its conversation with that player as context. The request runs on its own task; the bot never
   waits for the network. Whispers come back as whispers.
 * **Director.** With `llm.director = true` each bot asks, about every `director_interval_secs`
-  (jittered), which of the goals it may pick right now to do next, given a short summary of its
-  level, health, zone, money, recent goals and surroundings. The answer is applied only if the goal
-  is still eligible (not switched off, not cooling down, no GM-only goal without `gm_bootstrap`)
-  and never over a goal the operator forced; otherwise, or if the request fails, the bot's own
-  scoring decides. One request per bot is in flight at most.
+  (jittered), what to do next, given a short summary of its level, health, zone, money,
+  personality, recent goals, surroundings, how many zones it has seen and its last notes. It is
+  offered at most ten numbered options: the goals it may pick right now (not switched off, not
+  cooling down, no GM-only goal without `gm_bootstrap`), best first, and concrete variants it can do
+  now:
+
+  | Option | Offered when |
+  | --- | --- |
+  | `explore <zone>` | the explore goal is eligible and `[explore]` is on; up to two zones the bot has never been in (its journal), within 8 km, with quests at most five levels above it, reachable on the navigation mesh, not in a zone at war it keeps out of, and not deadly for its level (the quest goal's danger test: no aggressive monsters ten levels above it around the place, none fourteen levels above along the way) |
+  | `wander to the town of <zone>` | the wander goal is eligible and the quest hub of its zone is 150 m to 3 km away |
+  | `wander home` | the wander goal is eligible and its finished house is 150 m to 5 km away |
+  | `farm wild` | the farm goal is eligible, `[farm] wild` is on and the bot's outlaw trait is 0.6 or more |
+
+  The model answers with a short plan, up to `director_plan_steps` steps, an optional note and a
+  reason, as JSON (`{"steps":[{"choice":2},{"choice":0}],"note":"...","reason":"..."}`). A step
+  that names no offered option is dropped. The first step starts at once if the bot is idle,
+  strolling or resting, otherwise when its goal ends; every later step starts when the goal before
+  it ends, and each is checked again first (a goal that is no longer eligible, a zone it has seen
+  meanwhile, a wild farm no longer allowed: dropped). A plan is forgotten after 30 minutes, when a
+  newer one comes, and when the operator or an agent gives the bot a goal; it never overrides a
+  goal the operator forced. If the request fails the bot's own scoring decides. The log shows
+  `director: explore Gweonid Forest, then grind (new sights)` and `goal: explore (director 1/2)`.
+* **When the director asks.** By the interval, and with `director_triggers` sooner after a
+  level-up, a death, a failed goal, entering a zone the bot has never been in (not while it
+  explores on purpose) or when its plan runs out; the situation then says why. Never two requests
+  of one bot within `director_min_gap_secs` (and not in its first minute), one in flight at most,
+  and the global limits below apply to all of them. While a plan is waiting the interval alone does
+  not ask.
+* **Notes.** With `director_notes` the answer may carry one short line the bot wants to remember
+  ("the docks are busy at night"). It is filtered like a chat reply (no command, no link, no "I am
+  an AI", at most 120 characters) and kept in the journal (`notes`, at most 16 per bot, the oldest
+  go first). The next questions show the last three notes as quoted JSON strings marked as data,
+  not instructions; the web UI's bot detail shows them, and so does the agent API.
 * **Costs are bounded.** All bots share `max_requests_per_minute`, `max_concurrent` and
   `daily_token_budget`; a request over a limit is refused locally and costs nothing, and the bots
   fall back to canned lines and their own scoring. A reply is capped at `max_reply_tokens`. The web
-  UI shows requests, failures, throttled requests, tokens used today and left, chat replies and
-  director picks. A chat request is a persona prompt of a few hundred tokens plus the last lines of
+  UI shows requests, failures, throttled requests, tokens used today and left, chat replies,
+  director picks (steps started), plans and notes. A chat request is a persona prompt of a few hundred tokens plus the last lines of
   the conversation, and its reply is capped at `max_reply_tokens`; watch the numbers for a while
   and set the budget to taste.
 * **Safety.** Model output is untrusted. Every reply goes through `pb_llm::sanitize_reply`, which
@@ -745,7 +777,73 @@ playerbots run --config playerbots.toml
   an AI, and cuts the rest to 120 characters. The send path checks again and refuses any chat line
   whose first visible character is a slash, empty or too long. Other players' words only ever
   appear as chat messages, never in the instructions, and names are reduced to letters and digits
-  before they reach a prompt. If the key is missing the add-on is simply off.
+  before they reach a prompt. The director's options are made by the bot from its own eligibility
+  and its answer can only name one of them (by number); its notes are filtered like a reply and
+  shown back only as quoted data. GM commands never come from model output. If the key is missing
+  the add-on is simply off.
+
+### Agent API and MCP
+
+An LLM agent outside the process (or any program) can read and steer the bots through the web API,
+with the same checks and the same token as the operator's web UI (`[web] token` for every `POST`, the
+loopback `Host` check for every route).
+
+```text
+GET  /api/agent/tools          every action an agent may take: name, description, JSON schema, route
+GET  /api/agent/bots           one short row per bot (id, name, class, level, zone, goal, activity)
+GET  /api/agent/observe/{id}   one bot in a few dozen lines
+GET  /api/agent/zones          zone names and keys
+POST /api/bots/{id}/command    the commands, as for the web UI
+```
+
+`observe` is made for a model's context window: name, race, class, level, health and mana, zone and
+position, the running goal and what it is doing, the goals the bot may start right now
+(`eligible`, refreshed every 15 s by the bot itself), the director's plan, what is around it (a fair
+monster, characters, real players), its last eight log lines, its personality, its notes and how
+many zones it has seen.
+
+The commands an agent uses most:
+
+```json
+{"type": "act", "goal": "explore", "zone": "Gweonid", "why": "never been there"}
+{"type": "act", "goal": "wander", "x": 11380.0, "y": 11900.0}
+{"type": "act", "goal": "farm", "wild": true}
+{"type": "goal", "goal": "quest"}
+{"type": "note", "text": "Bob owes us a duel"}
+{"type": "say", "text": "anyone up for the boss?"}
+```
+
+`act` starts a goal once with details and then the bot chooses by itself again (a forced goal comes
+back after it); a zone is a name (any case, a unique start is enough: `Gweonid`) or a key from
+`/api/agent/zones`, and an ambiguous or unknown name is refused in words. `wander` with a point walks
+there (by portal or `/move` when those are on, like any long trip) and strolls around it. A goal that
+cannot succeed just fails and the bot moves on, so pick from `eligible`. `note` keeps a line in the
+bot's journal (filtered like a model's note) that the director shows the model as the bot's own
+memory. `set_goal`/`goal`, `say`, `whisper`, `profile`, `pause`, `resume`, `spawn` and `despawn` are
+there too; `/api/agent/tools` lists them all with their arguments.
+
+**MCP.** `playerbots mcp` speaks the Model Context Protocol on stdin and stdout and forwards each tool
+call to the web API of a running `playerbots run`; its tools are the catalog above. The log goes to
+stderr. The token is read from an environment variable whose name you give, so it never appears on a
+command line or in a config file of the MCP client:
+
+```sh
+export PLAYERBOTS_WEB_TOKEN=...          # the same as [web] token
+claude mcp add playerbots -- playerbots mcp --url http://127.0.0.1:8790 --token-env PLAYERBOTS_WEB_TOKEN
+```
+
+For Claude Desktop, the same in `claude_desktop_config.json`:
+
+```json
+{"mcpServers": {"playerbots": {"command": "playerbots",
+  "args": ["mcp", "--url", "http://127.0.0.1:8790", "--token-env", "PLAYERBOTS_WEB_TOKEN"],
+  "env": {"PLAYERBOTS_WEB_TOKEN": "..."}}}}
+```
+
+Without `--token-env` the reads work and the commands are refused when the web UI has a token. A
+request takes at most 15 s, an answer at most 1 MiB is read and a message on stdin is at most
+256 KiB. The bridge can do nothing the web UI could not: the web API checks every command (no line
+starting with `/`, names and lengths, counts) before a bot sees it.
 
 ## Web UI
 
