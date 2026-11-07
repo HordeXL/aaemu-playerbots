@@ -284,8 +284,27 @@ steal_from_players = false
 
 [gear]
 # Bots put on the best gear they have for their level, socket gems and tier up as they progress
-# (goal "gear").
+# (goal "gear"). The equip duty compares the bag with what the bot wears every check_secs and puts
+# on the better piece (item level, grade, gems and how well it suits the class build; never above
+# the bot's level requirement); quest rewards are picked the same way.
 enabled = true
+# The goal buys better pieces from merchants (copper only).
+buy = true
+# The goal mints the pieces and lunagems of the bot's tier with GM commands (needs
+# bots.gm_bootstrap).
+mint = true
+# The goal sockets lunagems into free sockets: always when the chance is 100 %, a riskier gem only
+# for bots with much gearhead (a failed socketing takes every gem of the piece out).
+socket = true
+# The goal regrades worn pieces with scrolls (needs bots.gm_bootstrap). Only grades a failure cannot
+# destroy; still a gamble, so off by default.
+regrade = false
+# The most a purchase may cost, in percent of the bot's money (1-100).
+max_spend_pct = 30
+# Seconds between two looks of the equip duty at the bag (1-3600).
+check_secs = 20
+# The farthest a bot goes to a merchant, in metres.
+max_trip_m = 3000.0
 
 [personality]
 # Every bot has a personality beside its temperament: how chatty, crude and funny it is, whether it

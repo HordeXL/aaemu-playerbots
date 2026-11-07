@@ -454,6 +454,8 @@ impl Brain {
         }
         // Guild duty: answers invitations, recruits, promotes and talks whatever the bot does.
         super::guild::duty(ctx, self.goal.as_ref().map(Goal::kind));
+        // Equip duty: puts on the better piece of the bag whatever the bot does (not in a fight).
+        super::gear::duty(ctx, self.goal.as_ref().map(Goal::kind));
         super::goals::housing::sync_marker(ctx);
         // A rift is running and the bot is free enough to help: the event goal replaces the small
         // things (never an operator's choice, and not while the goal cools down after a failure).

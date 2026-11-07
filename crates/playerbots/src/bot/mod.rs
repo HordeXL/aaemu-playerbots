@@ -28,6 +28,7 @@ pub mod coordinator;
 pub mod ctx;
 pub mod director;
 pub mod farm;
+pub mod gear;
 pub mod goals;
 pub mod guild;
 pub mod manner;

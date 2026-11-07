@@ -645,6 +645,84 @@ Tests: `presence/tests.rs` and the `schedule` and `plan` unit tests; `landmarks`
 (the landmarks of `main_world` and the trips a new bot plans from each race's start at levels 1 to
 30) and `tests/wild_real_data.rs` (patches near the starts and recall points, seed labor).
 
+## Gear (`bot/gear/`, goal `gear`)
+
+Bots wear the best pieces they have for their level, get better ones as they level, socket lunagems
+and, if the operator allows it, regrade. On with `[gear] enabled` (the default); minting and
+regrading need `bots.gm_bootstrap`, regrading also `[gear] regrade`.
+
+* **Protocol** (`aa-proto`, byte-exact tests in `tests/cs_gear.rs` and `tests/sc_gear.rs`):
+  `cs::swap_items` (`CSSwapItemsPacket` 0x03a: `u64 from_item_id, u64 to_item_id, u8 from_slot_type,
+  u8 from_slot, u8 to_slot_type, u8 to_slot`, the server's `MoveArgs::read`) with the helpers
+  `equip_into_empty` (from the empty equipment slot, item id 0, to the bag item: the server's
+  `DoEquipInEmptySlot`), `equip_swap` and `unequip`; `cs::start_skill_item_on_item` (`CSStartSkill`
+  with an item caster, `u8 2, bc caster, u64 item id, u32 template, u8 0, u32 0`, and an item target,
+  `u8 3, bc caster, u64 target item id, u32 0, u8 0`: the socketing and the regrade). The equipment
+  detail (type 1, 55 bytes: image, durability, `i16`, lunastone, charge time, dye, seven gem ids,
+  two `u16`s) is read for its gems: `OwnState::equipment_gems` (parallel to `equipment`, at log-in),
+  `ItemChange::Updated::gems` (an item task's update of a piece). `SCItemSocketingLunagemResult`
+  (0x09d: `u8 result, u64 item id, u32 gem, bool install`) is `WorldEvent::LunagemResult`,
+  `SCGradeEnchantResult` (0x09c: `u8 result, Item, u8 grade before, u8 after`) is
+  `WorldEvent::GradeEnchantResult` (`grade_enchant_result`: 0 break, 1 downgrade, 2 fail, 3 success,
+  4 great success).
+* **Data** (`aa-world` `gear.rs`, `World::gear()`): one 8-byte `GearItem` per equippable template
+  (slot type, armor/weapon/accessory, armor kind or holdable, item level, level requirement, fixed
+  grade, gender, gradable and regradable flags; about 8 500 templates, 124 KB with the rest), the
+  lunagems (where they fit, the lowest item level), sockets by slot type and grade, the socket
+  chances (100 % for the first gem, 50 % after), the grade facts (order, stat multiplier, regrade
+  odds), the copper offers of spawned merchants at the grade the server normalizes them to, the plain
+  regrade scrolls and the reward choices of every quest in the order of the client's index. The
+  server checks none of a client's rules (level requirement, gem fit, socket count): the bots do.
+* **Value** (`bot/gear/eval.rs`, pure): `(item level + 4) * grade factor * affinity * (1 + 4 % per
+  gem)`. The affinity (`Fit::of` the class build: armor kind, weapon kinds in order, shield, bow)
+  is 1 for armor of the build's kind, cloaks and accessories, 0.55 for another armor kind, 1 down to
+  0.6 for the build's weapon kinds, 0 for other weapons and for a shield the build does not use.
+  Both hands count together (a two-handed weapon 1.8 times). A bag piece goes on when it adds at
+  least 3 % (`best_move`), the bot meets its level requirement (an item without one at most two
+  levels above the character), and a two-handed weapon that pushes the off-hand piece out has a free
+  bag slot. Tiers are bands of ten levels: band `b` wants item level `10b - 3` and a grade (common,
+  common, uncommon, rare, ancient, heroic); `deficit` is how far the eight core slots are below it.
+* **Memory** (`GearMem`, `BotState::gear`, one pointer): the grade of bag pieces and the gems of the
+  pieces the bot has seen (at most 48 facts, by item id), the equip the duty waits for, the refused
+  pieces (ten minutes), the templates bought or minted this session, what the goal could do, the
+  session's numbers, the last results. The state feeds it: `SCCharacterState` (worn gems, bag size),
+  the bag chunks (grades), the item tasks (grades, gems, moves) and the two results. `BotState`
+  itself now moves pieces between the bag and the equipment with their grades (`move_item`), keeps
+  the grade of a piece added to the equipment and of a regrade, and keeps the gear memory across
+  `reset` (item ids outlive a connection).
+* **Equip duty** (`gear::duty`, one line in `brain.rs` `tick`): every `check_secs` (20 s), not in a
+  fight, a trade, an instance, while loading, travelling by portal, or while the gear, trade,
+  market, auction or dungeon goal runs. It sends one `CSSwapItems`, waits until the piece is worn
+  (4 s), and keeps a refused piece out for ten minutes; then it works out what the goal could do
+  (`plan::want`: cheap, the merchant offers and the worn pieces) and publishes the view.
+* **Goal** (`bot/goals/gear.rs`, `plan.rs`, `machine.rs`): one job per run, in this order: buy a
+  better piece (worth it, at most `max_spend_pct` of the money, the merchant within `max_trip_m`;
+  while minting is allowed only a piece that meets the tier), mint one (`/item add self <template> 1
+  <grade>`: the best piece of a wanted slot that suits the build well, at most the bot's level, at
+  the tier's grade and never of a fixed grade above it, no quest, test or NPC item, a core slot
+  first), socket a gem (only a piece whose gems are known, a free socket by the grade's limit, a gem
+  that fits; always at 100 %, a riskier gem only for a bot with gearhead 0.75 or more, from 30 % at
+  gearhead 1), regrade (a grade a failure cannot destroy; a failure that can lower it only from
+  gearhead 0.8). `GoalArgs::item` names a piece (put on even when worse) or a gem. The machine walks
+  to the merchant, buys one piece and checks the bag, or mints and waits, puts the piece on (one more
+  try after a refusal), or casts the gem's or scroll's use skill on the worn piece and waits for the
+  result. `score` = `weight * (0.3 + 2 * deficit)` for a piece, 0.7 times the weight for a gem, 0.4
+  for a regrade, with `weight = 0.3 * (0.4 + 1.2 * gearhead)`; a failed run rests five minutes.
+* **Quest rewards** (`gear::reward_choice`, at the two places the quest goal sends
+  `CSCompleteQuestContext`): the reward that adds most to the worn set; for the boxes the gear data
+  does not know, a hint from the English name (the build's weapon kind, then its armor kind);
+  otherwise the quest code's own choice.
+* **Journal** (`journal/gear.rs`): the last change, pieces put on, bought (and the copper spent),
+  minted, gems socketed, the last eight failed socketings, regrades.
+* **Web**: `BotDetail::gear` (`GearView`: summary, the worn pieces with slot, name, item level,
+  grade and gems, the tier, the average item level, the deficit, what the goal could do, the last
+  change, the session's numbers), rendered in the bot detail by `renderGear` in `app.js`.
+
+Open points: the client's `SkillCastItemTarget` for a socketing is not known from a capture; the
+bots send the caster's object id, a zero `type1` and `type2` (the server reads only the item id).
+A bag piece's gems are not parsed (its details are skipped), so a piece that comes back to the bag
+socketed counts as unknown and is not socketed again until the server updates it.
+
 ## Parties of real players (`bot/companion/`, goal `companion`)
 
 A bot in the party of a real player: it joins when invited, follows the leader, helps in the fights,

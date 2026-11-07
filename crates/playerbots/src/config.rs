@@ -705,17 +705,41 @@ impl Default for FarmCfg {
 }
 
 /// `[gear]`: bots put on the best gear they have for their level, socket gems and tier up as they
-/// progress (goal `gear`).
+/// progress (goal `gear`, see [`crate::bot::gear`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GearCfg {
-    /// Master switch of the gear features.
+    /// Master switch of the gear features: the equip duty, the goal, the quest reward pick.
     pub enabled: bool,
+    /// The goal buys better pieces from merchants.
+    pub buy: bool,
+    /// The goal mints the pieces and gems of the bot's tier with GM commands (needs
+    /// `bots.gm_bootstrap`).
+    pub mint: bool,
+    /// The goal sockets lunagems into free sockets.
+    pub socket: bool,
+    /// The goal regrades worn pieces with scrolls (needs `bots.gm_bootstrap`; a regrade can fail).
+    pub regrade: bool,
+    /// The most a purchase may cost, in percent of the bot's money (1..=100).
+    pub max_spend_pct: u8,
+    /// Seconds between two looks of the equip duty at the bag (1..=3600).
+    pub check_secs: u32,
+    /// The farthest a bot goes to a merchant, in metres.
+    pub max_trip_m: f32,
 }
 
 impl Default for GearCfg {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            buy: true,
+            mint: true,
+            socket: true,
+            regrade: false,
+            max_spend_pct: 30,
+            check_secs: 20,
+            max_trip_m: 3_000.0,
+        }
     }
 }
 
@@ -1294,6 +1318,22 @@ impl Config {
         );
         self.presence.validate()?;
         self.explore.validate()?;
+        let g = &self.gear;
+        ensure!(
+            (1..=100).contains(&g.max_spend_pct),
+            "gear.max_spend_pct {} must be between 1 and 100",
+            g.max_spend_pct
+        );
+        ensure!(
+            (1..=3_600).contains(&g.check_secs),
+            "gear.check_secs {} must be between 1 and 3600",
+            g.check_secs
+        );
+        ensure!(
+            g.max_trip_m.is_finite() && (50.0..=100_000.0).contains(&g.max_trip_m),
+            "gear.max_trip_m {} must be between 50 and 100000",
+            g.max_trip_m
+        );
         let c = &self.social;
         ensure!(
             c.reply_radius_m.is_finite() && c.reply_radius_m >= 0.0,
@@ -2281,6 +2321,52 @@ emote = true
             "[explore]\nlevel_gap = 0\n",
             "[explore]\ntrip_gap_mins = 2000\n",
             "[explore]\nzones = 3\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_gear_keys_have_safe_defaults() {
+        let g = Config::default().gear;
+        assert!(g.enabled && g.buy && g.mint && g.socket);
+        assert!(!g.regrade, "regrading is opt-in");
+        assert_eq!(
+            (g.max_spend_pct, g.check_secs, g.max_trip_m),
+            (30, 20, 3_000.0)
+        );
+        let ex = Config::parse(Config::example()).unwrap().gear;
+        assert!(ex.enabled && ex.buy && ex.mint && ex.socket && !ex.regrade);
+        assert_eq!(
+            (ex.max_spend_pct, ex.check_secs, ex.max_trip_m),
+            (30, 20, 3_000.0)
+        );
+        assert_documented(
+            "gear",
+            &[
+                "enabled = true",
+                "buy = true",
+                "mint = true",
+                "socket = true",
+                "regrade = false",
+                "max_spend_pct = 30",
+                "check_secs = 20",
+                "max_trip_m = 3000.0",
+            ],
+        );
+        let cfg = Config::parse("[gear]\nregrade = true\nmax_spend_pct = 100\n").unwrap();
+        assert!(cfg.gear.regrade);
+        assert_eq!(cfg.gear.max_spend_pct, 100);
+        for bad in [
+            "[gear]\nspend = 3\n",
+            "[gear]\nmax_spend_pct = 0\n",
+            "[gear]\nmax_spend_pct = 101\n",
+            "[gear]\nmax_spend_pct = -1\n",
+            "[gear]\ncheck_secs = 0\n",
+            "[gear]\ncheck_secs = 3601\n",
+            "[gear]\nmax_trip_m = 10.0\n",
+            "[gear]\nmax_trip_m = nan\n",
+            "[gear]\nregrade = 1\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

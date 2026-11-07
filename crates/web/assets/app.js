@@ -606,6 +606,7 @@ function renderDetail() {
     pf.append(li);
   }
   D.plots.replaceChildren(pf);
+  renderGear(d);
   // chat the bot heard and said, newest first
   const chat = (d.chat || []).slice().sort((a, b) => b.t - a.t).slice(0, 8);
   D.chatWrap.hidden = chat.length === 0;
@@ -627,6 +628,40 @@ function renderDetail() {
     lf.append(li);
   }
   D.log.replaceChildren(lf);
+}
+
+// ------------------------------------------------------------------ gear (the gear feature)
+// What the bot wears, its tier and what its gear goal could do. The block makes its own section
+// of the detail panel (after the plots) the first time it is needed.
+function renderGear(d) {
+  let wrap = $('d-gear-wrap');
+  if (!wrap) {
+    const anchor = $('d-plots-wrap');
+    if (!anchor) return;
+    wrap = h('div');
+    wrap.id = 'd-gear-wrap';
+    wrap.append(h('h3', null, 'Gear'), h('p', 'muted'), h('ul', 'plain'));
+    anchor.after(wrap);
+  }
+  const g = d && d.gear;
+  wrap.hidden = !g;
+  if (!g) return;
+  setText(wrap.children[1], g.summary || '');
+  const f = document.createDocumentFragment();
+  for (const ln of g.lines || []) {
+    const li = h('li');
+    const gems = ln.gems ? ' · ' + ln.gems + (ln.gems === 1 ? ' gem' : ' gems') : '';
+    li.append(h('span', null, ln.slot + ': ' + ln.item), h('span', null, 'lv ' + ln.level + ' ' + ln.grade + gems));
+    f.append(li);
+  }
+  if (!(g.lines || []).length) f.append(h('li', 'empty', 'Wears nothing.'));
+  const st = g.stats || {};
+  const did = [['equipped', 'put on'], ['bought', 'bought'], ['minted', 'minted'], ['socketed', 'socketed'],
+    ['socket_fails', 'sockets failed'], ['regraded', 'regraded']].filter(([k]) => st[k]).map(([k, l]) => l + ' ' + st[k]);
+  if (st.spent) did.push('spent ' + nf.format(st.spent) + ' copper');
+  if (did.length) f.append(h('li', 'empty', 'This session: ' + did.join(', ')));
+  if (g.last_change) f.append(h('li', 'empty', 'Last: ' + g.last_change));
+  wrap.children[2].replaceChildren(f);
 }
 
 function snapshotToView(s) {

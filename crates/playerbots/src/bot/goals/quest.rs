@@ -1084,12 +1084,9 @@ impl Inner {
             if now.saturating_sub(self.since_ms) > READY_WAIT_MS {
                 if self.tries == 0 {
                     self.tries = 1;
-                    ctx.send(cs::complete_quest_context(
-                        q,
-                        0,
-                        0,
-                        objective::reward_choice(quest),
-                    ));
+                    let selected =
+                        crate::bot::gear::reward_choice(ctx, q, objective::reward_choice(quest));
+                    ctx.send(cs::complete_quest_context(q, 0, 0, selected));
                     self.since_ms = now;
                 } else {
                     return self.fail(ctx, Failure::NoProgress);
@@ -1628,7 +1625,7 @@ impl Inner {
             self.begin(ctx, q, Mode::Work, None);
             return GoalStatus::Running;
         }
-        let selected = objective::reward_choice(quest);
+        let selected = crate::bot::gear::reward_choice(ctx, q, objective::reward_choice(quest));
         match quest.report {
             QuestReport::Npc(t) => match self.reach(ctx, Target::Npc(t), NPC_RANGE) {
                 Reach::Here(obj) => self.send_complete(ctx, q, obj, 0, selected),

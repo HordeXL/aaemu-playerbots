@@ -35,6 +35,7 @@ reads it (default `playerbots.toml`).
 | `[farm]` | Farming, off by default: `enabled`, `max_plots`, `growth_rate`, `public_farms`, `own_land`, `replant`, `max_trip_m`, and the wild farms `wild`, `wild_plots`, `wild_outlaw`, `steal` and `steal_from_players`. |
 | `[presence]` | Log-in schedules, off by default: `enabled`, `min_online`, `max_online`, `max_starts_per_min`, `max_stops_per_min`, `goodbye_chance` and `utc_offset_hours` (see [Presence](#presence-presence)). |
 | `[explore]` | The explore goal, on by default: `enabled`, `max_trip_m`, `level_gap` and `trip_gap_mins` (see [Exploring](#exploring-explore)). |
+| `[gear]` | Gear that follows progression, on by default: `enabled`, `buy`, `mint`, `socket`, `regrade` (off), `max_spend_pct`, `check_secs` and `max_trip_m` (see [Gear](#gear-gear)). |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -84,6 +85,7 @@ for a minute. The bot defends itself whatever it is doing.
 | **Companion** | A bot in the party of a real player follows the leader, helps in its fights, obeys a closed set of chat commands and, with `follow_into_dungeons`, goes through a dungeon door behind the leader. Needs `[party] join_player_parties`; see [Parties of real players](#parties-of-real-players-party). |
 | **Farm** | Off until `[farm] enabled`. Plants, waits and harvests crops, and grows what the server is short of; outlaws may keep a small wild farm and take other bots' crops; see [Farming](#farming-farm). |
 | **Explore** | Goes to see a zone the bot has never been to, a hill, the coast or a recall point within reach and safe for its level, and looks around there; see [Exploring](#exploring-explore). |
+| **Gear** | Tiers up as the bot levels: buys a better piece from a merchant, mints the piece of its tier (`gm_bootstrap`), sockets a lunagem, regrades (opt-in). Putting on the better piece of the bag is a duty that runs whatever the bot does. See [Gear](#gear-gear). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then, and sooner after a level-up, a death, a failure or a new zone, asks the LLM for a short plan among the currently eligible goals and concrete variants of them (explore a zone, wander to a town, farm wild); keeps the notes it makes (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -643,6 +645,59 @@ trips. `[explore] enabled = false` switches the goal off.
 | `max_trip_m` | `6000.0` | The farthest place a bot goes to on its own (metres, straight; 100 to 100000). A zone given with the goal's `zone` argument may be farther. |
 | `level_gap` | `5` | Hostile aggressive monsters this many levels above the bot make a place unsafe (1 to 60). |
 | `trip_gap_mins` | `45` | Minutes between two trips of an average bot (0 to 1440). |
+
+## Gear (`[gear]`)
+
+On by default. Bots put on the best gear they have for their level, get better pieces as they level,
+socket lunagems and, if you let them, regrade. The web UI shows a bot in the goal as `gear`; its
+detail view lists what it wears (slot, item, item level, grade, gems), its tier and what it did this
+session.
+
+**The equip duty** runs whatever the bot does, every `check_secs` (20 s): it puts on the best piece
+of the bag that is worth at least 3 % more than the worn one. The worth is the item level, the grade
+(like the game's stat multiplier), the gems and how well the piece suits the class build (its armor
+kind and weapon kinds; a plate build wears cloth only when it has nothing better, a staff build
+never holds a sword). A piece above the bot's level requirement is never put on (the server does not
+check it). The duty waits in a fight, a trade, an instance and while the bot travels by portal; a
+piece the server refuses is left alone for ten minutes.
+
+**The goal** tiers up: bands of ten levels, each with a lowest item level (7 for levels 10 to 19, 17
+for 20 to 29, ...) and a grade (common up to level 19, then uncommon, rare, ancient, heroic). One run
+does one job, in this order:
+
+* `buy` a better piece from a merchant within `max_trip_m` that costs at most `max_spend_pct` of the
+  bot's money (the merchants sell starter sets up to level 14; while minting is allowed a bot only
+  buys what meets its tier);
+* `mint` the best piece of its tier for an empty or weak slot (`bots.gm_bootstrap` and `mint`): at
+  most the bot's level, at the tier's grade, armor of the build's kind, the build's weapons; never a
+  quest, test or NPC item, at most 24 pieces a session;
+* `socket` a lunagem into a free socket (the grade sets how many: none below uncommon): the first gem
+  always (the server's chance is 100 %), a second one only for a bot with a high `gearhead`
+  (the chance is 50 %, and a failure takes every gem of the piece out). The gem comes from the bag
+  or is minted;
+* `regrade` a worn piece below the tier's grade with a regrade scroll (`regrade` and
+  `bots.gm_bootstrap`), only at grades where a failure cannot destroy the piece; a failure that can
+  lower the grade only for a bot with a high `gearhead`. Off by default.
+
+The agent API and the LLM director can start the goal with an item (the `act` command with
+`"goal": "gear"` and `"item": <template>`): the
+bot gets that piece (bag, merchant or GM) and puts it on even when it is worse, or sockets that gem.
+A finished quest that lets the player choose a reward gets the reward that suits the bot best.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch: the equip duty, the goal, the quest reward pick. |
+| `buy` | `true` | Buy better pieces from merchants (copper only). |
+| `mint` | `true` | Mint pieces and gems of the tier with GM commands (needs `bots.gm_bootstrap`). |
+| `socket` | `true` | Socket lunagems. |
+| `regrade` | `false` | Regrade worn pieces (needs `bots.gm_bootstrap`). |
+| `max_spend_pct` | `30` | The most a purchase may cost, in percent of the bot's money (1 to 100). |
+| `check_secs` | `20` | Seconds between two looks of the equip duty (1 to 3600). |
+| `max_trip_m` | `3000.0` | The farthest a bot goes to a merchant, in metres. |
+
+**Memory.** A bot keeps what it knows of its gear behind one pointer: at most 48 facts (bag grades,
+gems), eight refusals, sixteen fetched templates. The journal's `gear` section keeps the last change,
+the copper spent, what was minted and the last eight failed socketings across restarts.
 
 ## Selling (`[market]`)
 

@@ -566,7 +566,8 @@ fn item_task_covers_every_action() {
             ItemChange::Updated {
                 slot_type: 2,
                 slot: 5,
-                id: 0x44
+                id: 0x44,
+                gems: None
             },
             ItemChange::FlagsUpdated {
                 slot_type: 2,
