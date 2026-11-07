@@ -219,6 +219,15 @@ pub struct BotDetail {
     /// The bot's crops (the farming goal), empty when it has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plots: Vec<PlotLine>,
+    /// What the bot wears (the gear feature), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gear: Option<crate::gear::GearView>,
+    /// The bot's personality (the personality feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::persona::ProfileView>,
+    /// What the bot remembers between runs (the journal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<crate::journal::JournalView>,
 }
 
 /// Token-budget numbers of the optional LLM.
@@ -413,11 +422,16 @@ pub enum Command {
         #[serde(default)]
         filter: SpawnFilter,
     },
+    /// Start a goal once, with arguments (see [`crate::agent`]): `{"type":"act","goal":"explore",
+    /// "zone":"..."}`. Without a bot it goes to every bot.
+    Act(crate::agent::ActArgs),
+    /// Change the bot's personality (see [`crate::persona`]): `{"type":"profile","chatty":0.9}`.
+    Profile(crate::persona::ProfilePatch),
 }
 
 impl Command {
     /// Values accepted by [`Command::Goal`].
-    pub const GOALS: [&'static str; 19] = [
+    pub const GOALS: [&'static str; 21] = [
         "quest",
         "grind",
         "duel",
@@ -434,6 +448,8 @@ impl Command {
         "event",
         "companion",
         "farm",
+        "explore",
+        "gear",
         "rest",
         "wander",
         "auto",
@@ -518,6 +534,13 @@ impl Command {
                 } else {
                     filter.validate()
                 }
+            }
+            Command::Act(args) => args.validate(),
+            Command::Profile(patch) => {
+                if bot.is_none() {
+                    return Err("this command needs a bot: POST /api/bots/<id>/command".into());
+                }
+                patch.validate()
             }
         }
     }
@@ -899,9 +922,15 @@ mod tests {
             chat: Vec::new(),
             path: Vec::new(),
             plots: Vec::new(),
+            gear: None,
+            profile: None,
+            journal: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert!(v.get("path").is_none(), "{v}");
+        for key in ["gear", "profile", "journal"] {
+            assert!(v.get(key).is_none(), "{key} in {v}");
+        }
         assert!(v.get("plots").is_none(), "{v}");
         d.path = vec![[1.5, 2.0], [3.0, -4.25]];
         let json = serde_json::to_string(&d).unwrap();
@@ -920,6 +949,9 @@ mod tests {
             chat: Vec::new(),
             path: Vec::new(),
             plots: Vec::new(),
+            gear: None,
+            profile: None,
+            journal: None,
         };
         d.plots.push(PlotLine {
             x: 10.5,

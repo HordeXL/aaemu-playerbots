@@ -620,6 +620,9 @@ impl BotHub for MockHub {
             } else {
                 Vec::new()
             },
+            gear: None,
+            profile: None,
+            journal: None,
         })
     }
 
@@ -844,6 +847,18 @@ impl BotHub for MockHub {
             Command::Say { text } => {
                 let i = idx.ok_or("needs a bot")?;
                 inner.bots[i].say_log(format!("says: {text}"));
+            }
+            Command::Act(act) => {
+                for (i, b) in inner.bots.iter_mut().enumerate() {
+                    if idx.is_none() || idx == Some(i) {
+                        b.snap.goal = act.goal.clone();
+                        b.say_log(format!("act: {}", act.goal));
+                    }
+                }
+            }
+            Command::Profile(_) => {
+                let i = idx.ok_or("needs a bot")?;
+                inner.bots[i].say_log("personality changed");
             }
             Command::Whisper { to, text } => {
                 let i = idx.ok_or("needs a bot")?;

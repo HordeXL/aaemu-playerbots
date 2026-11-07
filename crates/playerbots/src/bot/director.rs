@@ -71,6 +71,8 @@ pub fn option_text(kind: GoalKind) -> &'static str {
         GoalKind::Event => "event: join a world event such as a rift",
         GoalKind::Companion => "companion: follow a player's party",
         GoalKind::Farm => "farm: plant and harvest crops",
+        GoalKind::Explore => "explore: see places this character has never been",
+        GoalKind::Gear => "gear: get, equip and upgrade gear for this level",
         GoalKind::Rest => "rest: sit down and recover",
         GoalKind::Wander => "wander: stroll around and see the sights",
     }
@@ -362,7 +364,7 @@ mod tests {
         // temperament weight, which `own_scores` replaces)
         // (the auction, market, guild, gank, warzone, event, companion and farm goals do too, and
         // are 0 until their features exist)
-        assert_eq!(with.len(), GoalKind::COUNT - 9);
+        assert_eq!(with.len(), GoalKind::COUNT - 11);
         assert!(!with.contains(&GoalKind::Sail));
         assert!(!with.contains(&GoalKind::Auction) && !with.contains(&GoalKind::Market));
         for g in [
@@ -372,6 +374,8 @@ mod tests {
             GoalKind::Event,
             GoalKind::Companion,
             GoalKind::Farm,
+            GoalKind::Explore,
+            GoalKind::Gear,
         ] {
             assert!(!with.contains(&g), "{g:?}");
         }

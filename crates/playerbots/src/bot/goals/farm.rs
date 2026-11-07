@@ -83,6 +83,12 @@ impl Farm {
         Farm::default()
     }
 
+    /// A fresh goal started with `args` (`GoalArgs::wild`: plant on unprotected land, `item`: the
+    /// seed to grow). The wild-farm feature routes them; until then they are ignored.
+    pub fn with_args(_args: Option<Box<crate::bot::cmd::GoalArgs>>) -> Farm {
+        Farm::new()
+    }
+
     /// Called once when the brain picks the goal: decides between harvesting and planting.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
         self.run = choose_job(ctx).map(Box::new);

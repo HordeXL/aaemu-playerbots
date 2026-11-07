@@ -6,6 +6,7 @@
 
 use std::fmt::Write;
 
+use crate::bot::cmd::GoalArgs;
 use crate::bot::ctx::Ctx;
 use crate::bot::manner;
 use crate::bot::motion::{MotionStatus, Pace};
@@ -36,6 +37,12 @@ pub struct Wander {
 }
 
 impl Wander {
+    /// A fresh goal started with `args` (`GoalArgs::dest` is a place to stroll to; the agent
+    /// feature routes it, the plain wander ignores it until then).
+    pub fn with_args(_args: Option<Box<GoalArgs>>) -> Wander {
+        Wander::default()
+    }
+
     /// Called once when the brain picks the goal.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
         self.home = ctx.pos();

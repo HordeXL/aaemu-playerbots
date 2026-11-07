@@ -40,10 +40,18 @@
 //! # Ok(()) }
 //! ```
 
+pub mod agent;
+pub mod gear;
+pub mod journal;
+pub mod persona;
 mod population;
 mod server;
 mod types;
 
+pub use agent::ActArgs;
+pub use gear::{GearLine, GearView};
+pub use journal::JournalView;
+pub use persona::{ProfilePatch, ProfileView, CHRONOTYPES};
 pub use population::{
     ActionRecord, Alliance, BoostRequest, BoostWish, Continent, DirectorView, EconomySources,
     EconomyView, HealthView, HeatCell, ItemRow, PlayerSeen, Policy, PolicyPatch, RegionCell,

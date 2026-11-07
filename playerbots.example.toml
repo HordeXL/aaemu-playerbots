@@ -44,6 +44,9 @@ ramp_ms = 750
 # The persistent roster: accounts, character names, classes and personas of all bots.
 # Created on the first run; keep it, it ties the bots to their characters.
 roster = "roster.json"
+# The bots' journal: what each bot remembers between runs (places it has seen, wild plots, its play
+# sessions, notes). Empty = journal.json next to the roster. Keep it with the roster.
+journal = ""
 # Races for new characters: nuian, elf, hariharan, ferre (the ones 1.2 lets a player create).
 races = ["nuian", "elf", "hariharan", "ferre"]
 # Let bots use GM chat commands (/item add, /gold add, /labor, /move) to get what trade runs and
@@ -262,6 +265,29 @@ replant = true
 # The farthest a bot walks to a farm, a vendor or a plot, in metres. With bots.gm_bootstrap and
 # bots.long_travel_teleport_m a longer trip is a GM /move.
 max_trip_m = 4000.0
+# Bots with a shady streak also plant "illegal" farms: crops on unprotected land out in the wild,
+# away from roads and towns. Nothing protects such a crop: anybody may take it.
+wild = false
+
+[gear]
+# Bots put on the best gear they have for their level, socket gems and tier up as they progress
+# (goal "gear").
+enabled = true
+
+[personality]
+# Every bot has a personality beside its temperament: how chatty, crude and funny it is, whether it
+# explores, does shady things or obsesses over gear, and when and how long it plays. Stored in the
+# roster. Off: every bot behaves like the neutral profile.
+enabled = true
+
+[presence]
+# Bots log in and out on schedules of their own (when in the day they play, how long, breaks), so
+# the population rises and falls like a real server's. Off: every bot stays online.
+enabled = false
+
+[explore]
+# Bots go and see places they have not been (goal "explore"); the journal remembers what they saw.
+enabled = true
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

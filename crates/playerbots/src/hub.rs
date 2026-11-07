@@ -73,6 +73,10 @@ pub struct SlotInner {
     /// The bot's crops, refreshed with the extra rows (the farming goal), shown as
     /// `BotDetail::plots`.
     pub plots: Vec<pb_web::PlotLine>,
+    /// What the bot wears (the gear feature), shown as `BotDetail::gear`.
+    pub gear: Option<pb_web::GearView>,
+    /// The bot's personality, shown as `BotDetail::profile`.
+    pub profile: Option<pb_web::ProfileView>,
     /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
     pub social: SlotSocial,
 }
@@ -377,6 +381,11 @@ pub struct Hub {
     llm: Option<Arc<pb_llm::Llm>>,
     /// What the bots know about the world's players and goods, and the population director.
     pub pop: Population,
+    /// What every bot remembers between runs, see [`crate::journal`].
+    pub journal: Arc<crate::journal::JournalBook>,
+    /// The log-in and log-out schedules of the bots (owned by the presence feature, see
+    /// [`crate::presence`]).
+    pub presence: crate::presence::Presence,
 }
 
 impl Hub {
@@ -414,6 +423,8 @@ impl Hub {
             supervisor: p.supervisor,
             llm: p.llm,
             pop: Population::inert(),
+            journal: Arc::new(crate::journal::JournalBook::memory()),
+            presence: crate::presence::Presence::default(),
         }
     }
 
@@ -421,6 +432,18 @@ impl Hub {
     /// nothing). Call before the hub is shared.
     pub fn with_population(mut self, pop: Population) -> Hub {
         self.pop = pop;
+        self
+    }
+
+    /// The hub with the bots' journal (read at start, written by its saver task).
+    pub fn with_journal(mut self, journal: Arc<crate::journal::JournalBook>) -> Hub {
+        self.journal = journal;
+        self
+    }
+
+    /// The hub with the presence schedules (the presence feature builds them from the config).
+    pub fn with_presence(mut self, presence: crate::presence::Presence) -> Hub {
+        self.presence = presence;
         self
     }
 
@@ -498,6 +521,18 @@ impl Hub {
         self.nav.tick();
         self.tick_events();
         self.pop.tick(self);
+        self.presence.tick(self);
+    }
+
+    /// The short view of bot `id`'s journal for the detail panel.
+    pub fn journal_view(&self, id: u32) -> pb_web::JournalView {
+        self.journal.read(id, |j| pb_web::JournalView {
+            zones_seen: j.seen.zones.len() as u32,
+            sessions: j.sessions.count,
+            played_secs: j.sessions.total_secs,
+            wild_plots: j.wild.plots.len() as u32,
+            notes: j.notes.lines.iter().map(|n| n.text.clone()).collect(),
+        })
     }
 
     /// While an event runs: tells the board how many bots are online and how high they are, and
@@ -781,6 +816,9 @@ impl BotHub for Hub {
             chat: g.social.chat_lines(),
             path: g.path.clone(),
             plots: g.plots.clone(),
+            gear: g.gear.clone(),
+            profile: g.profile.clone(),
+            journal: Some(self.journal_view(id)),
         }))
     }
 
@@ -958,7 +996,26 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
         | Command::DespawnWhere { .. } => {
             return Err("spawn and despawn are global commands".into())
         }
+        Command::Act(args) => crate::agent::act_command(&args)?,
+        Command::Profile(patch) => BotCmd::Profile(Box::new(profile_patch(&patch))),
     })
+}
+
+/// The roster's form of a web profile patch (the web layer checked the values).
+fn profile_patch(p: &pb_web::ProfilePatch) -> crate::roster::ProfilePatch {
+    crate::roster::ProfilePatch {
+        chatty: p.chatty,
+        crude: p.crude,
+        joker: p.joker,
+        explorer: p.explorer,
+        outlaw: p.outlaw,
+        gearhead: p.gearhead,
+        dedication: p.dedication,
+        chronotype: p
+            .chronotype
+            .as_deref()
+            .and_then(crate::roster::Chronotype::parse),
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1243,8 @@ mod tests {
             ("event", crate::bot::cmd::GoalKind::Event),
             ("companion", crate::bot::cmd::GoalKind::Companion),
             ("farm", crate::bot::cmd::GoalKind::Farm),
+            ("explore", crate::bot::cmd::GoalKind::Explore),
+            ("gear", crate::bot::cmd::GoalKind::Gear),
         ] {
             assert_eq!(
                 to_bot_cmd(Command::Goal { goal: name.into() }),

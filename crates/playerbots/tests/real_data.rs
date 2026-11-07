@@ -89,6 +89,7 @@ impl Rig {
             name: "Tester".into(),
             archetype,
             temper: Temperament::NEUTRAL,
+            profile: playerbots::roster::Profile::NEUTRAL,
         };
         let start = world.race_start(1).expect("Nuian start");
         let z = world.ground_z(start.x, start.y).unwrap_or(start.z);

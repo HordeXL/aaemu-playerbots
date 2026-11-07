@@ -21,3 +21,5 @@
 # tool leftovers
 *.tmp
 *.bak
+/journal.json
+/journal.json.*

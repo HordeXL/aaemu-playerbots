@@ -261,6 +261,14 @@ async fn run(
     let (sup_tx, sup_rx) = tokio::sync::mpsc::channel::<SupCmd>(16);
     let llm = pb_llm::Llm::from_config(&cfg.llm);
     let issues = Arc::new(Issues::open(&cfg.issues, &cfg.bots.roster));
+    let journal_path = cfg.bots.journal_path();
+    let journal = Arc::new(playerbots::journal::JournalBook::load(&journal_path)?);
+    tracing::info!(
+        path = %journal_path.display(),
+        bots = journal.ids().len(),
+        "journal loaded"
+    );
+    let journal_saver = journal.spawn_saver(playerbots::journal::SAVE_INTERVAL);
     let hub = Arc::new(
         Hub::new(HubParams {
             world: &world,
@@ -269,6 +277,7 @@ async fn run(
             llm,
         })
         .with_issues(issues)
+        .with_journal(journal)
         .with_population(Population::new(
             &cfg.population,
             cfg.bots.race_ids(),
@@ -374,6 +383,7 @@ async fn run(
     }
     // (the bots are gone: whatever they changed last is written now)
     saver.stop().await;
+    journal_saver.stop().await;
     issue_tasks.stop().await;
     tracing::info!("bye");
     Ok(())

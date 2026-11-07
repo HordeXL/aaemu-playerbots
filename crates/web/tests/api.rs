@@ -86,6 +86,9 @@ impl BotHub for TestHub {
             }],
             path: Vec::new(),
             plots: Vec::new(),
+            gear: None,
+            profile: None,
+            journal: None,
         })
     }
 

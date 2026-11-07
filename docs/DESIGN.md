@@ -319,6 +319,29 @@ pays one pointer for it. With eighteen goals, the zone table, the guild state, t
 behind a pointer (the farm memory is one `Option<Box<FarmMem>>` in the market state, the running
 farm machine one `Option<Box<Machine>>` in the goal).
 
+## Living-world hooks (LLM control, gear, personalities, presence)
+
+Four more features plug in the same way as the wave-1 ones: finer LLM control, gear, personalities
+and a world that looks played (presence, exploring, wild farms). Shared and done: the goal stubs,
+the goal arguments, the personality profile, the configuration sections, the journal and the web
+types. A feature fills in its own files and reads its own `[section]`.
+
+| Hook | Where | Owner |
+| --- | --- | --- |
+| `GoalKind::Explore` (goal `explore`, `goals::explore::{base_weight, score}`), `[explore]` | `bot/goals/explore.rs`, `config.rs` | presence and exploring |
+| `GoalKind::Gear` (goal `gear`, `goals::gear::{base_weight, score}`), `[gear]` | `bot/goals/gear.rs`, `config.rs` | gear |
+| `GoalArgs` (`dest`, `zone`, `item`, `target`, `wild`, `why`), `BotCmd::GoalWith { kind, args }`, `Brain::queue_with`, `Goal::with_args`; `Wander::with_args` and `Farm::with_args` take them and ignore them until their owners route them | `bot/cmd.rs`, `bot/brain.rs`, `bot/goals/mod.rs` | LLM control (wander, director), wild farms (farm) |
+| `Profile` (`chatty`, `crude`, `joker`, `explorer`, `outlaw`, `gearhead`, `dedication`, `chronotype`) in `RosterEntry::profile` (derived from the bot id for an entry that has none), `Persona::profile`, `ProfilePatch`, `BotCmd::Profile` (applied to the persona and the roster), `[personality] enabled` | `roster.rs`, `bot/ctx.rs`, `bot/mod.rs`, `config.rs` | personalities (chat), and every feature that reads a trait |
+| `JournalBook` (`hub.journal`, `journal.json` next to the roster, `bots.journal`): per bot `seen`, `wild`, `sessions`, `notes`, `gear`, each section in its own file | `journal/` | the section owners |
+| `Presence` (`hub.presence`, ticked by `Hub::tick`, `Hub::with_presence`), `[presence]` | `presence/` | presence |
+| `[farm] wild` | `config.rs` | wild farms |
+| Web: `Command::Act(ActArgs)` (`agent::act_command` turns it into `BotCmd::GoalWith`), `Command::Profile(ProfilePatch)`, `BotDetail::{gear, profile, journal}` (`GearView`, `ProfileView`, `JournalView`), `SlotInner::{gear, profile}` | pb-web `agent.rs`, `persona.rs`, `gear.rs`, `journal.rs`; `hub.rs`, `agent.rs` | LLM control (`act`), personalities (`profile`), gear (`gear`) |
+
+**Per-bot budget.** The roster entry in `Bot` is boxed now (it is read at login and on renames
+only), which took `size_of::<Bot>()` from 3192 to 3136 bytes with the profile in the persona and
+the goal arguments in the brain: the four features have 56 bytes to spend, so their per-bot state
+belongs behind one pointer each (or in the journal, or the hub).
+
 ## Farming (`bot/farm/`, goal `farm`)
 
 Bots buy seeds, plant them, wait and harvest, and they grow what the economy is short of. Everything

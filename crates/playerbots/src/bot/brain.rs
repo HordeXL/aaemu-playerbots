@@ -27,7 +27,7 @@ use std::cell::Cell;
 
 use smallvec::SmallVec;
 
-use super::cmd::{BotCmd, GoalChoice, GoalKind, GoalMask, PairKind, PairOrder};
+use super::cmd::{BotCmd, GoalArgs, GoalChoice, GoalKind, GoalMask, PairKind, PairOrder};
 use super::combat::Combat;
 use super::ctx::Ctx;
 use super::director::{self, Director, Pick, Situation};
@@ -101,6 +101,8 @@ pub fn base_weights(b: &BehaviorCfg, t: &Temperament) -> [f32; GoalKind::COUNT] 
     w[GoalKind::Event.index()] = super::goals::event::base_weight(b, t);
     w[GoalKind::Companion.index()] = super::goals::companion::base_weight(b, t);
     w[GoalKind::Farm.index()] = super::goals::farm::base_weight(b, t);
+    w[GoalKind::Explore.index()] = super::goals::explore::base_weight(b, t);
+    w[GoalKind::Gear.index()] = super::goals::gear::base_weight(b, t);
     w
 }
 
@@ -134,13 +136,15 @@ fn own_scores(
         super::goals::market::score(ctx, base[market])
     });
     // (the wave-one goals that are not built yet are stubs: 0 until their features exist)
-    let wave_one: [(GoalKind, OwnScore); 6] = [
+    let wave_one: [(GoalKind, OwnScore); 8] = [
         (GoalKind::Guild, super::goals::guild::score),
         (GoalKind::Gank, super::goals::gank::score),
         (GoalKind::Warzone, super::goals::warzone::score),
         (GoalKind::Event, super::goals::event::score),
         (GoalKind::Companion, super::goals::companion::score),
         (GoalKind::Farm, super::goals::farm::score),
+        (GoalKind::Explore, super::goals::explore::score),
+        (GoalKind::Gear, super::goals::gear::score),
     ];
     for (kind, score) in wave_one {
         let i = kind.index();
@@ -254,6 +258,9 @@ pub struct Brain {
     next_think_ms: u64,
     /// A goal to start at the next tick (operator command, pairing, recovery after death).
     queued: Option<(GoalKind, Option<PairOrder>)>,
+    /// The arguments that go with the queued goal; set only by [`Brain::queue_with`] and dropped by
+    /// every other way of queueing.
+    args: Option<Box<GoalArgs>>,
     /// The party order that goes with a queued [`GoalKind::Dungeon`]; set only by
     /// [`BotCmd::Party`] and dropped by every other way of queueing.
     party: Option<Box<PartyOrder>>,
@@ -277,6 +284,7 @@ impl Brain {
             cooldown_until: Cooldowns::default(),
             next_think_ms: 0,
             queued: None,
+            args: None,
             party: None,
             forced_fails: 0,
             gated: Cell::new((0, 0, 0)),
@@ -348,7 +356,12 @@ impl Brain {
                 self.queue(kind, None);
                 self.party = Some(order.clone());
             }
+            BotCmd::GoalWith { kind, args } => {
+                self.forced_fails = 0;
+                self.queue_with(*kind, args.clone());
+            }
             BotCmd::Pause | BotCmd::Resume | BotCmd::Say(_) | BotCmd::Whisper { .. } => {}
+            BotCmd::Profile(_) => {}
             BotCmd::DuelWith(_) | BotCmd::TradeWith(_) | BotCmd::ServerLogLine { .. } => {}
             // (the nav result belongs to the motion controller)
             BotCmd::PathReady { .. } => {}
@@ -360,6 +373,14 @@ impl Brain {
     pub fn queue(&mut self, kind: GoalKind, order: Option<PairOrder>) {
         self.queued = Some((kind, order));
         self.party = None;
+        self.args = None;
+    }
+
+    /// Queues `kind` with `args` to start at the next tick, replacing the running goal (one time:
+    /// afterwards the bot chooses again, or goes back to an operator's forced goal).
+    pub fn queue_with(&mut self, kind: GoalKind, args: Box<GoalArgs>) {
+        self.queue(kind, None);
+        self.args = Some(args);
     }
 
     /// One brain tick.
@@ -390,7 +411,8 @@ impl Brain {
 
         self.director_step(ctx);
         if let Some((kind, order)) = self.queued.take() {
-            self.start_goal(ctx, kind, order);
+            let args = self.args.take();
+            self.start_goal_with(ctx, kind, order, args);
         }
         // Market duty: negotiates in the trade chat whatever the bot does; a sale agreed there
         // starts the market goal (the meeting and the trade).
@@ -470,13 +492,28 @@ impl Brain {
     }
 
     fn start_goal(&mut self, ctx: &mut Ctx<'_>, kind: GoalKind, order: Option<PairOrder>) {
+        self.start_goal_with(ctx, kind, order, None);
+    }
+
+    /// [`Brain::start_goal`] with the arguments the goal was queued with.
+    fn start_goal_with(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        kind: GoalKind,
+        order: Option<PairOrder>,
+        args: Option<Box<GoalArgs>>,
+    ) {
         if self.goal.is_some() {
             self.end_goal(ctx, None);
         }
         let party = self.party.take();
-        let mut goal = Goal::with_party(kind, order, party);
+        let why = args.as_ref().and_then(|a| a.why.clone());
+        let mut goal = Goal::with_args(kind, order, party, args);
         goal.start(ctx);
-        ctx.log.say(format!("goal: {}", kind.name()));
+        match why {
+            Some(why) => ctx.log.say(format!("goal: {} ({why})", kind.name())),
+            None => ctx.log.say(format!("goal: {}", kind.name())),
+        }
         self.goal = Some(goal);
     }
 
@@ -974,6 +1011,8 @@ mod tests {
             GoalKind::Event,
             GoalKind::Companion,
             GoalKind::Farm,
+            GoalKind::Explore,
+            GoalKind::Gear,
         ];
         let w = base();
         let s = scores(&w, &input(100));
@@ -1053,6 +1092,27 @@ mod tests {
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(own_score(0, dungeon, || bad), 0.0, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_goal_with_arguments_is_queued_once_with_them() {
+        let mut brain = Brain::new(&BehaviorCfg::default(), &Temperament::NEUTRAL);
+        let args = GoalArgs {
+            zone: Some(3),
+            why: Some("director: new sights".into()),
+            ..GoalArgs::default()
+        };
+        brain.command(&BotCmd::GoalWith {
+            kind: GoalKind::Explore,
+            args: Box::new(args.clone()),
+        });
+        assert!(matches!(brain.queued, Some((GoalKind::Explore, None))));
+        assert_eq!(brain.args.as_deref(), Some(&args));
+        // the operator's choice is not touched: it is a one-time order
+        assert_eq!(brain.choice(), GoalChoice::Auto);
+        // any other way of queueing drops the arguments
+        brain.queue(GoalKind::Rest, None);
+        assert!(brain.args.is_none());
     }
 
     #[test]

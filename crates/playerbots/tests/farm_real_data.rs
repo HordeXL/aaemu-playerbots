@@ -160,6 +160,7 @@ impl Rig {
             name: "Farmer".into(),
             archetype,
             temper: Temperament::NEUTRAL,
+            profile: playerbots::roster::Profile::NEUTRAL,
         };
         let mut state = BotState::new();
         state.me.char_id = CHAR;

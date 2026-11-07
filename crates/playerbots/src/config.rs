@@ -46,6 +46,14 @@ pub struct Config {
     pub population: PopulationCfg,
     /// Farming: planting and harvesting crops.
     pub farm: FarmCfg,
+    /// Gear: equipping, socketing and upgrading what suits the level.
+    pub gear: GearCfg,
+    /// Personalities: chat style, exploring, shady business, gear risk, play time.
+    pub personality: PersonalityCfg,
+    /// Presence: bots log in and out on schedules of their own, so the world looks played.
+    pub presence: PresenceCfg,
+    /// Exploring: bots go and see places they have not been.
+    pub explore: ExploreCfg,
     /// Operator web UI (`bind`, `token`).
     pub web: pb_web::WebConfig,
     /// Optional LLM add-on.
@@ -131,6 +139,9 @@ pub struct BotsCfg {
     pub ramp_ms: u64,
     /// The persistent roster (accounts, character names, archetypes, personas).
     pub roster: PathBuf,
+    /// The bots' journal: what each bot remembers between runs (places seen, wild plots, play
+    /// sessions, notes). Empty: `journal.json` next to the roster.
+    pub journal: PathBuf,
     /// Races new characters may have: `nuian`, `elf`, `hariharan`, `ferre` (what the 1.2 data
     /// lets a player create), or a race id.
     pub races: Vec<String>,
@@ -160,6 +171,7 @@ impl Default for BotsCfg {
             count: 10,
             ramp_ms: 750,
             roster: "roster.json".into(),
+            journal: PathBuf::new(),
             races: ["nuian", "elf", "hariharan", "ferre"]
                 .map(String::from)
                 .to_vec(),
@@ -176,6 +188,15 @@ impl Default for BotsCfg {
 }
 
 impl BotsCfg {
+    /// Where the journal is kept: `journal`, else `journal.json` next to the roster.
+    pub fn journal_path(&self) -> PathBuf {
+        if self.journal.as_os_str().is_empty() {
+            self.roster.with_file_name("journal.json")
+        } else {
+            self.journal.clone()
+        }
+    }
+
     /// The configured races as ids (`races` was checked by [`Config::validate`]).
     pub fn race_ids(&self) -> Vec<u8> {
         self.races.iter().filter_map(|r| race_id(r)).collect()
@@ -647,6 +668,9 @@ pub struct FarmCfg {
     /// The farthest a bot walks to a farm, a vendor or a plot (metres); trips longer than
     /// `bots.long_travel_teleport_m` use the GM `/move` when `bots.gm_bootstrap` is on.
     pub max_trip_m: f32,
+    /// Bots with a shady streak (`Profile::outlaw`) also plant on unprotected land out in the
+    /// wild (an "illegal" farm: no labor-free protection, anybody may take the crop).
+    pub wild: bool,
 }
 
 impl Default for FarmCfg {
@@ -659,7 +683,64 @@ impl Default for FarmCfg {
             own_land: true,
             replant: true,
             max_trip_m: 4_000.0,
+            wild: false,
         }
+    }
+}
+
+/// `[gear]`: bots put on the best gear they have for their level, socket gems and tier up as they
+/// progress (goal `gear`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GearCfg {
+    /// Master switch of the gear features.
+    pub enabled: bool,
+}
+
+impl Default for GearCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[personality]`: every bot has a [`Profile`](crate::roster::Profile) (how chatty, crude and
+/// funny it is, whether it explores, does shady things, cares about gear, and when and how much it
+/// plays). Off: every bot behaves like the neutral profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalityCfg {
+    /// Master switch of the personalities.
+    pub enabled: bool,
+}
+
+impl Default for PersonalityCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[presence]`: bots log in and out on schedules of their own (when in the day they play, how
+/// long a session lasts, breaks), so the population rises and falls like a real server's. Off by
+/// default: every bot stays online.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PresenceCfg {
+    /// Master switch of the schedules.
+    pub enabled: bool,
+}
+
+/// `[explore]`: bots go and see places they have not been (goal `explore`); what they saw is
+/// kept in the journal.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExploreCfg {
+    /// Master switch of exploring.
+    pub enabled: bool,
+}
+
+impl Default for ExploreCfg {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
