@@ -11,6 +11,24 @@
 //!   what pays), buy its seeds from the nearest vendor (or, with `bots.gm_bootstrap` and no
 //!   vendor or money, mint them), walk to a free spot on its own land or a public farm and plant.
 //!
+//! # Wild farms
+//!
+//! With `[farm] wild`, a bot whose `outlaw` trait is at least `wild_outlaw` (or one started with
+//! [`GoalArgs::wild`]) plants up to `wild_plots` crops on one small patch out in the open
+//! ([`site::wild_patch`]: secluded, dry, flat, out of the farms, housing areas and war zones). A
+//! seed there costs labor ([`plan::labor_cap`]; a GM bot tops it up). The plots go into the
+//! journal's `wild` section, so the bot finds them again after a restart ([`restore_wild`]); a
+//! crop that is gone when the bot comes back counts as stolen, and its patch is given up for
+//! another one. A goal started with [`GoalArgs::item`] grows that seed (or a crop that gives that
+//! item).
+//!
+//! With `[farm] steal` an outlaw also harvests a ripe crop of somebody else out in the wild when
+//! no real player is near ([`steal_target`]): only the crops of the other bots of this process,
+//! unless `steal_from_players` (never with `bots.gm_bootstrap`). The server lets anybody harvest
+//! a crop outside the public farms and the houses; within a day of its planting the thief leaves
+//! footprints the owner can report. What a theft gives is never the bot's own for the ledger, and
+//! the stolen spot is not planted again.
+//!
 //! The state machine is [`machine`] (pure, tested against a scripted server); this file builds its
 //! input from [`Ctx`], applies the acts (packets, movement, GM lines), and holds the scoring.
 //!
@@ -38,19 +56,22 @@ mod tests;
 use std::cell::RefCell;
 
 use aa_proto::cs::{self, BuyItem, SHOP_MONEY};
-use aa_world::{Crop, FarmKind, World};
+use aa_world::{Crop, FarmKind, Vec3, World};
 use pb_web::Activity;
+use smallvec::SmallVec;
 
+use crate::bot::cmd::GoalArgs;
 use crate::bot::ctx::Ctx;
 use crate::bot::farm::plan::{self, Env, Plan, Vendor};
-use crate::bot::farm::site::{self, Site};
-use crate::bot::farm::FarmMem;
+use crate::bot::farm::site::{self, Site, WildEnv};
+use crate::bot::farm::{FarmMem, Foreign, Plot, MAX_PLOTS, STOLEN_LAND, WILD_LAND};
 use crate::bot::goals::housing::garden_radius;
 use crate::bot::motion::Pace;
 use crate::bot::state::{dist2d, BotState, UnitKind};
 use crate::config::BehaviorCfg;
 use crate::contest::plot_key;
-use crate::hub::Hub;
+use crate::hub::{unix_ms, Hub, Logger};
+use crate::journal::WildPlot;
 use crate::population::economy::ScarcityView;
 use crate::roster::Temperament;
 
@@ -75,6 +96,8 @@ const NEED_CAP: f32 = 3.0;
 #[derive(Debug, Default)]
 pub struct Farm {
     run: Option<Box<Machine>>,
+    /// What the goal was started with (`wild`: plant on a wild patch, `item`: the seed to grow).
+    args: Option<Box<GoalArgs>>,
 }
 
 impl Farm {
@@ -84,14 +107,21 @@ impl Farm {
     }
 
     /// A fresh goal started with `args` (`GoalArgs::wild`: plant on unprotected land, `item`: the
-    /// seed to grow). The wild-farm feature routes them; until then they are ignored.
-    pub fn with_args(_args: Option<Box<crate::bot::cmd::GoalArgs>>) -> Farm {
-        Farm::new()
+    /// seed to grow, or a crop that gives that item).
+    pub fn with_args(args: Option<Box<GoalArgs>>) -> Farm {
+        Farm { run: None, args }
     }
 
-    /// Called once when the brain picks the goal: decides between harvesting and planting.
+    /// The arguments it was started with.
+    pub fn args(&self) -> Option<&GoalArgs> {
+        self.args.as_deref()
+    }
+
+    /// Called once when the brain picks the goal: finds the wild plots of the journal again and
+    /// decides between harvesting and planting.
     pub fn start(&mut self, ctx: &mut Ctx<'_>) {
-        self.run = choose_job(ctx).map(Box::new);
+        restore_wild(ctx);
+        self.run = choose_job(ctx, self.args.as_deref()).map(Box::new);
         match &self.run {
             Some(m) => ctx.log.say(format!(
                 "goal: farm ({})",
@@ -148,6 +178,10 @@ impl Farm {
             machine.step(&io, &mut mem, &mut acts)
         };
         let last_crop = (mem.harvested != harvested_before).then_some(mem.last_crop);
+        if acts.iter().any(|a| matches!(a, Act::Publish)) || mem.has_gone() {
+            let patch = machine.plan().map(|p| p.site).filter(Site::is_wild);
+            sync_wild(ctx, &mut mem, patch.map(|s| s.centre));
+        }
         ctx.state.market.put_farm(mem);
         apply(ctx, acts);
         if let Some(doodad) = last_crop {
@@ -164,6 +198,9 @@ impl Farm {
             let mut acts = Vec::new();
             machine.stop(&mut mem, &mut acts);
             mem.last_end_ms = ctx.now_ms.max(1);
+            mem.drop_stolen();
+            let patch = machine.plan().map(|p| p.site).filter(Site::is_wild);
+            sync_wild(ctx, &mut mem, patch.map(|s| s.centre));
             ctx.state.market.put_farm(mem);
             apply(ctx, acts);
         } else {
@@ -236,26 +273,61 @@ pub fn score(ctx: &Ctx<'_>, _base: f32) -> f32 {
     }) {
         return base * HARVEST_BOOST;
     }
+    // a ripe wild plot of the journal the memory has not found again yet (after a restart)
+    let now_unix = unix_ms() / 1000;
+    if ctx.hub.journal.read(ctx.persona.id, |j| {
+        j.wild.plots.iter().any(|p| {
+            p.ripe_unix <= now_unix
+                && dist2d(pos, p.pos) <= cfg.max_trip_m
+                && mem.is_none_or(|m| m.at(p.pos[0], p.pos[1]).is_none())
+        })
+    }) {
+        return base * HARVEST_BOOST;
+    }
+    if steal_target(ctx).is_some() {
+        return base * HARVEST_BOOST;
+    }
     if mem.is_some_and(|m| m.last_end_ms != 0 && now < m.last_end_ms + RUN_COOLDOWN_MS) {
         return 0.0;
     }
     let mut rng = fastrand::Rng::with_seed(u64::from(ctx.persona.id) ^ (now / 60_000));
-    match plan_now(
-        ctx.world,
-        ctx.state,
-        ctx.hub,
-        ctx.cfg,
-        ctx.persona.id,
-        now,
-        &mut rng,
-    ) {
+    let who = Who::of(ctx, None);
+    match plan_now(ctx.world, ctx.state, ctx.hub, ctx.cfg, &who, now, &mut rng) {
         Some((pick, _)) => base * (1.0 + NEED_GAIN * pick.need.min(NEED_CAP)),
         None => 0.0,
     }
 }
 
+/// Who plants, and with what wishes: the farm planner's view of the bot beyond its state.
+struct Who {
+    bot: u32,
+    /// A wild patch may be used (`[farm] wild` and an outlaw, or the `wild` argument).
+    wild: bool,
+    /// Only a wild patch (the `wild` argument).
+    wild_only: bool,
+    /// The seed (or produce) the goal was started for.
+    item: Option<u32>,
+    /// The bot keeps out of zones at war.
+    avoid_war: bool,
+}
+
+impl Who {
+    fn of(ctx: &Ctx<'_>, args: Option<&GoalArgs>) -> Who {
+        let cfg = &ctx.cfg.farm;
+        let asked = args.is_some_and(|a| a.wild);
+        let outlaw = ctx.persona.profile.outlaw >= cfg.wild_outlaw;
+        Who {
+            bot: ctx.persona.id,
+            wild: cfg.wild && (asked || outlaw),
+            wild_only: cfg.wild && asked,
+            item: args.and_then(|a| a.item),
+            avoid_war: crate::bot::war::avoiding(&ctx.cfg.events),
+        }
+    }
+}
+
 /// Harvest if a plot is due and reachable, else plant if there is a plan.
-fn choose_job(ctx: &mut Ctx<'_>) -> Option<Machine> {
+fn choose_job(ctx: &mut Ctx<'_>, args: Option<&GoalArgs>) -> Option<Machine> {
     let cfg = &ctx.cfg.farm;
     let now = ctx.now_ms;
     let pos = ctx.state.me.pos;
@@ -268,15 +340,32 @@ fn choose_job(ctx: &mut Ctx<'_>) -> Option<Machine> {
     }) {
         return Some(Machine::harvest(fetch, now));
     }
-    let (_, plan) = plan_now(
-        ctx.world,
-        ctx.state,
-        ctx.hub,
-        ctx.cfg,
-        ctx.persona.id,
-        now,
-        ctx.rng,
-    )?;
+    if let Some(f) = steal_target(ctx) {
+        let seed = ctx
+            .world
+            .farm()
+            .crop_of_doodad(f.doodad)
+            .map_or(0, |c| c.seed);
+        ctx.state.market.farm_mut().plots.push(Plot {
+            obj: f.obj,
+            doodad: f.doodad,
+            seed,
+            pos: f.pos,
+            phase: f.phase,
+            ripe: true,
+            check_ms: 0,
+            planted_ms: 0,
+            honest: false,
+            land: STOLEN_LAND,
+        });
+        ctx.log.say(format!(
+            "farm: helps itself to a ripe crop at ({:.0}, {:.0}) that is not its own",
+            f.pos[0], f.pos[1]
+        ));
+        return Some(Machine::harvest(false, now));
+    }
+    let who = Who::of(ctx, args);
+    let (_, plan) = plan_now(ctx.world, ctx.state, ctx.hub, ctx.cfg, &who, now, ctx.rng)?;
     ctx.log.say(format!(
         "farm: plan {:?} seed {} x{} (buy {}, mint {}) at {}",
         plan.why,
@@ -295,13 +384,27 @@ fn plan_now(
     state: &BotState,
     hub: &Hub,
     cfg: &crate::config::Config,
-    bot: u32,
+    who: &Who,
     now_ms: u64,
     rng: &mut fastrand::Rng,
 ) -> Option<(plan::Pick, Plan)> {
     let fcfg = &cfg.farm;
+    let bot = who.bot;
     let mem = state.market.farm();
-    let sites = candidate_sites(world, state, mem, cfg);
+    let wild = if who.wild {
+        wild_site(world, state, hub, cfg, who, rng)
+    } else {
+        None
+    };
+    let mut sites = if who.wild_only {
+        Vec::new()
+    } else {
+        candidate_sites(world, state, mem, cfg)
+    };
+    // an outlaw plants out in the wild first, the rest where it may
+    if let Some(w) = wild {
+        sites.insert(0, w);
+    }
     if sites.is_empty() {
         return None;
     }
@@ -317,16 +420,76 @@ fn plan_now(
         mem,
         now_ms,
     };
-    let pick = plan::choose(world.farm().crops(), &env, fcfg.growth_rate, rng)?;
+    let crops = world.farm().crops();
+    let pick = match who.item {
+        // the goal was started for an item: that seed, or a crop that gives it
+        Some(item) => crops
+            .iter()
+            .filter(|c| c.seed == item || c.produce.iter().any(|y| y.item == item))
+            .filter_map(|c| plan::evaluate(c, &env, fcfg.growth_rate))
+            .max_by(|a, b| a.score.total_cmp(&b.score))?,
+        None => plan::choose(crops, &env, fcfg.growth_rate, rng)?,
+    };
     let crop = world.farm().crop_of_seed(pick.seed)?;
-    let site = *sites.iter().find(|s| takes(crop, s))?;
-    let room = site::room(mem, site.land, fcfg.max_plots);
-    let plan = plan::make_plan(&pick, site, room, state.me.money, cfg.bots.gm_bootstrap)?;
+    let gm = cfg.bots.gm_bootstrap;
+    let plan = sites.iter().filter(|s| takes(crop, s)).find_map(|&site| {
+        let room = if site.is_wild() {
+            site::wild_room(mem, fcfg.max_plots, fcfg.wild_plots)
+        } else {
+            site::room(mem, site.land, fcfg.max_plots)
+        };
+        let plan = plan::make_plan(&pick, site, room, state.me.money, gm)?;
+        if site.is_wild() {
+            plan::labor_cap(plan, state.me.labor, seed_labor(world, pick.seed), gm)
+        } else {
+            Some(plan)
+        }
+    })?;
     Some((pick, plan))
 }
 
-/// Whether `site` takes `crop`: a garden takes any crop that grows on land, a farm the crops of
-/// its kind.
+/// The labor planting one `seed` out in the wild costs: its use skill's `consume_lp`.
+fn seed_labor(world: &World, seed: u32) -> i16 {
+    world
+        .skill(world.item_use_skill(seed))
+        .map_or(0, |s| i16::try_from(s.labor).unwrap_or(i16::MAX))
+}
+
+/// The bot's wild patch: the one in the journal while it has room, else a new secluded one
+/// within reach ([`site::wild_patch`]). `None` when the bot has no room for wild plots or no spot
+/// will do.
+fn wild_site(
+    world: &World,
+    state: &BotState,
+    hub: &Hub,
+    cfg: &crate::config::Config,
+    who: &Who,
+    rng: &mut fastrand::Rng,
+) -> Option<Site> {
+    let fcfg = &cfg.farm;
+    let mem = state.market.farm();
+    if site::wild_room(mem, fcfg.max_plots, fcfg.wild_plots) == 0 {
+        return None;
+    }
+    let pos = state.me.pos;
+    let (patch, bad) = hub
+        .journal
+        .read(who.bot, |j| (j.wild.patch, j.wild.bad_patches.clone()));
+    if let Some(c) = patch.filter(|c| dist2d(pos, [c[0], c[1], 0.0]) <= fcfg.max_trip_m) {
+        return Some(Site::wild(c));
+    }
+    let env = WildWorld {
+        world,
+        state,
+        hub,
+        avoid_war: who.avoid_war,
+        bad: &bad,
+    };
+    site::wild_patch(&env, pos, rng)
+}
+
+/// Whether `site` takes `crop`: a garden and a wild patch take any crop that grows on land, a
+/// farm the crops of its kind.
 fn takes(crop: &Crop, site: &Site) -> bool {
     match site.kind() {
         None => true,
@@ -357,6 +520,229 @@ fn candidate_sites(
     }
     all.retain(|s| site::room(mem, s.land, fcfg.max_plots) > 0);
     site::nearest(all, state.me.pos, fcfg.max_trip_m)
+}
+
+/// The ripe crop of somebody else in view an outlaw may take (`[farm] steal`, see the module
+/// docs): out in the wild, of another bot of this process (or, with `steal_from_players` and
+/// without `bots.gm_bootstrap`, of anybody), not watched by a real player. The nearest.
+pub fn steal_target(ctx: &Ctx<'_>) -> Option<Foreign> {
+    let cfg = &ctx.cfg.farm;
+    if !cfg.steal || ctx.persona.profile.outlaw < cfg.wild_outlaw || ctx.real_player_near {
+        return None;
+    }
+    let players = cfg.steal_from_players && !ctx.cfg.bots.gm_bootstrap;
+    let mem = ctx.state.market.farm()?;
+    let (world, me) = (ctx.world, &ctx.state.me);
+    let war = crate::bot::war::avoiding(&ctx.cfg.events);
+    mem.foreign
+        .iter()
+        .filter(|f| {
+            let [x, y, _] = f.pos;
+            f.owner != me.char_id
+                && (players || ctx.hub.is_bot_char(f.owner))
+                && world
+                    .farm()
+                    .crop_of_doodad(f.doodad)
+                    .is_some_and(|c| c.is_ripe(f.phase))
+                && mem.at(x, y).is_none()
+                && dist2d(me.pos, f.pos) <= cfg.max_trip_m
+                && world.housing_area_at(x, y).is_none()
+                && world.farm().area_at(x, y).is_none()
+                && !(war && crate::bot::war::at_war(world, ctx.state, x, y))
+        })
+        .min_by(|a, b| dist2d(me.pos, a.pos).total_cmp(&dist2d(me.pos, b.pos)))
+        .copied()
+}
+
+/// Puts the wild plots of the journal (planted before a restart, or by an earlier session) back
+/// into the farm memory, so the harvest finds them; forgets the ones that withered long ago.
+fn restore_wild(ctx: &mut Ctx<'_>) {
+    let (id, now_unix, now) = (ctx.persona.id, unix_ms() / 1000, ctx.now_ms);
+    let journal = &ctx.hub.journal;
+    if journal.read(id, |j| j.wild.plots.is_empty()) {
+        return;
+    }
+    let plots = journal.update(id, |j| {
+        j.wild.prune(now_unix);
+        j.wild.plots.clone()
+    });
+    let mem = ctx.state.market.farm_mut();
+    let mut back = 0;
+    for wp in plots {
+        if mem.plots.len() >= MAX_PLOTS || mem.at(wp.pos[0], wp.pos[1]).is_some() {
+            continue;
+        }
+        let left_ms = wp.ripe_unix.saturating_sub(now_unix).saturating_mul(1000);
+        mem.plots.push(Plot {
+            obj: 0,
+            doodad: wp.doodad,
+            seed: wp.seed,
+            pos: wp.pos,
+            phase: 0,
+            ripe: false,
+            check_ms: now.saturating_add(left_ms).max(1),
+            planted_ms: 0,
+            honest: wp.honest,
+            land: WILD_LAND,
+        });
+        back += 1;
+    }
+    if back > 0 {
+        ctx.log.say(format!(
+            "farm: remembers {back} wild plot(s) from the journal"
+        ));
+    }
+}
+
+/// Writes the wild plots to the journal: the ones planted in this session, the ones harvested
+/// (forgotten) and the ones gone when the bot came back (stolen: the patch is given up).
+/// `patch`: the middle of the wild patch the run plants on.
+fn sync_wild(ctx: &Ctx<'_>, mem: &mut FarmMem, patch: Option<[f32; 2]>) {
+    let gone = mem.take_gone();
+    for g in gone.iter().filter(|g| g.land == STOLEN_LAND && g.harvested) {
+        ctx.log.say(format!(
+            "farm: took the crop at ({:.0}, {:.0}); it is not the bot's own to sell",
+            g.pos[0], g.pos[1]
+        ));
+    }
+    let now_unix = unix_ms() / 1000;
+    let (now, rate) = (ctx.now_ms, ctx.cfg.farm.growth_rate);
+    let world = ctx.world;
+    let fresh: SmallVec<[WildPlot; 4]> = mem
+        .plots
+        .iter()
+        .filter(|p| p.land == WILD_LAND && p.obj != 0 && p.planted_ms != 0)
+        .map(|p| {
+            let planted = now_unix.saturating_sub(now.saturating_sub(p.planted_ms) / 1000);
+            let grow_s = world
+                .farm()
+                .crop_of_doodad(p.doodad)
+                .map_or(0, |c| c.grow_ms_at(rate) / 1000);
+            WildPlot {
+                pos: p.pos,
+                seed: p.seed,
+                doodad: p.doodad,
+                planted_unix: planted,
+                ripe_unix: planted + grow_s,
+                honest: p.honest,
+            }
+        })
+        .collect();
+    if fresh.is_empty() && gone.iter().all(|g| g.land != WILD_LAND) {
+        return;
+    }
+    let mut stolen: SmallVec<[[f32; 3]; 2]> = SmallVec::new();
+    ctx.hub.journal.update(ctx.persona.id, |j| {
+        for g in gone.iter().filter(|g| g.land == WILD_LAND) {
+            if g.harvested {
+                j.wild.harvested_at(g.pos);
+            } else if j.wild.stolen_at(g.pos) {
+                stolen.push(g.pos);
+            }
+        }
+        for f in &fresh {
+            let known = j
+                .wild
+                .plots
+                .iter()
+                .any(|p| dist2d(p.pos, f.pos) < crate::bot::farm::SAME_SPOT_M);
+            if !known {
+                j.wild.add(f.clone());
+            }
+        }
+        if let Some(c) = patch.filter(|_| !fresh.is_empty() && stolen.is_empty()) {
+            j.wild.patch = Some(c);
+        }
+    });
+    for p in stolen {
+        say_stolen(ctx.log, p);
+    }
+}
+
+fn say_stolen(log: &Logger, p: [f32; 3]) {
+    log.say(format!(
+        "farm: the wild crop at ({:.0}, {:.0}) is gone: somebody took it; the next patch goes \
+         somewhere else",
+        p[0], p[1]
+    ));
+}
+
+/// The NPC spawns within `radius` of (x, y) that are townsfolk to a bot of `faction`: friendly to
+/// it, or with a service (a merchant, a trainer) or a quest. The wildlife does not count.
+pub fn townsfolk(world: &World, faction: u32, x: f32, y: f32, radius: f32) -> u32 {
+    let mut n = 0u32;
+    world.npc_spawns_within(Vec3::new(x, y, 0.0), radius, |t, _| {
+        if world.npc(t).is_some_and(|npc| {
+            npc.roles.0 != 0
+                || npc.is_quest_giver
+                || world.relation(faction, npc.faction_id) == aa_world::Relation::Friendly
+        }) {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The world's side of [`site::wild_patch`].
+struct WildWorld<'a> {
+    world: &'a World,
+    state: &'a BotState,
+    hub: &'a Hub,
+    avoid_war: bool,
+    /// Patches where crops were stolen.
+    bad: &'a [[f32; 2]],
+}
+
+impl WildEnv for WildWorld<'_> {
+    fn ground(&self, x: f32, y: f32) -> Option<f32> {
+        super::walkable(self.world, x, y).then(|| self.world.ground_z(x, y).unwrap_or(0.0))
+    }
+
+    fn protected(&self, x: f32, y: f32) -> bool {
+        self.world.housing_area_at(x, y).is_some()
+            || self.world.farm().area_at(x, y).is_some()
+            || (self.avoid_war && crate::bot::war::at_war(self.world, self.state, x, y))
+    }
+
+    fn npcs(&self, x: f32, y: f32, radius: f32, cap: u32) -> u32 {
+        townsfolk(self.world, self.state.me.faction, x, y, radius).min(cap)
+    }
+
+    fn quest_giver(&self, x: f32, y: f32, radius: f32) -> bool {
+        let mut found = false;
+        let world = self.world;
+        world.npc_spawns_within(Vec3::new(x, y, 0.0), radius, |t, _| {
+            found = found || world.npc(t).is_some_and(|n| n.is_quest_giver);
+        });
+        found
+    }
+
+    fn monster(&self, x: f32, y: f32, radius: f32) -> bool {
+        let faction = self.state.me.faction;
+        crate::bot::goals::quest::progress::worst_near(self.world, faction, x, y, radius, u8::MAX)
+            > 0
+    }
+
+    fn town(&self, x: f32, y: f32, radius: f32) -> bool {
+        let near = |p: Vec3| (p.x - x).powi(2) + (p.y - y).powi(2) <= radius * radius;
+        let portals = &self.world.travel().portals;
+        portals.recall_points().iter().any(|r| near(r.pos))
+            || portals.respawn_points().iter().any(|r| near(r.pos))
+    }
+
+    fn player(&self, x: f32, y: f32, radius: f32) -> bool {
+        self.state.units.values().any(|u| {
+            u.kind == UnitKind::Character
+                && dist2d(u.pos, [x, y, 0.0]) <= radius
+                && !self.hub.is_bot_char(u.id)
+        })
+    }
+
+    fn bad(&self, x: f32, y: f32) -> bool {
+        self.bad
+            .iter()
+            .any(|b| dist2d([b[0], b[1], 0.0], [x, y, 0.0]) <= site::WILD_BAD_M)
+    }
 }
 
 /// The nearest merchant NPC of `template` that is in view and alive: `(object id, position)`.
@@ -567,5 +953,9 @@ impl Ops for RealOps<'_> {
             .farm()
             .crop_of_doodad(doodad)
             .map_or(500, |c| c.radius_mm)
+    }
+
+    fn plant_labor(&self, seed: u32) -> i16 {
+        seed_labor(self.world, seed)
     }
 }

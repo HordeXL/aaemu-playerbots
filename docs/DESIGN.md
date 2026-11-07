@@ -514,6 +514,137 @@ unit and flow tests in `bot/farm/` and `bot/goals/farm/`, and `tests/farm_real_d
 needs `AA_COMPACT` and `AA_SERVER_DATA`) which runs the whole loop against the real data and a fake
 server.
 
+## Presence, exploring and wild farms (`presence/`, goals `explore` and `farm`)
+
+Three pieces that make the world look played: bots log in and out on rhythms of their own, go and
+see places, and the shady ones grow crops out in the wild (and take other people's). None of them
+adds a byte to `Bot`: `size_of::<Bot>()` stays 3136 (presence lives on the hub, the explore trip is
+boxed in its goal, the wild-farm state is in the boxed `FarmMem` and the journal).
+
+**Presence** (`presence/`, `[presence]`, off by default).
+
+* `schedule.rs` (pure): a bot's day from its `Profile` (`chronotype`, `dedication`) and its id.
+  The chronotype sets the peak of the day (early bird 08:00, daytime 14:00, evening 20:30, night owl
+  23:30, each bot shifted by up to 50 minutes); dedication sets how many sessions (one, sometimes two
+  or three), how long (a casual player 20 to 60 minutes, a dedicated one hours, half again at the
+  weekend, at most ten), breaks of 5 to 20 minutes in sessions over 100 minutes, and how often a day
+  is skipped (casual players skip more, the weekend less). Every value is drawn from a generator
+  seeded with the bot id and the local day, so a schedule is the same on every call and across
+  restarts. `online_at`, `next_edge` and `curve` (bots scheduled per hour) answer from it.
+* `plan.rs` (pure): one pass. Every bot is a `Row` (online, owned by presence, owned by the
+  director, scheduled, held, its `stop_rank`). The target is the scheduled count, raised to
+  `min_online` and capped at `max_online`, counting every online bot; presence then logs in
+  scheduled bots of its pool first (then unscheduled ones when `min_online` asks for more, the ones
+  whose next session is nearest first) and logs out its own bots whose session is over or that are
+  above the cap, the safest first (`stop_rank`, then the longest online). A bot that may not be
+  stopped now waits for the next pass.
+* `mod.rs` (glue): the supervisor attaches the configuration and the roster; `Hub::tick` calls
+  `Presence::tick` once a second and a pass runs every 20 s (3 s after the start). The pass reads
+  the bot slots (online, activity, party), asks `population::select::stop_rank` whether a bot may be
+  stopped (never in a trade, a duel, a dungeon, a market meeting, on a boat, or in the party of a real
+  player), keeps to `max_starts_per_min` and `max_stops_per_min` and sends
+  `SupCmd::StartIds { presence: true }` and `SupCmd::StopIds { presence: true }`. The supervisor
+  queues the starts through the ordinary login ramp and checks the stop rules once more. With
+  `[social]` on, a bot whose session ends may say a goodbye (`goodbye_chance`, a line that fits the
+  hour) and leaves one pass later.
+* **Who decides about which bot.** A bot the population director started (`Population::is_owned`)
+  is the director's: presence never starts, stops or adopts it, but it counts towards the bounds. A
+  bot the operator started (web UI, `Spawn`) is never stopped by presence. A bot the operator stopped
+  is held: presence does not log it in again until its schedule ends the current session. Presence
+  owns only the bots it started, and forgets a start that did not come online within five minutes.
+  With presence on, the supervisor starts nobody at launch (`bots.count` only sizes the roster).
+* The journal's `sessions` section (`journal/sessions.rs`) counts the sessions that reached the
+  world, the play time and the last log-in and log-out (`Bot::world_loop`, `Bot::go_offline`).
+* Web: `DirectorView::presence` (`PresenceView`, absent when presence is not attached): the local
+  time, online against scheduled, the target and bounds, the next changes, the counts per chronotype
+  and the curve of the day; the Director view shows it as a block below "Process health".
+* The local time is the machine's (`chrono::Local`) or `utc_offset_hours`.
+
+**Exploring** (goal `explore`, `[explore]`, on by default).
+
+* Landmarks (`aa-world` `landmarks.rs`, `World::landmarks`, built at the first call from the zone
+  grid, the terrain and the recall points, about 0.1 s and 25 KiB for `main_world`): per zone key
+  the walkable ground nearest the middle, the highest walkable ground when it stands 25 m above the
+  middle, the coast nearest the middle (walkable ground with water within 48 m) and the recall
+  points. Keys without a zone group (test maps, cut-scene maps, unused areas) get none. A zone as
+  players know it is the zone group (`Landmarks::region`): "Solzreed Peninsula" is three keys.
+* The planner (`goals/explore/plan.rs`, pure over an `Env`): candidates within `max_trip_m` and at
+  least 150 m away, a landmark in a zone (region) the bot has never stood in counting three times a
+  new landmark of a known zone, a seen one a tenth; hills before the coast, recall points and zone
+  middles; nearer counts more (half at 2 km). The best twelve are drawn by weight and at most six
+  are checked: not at war (`ctx.in_war_zone`), on the bot's part of the navigation mesh or on a
+  portal route (`progress::cut_off`, `travel::has_route`), and safe for its level
+  (`WorldChecks::dangerous`: hostile aggressive monsters `level_gap` above it within 150 m of the
+  place, normal and elite ones within 300 m, `level_gap + 4` above it along the straight line, or
+  the quest goal's `progress::deadly`).
+* The goal (`goals/explore.rs`, trip boxed): travels with `ctx.travel` in legs (a far trip may go
+  by portal), gives up after its time budget (2 minutes plus the distance at 2 m/s, at most 40
+  minutes) and avoids the place for six hours; at the place it looks around for 40 to 100 seconds
+  (half again on a hill, at the coast or in a new zone) with short walks and pauses, and jumps for
+  joy when the bot jumps at all. The place goes into the journal's `seen` (100 m cells) on arrival,
+  the end of the trip sets `last_trip_unix`.
+* Every zone a bot stands in is recorded in `seen.zones` by `Bot::publish`, whatever it does.
+* Score (`goals::explore::score`): 0 unless `[explore] enabled`, settled (60 s), healthy (70 %),
+  not in an instance, past the gap since the last trip (`trip_gap_mins` times `1.5 - explorer`) and
+  with something new within `max_trip_m`. Else `(0.05 + 0.45 * explorer^2) * (1 + 0.1 * new places,
+  up to 6) * (1 + 0.2 * the gaps it is overdue, up to 2)`: about a third of the quest weight for an
+  average bot, more for a born explorer.
+* `GoalArgs::dest` heads for that point, `GoalArgs::zone` for a landmark of that zone at any
+  distance; the checks still apply.
+
+**Wild farms** (`[farm] wild`, `steal`, off by default; `bot/farm/`, `goals/farm.rs`).
+
+* What the server does (AAEmu-1.2-Rust, read-only): `systems/npcs/doodad/manager.rs`
+  `handle_create_doodad` lets a seed go down anywhere on dry ground within 30 m unless
+  `placement.rs` refuses the spot (276 area or restricted zone, 154 too far, 277 and 278 another
+  doodad or a unit too close); on a public farm (`public_farm::can_place`) and on house land the
+  seed costs no labor (house land needs the owner's permission, else `NO_PERM` 2), anywhere else it
+  costs the labor of the seed's use skill (`consume_lp`: 10 for most seeds in `compact.sqlite3`, 1
+  for some, 0 for a few) and too little labor is `LABOR_POWER_NEEDED` 9 (the old `refusal::NO_LABOR`
+  29 never matched; it is 9 now, and `NO_PERM` costs only the spot). The crop is saved with its
+  owner. `interactions.rs` `crop_harvest` and `funcs/skills.rs` let anybody harvest a crop out in
+  the open (owner-only applies inside public farms during the guard time, house land needs house
+  permission), and `phase.rs` `theft_evidence` with `social/crime.rs`
+  `generate_evidence_from_theft` leaves footprints (a reportable crime) when somebody else harvests
+  a character's crop with a crime-point harvest skill (all of 13980 to 20486) within the guard time
+  of 24 hours after the planting.
+* A new land type `WILD_LAND` (9) with `Site::wild` (a 4 m circle) beside the gardens (0) and the
+  public farms (1 to 4); `site::wild_patch` (pure over `WildEnv`) draws 32 candidates 60 to 600 m
+  from the bot and keeps the most secluded one that passes `wild_ok`: dry and flat ground across the
+  patch (1.2 m at most), not a public farm, a housing area or a zone at war, no townsfolk (an NPC
+  friendly to the bot or with a service) within 100 m, no recall or respawn point within 200 m, no
+  hostile aggressive monster within 50 m, no quest giver within 150 m, no real player in view within
+  120 m and not within 150 m of a patch where its crops were stolen. On the real data it finds a
+  patch from 15 of 16 race starts and recall points.
+* Who: `[farm] wild` and an `outlaw` trait of at least `wild_outlaw`, or a goal started with
+  `GoalArgs::wild` (then only the wild patch). An outlaw tries its patch first, up to `wild_plots`
+  (part of `max_plots`). `plan::labor_cap` cuts the run to the seeds its labor pays for; the machine
+  checks the labor before every wild seed and a GM bot tops it up (`/labor`). `GoalArgs::item` picks
+  that seed, or a crop that gives that item.
+* The journal's `wild` section keeps the plots (position, seed, doodad, planted and ripe times,
+  honest), the patch and the robbed patches. `Farm::start` puts the plots back into `FarmMem`
+  (`restore_wild`), so a bot that restarted harvests them; `score` also counts a ripe wild plot of the
+  journal. `FarmMem::observe` now tells the land of a crop found again (a public farm, the bot's
+  garden or a housing area, else wild) and keeps the wild plots when the public-farm list arrives.
+  A plot that leaves the memory is noted (`FarmMem::take_gone`); the goal writes harvested ones out
+  of the journal, and a wild one that was gone when the bot came for it counts as stolen: logged,
+  counted, and its patch is given up for another one.
+* Honesty does not change: a plot is honest only when the ledger counted its seed clean (bought), and
+  a minted seed never is.
+* Stealing (`[farm] steal`): a farming bot keeps the ripe crops of others out in the wild that are in
+  view (`FarmMem::foreign`, four at most). An outlaw with no real player near takes one
+  (`steal_target`): the crop of another bot of this process, or of anybody with
+  `steal_from_players` (never with `bots.gm_bootstrap`). The crop goes into the memory as
+  `STOLEN_LAND` (10) for one harvest run: a dishonest window, no replanting, forgotten when the run
+  ends. The bot does not know when the crop was planted, so a theft within the 24 hours leaves
+  footprints for the owner.
+
+Tests: `presence/tests.rs` and the `schedule` and `plan` unit tests; `landmarks` and
+`goals/explore/plan.rs` unit tests; the wild cases in `bot/farm/tests.rs`, `bot/farm/site.rs`,
+`bot/farm/plan.rs` and `goals/farm/tests.rs`; ignored real-data tests `tests/explore_real_data.rs`
+(the landmarks of `main_world` and the trips a new bot plans from each race's start at levels 1 to
+30) and `tests/wild_real_data.rs` (patches near the starts and recall points, seed labor).
+
 ## Parties of real players (`bot/companion/`, goal `companion`)
 
 A bot in the party of a real player: it joins when invited, follows the leader, helps in the fights,

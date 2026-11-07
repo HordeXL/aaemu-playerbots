@@ -345,7 +345,14 @@ impl Bot {
     }
 
     fn go_offline(&mut self) {
-        self.online_since = None;
+        // (the journal's sessions: the time of a session that reached the world)
+        if let Some(since) = self.online_since.take() {
+            let (secs, now) = (since.elapsed().as_secs(), crate::hub::unix_ms() / 1000);
+            self.shared
+                .hub
+                .journal
+                .update(self.entry.id, |j| j.sessions.logout(now, secs));
+        }
         self.shared.hub.contest.release_bot(self.entry.id);
         self.shared.hub.events.release_bot(self.entry.id);
         self.shared.hub.farms.release_bot(self.entry.id);
@@ -547,6 +554,11 @@ impl Bot {
         self.motion
             .enter_world(self.state.me.obj, self.state.me.pos, self.state.me.yaw, now);
         self.online_since = Some(Instant::now());
+        let unix = crate::hub::unix_ms() / 1000;
+        self.shared
+            .hub
+            .journal
+            .update(self.entry.id, |j| j.sessions.login(unix));
         self.paused = false;
         self.secs = 0;
         self.publish(conn);
@@ -1157,6 +1169,13 @@ impl Bot {
         let zone_key = world.zone_key_at(me.pos[0], me.pos[1]);
         let zone_changed = zone_key != self.zone_key;
         self.zone_key = zone_key;
+        // (every zone the bot stands in goes into the journal's `seen`, whatever it does)
+        if let Some(k) = zone_key.filter(|_| zone_changed) {
+            let (journal, id) = (&self.shared.hub.journal, self.entry.id);
+            if !journal.read(id, |j| j.seen.has_zone(k)) {
+                journal.update(id, |j| j.seen.add_zone(k));
+            }
+        }
         let online_secs = self
             .online_since
             .map_or(0, |t| t.elapsed().as_secs() as u32);

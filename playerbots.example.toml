@@ -266,8 +266,21 @@ replant = true
 # bots.long_travel_teleport_m a longer trip is a GM /move.
 max_trip_m = 4000.0
 # Bots with a shady streak also plant "illegal" farms: crops on unprotected land out in the wild,
-# away from roads and towns. Nothing protects such a crop: anybody may take it.
+# away from roads, towns and people. Planting there costs labor (the seed's use skill, usually 1 or
+# 10 points) and nothing protects such a crop: anybody may take it. The plots are kept in the
+# journal (no server packet lists them); a crop that is gone when the bot comes back was stolen,
+# and the bot plants its next patch elsewhere.
 wild = false
+# One bot keeps at most this many wild plots (part of max_plots) ...
+wild_plots = 3
+# ... and plants them of its own accord from this outlaw trait (0 to 1) on.
+wild_outlaw = 0.6
+# Outlaw bots harvest ripe wild crops that are not theirs: only the crops of this process's other
+# bots, unless steal_from_players. The server lets anybody harvest a crop in the wild; for a day
+# after the planting the thief leaves footprints (crime evidence a player can report).
+steal = false
+# With steal: real players' crops too. Never while bots.gm_bootstrap is on.
+steal_from_players = false
 
 [gear]
 # Bots put on the best gear they have for their level, socket gems and tier up as they progress
@@ -281,13 +294,39 @@ enabled = true
 enabled = true
 
 [presence]
-# Bots log in and out on schedules of their own (when in the day they play, how long, breaks), so
-# the population rises and falls like a real server's. Off: every bot stays online.
+# Bots log in and out on schedules of their own, so the population rises and falls like a real
+# server's: when in the day a bot plays follows its chronotype (early bird, daytime, evening, night
+# owl), how long and how often its dedication (a casual plays 20 to 60 minutes and skips days, a
+# no-lifer plays for hours with breaks). On: nobody is started at launch, bots.count only sizes the
+# roster and the schedules log the bots in through the ramp. Bots you start by hand are never
+# logged out by the schedules; a bot you stop by hand stays offline until its schedule ends that
+# session; the population director's bots are its own. Off: every bot stays online.
 enabled = false
+# Bots online at least, all together (sessions are brought forward to keep it) ...
+min_online = 0
+# ... and at most (0 = no limit but the roster). Every bot online counts, whoever started it.
+max_online = 0
+# The schedules log in at most this many bots per minute ...
+max_starts_per_min = 20
+# ... and log out at most this many. A bot is only logged out when that is safe (not in a trade, a
+# duel, a dungeon, a market meeting, on a boat or in the party of a real player).
+max_stops_per_min = 3
+# Chance (0 to 1) that a bot says a short goodbye before it logs out (only with [social] enabled).
+goodbye_chance = 0.1
+# The schedules go by the machine's local time; set this to use UTC plus so many hours instead.
+# utc_offset_hours = 1.0
 
 [explore]
-# Bots go and see places they have not been (goal "explore"); the journal remembers what they saw.
+# Bots go and see places they have not been (goal "explore"): zones they never stood in, the
+# recall points, hills with a view and the coast of the zones they know. What they saw is kept in
+# the journal.
 enabled = true
+# The farthest an exploring trip goes, in metres (portals and the GM /move work as for any trip).
+max_trip_m = 6000.0
+# A destination with monsters this many levels above the bot is left out.
+level_gap = 5
+# Minutes a bot of average curiosity waits between two trips (an explorer at heart half as long).
+trip_gap_mins = 45
 
 [web]
 # Operator UI and JSON API. Keep it on loopback unless you set a token.

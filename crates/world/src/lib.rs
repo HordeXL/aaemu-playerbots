@@ -21,6 +21,7 @@ pub mod geom;
 pub mod housing;
 pub mod items;
 pub mod jsonc;
+pub mod landmarks;
 pub mod npc;
 pub mod quest;
 pub mod quest_atlas;

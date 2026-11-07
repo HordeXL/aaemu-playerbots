@@ -1414,6 +1414,7 @@ impl Inner {
             min_action_gap_secs: 20,
             auto_wishes: vec![3412],
             log: self.pop.log.iter().cloned().collect(),
+            presence: None,
         }
     }
 }

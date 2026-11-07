@@ -381,3 +381,71 @@ fn plots_are_found_by_object_and_by_place() {
     m.drop_plot(9);
     assert!(m.plots.is_empty());
 }
+
+#[test]
+fn wild_plots_survive_the_public_farm_list_and_a_vanished_one_is_noted_as_gone() {
+    let b = book();
+    let wild = |_: f32, _: f32| WILD_LAND;
+    let mut m = FarmMem::default();
+    let w = watcher(&b, &wild, [6.0, 5.0, 10.0], 1_000);
+    m.observe(&w, &created(&[doodad(1, 2259, ME, 4456, 5.0, 5.0)]));
+    assert_eq!(m.plots[0].land, WILD_LAND, "found again out in the open");
+    assert!(m.plots[0].kind().is_none());
+    // the list of the public farms does not name it, and it stays
+    m.observe(&w, &WorldEvent::CommonFarmList(Box::new([])));
+    assert_eq!(m.plots.len(), 1);
+    assert!(!m.has_gone());
+    // it vanishes while the bot looks on: gone, not harvested
+    m.observe(&w, &WorldEvent::DoodadsRemoved(smallvec![1]));
+    assert!(m.plots.is_empty());
+    let gone = m.take_gone();
+    assert_eq!(gone.len(), 1);
+    assert_eq!((gone[0].land, gone[0].harvested), (WILD_LAND, false));
+    assert!(!m.has_gone());
+}
+
+#[test]
+fn a_farming_bot_keeps_an_eye_on_the_wild_crops_of_others_and_only_those() {
+    let b = book();
+    let wild = |x: f32, _: f32| if x < 100.0 { WILD_LAND } else { OWN_LAND };
+    let mut m = FarmMem::default();
+    let w = watcher(&b, &wild, [0.0; 3], 1_000);
+    m.observe(
+        &w,
+        &created(&[
+            doodad(1, 2259, 555, 4456, 5.0, 5.0),
+            doodad(2, 2259, 556, 4457, 150.0, 5.0),
+            doodad(3, 4242, 557, 1, 6.0, 6.0),
+            doodad(4, 2259, ME, 4456, 9.0, 9.0),
+        ]),
+    );
+    assert_eq!(
+        m.foreign.len(),
+        1,
+        "a garden's crop and a stranger are left alone"
+    );
+    assert_eq!((m.foreign[0].obj, m.foreign[0].owner), (1, 555));
+    assert_eq!(m.plots.len(), 1, "the bot's own crop is a plot");
+    m.observe(
+        &w,
+        &WorldEvent::DoodadPhase {
+            obj: 1,
+            phase: 4457,
+        },
+    );
+    assert_eq!(m.foreign[0].phase, 4457);
+    m.observe(&w, &WorldEvent::DoodadsRemoved(smallvec![1]));
+    assert!(m.foreign.is_empty());
+    // bounded
+    for i in 0..10 {
+        m.observe(
+            &w,
+            &created(&[doodad(10 + i, 2259, 555, 4456, i as f32, 0.0)]),
+        );
+    }
+    assert_eq!(m.foreign.len(), MAX_FOREIGN);
+    // the crops a run took on are forgotten when it ends
+    m.plots[0].land = STOLEN_LAND;
+    m.drop_stolen();
+    assert!(m.plots.is_empty());
+}

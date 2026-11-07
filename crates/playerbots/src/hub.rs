@@ -201,7 +201,7 @@ pub struct Counters {
 }
 
 /// A request to the supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupCmd {
     /// Start `n` more bots.
     Spawn(u32),
@@ -217,6 +217,13 @@ pub enum SupCmd {
         sel: Selector,
         rule: StopRule,
     },
+    /// Start the roster bots `ids` that do not run (queued for the ramp like every start);
+    /// `presence`: the presence schedules asked, and the bots are theirs to stop again.
+    StartIds { ids: Box<[u32]>, presence: bool },
+    /// Stop those of the bots `ids` that are safe to stop now (see
+    /// [`crate::population::select::stop_rank`]; never one in the party of a real player); queued
+    /// ones leave the queue. `presence`: only the bots the presence schedules started.
+    StopIds { ids: Box<[u32]>, presence: bool },
 }
 
 #[derive(Debug)]
@@ -929,7 +936,9 @@ impl BotHub for Hub {
     }
 
     fn director(&self) -> DirectorView {
-        self.pop.director_view(self)
+        let mut view = self.pop.director_view(self);
+        view.presence = self.presence.view();
+        view
     }
 
     fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {

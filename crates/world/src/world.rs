@@ -178,6 +178,8 @@ pub struct World {
     quest_atlas: OnceLock<QuestAtlas>,
     /// Spots inside each conflict zone group, built at the first [`World::zone_group_spots`].
     group_spots: OnceLock<FxHashMap<u16, Box<[[f32; 2]]>>>,
+    /// Places worth seeing, built at the first [`World::landmarks`].
+    pub(crate) landmarks: OnceLock<crate::landmarks::Landmarks>,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -310,6 +312,7 @@ impl World {
             water_deep: OnceLock::new(),
             quest_atlas: OnceLock::new(),
             group_spots: OnceLock::new(),
+            landmarks: OnceLock::new(),
         };
         let q = world.quests.stats();
         tracing::info!(

@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 
 use crate::bot::farm::plan::Plan;
 use crate::bot::farm::site::Site;
-use crate::bot::farm::{refusal, FarmMem, Plot, SAME_SPOT_M};
+use crate::bot::farm::{refusal, FarmMem, Plot, SAME_SPOT_M, STOLEN_LAND, WILD_LAND};
 use crate::bot::motion::{MotionStatus, MoveFailure};
 use crate::bot::state::{dist2d, StateError};
 
@@ -133,6 +133,19 @@ pub trait Ops {
     fn cast_ms(&self, skill: u32) -> u64;
     /// The crop's planting radius for a seed.
     fn radius_mm(&self, doodad: u32) -> u16;
+    /// The labor planting one `seed` out in the wild costs (its use skill's).
+    fn plant_labor(&self, seed: u32) -> i16;
+}
+
+/// What [`Machine::labor`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Labor {
+    /// The bot has the points.
+    Enough,
+    /// A GM top-up was asked for; wait for it.
+    Wait,
+    /// Not enough, and no top-up to wait for.
+    Short,
 }
 
 /// What the bot knows this tick.
@@ -403,6 +416,24 @@ impl Machine {
             Job::Plant(p) => Some(p),
             Job::Reap => None,
         }
+    }
+
+    /// Whether the bot has `need` labor points; a GM bot asks for a top-up once per run and
+    /// waits a few seconds for it.
+    fn labor(&mut self, io: &Input<'_>, acts: &mut Vec<Act>, need: i16) -> Labor {
+        if io.labor >= need {
+            return Labor::Enough;
+        }
+        if io.gm && !self.labor_asked {
+            self.labor_asked = true;
+            self.labor_ms = io.now_ms;
+            acts.push(Act::Gm(format!("/labor {}", LABOR_TOP_UP.max(need))));
+            return Labor::Wait;
+        }
+        if io.gm && io.now_ms.saturating_sub(self.labor_ms) < 8_000 {
+            return Labor::Wait;
+        }
+        Labor::Short
     }
 
     fn enter(&mut self, phase: Phase, io: &Input<'_>) {
@@ -690,6 +721,28 @@ impl Machine {
                 if io.now_ms.saturating_sub(sow.faced_ms) < FACE_WAIT_MS {
                     return GoalStatus::Running;
                 }
+                // a seed out in the wild costs the labor of its use skill
+                if sow.land == WILD_LAND {
+                    let need = io.ops.plant_labor(sow.seed);
+                    match self.labor(io, acts, need) {
+                        Labor::Enough => {}
+                        Labor::Wait => return GoalStatus::Running,
+                        Labor::Short => {
+                            acts.push(Act::Say(format!(
+                                "farm: {} labor points are not enough to plant out in the wild \
+                                 (needs {need})",
+                                io.labor
+                            )));
+                            return self.sow_end(
+                                io,
+                                mem,
+                                acts,
+                                sow,
+                                Some(FailReason::Other("not enough labor")),
+                            );
+                        }
+                    }
+                }
                 let honest = (io.clean)(sow.seed) >= 1;
                 acts.push(Act::Plant {
                     doodad: sow.doodad,
@@ -786,6 +839,7 @@ impl Machine {
                     Some(FailReason::Other("not enough labor")),
                 ),
                 refusal::AREA
+                | refusal::NO_PERM
                 | refusal::TOO_CLOSE_DOODAD
                 | refusal::TOO_CLOSE_UNIT
                 | refusal::TOO_FAR => {
@@ -947,11 +1001,16 @@ impl Machine {
                     if io.now_ms.saturating_sub(self.reap.unseen_ms) > VIEW_WAIT_MS {
                         // the bot stands at the place and sees no crop: it is gone
                         acts.push(Act::Say(format!(
-                            "farm: no crop at ({:.0}, {:.0}) any more",
-                            at[0], at[1]
+                            "farm: no crop at ({:.0}, {:.0}) any more{}",
+                            at[0],
+                            at[1],
+                            if plot.land == WILD_LAND {
+                                " (somebody took it?)"
+                            } else {
+                                ""
+                            }
                         )));
-                        mem.drop_plot(i);
-                        mem.lost += 1;
+                        mem.lose_plot(i);
                         acts.push(Act::Publish);
                         self.reap = Reap::default();
                     }
@@ -988,24 +1047,19 @@ impl Machine {
             return GoalStatus::Running;
         };
         let need = labor_of(skill);
-        if io.labor < need {
-            if io.gm && !self.labor_asked {
-                self.labor_asked = true;
-                self.labor_ms = io.now_ms;
-                acts.push(Act::Gm(format!("/labor {LABOR_TOP_UP}")));
-                return GoalStatus::Running;
+        match self.labor(io, acts, need) {
+            Labor::Enough => {}
+            Labor::Wait => return GoalStatus::Running,
+            Labor::Short => {
+                acts.push(Act::Say(format!(
+                    "farm: {} labor points are not enough for the harvest (needs {need})",
+                    io.labor
+                )));
+                return self.finish(
+                    mem,
+                    GoalStatus::Failed(FailReason::Other("not enough labor")),
+                );
             }
-            if io.gm && io.now_ms.saturating_sub(self.labor_ms) < 8_000 {
-                return GoalStatus::Running;
-            }
-            acts.push(Act::Say(format!(
-                "farm: {} labor points are not enough for the harvest (needs {need})",
-                io.labor
-            )));
-            return self.finish(
-                mem,
-                GoalStatus::Failed(FailReason::Other("not enough labor")),
-            );
         }
         acts.push(Act::StopMotion);
         acts.push(Act::Face {
@@ -1104,7 +1158,8 @@ impl Machine {
         let r = self.reap;
         self.visit(at);
         self.reap = Reap::default();
-        if idx.is_none() && io.replant {
+        // (a stolen crop's place is not the bot's to plant again)
+        if idx.is_none() && io.replant && r.land != STOLEN_LAND {
             if let Some((_, have)) = (io.item)(r.seed).filter(|(_, n)| *n > 0) {
                 let _ = have;
                 self.sow = Some(Sow {

@@ -57,9 +57,10 @@ pub use gear::{GearLine, GearView};
 pub use journal::JournalView;
 pub use persona::{ProfilePatch, ProfileView, CHRONOTYPES};
 pub use population::{
-    ActionRecord, Alliance, BoostRequest, BoostWish, Continent, DirectorView, EconomySources,
-    EconomyView, HealthView, HeatCell, ItemRow, PlayerSeen, Policy, PolicyPatch, RegionCell,
-    ServerView, SideRow, SpawnFilter, WorldTotals, WorldView, ZoneRow,
+    ActionRecord, Alliance, BoostRequest, BoostWish, ChronotypeRow, Continent, DirectorView,
+    EconomySources, EconomyView, HealthView, HeatCell, ItemRow, PlayerSeen, Policy, PolicyPatch,
+    PresenceChange, PresenceView, RegionCell, ServerView, SideRow, SpawnFilter, WorldTotals,
+    WorldView, ZoneRow,
 };
 pub use server::{router, serve, serve_listener, WebConfig, TOKEN_HEADER};
 pub use types::{

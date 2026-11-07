@@ -32,7 +32,9 @@ reads it (default `playerbots.toml`).
 | `[events]` | World events such as rifts, off by default: `enabled`, `max_bots_per_event`, `max_share`, `join_delay_secs` and `avoid_war_zones` (see [World events](#world-events-events)). |
 | `[party]` | Bots and the parties of real players, off by default: `join_player_parties`, `chat_commands` and `follow_into_dungeons`. |
 | `[population]` | The web UI's population director, off by default and a dry run when on: `enabled`, `dry_run`, `max_spawn_per_min` and `min_action_gap_secs`. |
-| `[farm]` | Farming, off by default: `enabled`, `max_plots`, `growth_rate`, `public_farms`, `own_land`, `replant` and `max_trip_m`. |
+| `[farm]` | Farming, off by default: `enabled`, `max_plots`, `growth_rate`, `public_farms`, `own_land`, `replant`, `max_trip_m`, and the wild farms `wild`, `wild_plots`, `wild_outlaw`, `steal` and `steal_from_players`. |
+| `[presence]` | Log-in schedules, off by default: `enabled`, `min_online`, `max_online`, `max_starts_per_min`, `max_stops_per_min`, `goodbye_chance` and `utc_offset_hours` (see [Presence](#presence-presence)). |
+| `[explore]` | The explore goal, on by default: `enabled`, `max_trip_m`, `level_gap` and `trip_gap_mins` (see [Exploring](#exploring-explore)). |
 | `[web]` | The web UI's `bind` address and optional `token`. |
 | `[social]` | The chat limits (see [Chat and the LLM](#chat-and-the-llm)). |
 | `[llm]` | The optional chat and director add-on. |
@@ -80,7 +82,8 @@ for a minute. The bot defends itself whatever it is doing.
 | **Warzone** | Off until `[pvp] enabled` and `warzone`. Scored while a reachable land zone group is at war (conflict or war) with enough time left and the bot has not yet killed `war_kill_cap` characters in it: goes there, patrols from spot to spot, fights allowed characters when the odds are fair, regroups when hurt and leaves at peace. See [Player versus player](#player-versus-player-pvp). |
 | **Event** | Joins a rift (a tower defence event) while one runs, walks to the defended target, kills the monsters of the current wave next to other bots and leaves when it ends. Needs `[events] enabled`; see [World events](#world-events-events). |
 | **Companion** | A bot in the party of a real player follows the leader, helps in its fights, obeys a closed set of chat commands and, with `follow_into_dungeons`, goes through a dungeon door behind the leader. Needs `[party] join_player_parties`; see [Parties of real players](#parties-of-real-players-party). |
-| **Farm** | Off until `[farm] enabled`. Plants, waits and harvests crops, and grows what the server is short of; see [Farming](#farming-farm). |
+| **Farm** | Off until `[farm] enabled`. Plants, waits and harvests crops, and grows what the server is short of; outlaws may keep a small wild farm and take other bots' crops; see [Farming](#farming-farm). |
+| **Explore** | Goes to see a zone the bot has never been to, a hill, the coast or a recall point within reach and safe for its level, and looks around there; see [Exploring](#exploring-explore). |
 | **Rest / Wander** | Stand still until hit points and mana recover; stroll around. |
 | **Social chat** | Answers whispers and nearby players (canned lines, or an LLM in character) and chats a little with other bots (see [Chat and the LLM](#chat-and-the-llm)). A background duty, not a goal. |
 | **LLM director** (optional) | Now and then, and sooner after a level-up, a death, a failure or a new zone, asks the LLM for a short plan among the currently eligible goals and concrete variants of them (explore a zone, wander to a town, farm wild); keeps the notes it makes (see [Chat and the LLM](#chat-and-the-llm)). |
@@ -198,6 +201,18 @@ companion goal in [Parties of real players](#parties-of-real-players-party) and 
 | | `own_land` | `true` | Plant on the land of the bot's own houses. |
 | | `replant` | `true` | Plant the seeds a harvest gives back on the spot the crop stood. |
 | | `max_trip_m` | `4000.0` | The farthest a bot walks to a farm, a vendor or a plot (metres). |
+| | `wild` | `false` | Outlaw bots also keep a small farm out in the wild (no protection, costs labor; see [Farming](#farming-farm)). |
+| | `wild_plots` | `3` | One bot keeps at most this many wild plots, part of `max_plots` (0 to 32). |
+| | `wild_outlaw` | `0.6` | The `outlaw` trait (0 to 1) from which a bot plants wild farms and, with `steal`, steals. |
+| | `steal` | `false` | Outlaw bots harvest ripe wild crops of the other bots of this process. |
+| | `steal_from_players` | `false` | With `steal`: the wild crops of real players too; never while `bots.gm_bootstrap` is on. |
+| `[presence]` | `enabled` | `false` | Bots log in and out on schedules of their own (see [Presence](#presence-presence)). |
+| | `min_online` | `0` | At least this many bots online at all hours. |
+| | `max_online` | `0` | At most this many bots online (0: as many as the roster has). |
+| | `max_starts_per_min` | `20` | Log-ins per minute at most (1 to 1000). |
+| | `max_stops_per_min` | `3` | Log-outs per minute at most (1 to 1000). |
+| | `goodbye_chance` | `0.1` | The chance (0 to 1) that a bot says goodbye before it logs out; needs `[social]`. |
+| | `utc_offset_hours` | (machine) | The local time of the schedules as hours from UTC (-14 to 14); not set: the machine's local time. |
 
 The process warns at start when `pvp.attack_players` is set together with `bots.gm_bootstrap`.
 
@@ -525,7 +540,7 @@ hub's farm board, halved at 40 units). A wished item beats any profit, so "boost
 to potatoes, and thirty bots do not all plant the one scarce item.
 
 **Where.** The server lets a character plant anywhere on dry ground within 30 m, but a plot costs
-labor everywhere except in two places, which are the only ones the bots use:
+labor everywhere except in two places, which are the only ones the bots use (unless `wild`, below):
 
 * the **garden of the bot's own house** (`own_land`), a square of twice the garden radius around it;
 * a **public farm** (`public_farms`), the farm sub zones. A character may have 10 crops on a field
@@ -555,10 +570,79 @@ the harvest cast: a plot planted from clean seeds is `honest` and its produce co
 own (and may be sold, see [Selling](#selling-market)); a plot from minted seeds, or one found again
 after a reconnect, is not counted at all. The plot list in the web UI shows which is which.
 
+**Wild farms.** With `wild`, a bot whose `outlaw` trait is at least `wild_outlaw` (or a farm goal
+given the `wild` argument) also plants up to `wild_plots` crops on one small patch out in the open:
+a secluded spot 60 to 600 m away on dry, flat ground, outside the public farms, the housing areas
+and zones at war, away from townsfolk, quest givers, recall and respawn points, aggressive monsters
+and real players. Each seed there costs the labor of its use skill (10 points for most seeds), so a
+bot plants only as many as its labor pays for (a GM bot tops its labor up). The plots are kept in
+the bot's journal, so it comes back for them after a restart. Anybody may harvest a crop out in the
+open: when the bot comes back and its crop is gone, the log says so, the journal counts it as
+stolen, and the next patch goes somewhere else. The server lets a stranger who harvests a crop
+within 24 hours of the planting leave footprints (a crime the owner can report). The web UI shows
+such plots with the land "wild".
+
+**Stealing.** With `steal`, those outlaws also harvest a ripe crop out in the wild that is not
+theirs when no real player is near: only the crops of the other bots of this process, unless
+`steal_from_players` (never with `bots.gm_bootstrap`). What a theft gives never counts as the bot's
+own (it is not sold), and the stolen spot is not planted again. Together with wild farms this makes
+the bots rob each other now and then, and the robbed ones move their patch.
+
 **Limits and memory.** A bot remembers at most 64 plots. The memory sits behind one pointer in the
 bot's market state, so a bot that never farms pays eight bytes. The farming bots publish what they are
 growing to the hub's board (at most 16 items each, dropped when the bot leaves) and the Economy
 view's "Growing" column is its sum.
+
+## Presence (`[presence]`)
+
+With `[presence] enabled` the bots log in and out on schedules of their own, so the population rises
+in the evening and thins out at night like a real server's. Off by default: every bot started stays
+online.
+
+* **Rhythm.** Every bot has a chronotype (early bird, daytime, evening, night owl) and a dedication
+  in its personality (`[personality]`; without it every bot is a daytime player of middling
+  dedication). A casual bot plays one session of 20 to 60 minutes on most days; a dedicated one
+  plays for hours, sometimes twice a day, with breaks, and skips fewer days; weekends run longer.
+  The schedule follows from the bot id and the day, so it is the same after a restart. The clock is
+  the machine's local time, or UTC plus `utc_offset_hours`.
+* **Passes.** Every 20 seconds presence compares who is online with who is scheduled. It logs in
+  scheduled bots through the usual login ramp (at most `max_starts_per_min`) and logs out its own
+  bots whose session is over (at most `max_stops_per_min`). It never logs out a bot that is trading,
+  duelling, in a dungeon, at a market meeting, on a boat or in the party of a real player; that bot
+  goes at a later pass.
+* **Bounds.** `min_online` keeps that many bots online at all hours (presence logs in unscheduled
+  ones, the next to play first); `max_online` caps the bots online (0: no cap, only the roster).
+  Both count every online bot.
+* **Who decides.** The population director's bots are its own: presence leaves them alone but
+  counts them. A bot you start in the web UI is never logged out by presence; a bot you stop is not
+  logged in again until its current session would have ended. With presence on, nobody is started
+  at launch: `bots.count` only sizes the roster (new characters are made as usual when a bot first
+  logs in).
+* **Goodbyes.** With `[social]` on, a bot whose session ends may say a short goodbye in local chat
+  first (`goodbye_chance`) and leaves twenty seconds later.
+* **Web UI.** The Director view has a "Presence" block: local time, online and scheduled, the target
+  and bounds, log-ins and log-outs in the last hour, the next changes, the bots per chronotype and a
+  bar chart of the day. The bot's journal counts its sessions and play time.
+
+## Exploring (`[explore]`)
+
+Bots now and then go and see a place (goal `explore`, on by default): a zone they have never been
+to, the high ground of a zone, the coast, a recall point or the middle of a zone, within
+`max_trip_m` (6 km). They pick places safe for their level (no aggressive monsters `level_gap`
+levels above them at the place, none much stronger on the way, nothing the quest goal calls
+deadly), out of zones at war and reachable on foot or by portal; they look around for a minute or
+two and jump for joy at a new zone or on a hill. A place they could not reach is left alone for six
+hours. How often depends on the `explorer` trait of the personality: a born explorer goes every 20
+minutes or so (`trip_gap_mins` 45 times `1.5 - explorer`), a bot that does not care rarely. The
+bot's journal remembers the zones it stood in (whatever it was doing), the places it saw and its
+trips. `[explore] enabled = false` switches the goal off.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | The goal is on. |
+| `max_trip_m` | `6000.0` | The farthest place a bot goes to on its own (metres, straight; 100 to 100000). A zone given with the goal's `zone` argument may be farther. |
+| `level_gap` | `5` | Hostile aggressive monsters this many levels above the bot make a place unsafe (1 to 60). |
+| `trip_gap_mins` | `45` | Minutes between two trips of an average bot (0 to 1440). |
 
 ## Selling (`[market]`)
 

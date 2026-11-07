@@ -671,6 +671,18 @@ pub struct FarmCfg {
     /// Bots with a shady streak (`Profile::outlaw`) also plant on unprotected land out in the
     /// wild (an "illegal" farm: no labor-free protection, anybody may take the crop).
     pub wild: bool,
+    /// One bot keeps at most this many wild plots (part of `max_plots`).
+    pub wild_plots: u32,
+    /// The `outlaw` trait (0..=1) from which a bot plants wild farms of its own accord (a farm goal
+    /// started with the `wild` argument always does).
+    pub wild_outlaw: f32,
+    /// Outlaw bots harvest ripe wild crops that are not theirs (crops of the other bots of this
+    /// process only, unless `steal_from_players`). The server lets anybody harvest a crop out in
+    /// the wild; within a day of its planting the thief leaves footprints (crime evidence).
+    pub steal: bool,
+    /// With `steal`: the crops of real players are fair game too. Never while
+    /// `bots.gm_bootstrap` is on.
+    pub steal_from_players: bool,
 }
 
 impl Default for FarmCfg {
@@ -684,6 +696,10 @@ impl Default for FarmCfg {
             replant: true,
             max_trip_m: 4_000.0,
             wild: false,
+            wild_plots: 3,
+            wild_outlaw: 0.6,
+            steal: false,
+            steal_from_players: false,
         }
     }
 }
@@ -721,12 +737,79 @@ impl Default for PersonalityCfg {
 
 /// `[presence]`: bots log in and out on schedules of their own (when in the day they play, how
 /// long a session lasts, breaks), so the population rises and falls like a real server's. Off by
-/// default: every bot stays online.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// default: every bot stays online. See [`crate::presence`].
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PresenceCfg {
-    /// Master switch of the schedules.
+    /// Master switch of the schedules. On: the supervisor starts nobody at launch and the
+    /// schedules log the bots in and out (`bots.count` only sizes the roster).
     pub enabled: bool,
+    /// Bots online at least, all together (the schedules bring sessions forward to keep it).
+    pub min_online: u32,
+    /// Bots online at most, all together (0 = no limit but the roster).
+    pub max_online: u32,
+    /// The schedules log in at most this many bots per minute (through the login ramp).
+    pub max_starts_per_min: u32,
+    /// ... and log out at most this many per minute.
+    pub max_stops_per_min: u32,
+    /// Chance (0..=1) that a bot says a short goodbye before it logs out (only with
+    /// `[social] enabled`).
+    pub goodbye_chance: f32,
+    /// The schedules' clock is UTC plus this many hours; unset = the machine's local time.
+    pub utc_offset_hours: Option<f32>,
+}
+
+impl Default for PresenceCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_online: 0,
+            max_online: 0,
+            max_starts_per_min: 20,
+            max_stops_per_min: 3,
+            goodbye_chance: 0.1,
+            utc_offset_hours: None,
+        }
+    }
+}
+
+impl PresenceCfg {
+    /// Checks the values.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (key, v) in [
+            ("min_online", self.min_online),
+            ("max_online", self.max_online),
+        ] {
+            ensure!(
+                v <= MAX_BOTS,
+                "presence.{key} {v} is above the limit of {MAX_BOTS}"
+            );
+        }
+        ensure!(
+            self.max_online == 0 || self.min_online <= self.max_online,
+            "presence.min_online must not be above presence.max_online"
+        );
+        for (key, v) in [
+            ("max_starts_per_min", self.max_starts_per_min),
+            ("max_stops_per_min", self.max_stops_per_min),
+        ] {
+            ensure!(
+                (1..=1000).contains(&v),
+                "presence.{key} must be in 1..=1000"
+            );
+        }
+        ensure!(
+            self.goodbye_chance.is_finite() && (0.0..=1.0).contains(&self.goodbye_chance),
+            "presence.goodbye_chance must be in 0..=1"
+        );
+        if let Some(h) = self.utc_offset_hours {
+            ensure!(
+                h.is_finite() && (-14.0..=14.0).contains(&h),
+                "presence.utc_offset_hours must be in -14..=14"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[explore]`: bots go and see places they have not been (goal `explore`); what they saw is
@@ -736,11 +819,45 @@ pub struct PresenceCfg {
 pub struct ExploreCfg {
     /// Master switch of exploring.
     pub enabled: bool,
+    /// The farthest an exploring trip goes (metres, straight line; portals and the GM `/move`
+    /// work as for any trip).
+    pub max_trip_m: f32,
+    /// A destination with monsters this many levels above the bot is left out (also along the
+    /// way, the quest goal's danger checks apply too).
+    pub level_gap: u8,
+    /// Minutes a bot of average curiosity waits between two trips (an explorer at heart half as
+    /// long, a homebody twice as long).
+    pub trip_gap_mins: u32,
 }
 
 impl Default for ExploreCfg {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            max_trip_m: 6_000.0,
+            level_gap: 5,
+            trip_gap_mins: 45,
+        }
+    }
+}
+
+impl ExploreCfg {
+    /// Checks the values.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.max_trip_m.is_finite() && (100.0..=100_000.0).contains(&self.max_trip_m),
+            "explore.max_trip_m {} must be between 100 and 100000",
+            self.max_trip_m
+        );
+        ensure!(
+            (1..=60).contains(&self.level_gap),
+            "explore.level_gap must be in 1..=60"
+        );
+        ensure!(
+            self.trip_gap_mins <= 1440,
+            "explore.trip_gap_mins must be at most 1440"
+        );
+        Ok(())
     }
 }
 
@@ -1165,6 +1282,18 @@ impl Config {
             "farm.max_trip_m {} must be between 50 and 100000",
             self.farm.max_trip_m
         );
+        ensure!(
+            self.farm.wild_plots as usize <= crate::journal::MAX_WILD_PLOTS,
+            "farm.wild_plots {} is above the limit of {}",
+            self.farm.wild_plots,
+            crate::journal::MAX_WILD_PLOTS
+        );
+        ensure!(
+            self.farm.wild_outlaw.is_finite() && (0.0..=1.0).contains(&self.farm.wild_outlaw),
+            "farm.wild_outlaw must be in 0..=1"
+        );
+        self.presence.validate()?;
+        self.explore.validate()?;
         let c = &self.social;
         ensure!(
             c.reply_radius_m.is_finite() && c.reply_radius_m >= 0.0,
@@ -2038,6 +2167,120 @@ emote = true
             "[farm]\ngrowth_rate = 0.0\n",
             "[farm]\ngrowth_rate = nan\n",
             "[farm]\nmax_trip_m = 10.0\n",
+            "[farm]\nwild_plots = 33\n",
+            "[farm]\nwild_outlaw = 1.5\n",
+            "[farm]\nsteal = 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_wild_farm_keys_are_off_by_default() {
+        let f = Config::default().farm;
+        assert!(!f.wild && !f.steal && !f.steal_from_players);
+        assert_eq!((f.wild_plots, f.wild_outlaw), (3, 0.6));
+        let ex = Config::parse(Config::example()).unwrap().farm;
+        assert!(!ex.wild && !ex.steal && !ex.steal_from_players);
+        assert_eq!((ex.wild_plots, ex.wild_outlaw), (3, 0.6));
+        assert_documented(
+            "farm",
+            &[
+                "wild = false",
+                "wild_plots = 3",
+                "wild_outlaw = 0.6",
+                "steal = false",
+                "steal_from_players = false",
+            ],
+        );
+        let cfg =
+            Config::parse("[farm]\nwild = true\nwild_plots = 0\nwild_outlaw = 0.0\nsteal = true\n")
+                .unwrap();
+        assert!(cfg.farm.wild && cfg.farm.steal);
+        assert_eq!(cfg.farm.wild_plots, 0);
+    }
+
+    #[test]
+    fn the_presence_keys_are_off_and_documented() {
+        let p = Config::default().presence;
+        assert!(!p.enabled);
+        assert_eq!((p.min_online, p.max_online), (0, 0));
+        assert_eq!((p.max_starts_per_min, p.max_stops_per_min), (20, 3));
+        assert_eq!(p.goodbye_chance, 0.1);
+        assert!(p.utc_offset_hours.is_none());
+        let ex = Config::parse(Config::example()).unwrap().presence;
+        assert!(!ex.enabled);
+        assert_eq!((ex.min_online, ex.max_online), (0, 0));
+        assert_eq!((ex.max_starts_per_min, ex.max_stops_per_min), (20, 3));
+        assert_eq!(ex.goodbye_chance, 0.1);
+        assert!(
+            ex.utc_offset_hours.is_none(),
+            "commented out in the example"
+        );
+        assert_documented(
+            "presence",
+            &[
+                "enabled = false",
+                "min_online = 0",
+                "max_online = 0",
+                "max_starts_per_min = 20",
+                "max_stops_per_min = 3",
+                "goodbye_chance = 0.1",
+                "# utc_offset_hours = 1.0",
+            ],
+        );
+        let cfg = Config::parse(
+            "[presence]\nenabled = true\nmin_online = 5\nmax_online = 40\nutc_offset_hours = -5.5\n",
+        )
+        .unwrap();
+        let p = cfg.presence;
+        assert!(p.enabled);
+        assert_eq!((p.min_online, p.max_online), (5, 40));
+        assert_eq!(p.utc_offset_hours, Some(-5.5));
+        for bad in [
+            "[presence]\nenable = true\n",
+            "[presence]\nmin_online = 10\nmax_online = 5\n",
+            "[presence]\nmax_online = 5001\n",
+            "[presence]\nmax_stops_per_min = 0\n",
+            "[presence]\nmax_starts_per_min = 1001\n",
+            "[presence]\ngoodbye_chance = 2.0\n",
+            "[presence]\nutc_offset_hours = 15.0\n",
+            "[presence]\nutc_offset_hours = nan\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        // no upper bound: any floor goes
+        assert!(Config::parse("[presence]\nmin_online = 30\n").is_ok());
+    }
+
+    #[test]
+    fn the_explore_keys_are_on_and_documented() {
+        let e = Config::default().explore;
+        assert!(e.enabled);
+        assert_eq!(
+            (e.max_trip_m, e.level_gap, e.trip_gap_mins),
+            (6_000.0, 5, 45)
+        );
+        let ex = Config::parse(Config::example()).unwrap().explore;
+        assert!(ex.enabled);
+        assert_eq!(
+            (ex.max_trip_m, ex.level_gap, ex.trip_gap_mins),
+            (6_000.0, 5, 45)
+        );
+        assert_documented(
+            "explore",
+            &[
+                "enabled = true",
+                "max_trip_m = 6000.0",
+                "level_gap = 5",
+                "trip_gap_mins = 45",
+            ],
+        );
+        for bad in [
+            "[explore]\nmax_trip_m = 10.0\n",
+            "[explore]\nlevel_gap = 0\n",
+            "[explore]\ntrip_gap_mins = 2000\n",
+            "[explore]\nzones = 3\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
