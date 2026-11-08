@@ -680,6 +680,7 @@ function renderDirector(force) {
   add('登录中', num(hl.connecting));
   if (hl.holding) add('暂停原因', hl.holding);
   E.dHealth.replaceChildren(kv);
+  renderPresence(d.presence);
 
   // forms: do not overwrite what the operator is typing
   for (const [key] of POLICY_NUMBERS) {
@@ -711,6 +712,69 @@ function renderDirector(force) {
     }
     E.dLog.replaceChildren(lt);
   }
+}
+
+// ------------------------------------------------------------------ 在线日程（presence）
+// 一个块：第一次渲染时建立在"进程健康度"下面，数据来自 d.presence。
+const CHRONO_LABEL = { early_bird: '早起的鸟', daytime: '白天型', evening: '夜猫子', night_owl: '深夜党' };
+function presenceCurve(values, localTime) {
+  const v = (values || []).map(num);
+  const top = Math.max(1, ...v);
+  const hour = parseInt(String(localTime || '').slice(0, 2), 10);
+  const box = h('div');
+  box.style.cssText = 'display:flex;align-items:flex-end;gap:1px;height:44px;margin-top:4px';
+  box.title = '一天中每个小时排班的 bot 数（未算上下限）';
+  v.forEach((n, i) => {
+    const b = h('div');
+    b.style.cssText = 'flex:1 1 0;min-width:2px;border-radius:2px 2px 0 0;background:var(--'
+      + (i === hour ? 'warn' : 'accent') + ');height:' + Math.max(1, Math.round((n / top) * 40)) + 'px';
+    b.title = String(i).padStart(2, '0') + ':30 · ' + n + ' 个 bot';
+    box.append(b);
+  });
+  const axis = h('div', 'muted pop-note', '00:00 … 23:59 · 现在 = ' + (localTime || '?'));
+  const out = h('div');
+  out.append(box, axis);
+  return out;
+}
+function renderPresence(pv) {
+  if (!E.pBlock) {
+    E.pHead = section('在线日程', '（登录日程）');
+    E.pBlock = h('div', 'pop-block');
+    E.dHealth.after(E.pHead, E.pBlock);
+  }
+  E.pHead.hidden = E.pBlock.hidden = !pv;
+  if (!pv) return;
+  if (!pv.enabled) {
+    E.pBlock.replaceChildren(empty('已关闭（[presence] enabled = false）：所有 bot 保持在线。'));
+    return;
+  }
+  const off = num(pv.utc_offset_hours);
+  const tiles = h('div', 'pop-tiles');
+  tiles.append(
+    tile('本地时间', pv.local_time || '?', 'UTC' + (off >= 0 ? '+' : '') + off),
+    tile('在线', fmtCount(pv.online), fmtCount(pv.own_online) + ' 个按日程，池 ' + fmtCount(pv.pool)),
+    tile('当前排班', fmtCount(pv.scheduled), '目标 ' + fmtCount(pv.target) + ' 个在线'),
+    tile('最近一小时', num(pv.logins_last_hour) + ' 个上线', num(pv.logouts_last_hour) + ' 个下线'),
+    tile('上下限', num(pv.min_online) + ' – ' + (num(pv.max_online) ? num(pv.max_online) : '∞'), 'bot 同时在线总数'),
+    tile('等待中', num(pv.waiting) + ' 个忙碌', num(pv.leaving) + ' 个告别，' + num(pv.held) + ' 个暂缓'),
+  );
+  const next = mkTable('presence-next', [{ t: '时间' }, { t: 'Bot' }, { t: '变动' }]);
+  for (const c of pv.next || []) {
+    next.tBodies[0].append(row([{ t: fmtAge(c.in_secs) + '后' }, { t: (c.name || '#' + c.id) + ' (' + c.id + ')' },
+      { t: c.login ? '上线' : '下线', cls: c.login ? 'bt' : '' }]));
+  }
+  const chrono = mkTable('presence-chrono', [{ t: '作息' }, { t: 'Bot 数', n: true }, { t: '在线', n: true },
+    { t: '排班', n: true }, { t: '' }]);
+  for (const r of pv.chronotypes || []) {
+    chrono.tBodies[0].append(row([{ t: CHRONO_LABEL[r.chronotype] || label(r.chronotype) }, { t: num(r.bots), n: true },
+      { t: num(r.online), n: true }, { t: num(r.scheduled), n: true }, { el: bar(num(r.online) / Math.max(1, num(r.bots))) }]));
+  }
+  E.pBlock.replaceChildren(
+    tiles,
+    presenceCurve(pv.curve, pv.local_time),
+    (pv.next || []).length ? next : empty('一天内没有变动。'),
+    chrono,
+  );
 }
 
 // ------------------------------------------------------------------ the heat overlay

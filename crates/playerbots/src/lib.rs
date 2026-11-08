@@ -16,6 +16,7 @@
 //!    └─ coordinator (pairs bots for duels and trades)
 //! ```
 
+pub mod agent;
 pub mod archetype;
 pub mod bot;
 pub mod config;
@@ -24,8 +25,10 @@ pub mod events;
 pub mod gm;
 pub mod hub;
 pub mod issues;
+pub mod journal;
 pub mod names;
 pub mod population;
+pub mod presence;
 pub mod roster;
 pub mod secrets;
 pub mod supervisor;

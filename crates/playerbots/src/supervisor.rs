@@ -9,6 +9,12 @@
 //! stop stays in the book as *stopping* until it has finished. A stopping bot is free for the
 //! next `Spawn` (it is started again as soon as its old task is gone, so two tasks never share a
 //! slot), is never picked by a second `Despawn`, and never makes the roster grow.
+//!
+//! With `[presence] enabled` the supervisor starts nobody at launch: the presence schedules (see
+//! [`crate::presence`]) ask for the bots by id ([`SupCmd::StartIds`], [`SupCmd::StopIds`]), the
+//! supervisor queues them for the ramp, stops only those that are safe to stop and tells presence
+//! what it did. The bots the operator stops by hand are reported to presence as well, so it does
+//! not start them again at once.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -272,20 +278,40 @@ impl<T: Task> Book<T> {
     /// Tells the `n` highest running bots to stop; bots that never started leave the queue first.
     /// Returns how many bots were dropped from the queue and how many tasks were told to stop.
     pub fn despawn(&mut self, n: usize) -> (usize, usize) {
-        let mut left = n;
-        let mut unqueued = 0;
-        while left > 0 && self.pending.pop_back().is_some() {
-            left -= 1;
-            unqueued += 1;
+        let (unqueued, stopped) = self.despawn_ids(n);
+        (unqueued.len(), stopped.len())
+    }
+
+    /// [`Book::despawn`], returning the ids dropped from the queue and the ids told to stop.
+    pub fn despawn_ids(&mut self, n: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut unqueued = Vec::new();
+        while unqueued.len() < n {
+            let Some(id) = self.pending.pop_back() else {
+                break;
+            };
+            unqueued.push(id);
         }
-        let ids = self.pick_despawn(left);
+        let ids = self.pick_despawn(n - unqueued.len());
         for id in &ids {
             if let Some(e) = self.running.get_mut(id) {
                 e.stopping = true;
                 e.task.cancel();
             }
         }
-        (unqueued, ids.len())
+        (unqueued, ids)
+    }
+
+    /// Queues those of `ids` that do not run (or are stopping) and do not wait for their start
+    /// already, in the order given; returns them.
+    pub fn queue_ids(&mut self, ids: &[u32]) -> Vec<u32> {
+        let mut picked: Vec<u32> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if !picked.contains(&id) && !self.pick_idle(&[id], 1).is_empty() {
+                picked.push(id);
+            }
+        }
+        self.pending.extend(picked.iter().copied());
+        picked
     }
 
     /// The next bot to start (queue order), or `None`.
@@ -363,8 +389,13 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// A supervisor with no bots running.
+    /// A supervisor with no bots running. Hands the presence schedules the roster and the
+    /// configuration.
     pub fn new(shared: Arc<Shared>) -> Supervisor {
+        shared
+            .hub
+            .presence
+            .attach(&shared.cfg, shared.roster.clone());
         Supervisor {
             shared,
             book: Book::default(),
@@ -436,8 +467,93 @@ impl Supervisor {
     }
 
     fn despawn(&mut self, n: usize) {
-        let (unqueued, stopping) = self.book.despawn(n);
-        tracing::info!(requested = n, unqueued, stopping, "stopping bots");
+        let (unqueued, stopping) = self.book.despawn_ids(n);
+        tracing::info!(
+            requested = n,
+            unqueued = unqueued.len(),
+            stopping = stopping.len(),
+            "stopping bots"
+        );
+        // (the operator's: the presence schedules do not start them again at once)
+        let presence = &self.shared.hub.presence;
+        presence.operator_stopped(&unqueued);
+        presence.operator_stopped(&stopping);
+    }
+
+    /// Queues the roster bots `ids` that do not run; `presence`: for the presence schedules.
+    fn start_ids(&mut self, ids: &[u32], presence: bool) {
+        let shared = self.shared.clone();
+        let known: Vec<u32> = shared.roster.read(|r| {
+            ids.iter()
+                .copied()
+                .filter(|id| r.get(*id).is_some())
+                .collect()
+        });
+        let picked = self.book.queue_ids(&known);
+        if presence {
+            shared.hub.presence.own(&picked, unix_ms());
+        }
+        tracing::info!(
+            requested = ids.len(),
+            queued = picked.len(),
+            presence,
+            "starting bots by id"
+        );
+    }
+
+    /// Stops those of the bots `ids` that are safe to stop now; queued ones leave the queue.
+    /// `presence`: only the bots the presence schedules started.
+    fn stop_ids(&mut self, ids: &[u32], presence: bool) {
+        let shared = self.shared.clone();
+        let ours = |id: u32| !presence || shared.hub.presence.is_owned(id);
+        let queued: Vec<u32> = self
+            .book
+            .pending_ids()
+            .into_iter()
+            .filter(|id| ids.contains(id) && ours(*id))
+            .collect();
+        self.book.unqueue(&queued);
+        let race_of = |id: u32| shared.roster.read(|r| r.get(id).map(|e| e.race));
+        let snaps: Vec<(u32, u8, pb_web::BotSnapshot)> = self
+            .book
+            .live_ids()
+            .into_iter()
+            .filter(|id| ids.contains(id) && ours(*id))
+            .filter_map(|id| Some((id, race_of(id)?, shared.hub.slot(id)?.snapshot())))
+            .collect();
+        let cands: Vec<Candidate<'_>> = snaps
+            .iter()
+            // (never under a real player's party)
+            .filter(|(_, _, s)| {
+                !s.party
+                    .as_ref()
+                    .is_some_and(|p| p.members.iter().any(|m| !m.bot && m.online))
+            })
+            .map(|(id, race, s)| Candidate {
+                id: *id,
+                race: *race,
+                alliance: s.alliance,
+                continent: s.continent,
+                activity: s.activity,
+                goal: &s.goal,
+                online_secs: s.online_secs,
+                owned: false,
+            })
+            .collect();
+        let stop = pick_stops(&cands, &Selector::ALL, StopRule::default(), cands.len());
+        self.book.stop(&stop);
+        if presence {
+            shared.hub.presence.disown(&queued);
+            shared.hub.presence.disown(&stop);
+        }
+        tracing::info!(
+            requested = ids.len(),
+            unqueued = queued.len(),
+            stopping = stop.len(),
+            busy = snaps.len() - stop.len(),
+            presence,
+            "stopping bots by id"
+        );
     }
 
     /// Starts `n` bots of the kind `sel` names; the roster grows with matching races when it has
@@ -548,6 +664,10 @@ impl Supervisor {
         let mut gone = queued;
         gone.extend(&stopped);
         shared.hub.pop.disown(&gone);
+        if !rule.owned_only {
+            // (the operator's: the presence schedules do not start them again at once)
+            shared.hub.presence.operator_stopped(&gone);
+        }
         tracing::info!(
             requested = n,
             unqueued,
@@ -588,7 +708,12 @@ impl Supervisor {
         mut rx: mpsc::Receiver<SupCmd>,
         cancel: CancellationToken,
     ) {
-        self.queue_spawn(initial);
+        if self.shared.hub.presence.enabled() {
+            // (the schedules decide who is online; their first pass comes in a moment)
+            tracing::info!(roster = initial, "presence: the schedules log the bots in");
+        } else {
+            self.queue_spawn(initial);
+        }
         let ramp = Duration::from_millis(self.shared.cfg.bots.ramp_ms.max(1));
         let mut ramp_timer = tokio::time::interval(ramp);
         ramp_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -613,6 +738,8 @@ impl Supervisor {
                     Some(SupCmd::DespawnWhere { n, sel, rule }) => {
                         self.despawn_where(n as usize, sel, rule)
                     }
+                    Some(SupCmd::StartIds { ids, presence }) => self.start_ids(&ids, presence),
+                    Some(SupCmd::StopIds { ids, presence }) => self.stop_ids(&ids, presence),
                     None => commands_open = false,
                 },
             }
@@ -941,6 +1068,23 @@ mod tests {
         assert!(rig.current(2).cancelled.get() && !rig.current(1).cancelled.get());
         assert_eq!(rig.book.live_ids(), vec![1]);
         assert_eq!(rig.book.stop(&[2, 3]), 0);
+    }
+
+    #[test]
+    fn bots_are_queued_by_id_once_and_despawns_name_their_ids() {
+        let mut rig = Rig::new(8, &[1, 2]);
+        // 2 runs, 5 is named twice, 9 is not running either (the caller checks the roster)
+        assert_eq!(rig.book.queue_ids(&[2, 5, 3, 5, 9]), vec![5, 3, 9]);
+        assert_eq!(rig.book.pending_ids(), vec![5, 3, 9]);
+        assert!(rig.book.queue_ids(&[5, 3]).is_empty(), "already queued");
+        // a stopping bot may be queued again (it starts once its old task is gone)
+        rig.book.stop(&[1]);
+        assert_eq!(rig.book.queue_ids(&[1]), vec![1]);
+        // a despawn names what it took off the queue (newest first) and what it stopped
+        let (unqueued, stopped) = rig.book.despawn_ids(5);
+        assert_eq!(unqueued, vec![1, 9, 3, 5]);
+        assert_eq!(stopped, vec![2]);
+        assert_eq!(rig.book.despawn(3), (0, 0));
     }
 
     #[test]

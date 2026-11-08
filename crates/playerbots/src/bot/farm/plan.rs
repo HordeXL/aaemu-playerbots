@@ -278,6 +278,23 @@ pub fn make_plan(pick: &Pick, site: Site, room: u32, money: i64, gm: bool) -> Op
     })
 }
 
+/// Caps `plan` to the seeds the bot's `labor` pays for when every seed costs `cost` points (a
+/// wild patch). A GM bot keeps its plan (the farm machine tops its labor up); `None` when not
+/// one seed is paid for.
+pub fn labor_cap(mut plan: Plan, labor: i16, cost: i16, gm: bool) -> Option<Plan> {
+    if cost <= 0 || gm {
+        return Some(plan);
+    }
+    let n = u8::try_from((labor.max(0) / cost).min(i16::from(RUN_MAX))).unwrap_or(0);
+    if n == 0 {
+        return None;
+    }
+    plan.want = plan.want.min(n);
+    plan.buy = plan.buy.min(plan.want);
+    plan.mint = plan.mint.min(plan.want);
+    Some(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +567,22 @@ mod tests {
         let held = evaluate(&crops()[0], &f, 1.0).unwrap();
         let p = make_plan(&held, site(), 5, 0, false).unwrap();
         assert_eq!((p.want, p.buy, p.mint), (2, 0, 0));
+    }
+
+    #[test]
+    fn a_wild_plan_is_as_big_as_the_labor_pays_for() {
+        let f = shop();
+        let pick = evaluate(&crops()[0], &f, 1.0).unwrap();
+        let p = make_plan(&pick, site(), 5, 10_000, false).unwrap();
+        assert_eq!(p.want, 5);
+        let capped = labor_cap(p, 25, 10, false).unwrap();
+        assert_eq!(
+            (capped.want, capped.buy),
+            (2, 2),
+            "25 labor pays for two seeds"
+        );
+        assert!(labor_cap(p, 9, 10, false).is_none());
+        assert_eq!(labor_cap(p, 0, 10, true).unwrap().want, 5, "a GM tops up");
+        assert_eq!(labor_cap(p, 0, 0, false).unwrap().want, 5, "a free seed");
     }
 }

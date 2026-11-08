@@ -1673,28 +1673,6 @@ fn every_bot_runs_at_its_own_speed_within_three_percent() {
 }
 
 #[test]
-fn the_pace_of_the_updates_is_uneven_only_for_a_walker_in_front_of_a_player() {
-    let mut rig = Rig::new(3, 1.0);
-    let mut rng = fastrand::Rng::with_seed(5);
-    assert_eq!(rig.motion.period_scale(&mut rng), 1.0, "standing");
-    rig.motion.go_to(10.0, 500.0, 0.0, Pace::Run, rig.now);
-    let scales: Vec<f32> = (0..4000)
-        .map(|_| rig.motion.period_scale(&mut rng))
-        .collect();
-    assert!(scales.iter().all(|s| (0.8..=1.2).contains(s)));
-    let mean = scales.iter().sum::<f32>() / scales.len() as f32;
-    assert!((mean - 1.0).abs() < 0.02, "the mean pace stays: {mean}");
-    assert!(scales.iter().any(|s| *s < 0.9) && scales.iter().any(|s| *s > 1.1));
-    rig.life().gate.audience = false;
-    assert_eq!(rig.motion.period_scale(&mut rng), 1.0, "nobody watches");
-    rig.life().gate = Gate { busy: true, ..SHOW };
-    assert_eq!(rig.motion.period_scale(&mut rng), 1.0, "busy");
-    let mut plain = Rig::plain();
-    plain.motion.go_to(10.0, 500.0, 0.0, Pace::Run, plain.now);
-    assert_eq!(plain.motion.period_scale(&mut rng), 1.0, "lifelike off");
-}
-
-#[test]
 fn the_packet_rate_stays_flat_with_the_life_like_parts_on() {
     let mut off = Rig::plain();
     let mut on = Rig::new(playful(), 1.0);

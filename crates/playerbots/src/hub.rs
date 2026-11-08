@@ -73,8 +73,15 @@ pub struct SlotInner {
     /// The bot's crops, refreshed with the extra rows (the farming goal), shown as
     /// `BotDetail::plots`.
     pub plots: Vec<pb_web::PlotLine>,
+    /// What the bot wears (the gear feature), shown as `BotDetail::gear`.
+    pub gear: Option<pb_web::GearView>,
+    /// The bot's personality, shown as `BotDetail::profile`.
+    pub profile: Option<pb_web::ProfileView>,
     /// Chat rings: the system lines goals read and the chat lines the detail panel shows.
     pub social: SlotSocial,
+    /// What the agent API shows that only the bot knows (the goals it may start now, the
+    /// director's plan, what is around it), filled in by its brain (owned by the agent feature).
+    pub agent: crate::agent::AgentSlot,
 }
 
 /// The public face of one bot.
@@ -194,7 +201,7 @@ pub struct Counters {
 }
 
 /// A request to the supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupCmd {
     /// Start `n` more bots.
     Spawn(u32),
@@ -210,6 +217,13 @@ pub enum SupCmd {
         sel: Selector,
         rule: StopRule,
     },
+    /// Start the roster bots `ids` that do not run (queued for the ramp like every start);
+    /// `presence`: the presence schedules asked, and the bots are theirs to stop again.
+    StartIds { ids: Box<[u32]>, presence: bool },
+    /// Stop those of the bots `ids` that are safe to stop now (see
+    /// [`crate::population::select::stop_rank`]; never one in the party of a real player); queued
+    /// ones leave the queue. `presence`: only the bots the presence schedules started.
+    StopIds { ids: Box<[u32]>, presence: bool },
 }
 
 #[derive(Debug)]
@@ -377,6 +391,13 @@ pub struct Hub {
     llm: Option<Arc<pb_llm::Llm>>,
     /// What the bots know about the world's players and goods, and the population director.
     pub pop: Population,
+    /// What every bot remembers between runs, see [`crate::journal`].
+    pub journal: Arc<crate::journal::JournalBook>,
+    /// The log-in and log-out schedules of the bots (owned by the presence feature, see
+    /// [`crate::presence`]).
+    pub presence: crate::presence::Presence,
+    /// The zone names an `act` of the agent API may use (owned by the agent feature).
+    pub zones: crate::agent::ZoneNames,
 }
 
 impl Hub {
@@ -414,6 +435,9 @@ impl Hub {
             supervisor: p.supervisor,
             llm: p.llm,
             pop: Population::inert(),
+            journal: Arc::new(crate::journal::JournalBook::memory()),
+            presence: crate::presence::Presence::default(),
+            zones: crate::agent::ZoneNames::from_world(p.world),
         }
     }
 
@@ -421,6 +445,12 @@ impl Hub {
     /// nothing). Call before the hub is shared.
     pub fn with_population(mut self, pop: Population) -> Hub {
         self.pop = pop;
+        self
+    }
+
+    /// The hub with the bots' journal (read at start, written by its saver task).
+    pub fn with_journal(mut self, journal: Arc<crate::journal::JournalBook>) -> Hub {
+        self.journal = journal;
         self
     }
 
@@ -498,6 +528,18 @@ impl Hub {
         self.nav.tick();
         self.tick_events();
         self.pop.tick(self);
+        self.presence.tick(self);
+    }
+
+    /// The short view of bot `id`'s journal for the detail panel.
+    pub fn journal_view(&self, id: u32) -> pb_web::JournalView {
+        self.journal.read(id, |j| pb_web::JournalView {
+            zones_seen: j.seen.zones.len() as u32,
+            sessions: j.sessions.count,
+            played_secs: j.sessions.total_secs,
+            wild_plots: j.wild.plots.len() as u32,
+            notes: j.notes.lines.iter().map(|n| n.text.clone()).collect(),
+        })
     }
 
     /// While an event runs: tells the board how many bots are online and how high they are, and
@@ -781,6 +823,9 @@ impl BotHub for Hub {
             chat: g.social.chat_lines(),
             path: g.path.clone(),
             plots: g.plots.clone(),
+            gear: g.gear.clone(),
+            profile: g.profile.clone(),
+            journal: Some(self.journal_view(id)),
         }))
     }
 
@@ -824,6 +869,9 @@ impl BotHub for Hub {
                     rate_limited: u.rate_limited,
                     chat_replies: s.llm_replies.load(Ordering::Relaxed),
                     director_picks: s.director_picks.load(Ordering::Relaxed),
+                    plans: u.plans,
+                    plan_steps: u.plan_steps,
+                    notes: u.notes,
                 }
             }),
             activity_counts: Activity::ALL
@@ -882,17 +930,32 @@ impl BotHub for Hub {
     }
 
     fn director(&self) -> DirectorView {
-        self.pop.director_view(self)
+        let mut view = self.pop.director_view(self);
+        view.presence = self.presence.view();
+        view
     }
 
     fn set_policy(&self, patch: PolicyPatch) -> Result<(), String> {
         self.pop.set_policy(patch)
     }
 
+    fn observe(&self, id: u32) -> Option<pb_web::Observation> {
+        crate::agent::observe(self, id)
+    }
+
+    fn zones(&self) -> Vec<pb_web::ZoneEntry> {
+        self.zones.entries()
+    }
+
     fn command(&self, bot: Option<u32>, cmd: Command) -> Result<(), String> {
         cmd.validate(bot)?;
+        // (an `act` may name its zone; the bots only know zone keys)
+        let cmd = crate::agent::resolve_zones(&self.zones, cmd)?;
         match bot {
             Some(id) => {
+                if let Command::Note { text } = &cmd {
+                    return crate::agent::write_note(self, id, text);
+                }
                 let slot = self.slot(id).ok_or_else(|| format!("no bot {id}"))?;
                 slot.send(to_bot_cmd(cmd)?)
             }
@@ -958,7 +1021,28 @@ fn to_bot_cmd(cmd: Command) -> Result<BotCmd, String> {
         | Command::DespawnWhere { .. } => {
             return Err("spawn and despawn are global commands".into())
         }
+        Command::Act(args) => crate::agent::act_command(&args)?,
+        Command::Profile(patch) => BotCmd::Profile(Box::new(profile_patch(&patch))),
+        // (the hub writes a note into the journal itself, see `BotHub::command`)
+        Command::Note { .. } => return Err("a note is kept by the hub, not sent to the bot".into()),
     })
+}
+
+/// The roster's form of a web profile patch (the web layer checked the values).
+fn profile_patch(p: &pb_web::ProfilePatch) -> crate::roster::ProfilePatch {
+    crate::roster::ProfilePatch {
+        chatty: p.chatty,
+        crude: p.crude,
+        joker: p.joker,
+        explorer: p.explorer,
+        outlaw: p.outlaw,
+        gearhead: p.gearhead,
+        dedication: p.dedication,
+        chronotype: p
+            .chronotype
+            .as_deref()
+            .and_then(crate::roster::Chronotype::parse),
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1270,8 @@ mod tests {
             ("event", crate::bot::cmd::GoalKind::Event),
             ("companion", crate::bot::cmd::GoalKind::Companion),
             ("farm", crate::bot::cmd::GoalKind::Farm),
+            ("explore", crate::bot::cmd::GoalKind::Explore),
+            ("gear", crate::bot::cmd::GoalKind::Gear),
         ] {
             assert_eq!(
                 to_bot_cmd(Command::Goal { goal: name.into() }),

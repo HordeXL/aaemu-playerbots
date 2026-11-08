@@ -86,6 +86,9 @@ impl BotHub for TestHub {
             }],
             path: Vec::new(),
             plots: Vec::new(),
+            gear: None,
+            profile: None,
+            journal: None,
         })
     }
 
@@ -1338,5 +1341,93 @@ async fn filtered_spawn_and_despawn_commands_are_checked_and_reach_the_hub() {
         .await;
     assert_eq!(r.status, 400);
     assert_eq!(s.hub.commands.lock().unwrap().len(), 3);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_routes_describe_the_tools_and_the_bots() {
+    let s = Server::start(None, false).await;
+
+    let tools = s.get("/api/agent/tools").await;
+    assert_eq!(tools.status, 200);
+    let tools = tools.json();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for want in ["observe", "act", "note", "list_bots", "zones"] {
+        assert!(names.contains(&want), "{want} in {names:?}");
+    }
+    let act = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "act")
+        .unwrap();
+    assert_eq!(act["http"]["method"], "POST");
+    assert_eq!(act["http"]["command"], "act");
+    assert_eq!(act["input_schema"]["required"][0], "goal");
+
+    let bots = s.get("/api/agent/bots").await.json();
+    assert_eq!(bots.as_array().unwrap().len(), 2);
+    assert_eq!(bots[0]["id"], 1);
+    assert_eq!(bots[1]["activity"], "trade_run");
+    assert!(bots[0].get("detail").is_none(), "a row is short");
+
+    // the default observation is what the detail has
+    let o = s.get("/api/agent/observe/2").await;
+    assert_eq!(o.status, 200);
+    let o = o.json();
+    assert_eq!(o["id"], 2);
+    assert_eq!(o["log"][0], "hello");
+    assert_eq!(o["doing"], "Quest 330 A Friendly Reminder: talk to Maude");
+    assert!(o["eligible"].as_array().unwrap().is_empty());
+    assert_eq!(s.get("/api/agent/observe/77").await.status, 404);
+    assert_eq!(s.get("/api/agent/observe/x").await.status, 400);
+
+    let zones = s.get("/api/agent/zones").await.json();
+    assert!(zones.as_array().unwrap().is_empty());
+
+    // a note reaches the hub; one without a bot or with a command in it does not
+    let r = s
+        .post(
+            "/api/bots/1/command",
+            &[],
+            r#"{"type":"note","text":"Bob owes us a duel"}"#,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    for (path, body) in [
+        ("/api/command", r#"{"type":"note","text":"hi"}"#),
+        (
+            "/api/bots/1/command",
+            r#"{"type":"note","text":"/gold add self 1"}"#,
+        ),
+        ("/api/bots/1/command", r#"{"type":"note","text":"  "}"#),
+    ] {
+        assert_eq!(s.post(path, &[], body).await.status, 400, "{body}");
+    }
+    assert_eq!(
+        s.hub.commands.lock().unwrap().clone(),
+        vec![(
+            Some(1),
+            Command::Note {
+                text: "Bob owes us a duel".into()
+            }
+        )]
+    );
+
+    // the reads check the host name like every other route
+    let r = s
+        .request(
+            "GET",
+            "/api/agent/observe/1",
+            &[("Host", "evil.example")],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 403);
     s.shutdown().await;
 }

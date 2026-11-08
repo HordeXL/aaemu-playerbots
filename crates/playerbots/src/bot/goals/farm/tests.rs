@@ -12,7 +12,7 @@ use super::machine::{Act, Input, Machine, Ops, Phase};
 use super::{FailReason, GoalStatus};
 use crate::bot::farm::plan::{Plan, Vendor, Why};
 use crate::bot::farm::site::Site;
-use crate::bot::farm::{refusal, CropBook, FarmMem, Plot, Watcher, OWN_LAND};
+use crate::bot::farm::{refusal, CropBook, FarmMem, Plot, Watcher, OWN_LAND, WILD_LAND};
 use crate::bot::motion::MotionStatus;
 use crate::bot::state::{dist2d, StateError};
 
@@ -79,6 +79,9 @@ impl Ops for FakeOps {
     fn radius_mm(&self, _: u32) -> u16 {
         500
     }
+    fn plant_labor(&self, _: u32) -> i16 {
+        10
+    }
 }
 
 /// What the scripted server does with a `CSCreateDoodad`.
@@ -132,6 +135,8 @@ struct Rig {
     planted_at: Vec<[f32; 3]>,
     publishes: u32,
     status: GoalStatus,
+    /// Labor the scripted server takes for a seed it plants (a wild patch costs some).
+    plant_cost: i16,
 }
 
 fn plan(want: u8, buy: u8, mint: u8, vendor: Option<Vendor>) -> Plan {
@@ -194,6 +199,7 @@ impl Rig {
             planted_at: Vec::new(),
             publishes: 0,
             status: GoalStatus::Running,
+            plant_cost: 0,
         }
     }
 
@@ -355,7 +361,12 @@ impl Rig {
                         "the bag item is named by its id"
                     );
                     match self.plant {
+                        Plant::Accept if self.labor < self.plant_cost => {
+                            self.errors
+                                .push((self.now + 100, StateError::Msg(refusal::NO_LABOR)));
+                        }
                         Plant::Accept => {
+                            self.labor -= self.plant_cost;
                             self.bag.get_mut(&SEED).unwrap().1 -= 1;
                             if let Some(c) = self.clean.get_mut(&SEED) {
                                 *c = c.saturating_sub(1);
@@ -933,4 +944,114 @@ fn neighbouring_plots_a_spacing_apart_are_harvested_and_replanted_one_by_one() {
     xs.sort_by(f32::total_cmp);
     assert_eq!(xs, vec![100.0, 101.7, 103.4]);
     assert_eq!(rig.mem.lost, 0);
+}
+
+fn wild_plan(want: u8) -> Plan {
+    Plan {
+        site: Site::wild([100.0, 100.0]),
+        ..plan(want, 0, 0, None)
+    }
+}
+
+#[test]
+fn a_wild_patch_costs_labor_per_seed_and_stops_when_it_runs_out() {
+    let spots = [[101.0, 100.0, 0.0], [99.0, 102.0, 0.0], [99.0, 98.0, 0.0]];
+    let mut rig = Rig::new(Machine::plant(wild_plan(3), false, 10_000))
+        .with_spots(&spots)
+        .with_seeds(3, 3);
+    rig.plant_cost = 10;
+    rig.labor = 25;
+    assert_eq!(rig.run(120_000), GoalStatus::Done);
+    assert_eq!(rig.planted_at.len(), 2, "25 labor pays for two");
+    assert_eq!(rig.mem.count_on(WILD_LAND), 2);
+    assert!(
+        rig.mem.plots.iter().all(|p| p.honest),
+        "bought seeds stay honest"
+    );
+    assert!(rig.gm_lines.is_empty());
+    // a GM tops its labor up and plants all three
+    let mut rig = Rig::new(Machine::plant(wild_plan(3), false, 10_000))
+        .with_spots(&spots)
+        .with_seeds(3, 0);
+    rig.plant_cost = 10;
+    rig.labor = 0;
+    rig.gm = true;
+    assert_eq!(rig.run(120_000), GoalStatus::Done);
+    assert_eq!(rig.gm_lines, vec!["/labor 60"]);
+    assert_eq!(rig.planted_at.len(), 3);
+    assert!(
+        rig.mem.plots.iter().all(|p| !p.honest),
+        "seeds that are not the bot's own make no honest plot"
+    );
+    // the server's own refusal ends the run too
+    let mut rig = Rig::new(Machine::plant(wild_plan(1), false, 10_000))
+        .with_spots(&spots)
+        .with_seeds(1, 1);
+    rig.plant = Plant::Refuse(refusal::NO_LABOR);
+    assert_eq!(
+        rig.run(60_000),
+        GoalStatus::Failed(FailReason::Other("not enough labor"))
+    );
+    assert!(rig.mem.plots.is_empty());
+}
+
+#[test]
+fn a_wild_crop_that_is_gone_at_its_place_is_noted_as_gone_and_one_harvested_as_harvested() {
+    // gone: the bot stands at the place and sees nothing
+    let mut rig = Rig::new(Machine::harvest(false, 10_000));
+    let mut p = ripe_plot(0, 110.0, true);
+    p.land = WILD_LAND;
+    p.check_ms = 1;
+    p.ripe = false;
+    rig.mem.plots.push(p);
+    assert_eq!(rig.run(120_000), GoalStatus::Done);
+    assert_eq!(rig.mem.lost, 1);
+    let gone = rig.mem.take_gone();
+    assert_eq!(gone.len(), 1);
+    assert_eq!((gone[0].land, gone[0].harvested), (WILD_LAND, false));
+    assert!(rig.mem.take_gone().is_empty(), "taken once");
+    // harvested: the crop leaves the world after the harvest
+    let mut rig = Rig::new(Machine::harvest(false, 10_000));
+    rig.replant = false;
+    let mut p = ripe_plot(3_001, 110.0, true);
+    p.land = WILD_LAND;
+    rig.mem.plots.push(p);
+    assert_eq!(rig.run(120_000), GoalStatus::Done);
+    assert_eq!(rig.machine.harvested, 1);
+    let gone = rig.mem.take_gone();
+    assert_eq!(gone.len(), 1);
+    assert!(gone[0].harvested);
+    assert_eq!(rig.mem.lost, 0);
+}
+
+#[test]
+fn a_refusal_for_somebody_elses_land_costs_only_the_spot() {
+    let spots = [[104.0, 100.0, 0.0], [100.0, 105.0, 0.0]];
+    let mut rig = Rig::new(Machine::plant(wild_plan(1), false, 10_000))
+        .with_spots(&spots)
+        .with_seeds(1, 1);
+    rig.plant = Plant::Refuse(refusal::NO_PERM);
+    let _ = rig.run(8_000);
+    assert!(rig.mem.spot_is_bad(104.0, 100.0, rig.now));
+    assert!(rig.planted_at.len() >= 2, "the next spot is tried");
+}
+
+#[test]
+fn a_stolen_crop_is_harvested_dishonestly_and_its_place_is_not_planted_again() {
+    let mut rig = Rig::new(Machine::harvest(false, 10_000));
+    let mut p = ripe_plot(3_001, 110.0, false);
+    p.land = crate::bot::farm::STOLEN_LAND;
+    rig.mem.plots.push(p);
+    let mut window = None;
+    for _ in 0..400 {
+        if rig.tick() != GoalStatus::Running {
+            break;
+        }
+        window = window.or(rig.mem.harvest_honest);
+    }
+    assert_eq!(rig.status, GoalStatus::Done);
+    assert_eq!(window, Some(false), "a theft is never the bot's own");
+    assert_eq!(rig.machine.harvested, 1);
+    assert!(rig.planted_at.is_empty(), "the thief does not plant there");
+    assert!(rig.mem.plots.is_empty());
 }

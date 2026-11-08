@@ -34,6 +34,31 @@ pub struct LlmConfig {
     pub director: bool,
     /// Average seconds between two director requests of one bot (each bot jitters around it).
     pub director_interval_secs: u64,
+    /// Steps the model may plan ahead in one director answer (1..=5; the brain starts the next
+    /// one when the running goal ends, re-checking that it is still allowed).
+    pub director_plan_steps: u8,
+    /// Ask the director sooner than the interval when something happened: a level-up, a death, a
+    /// failed goal, a zone the bot has never been in, a plan that runs out.
+    pub director_triggers: bool,
+    /// The shortest time between two director requests of one bot, in seconds (also for the
+    /// triggers; at least 30).
+    pub director_min_gap_secs: u64,
+    /// Let the director's answer carry a short note the bot keeps in its journal (shown to the
+    /// model again as the bot's own memories, quoted as data).
+    pub director_notes: bool,
+}
+
+impl LlmConfig {
+    /// Steps per director plan, clamped to 1..=5.
+    pub fn plan_steps(&self) -> usize {
+        usize::from(self.director_plan_steps.clamp(1, 5))
+    }
+
+    /// The shortest gap between two director requests of one bot, in milliseconds (at least
+    /// 30 s).
+    pub fn min_gap_ms(&self) -> u64 {
+        self.director_min_gap_secs.max(30).saturating_mul(1000)
+    }
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -52,6 +77,10 @@ impl std::fmt::Debug for LlmConfig {
             .field("max_reply_tokens", &self.max_reply_tokens)
             .field("director", &self.director)
             .field("director_interval_secs", &self.director_interval_secs)
+            .field("director_plan_steps", &self.director_plan_steps)
+            .field("director_triggers", &self.director_triggers)
+            .field("director_min_gap_secs", &self.director_min_gap_secs)
+            .field("director_notes", &self.director_notes)
             .finish()
     }
 }
@@ -71,6 +100,10 @@ impl Default for LlmConfig {
             max_reply_tokens: 80,
             director: false,
             director_interval_secs: 600,
+            director_plan_steps: 3,
+            director_triggers: true,
+            director_min_gap_secs: 120,
+            director_notes: true,
         }
     }
 }
@@ -107,6 +140,30 @@ mod tests {
         assert_eq!(cfg.max_reply_tokens, 80);
         assert!(!cfg.director);
         assert_eq!(cfg.director_interval_secs, 600);
+        assert_eq!(cfg.director_plan_steps, 3);
+        assert!(cfg.director_triggers && cfg.director_notes);
+        assert_eq!(cfg.director_min_gap_secs, 120);
+    }
+
+    #[test]
+    fn the_plan_length_and_the_gap_are_clamped_where_they_are_used() {
+        let cfg = |steps: u8, gap: u64| LlmConfig {
+            director_plan_steps: steps,
+            director_min_gap_secs: gap,
+            ..LlmConfig::default()
+        };
+        assert_eq!(cfg(0, 0).plan_steps(), 1);
+        assert_eq!(cfg(3, 0).plan_steps(), 3);
+        assert_eq!(cfg(200, 0).plan_steps(), 5);
+        assert_eq!(cfg(1, 0).min_gap_ms(), 30_000);
+        assert_eq!(cfg(1, 120).min_gap_ms(), 120_000);
+        let parsed: LlmConfig = serde_json::from_str(
+            r#"{"director_plan_steps": 2, "director_triggers": false, "director_min_gap_secs": 300, "director_notes": false}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.plan_steps(), 2);
+        assert!(!parsed.director_triggers && !parsed.director_notes);
+        assert_eq!(parsed.min_gap_ms(), 300_000);
     }
 
     #[test]

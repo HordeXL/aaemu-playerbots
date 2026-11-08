@@ -3,9 +3,12 @@
 //! A goal is a small state machine the [`Brain`](super::brain::Brain) starts, ticks and stops.
 //! The set is closed (an enum, no allocation per goal): [`Wander`], [`Rest`], [`Grind`],
 //! [`Quest`], [`Duel`], [`Trade`], [`TradeRun`], [`Housing`], [`Dungeon`], [`Sail`], [`Auction`],
-//! [`Market`], [`Guild`], [`Gank`], [`Warzone`], [`Event`], [`Companion`] and [`Farm`] (all are
-//! built; a goal added as a stub reports [`FailReason::NotImplemented`] and is switched off for
-//! good by the brain).
+//! [`Market`], [`Guild`], [`Gank`], [`Warzone`], [`Event`], [`Companion`], [`Farm`], [`Explore`]
+//! and [`Gear`] (a goal added as a stub reports [`FailReason::NotImplemented`] and is switched off
+//! for good by the brain).
+//!
+//! A goal may be started with [`GoalArgs`] ([`Goal::with_args`]: the LLM director, the web UI's
+//! `act` command, the agent API); a goal that takes none ignores them.
 //!
 //! # Writing a goal
 //!
@@ -25,8 +28,10 @@ pub mod companion;
 pub mod duel;
 pub mod dungeon;
 pub mod event;
+pub mod explore;
 pub mod farm;
 pub mod gank;
+pub mod gear;
 pub mod grind;
 pub mod guild;
 pub mod housing;
@@ -47,8 +52,10 @@ pub use companion::Companion;
 pub use duel::Duel;
 pub use dungeon::Dungeon;
 pub use event::Event;
+pub use explore::Explore;
 pub use farm::Farm;
 pub use gank::Gank;
+pub use gear::Gear;
 pub use grind::Grind;
 pub use guild::Guild;
 pub use housing::Housing;
@@ -61,7 +68,7 @@ pub use trade_run::TradeRun;
 pub use wander::Wander;
 pub use warzone::Warzone;
 
-use super::cmd::{GoalKind, PairOrder};
+use super::cmd::{GoalArgs, GoalKind, PairOrder};
 use super::combat::CombatStatus;
 use super::ctx::Ctx;
 use super::motion::SWIM_THRESHOLD;
@@ -132,6 +139,10 @@ pub enum Goal {
     Companion(Companion),
     /// Plant and harvest crops.
     Farm(Farm),
+    /// See new places.
+    Explore(Explore),
+    /// Get, equip and upgrade gear.
+    Gear(Gear),
 }
 
 impl Goal {
@@ -147,8 +158,19 @@ impl Goal {
         order: Option<PairOrder>,
         party: Option<Box<PartyOrder>>,
     ) -> Goal {
+        Goal::with_args(kind, order, party, None)
+    }
+
+    /// Like [`Goal::with_party`], with the [`GoalArgs`] somebody started it with (`None`: the bot's
+    /// own choice). Only the goals that understand arguments keep them.
+    pub fn with_args(
+        kind: GoalKind,
+        order: Option<PairOrder>,
+        party: Option<Box<PartyOrder>>,
+        args: Option<Box<GoalArgs>>,
+    ) -> Goal {
         match kind {
-            GoalKind::Wander => Goal::Wander(Wander::default()),
+            GoalKind::Wander => Goal::Wander(Wander::with_args(args)),
             GoalKind::Rest => Goal::Rest(Rest::default()),
             GoalKind::Grind => Goal::Grind(Grind::default()),
             GoalKind::Quest => Goal::Quest(Quest::default()),
@@ -165,7 +187,9 @@ impl Goal {
             GoalKind::Warzone => Goal::Warzone(Warzone::new()),
             GoalKind::Event => Goal::Event(Event::new()),
             GoalKind::Companion => Goal::Companion(Companion::new()),
-            GoalKind::Farm => Goal::Farm(Farm::new()),
+            GoalKind::Farm => Goal::Farm(Farm::with_args(args)),
+            GoalKind::Explore => Goal::Explore(Explore::new(args)),
+            GoalKind::Gear => Goal::Gear(Gear::new(args)),
         }
     }
 
@@ -190,6 +214,8 @@ impl Goal {
             Goal::Event(_) => GoalKind::Event,
             Goal::Companion(_) => GoalKind::Companion,
             Goal::Farm(_) => GoalKind::Farm,
+            Goal::Explore(_) => GoalKind::Explore,
+            Goal::Gear(_) => GoalKind::Gear,
         }
     }
 
@@ -208,6 +234,8 @@ impl Goal {
             Goal::Event(g) => g.owns_combat(),
             Goal::Companion(g) => g.owns_combat(),
             Goal::Farm(g) => g.owns_combat(),
+            Goal::Explore(g) => g.owns_combat(),
+            Goal::Gear(g) => g.owns_combat(),
             _ => false,
         }
     }
@@ -233,6 +261,8 @@ impl Goal {
             Goal::Event(g) => g.start(ctx),
             Goal::Companion(g) => g.start(ctx),
             Goal::Farm(g) => g.start(ctx),
+            Goal::Explore(g) => g.start(ctx),
+            Goal::Gear(g) => g.start(ctx),
         }
     }
 
@@ -263,6 +293,8 @@ impl Goal {
             Goal::Event(g) => return g.tick(ctx, combat),
             Goal::Companion(g) => return g.tick(ctx),
             Goal::Farm(g) => return g.tick(ctx),
+            Goal::Explore(g) => return g.tick(ctx),
+            Goal::Gear(g) => return g.tick(ctx),
         };
         if !resume {
             return GoalStatus::Done;
@@ -297,6 +329,8 @@ impl Goal {
             Goal::Event(g) => g.stop(ctx),
             Goal::Companion(g) => g.stop(ctx),
             Goal::Farm(g) => g.stop(ctx),
+            Goal::Explore(g) => g.stop(ctx),
+            Goal::Gear(g) => g.stop(ctx),
         }
     }
 
@@ -333,6 +367,8 @@ impl Goal {
             Goal::Event(g) => g.activity(moving, fighting),
             Goal::Companion(g) => g.activity(moving, fighting),
             Goal::Farm(g) => g.activity(moving, fighting),
+            Goal::Explore(g) => g.activity(moving, fighting),
+            Goal::Gear(g) => g.activity(moving, fighting),
         }
     }
 
@@ -357,6 +393,8 @@ impl Goal {
             Goal::Event(g) => g.describe(out),
             Goal::Companion(g) => g.describe(out),
             Goal::Farm(g) => g.describe(out),
+            Goal::Explore(g) => g.describe(out),
+            Goal::Gear(g) => g.describe(out),
         }
     }
 }
@@ -475,6 +513,34 @@ mod tests {
             Goal::with_party(GoalKind::Sail, None, Some(Box::new(order))),
             Goal::Sail(_)
         ));
+    }
+
+    #[test]
+    fn the_living_world_stubs_keep_their_arguments_and_own_no_combat() {
+        let args = GoalArgs {
+            zone: Some(12),
+            why: Some("test".into()),
+            ..GoalArgs::default()
+        };
+        for kind in [GoalKind::Explore, GoalKind::Gear] {
+            let g = Goal::with_args(kind, None, None, Some(Box::new(args.clone())));
+            assert_eq!(g.kind(), kind);
+            assert!(!g.owns_combat());
+            let kept = match &g {
+                Goal::Explore(e) => e.args().cloned(),
+                Goal::Gear(e) => e.args().cloned(),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(kept.as_ref(), Some(&args));
+            let mut text = String::new();
+            g.describe(&mut text);
+            assert!(text.starts_with(kind.name()), "{text}");
+        }
+        // the other goals take no arguments and do not mind getting some
+        for kind in GoalKind::ALL {
+            let g = Goal::with_args(kind, None, None, Some(Box::new(args.clone())));
+            assert_eq!(g.kind(), kind);
+        }
     }
 
     #[test]

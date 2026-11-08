@@ -1005,6 +1005,7 @@ fn calm(ctx: &Ctx<'_>, goal: Option<GoalKind>) -> bool {
                 | GoalKind::Event
                 | GoalKind::Companion
                 | GoalKind::Farm
+                | GoalKind::Gear
         )
     );
     let st = &ctx.state;

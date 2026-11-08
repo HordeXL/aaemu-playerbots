@@ -37,7 +37,8 @@ const ACT_COLORS = ACTIVITIES.map((a) => ACT[a].color);
 const GOALS = [['auto', '自动'], ['quest', '任务'], ['grind', '刷怪'], ['duel', '决斗'], ['trade', '交易'],
   ['trade_run', '跑商'], ['housing', '房产'], ['dungeon', '副本'], ['sail', '帆船'],
   ['auction', '拍卖'], ['market', '市场'], ['guild', '公会'], ['gank', '伏击'], ['warzone', '战区'],
-  ['event', '事件'], ['companion', '随从'], ['farm', '种植'], ['rest', '休息'], ['wander', '闲逛']];
+  ['event', '事件'], ['companion', '随从'], ['farm', '种植'], ['explore', '探索'], ['gear', '装备'],
+  ['rest', '休息'], ['wander', '闲逛']];
 
 const MARKER = {
   house:        { label: '房屋',        color: '#a0693a', minScale: 0 },
@@ -293,6 +294,8 @@ function renderStats() {
     if (num(l.rate_limited)) extra.push(nf.format(l.rate_limited) + ' 次限流');
     if (num(l.chat_replies)) extra.push(nf.format(l.chat_replies) + ' 次聊天回复');
     if (num(l.director_picks)) extra.push(nf.format(l.director_picks) + ' 次导演决策');
+    if (num(l.plans)) extra.push(nf.format(l.plans) + ' 份计划（' + nf.format(l.plan_steps) + ' 步）');
+    if (num(l.notes)) extra.push(nf.format(l.notes) + ' 条笔记');
     setTile('st-llm', nf.format(l.requests) + ' 次请求, ' + nf.format(l.failures) + ' 次失败',
       fmtCount(l.tokens_today) + ' token 今日, ' + (unlimited ? '无预算上限' : '剩余 ' + fmtCount(l.budget_left)) +
       (extra.length ? ' \u00b7 ' + extra.join(', ') : ''));
@@ -700,6 +703,7 @@ function renderDetail() {
   setText(D.pause, b.paused ? '继续' : '暂停');
   renderPartner(b);
   fillPartnerSelects();
+  renderProfile(d);
 
   if (!d) return;
   // quests
@@ -732,6 +736,7 @@ function renderDetail() {
     pf.append(li);
   }
   D.plots.replaceChildren(pf);
+  renderGear(d);
   // chat the bot heard and said, newest first
   const chat = (d.chat || []).slice().sort((a, b) => b.t - a.t).slice(0, 8);
   D.chatWrap.hidden = chat.length === 0;
@@ -753,6 +758,64 @@ function renderDetail() {
     lf.append(li);
   }
   D.log.replaceChildren(lf);
+}
+
+// ------------------------------------------------------------------ 装备（gear 功能）
+// 机器人身上的装备、品阶，以及装备目标能做什么。这一块第一次用到时在详情面板
+// （地块之后）建立自己的小节。
+function renderGear(d) {
+  let wrap = $('d-gear-wrap');
+  if (!wrap) {
+    const anchor = $('d-plots-wrap');
+    if (!anchor) return;
+    wrap = h('div');
+    wrap.id = 'd-gear-wrap';
+    wrap.append(h('h3', null, '装备'), h('p', 'muted'), h('ul', 'plain'));
+    anchor.after(wrap);
+  }
+  const g = d && d.gear;
+  wrap.hidden = !g;
+  if (!g) return;
+  setText(wrap.children[1], g.summary || '');
+  const f = document.createDocumentFragment();
+  for (const ln of g.lines || []) {
+    const li = h('li');
+    const gems = ln.gems ? ' · ' + ln.gems + ' 颗宝石' : '';
+    li.append(h('span', null, ln.slot + ': ' + ln.item), h('span', null, 'Lv ' + ln.level + ' ' + ln.grade + gems));
+    f.append(li);
+  }
+  if (!(g.lines || []).length) f.append(h('li', 'empty', '什么都没穿。'));
+  const st = g.stats || {};
+  const did = [['equipped', '穿上'], ['bought', '买到'], ['minted', '铸出'], ['socketed', '镶嵌'],
+    ['socket_fails', '次镶嵌失败'], ['regraded', '次改级']].filter(([k]) => st[k]).map(([k, l]) => l + ' ' + st[k]);
+  if (st.spent) did.push('花费 ' + nf.format(st.spent) + ' 铜币');
+  if (did.length) f.append(h('li', 'empty', '本次会话：' + did.join('，')));
+  if (g.last_change) f.append(h('li', 'empty', '最近：' + g.last_change));
+  wrap.children[2].replaceChildren(f);
+}
+
+// ---- 人格：详情面板里 bot 的性格画像（归 personality 功能所有）----
+const PROFILE_TRAITS = [
+  ['chatty', '话痨'], ['joker', '玩笑'], ['crude', '粗俗'], ['explorer', '探索'],
+  ['outlaw', '歪门'], ['gearhead', '装备'], ['dedication', '在线'],
+];
+// 第一次用到时在详情面板的聊天上方建立；没有画像时隐藏。
+function renderProfile(d) {
+  let wrap = $('d-profile-wrap');
+  if (!wrap) {
+    const chat = $('d-chat-wrap');
+    if (!chat) return;
+    wrap = h('div');
+    wrap.id = 'd-profile-wrap';
+    wrap.append(h('h3', null, '人格'), h('p', 'muted'), h('dl', 'kv'));
+    chat.before(wrap);
+  }
+  const p = d && d.profile;
+  wrap.hidden = !p;
+  if (!p) return;
+  const [, summary, dl] = wrap.children;
+  setText(summary, [p.summary, words(p.chronotype)].filter(Boolean).join(' · '));
+  fillKv(dl, PROFILE_TRAITS.map(([k, label]) => [label, Math.round(clamp(num(p[k]), 0, 1) * 100) + '%']));
 }
 
 function snapshotToView(s) {

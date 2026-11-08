@@ -17,6 +17,7 @@ use crate::economy::{Craft, Economy};
 use crate::event::Events;
 use crate::faction::{Factions, Relation};
 use crate::farm::Farming;
+use crate::gear::GearData;
 use crate::geom::{IdMap, StrTable, Vec3};
 use crate::housing::{AreaIndex, Housing, HousingDesign};
 use crate::items::{ItemFacts, ItemTable};
@@ -170,6 +171,8 @@ pub struct World {
     events: Events,
     /// Crops, seed vendors and the public farms.
     farm: Farming,
+    /// Equippable items, lunagems, sockets, gear merchants (the gear feature).
+    gear: GearData,
     /// The sea mask boats are planned on, built from the terrain at the first [`World::water`].
     water: OnceLock<Option<WaterMap>>,
     /// The same for the large hulls (4.5 m of water), built at the first [`World::water_deep`].
@@ -178,6 +181,8 @@ pub struct World {
     quest_atlas: OnceLock<QuestAtlas>,
     /// Spots inside each conflict zone group, built at the first [`World::zone_group_spots`].
     group_spots: OnceLock<FxHashMap<u16, Box<[[f32; 2]]>>>,
+    /// Places worth seeing, built at the first [`World::landmarks`].
+    pub(crate) landmarks: OnceLock<crate::landmarks::Landmarks>,
 }
 
 // Bots share the world through `Arc<World>` across tasks.
@@ -279,6 +284,8 @@ impl World {
         let farm = Farming::load(&conn, &npcs, &|n| npc_spawns.has(n))
             .context("load farming data")?
             .with_areas(&baked.farm_areas);
+        let gear =
+            GearData::load(&conn, &npcs, &|n| npc_spawns.has(n)).context("load gear data")?;
 
         let world = World {
             baked,
@@ -306,10 +313,12 @@ impl World {
             travel,
             events,
             farm,
+            gear,
             water: OnceLock::new(),
             water_deep: OnceLock::new(),
             quest_atlas: OnceLock::new(),
             group_spots: OnceLock::new(),
+            landmarks: OnceLock::new(),
         };
         let q = world.quests.stats();
         tracing::info!(
@@ -379,6 +388,7 @@ impl World {
             ("item trade facts", self.item_facts.bytes()),
             ("auctioneers", self.auctioneers.bytes()),
             ("item use skills", self.item_uses.bytes()),
+            ("gear", self.gear.bytes()),
             ("quest start gates", self.start_gates.bytes()),
             ("crafts + specialty", self.economy.bytes()),
             ("housing", self.housing.bytes() + self.areas.bytes()),
@@ -429,6 +439,11 @@ impl World {
     /// Crops, seed vendors and the public farms; see [`crate::farm`].
     pub fn farm(&self) -> &Farming {
         &self.farm
+    }
+
+    /// Equippable items, lunagems, sockets and gear merchants; see [`crate::gear`].
+    pub fn gear(&self) -> &GearData {
+        &self.gear
     }
 
     /// The sea map boats are planned on, built from the baked terrain the first time it is asked

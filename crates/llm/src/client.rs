@@ -11,9 +11,10 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 
 use crate::choose;
 use crate::config::LlmConfig;
+use crate::decide;
 use crate::error::LlmError;
 use crate::limit::{utc_day, Cooldown, DailyBudget, RateWindow};
-use crate::types::{ChatReply, ChatRequest, Choice, LlmUsage, Role};
+use crate::types::{ChatReply, ChatRequest, Choice, Decision, LlmUsage, Role};
 
 /// How long a request waits for a free concurrency slot before it is refused.
 const PERMIT_WAIT: Duration = Duration::from_millis(250);
@@ -24,6 +25,8 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(60);
 const JSON_TEMPERATURE_CAP: f32 = 0.5;
 /// Minimum reply budget for `choose` so the JSON object is not cut off.
 const CHOOSE_MIN_TOKENS: u32 = 60;
+/// Minimum reply budget for `decide`: a plan of a few steps, a note and a reason.
+const DECIDE_MIN_TOKENS: u32 = 160;
 const ERROR_TEXT_CAP: usize = 200;
 /// The longest response body read: a chat completion of a few hundred tokens is a few KiB, so
 /// anything near this is a misbehaving (or hostile) endpoint, not an answer.
@@ -36,13 +39,17 @@ struct Counters {
     rate_limited: AtomicU64,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+    plans: AtomicU64,
+    plan_steps: AtomicU64,
+    notes: AtomicU64,
 }
 
 /// An OpenAI-compatible chat-completions client with a request window, a concurrency cap and a
 /// daily token budget. One instance (behind an `Arc`) is shared by all bots.
 ///
-/// It is never on a bot's tick path: callers spawn a task, await [`chat`](Self::chat) or
-/// [`choose`](Self::choose) there and use the answer only if it arrives in time.
+/// It is never on a bot's tick path: callers spawn a task, await [`chat`](Self::chat),
+/// [`choose`](Self::choose) or [`decide`](Self::decide) there and use the answer only if it
+/// arrives in time.
 pub struct Llm {
     client: reqwest::Client,
     url: String,
@@ -238,6 +245,57 @@ impl Llm {
         })
     }
 
+    /// Asks the model for a short plan: up to `max_steps` of the numbered `options` in the order
+    /// to do them, an optional note the character keeps and a reason. The answer is requested as
+    /// `{"steps": [{"choice": <index>}], "note": "...", "reason": "..."}` in JSON mode and parsed
+    /// tolerantly; steps that name no offered option are dropped, and an answer without a usable
+    /// step is a [`LlmError::BadResponse`]. The note is filtered like a chat line
+    /// ([`sanitize_reply`](crate::sanitize_reply)). With a single option and a one-step plan no
+    /// request is made.
+    pub async fn decide(
+        &self,
+        system: &str,
+        situation: &str,
+        options: &[String],
+        max_steps: usize,
+    ) -> Result<Decision, LlmError> {
+        if options.is_empty() {
+            return Err(LlmError::BadResponse(
+                "decide called without options".into(),
+            ));
+        }
+        if options.len() == 1 && max_steps <= 1 {
+            return Ok(Decision {
+                steps: vec![0],
+                note: None,
+                reason: String::new(),
+            });
+        }
+        let reply = self
+            .chat(ChatRequest {
+                system: decide::system_prompt(system, max_steps),
+                messages: vec![crate::types::Msg::user(choose::user_prompt(
+                    situation, options,
+                ))],
+                max_tokens: Some(self.default_max_tokens.max(DECIDE_MIN_TOKENS)),
+                json: true,
+            })
+            .await?;
+        let decision =
+            decide::parse_decision(&reply.text, options.len(), max_steps).inspect_err(|e| {
+                self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("llm plan unusable: {e}");
+            })?;
+        self.counters.plans.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .plan_steps
+            .fetch_add(decision.steps.len() as u64, Ordering::Relaxed);
+        if decision.note.is_some() {
+            self.counters.notes.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(decision)
+    }
+
     /// A snapshot of the counters and today's budget.
     pub fn usage(&self) -> LlmUsage {
         let today = utc_day();
@@ -249,6 +307,9 @@ impl Llm {
             completion_tokens: self.counters.completion_tokens.load(Ordering::Relaxed),
             tokens_today: self.budget.used(today),
             budget_left: self.budget.left(today),
+            plans: self.counters.plans.load(Ordering::Relaxed),
+            plan_steps: self.counters.plan_steps.load(Ordering::Relaxed),
+            notes: self.counters.notes.load(Ordering::Relaxed),
         }
     }
 

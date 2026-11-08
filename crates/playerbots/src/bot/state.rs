@@ -146,6 +146,15 @@ pub struct Item {
     pub count: i32,
 }
 
+/// An item on its way from one slot to another ([`BotState::move_item`]).
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    id: u64,
+    template: u32,
+    count: i32,
+    grade: u8,
+}
+
 /// One of the bot's houses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HouseBrief {
@@ -436,6 +445,10 @@ pub struct BotState {
     /// shuns, the run in progress, its kills (owned by the pvp feature, see [`super::pvp`]);
     /// allocated by the first carrier in view or fight.
     pub pvp: Option<Box<super::pvp::PvpMem>>,
+    /// What the bot knows of its gear beyond the equipment list (bag grades, gems), the equip
+    /// duty's refusals and the gear goal's notes (owned by the gear feature, see
+    /// [`super::gear`]); allocated at log-in or by the first gear fact.
+    pub gear: Option<Box<super::gear::GearMem>>,
 }
 
 /// The module that follows an event besides the general bookkeeping of
@@ -494,8 +507,20 @@ impl BotState {
         // (the sailing cooldown outlives a connection: a bot that keeps losing its link does not
         // get a trip every time it is back)
         let trips = self.vehicle.trip_log();
+        // (and so does the gear memory: item ids outlive a connection, and the counts of what the
+        // bot bought and minted keep a reconnecting bot from fetching it all again)
+        let gear = self.gear.take().map(|mut g| {
+            g.after_reset();
+            g
+        });
         *self = BotState::default();
         self.vehicle.restore_trip_log(trips);
+        self.gear = gear;
+    }
+
+    /// The gear memory, allocated on first use.
+    pub fn gear_mut(&mut self) -> &mut super::gear::GearMem {
+        self.gear.get_or_insert_with(Box::default)
     }
 
     // ---- queries ------------------------------------------------------------------------
@@ -674,6 +699,7 @@ impl BotState {
                 me.money = own.money;
                 self.guild.on_own_guild(own.expedition_id, self.now_ms);
                 self.equipment = own.equipment.to_vec();
+                self.gear_mut().on_login(own);
                 // Saved with no hit points: the server sends no death event for it.
                 if own.hp <= 0 {
                     self.watch.death.found_dead_at_login(self.now_ms);
@@ -874,9 +900,29 @@ impl BotState {
                         );
                     }
                     self.market.on_bag_reloaded(&self.bag);
+                    if self.gear.is_some() || items.iter().any(|it| it.grade != 0) {
+                        self.gear_mut().on_bag(items);
+                    }
                 }
             }
             WorldEvent::ItemTask(task) => self.apply_item_task(task),
+            WorldEvent::LunagemResult {
+                result, item_id, ..
+            } => {
+                let now = self.now_ms;
+                self.gear_mut().on_lunagem(now, *result, *item_id);
+            }
+            WorldEvent::GradeEnchantResult {
+                result,
+                item_id,
+                before,
+                after,
+                ..
+            } => {
+                let now = self.now_ms;
+                self.gear_mut()
+                    .on_grade(now, *result, *item_id, *before, *after);
+            }
             WorldEvent::LaborChanged { delta, .. } => {
                 let v = i32::from(self.me.labor).saturating_add(*delta);
                 self.me.labor = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
@@ -1161,12 +1207,25 @@ impl BotState {
         let touched = super::market::ledger::Touched::before(task, &self.bag);
         for change in &task.changes {
             self.apply_item_change(change);
+            self.gear_note(change);
         }
         if !task.force_removed.is_empty() {
             self.bag
                 .retain(|_, item| !task.force_removed.contains(&item.id));
         }
         self.market.on_item_task(task.reason, &touched, &self.bag);
+    }
+
+    /// Tells the gear memory about an item change that carries a gear fact (a grade, gems).
+    fn gear_note(&mut self, change: &ItemChange) {
+        let fact = match change {
+            ItemChange::Added { grade, .. } => *grade != 0,
+            ItemChange::GradeChange { .. } | ItemChange::Updated { gems: Some(_), .. } => true,
+            _ => false,
+        };
+        if fact || self.gear.is_some() {
+            self.gear_mut().on_change(change);
+        }
     }
 
     fn apply_item_change(&mut self, change: &ItemChange) {
@@ -1177,6 +1236,7 @@ impl BotState {
                 slot,
                 template,
                 id,
+                grade,
                 count,
                 ..
             } => match slot_type {
@@ -1190,11 +1250,21 @@ impl BotState {
                         slot,
                         template,
                         id,
-                        grade: 0,
+                        grade,
                     });
                 }
                 _ => {}
             },
+            ItemChange::GradeChange {
+                slot_type: SLOT_EQUIPMENT,
+                id,
+                grade,
+                ..
+            } => {
+                if let Some(e) = self.equipment.iter_mut().find(|e| e.id == id) {
+                    e.grade = grade;
+                }
+            }
             ItemChange::CountUpdate {
                 slot_type,
                 slot,
@@ -1285,7 +1355,8 @@ impl BotState {
         }
     }
 
-    /// Bag-to-bag moves and swaps. Moves involving equipment only keep the bag consistent.
+    /// Moves and swaps inside the bag and between the bag and the equipment (the grade goes with
+    /// the piece). A move to or from another container only keeps the bag consistent.
     fn move_item(
         &mut self,
         from_type: u8,
@@ -1304,20 +1375,77 @@ impl BotState {
             if let Some(b) = b.filter(|b| to_id != 0 && b.id == to_id) {
                 self.bag.insert(u16::from(from), b);
             }
-        } else if from_type == SLOT_BAG {
-            self.bag.remove(&u16::from(from));
-        } else if to_type == SLOT_BAG && from_type == SLOT_EQUIPMENT {
-            if let Some(e) = self.equipment.iter().find(|e| e.id == from_id).cloned() {
-                self.equipment.retain(|x| x.id != from_id);
+            return;
+        }
+        // (an equip into an empty slot comes as a move from the empty slot, id 0, to the bag item)
+        let a = self.take_held(from_type, from, from_id);
+        let b = self.take_held(to_type, to, to_id);
+        if let Some(a) = a {
+            self.put_held(to_type, to, a);
+        }
+        if let Some(b) = b {
+            self.put_held(from_type, from, b);
+        }
+    }
+
+    /// Empties slot `slot` of container `kind` and returns what it held when that is item `id`
+    /// (in the bag also any item when `id` is 0): a stale item the server does not name is
+    /// dropped.
+    fn take_held(&mut self, kind: u8, slot: u8, id: u64) -> Option<Held> {
+        match kind {
+            SLOT_BAG => {
+                let it = self.bag.remove(&u16::from(slot))?;
+                if it.id != id && id != 0 {
+                    return None;
+                }
+                let grade = self.gear.as_deref().map_or(0, |g| g.grade_of(it.id));
+                Some(Held {
+                    id: it.id,
+                    template: it.template,
+                    count: it.count,
+                    grade,
+                })
+            }
+            SLOT_EQUIPMENT => {
+                let i = self.equipment.iter().position(|e| e.slot == slot)?;
+                let e = self.equipment.remove(i);
+                (e.id == id && id != 0).then_some(Held {
+                    id: e.id,
+                    template: e.template,
+                    count: 1,
+                    grade: e.grade,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Puts `h` into slot `slot` of container `kind`.
+    fn put_held(&mut self, kind: u8, slot: u8, h: Held) {
+        match kind {
+            SLOT_BAG => {
                 self.bag.insert(
-                    u16::from(to),
+                    u16::from(slot),
                     Item {
-                        id: e.id,
-                        template: e.template,
-                        count: 1,
+                        id: h.id,
+                        template: h.template,
+                        count: h.count,
                     },
                 );
+                if h.grade != 0 {
+                    self.gear_mut().note_grade(h.id, h.grade);
+                }
             }
+            SLOT_EQUIPMENT => {
+                self.equipment.retain(|e| e.slot != slot);
+                self.equipment.push(EquipSlot {
+                    slot,
+                    template: h.template,
+                    id: h.id,
+                    grade: h.grade,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -1468,6 +1596,7 @@ mod tests {
                 id: 99,
                 grade: 1,
             }]),
+            equipment_gems: Box::new([2]),
         }
     }
 

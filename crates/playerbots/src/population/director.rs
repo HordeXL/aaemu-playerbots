@@ -713,6 +713,7 @@ impl Director {
             min_action_gap_secs: self.limits.min_action_gap_secs,
             auto_wishes: st.auto_wishes.iter().map(|(t, _)| *t).collect(),
             log: st.log.iter().cloned().collect(),
+            presence: None,
         }
     }
 }
