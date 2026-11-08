@@ -177,6 +177,9 @@ pub struct DuelWatch {
     finished: u16,
     /// The goal walks away from a stalled duel: the controller must not fight the opponent.
     withdraw: bool,
+    /// The opponent of the duel that just ended, and when: the defence must not read the duel
+    /// itself as an attack and re-engage the player, who would then stay in combat.
+    last_opponent: Option<(u32, u64)>,
 }
 
 impl DuelWatch {
@@ -248,6 +251,14 @@ impl DuelWatch {
                 self.pending = None;
                 self.withdraw = false;
                 self.finished = self.finished.saturating_add(1);
+                if mine {
+                    let opponent = if *winner_obj == me_obj {
+                        *loser_obj
+                    } else {
+                        *winner_obj
+                    };
+                    self.last_opponent = Some((opponent, now_ms));
+                }
             }
             _ => {}
         }
@@ -273,6 +284,17 @@ impl DuelWatch {
     /// Whether the goal is walking away from the duel.
     pub fn withdrawing(&self) -> bool {
         self.withdraw
+    }
+
+    /// How long after a duel the opponent is not read as an attacker: longer than the threat
+    /// window (10 s) and the server's own combat decay (15 s).
+    pub const OPPONENT_AFTERGLOW_MS: u64 = 20_000;
+
+    /// The opponent of a duel that ended this recently, if there was one. The defence skips
+    /// them: they attacked the bot during the duel, which is what duels are for.
+    pub fn recent_opponent(&self, now_ms: u64) -> Option<u32> {
+        let (obj, at) = self.last_opponent?;
+        (now_ms.saturating_sub(at) < Self::OPPONENT_AFTERGLOW_MS).then_some(obj)
     }
 
     /// Marks whether a duel goal is running (it reads the end of the duel itself).

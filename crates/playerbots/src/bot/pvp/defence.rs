@@ -48,9 +48,15 @@ pub fn pick(ctx: &Ctx<'_>, travelling: bool) -> Option<u32> {
         (WINDOW_MS, f32::INFINITY)
     };
     let hurt = ctx.state.damaged_within(DAMAGE_WINDOW_MS);
+    // the opponent of a duel that just ended: they hit the bot during the duel, which the
+    // defence must not read as an attack (the player would stay in combat for ever)
+    let duel_recent = ctx.combat.duel.recent_opponent(now);
     let allowed = |obj: u32| -> Option<f32> {
         let u = ctx.state.units.get(&obj)?;
         if u.kind != UnitKind::Character || u.dead() {
+            return None;
+        }
+        if duel_recent == Some(obj) {
             return None;
         }
         if ctx.state.pvp.as_ref().is_some_and(|p| p.shunned(obj, now)) {

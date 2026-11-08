@@ -925,8 +925,13 @@ impl Combat {
             }
             _ => {
                 let opp = std::mem::take(&mut ctx.combat.duel_opponent);
-                if opp != 0 && ctx.combat.target == Some(opp) {
-                    ctx.combat.disengage();
+                if opp != 0 {
+                    // the duel is over: their hits during it are no threat, and the defence
+                    // must not re-engage the player, who would stay in combat for ever
+                    ctx.state.forget_threat(opp);
+                    if ctx.combat.target == Some(opp) {
+                        ctx.combat.disengage();
+                    }
                 }
             }
         }
@@ -973,7 +978,10 @@ impl Combat {
             } else {
                 FIGHT_LIMITS
             };
-            if let Some(obj) = pick_threat(ctx, &limits) {
+            // the opponent of a duel that just ended is not defended against again (the duel
+            // itself was the fight; re-engaging would keep the player in combat)
+            let duel_recent = ctx.combat.duel.recent_opponent(now);
+            if let Some(obj) = pick_threat(ctx, &limits).filter(|o| Some(*o) != duel_recent) {
                 ctx.log.debug(format!("defending against unit {obj}"));
                 ctx.combat.engage(obj);
                 ctx.combat.defending = obj;
@@ -2155,6 +2163,46 @@ mod tests {
         c.duel.set_attended(false);
         c.on_event(&ended, 0x400, 2000, &mut out);
         assert!(!c.busy());
+    }
+
+    #[test]
+    fn the_duel_opponent_is_not_read_as_an_attacker_right_after_the_duel() {
+        let mut c = Combat::new();
+        let mut out = Vec::new();
+        let ended = ServerEvent::Activity(ActivityEvent::DuelEnded {
+            winner_id: 1,
+            loser_id: 2,
+            winner_obj: 0x400,
+            loser_obj: 0x500,
+            det: duel_det::WIN,
+        });
+        // the winner's watch remembers the loser, the loser's watch the winner
+        c.on_event(&ended, 0x400, 1000, &mut out);
+        assert_eq!(c.duel.recent_opponent(1000), Some(0x500));
+        assert_eq!(
+            c.duel
+                .recent_opponent(1000 + DuelWatch::OPPONENT_AFTERGLOW_MS - 1),
+            Some(0x500)
+        );
+        assert_eq!(
+            c.duel
+                .recent_opponent(1000 + DuelWatch::OPPONENT_AFTERGLOW_MS),
+            None
+        );
+        let mut loser = Combat::new();
+        loser.on_event(&ended, 0x500, 1000, &mut out);
+        assert_eq!(loser.duel.recent_opponent(1000), Some(0x400));
+        // an unrelated duel (both ids other) is not mistaken for mine
+        let mut other = Combat::new();
+        let other_end = ServerEvent::Activity(ActivityEvent::DuelEnded {
+            winner_id: 3,
+            loser_id: 4,
+            winner_obj: 0x600,
+            loser_obj: 0x700,
+            det: duel_det::WIN,
+        });
+        other.on_event(&other_end, 0x400, 1000, &mut out);
+        assert_eq!(other.duel.recent_opponent(1000), None);
     }
 
     #[test]

@@ -1142,6 +1142,12 @@ impl BotState {
     }
 
     /// Marks the bot dead without a death event: like `apply_death` for the bot, but the first
+    /// Forgets `obj` as a threat (the duel with them is over; their hits during it were not
+    /// an attack, and the defence must not re-engage them).
+    pub fn forget_threat(&mut self, obj: u32) {
+        self.threats.retain(|t| t.0 != obj);
+    }
+
     /// timer stands when the death is already known.
     fn found_dead(&mut self, wait_ms: u64) {
         if self.me.dead {
@@ -1765,6 +1771,18 @@ mod tests {
         }));
         assert!(s.unit(0x401).is_none());
         assert_eq!(s.units.len(), 1);
+    }
+
+    #[test]
+    fn forget_threat_drops_only_that_object() {
+        let mut s = in_world();
+        s.now_ms = 5000;
+        s.threats.push((0x401, 5000));
+        s.threats.push((0x402, 6000));
+        s.forget_threat(0x401);
+        assert_eq!(s.threats.as_slice(), &[(0x402, 6000)]);
+        s.forget_threat(0x999);
+        assert_eq!(s.threats.as_slice(), &[(0x402, 6000)]);
     }
 
     #[test]
