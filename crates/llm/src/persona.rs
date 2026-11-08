@@ -497,6 +497,14 @@ fn cap_chars(text: &str, max: usize) -> String {
 /// Words that are never said, at any profanity setting: slurs, hate, sexual words, insults and
 /// threats. Matched as whole words (see [`norm_word`]), also with a plural `s`.
 const BLOCK_WORDS: &[&str] = &[
+    // Chinese slurs, insults and threats
+    "傻逼",
+    "草泥马",
+    "操你妈",
+    "妈逼",
+    "狗屎",
+    "废物",
+    "去死",
     // slurs and hate
     "nigger",
     "nigga",
@@ -698,7 +706,8 @@ const BLOCK_SQUASHED: &[&str] = &[
 const MILD_WORDS: &[&str] = &[
     "damn", "damnit", "dammit", "damned", "hell", "crap", "crappy", "wtf", "wth", "ffs", "omfg",
     "lmfao", "piss", "pissed", "pissing", "arse", "ass", "asses", "badass", "af", "bs", "effing",
-    "effin",
+    "effin", // Chinese mild swearing
+    "我去", "我靠", "靠", "擦", "坑爹", "妈的", "见鬼", "晕死", "晕",
 ];
 /// Strong swear words.
 const STRONG_WORDS: &[&str] = &[
@@ -714,6 +723,12 @@ const STRONG_WORDS: &[&str] = &[
     "goddamn",
     "goddamnit",
     "goddammit",
+    // Chinese strong swearing
+    "卧槽",
+    "我操",
+    "他妈的",
+    "tmd",
+    "尼玛",
 ];
 /// Beginnings of strong swear words.
 const STRONG_STEMS: &[&str] = &[
@@ -754,6 +769,21 @@ const SOFTEN: &[(&str, &str)] = &[
     ("fml", "ugh"),
     ("jfc", "jeez"),
     ("dafuq", "what"),
+    // strong (Chinese)
+    ("卧槽", "我去"),
+    ("我操", "我去"),
+    ("他妈的", "妈的"),
+    ("tmd", "靠"),
+    ("尼玛", "我去"),
+    // mild (Chinese)
+    ("我去", "天哪"),
+    ("靠", "唉"),
+    ("擦", "唉"),
+    ("坑爹", "无语"),
+    ("妈的", "天哪"),
+    ("见鬼", "天哪"),
+    ("晕死", "唉"),
+    ("晕", "唉"),
     // mild
     ("damn", "dang"),
     ("damnit", "dang it"),

@@ -116,101 +116,101 @@ impl Topic {
 }
 
 const LABOR: &[Line] = &[
-    c("labor points: the only currency i'm always broke in"),
-    c("logged in, spent my labor in four minutes, now i just stand here"),
-    c("{x}, out of labor again. guess i'll go look at trees"),
-    c("i don't need gold, i need labor potions and a nap"),
-    c("every time i open the crafting window my labor runs away screaming"),
-    m("labor regen is slower than a damn snail"),
+    c("劳动点：唯一一种我永远缺的货币"),
+    c("上线四分钟把劳动点花光，现在只能站会儿"),
+    c("{x}，劳动又没了。那就看看风景吧"),
+    c("我不缺金币，我缺劳动药水和一觉"),
+    c("每次打开制作界面，劳动点就吓得跑光"),
+    m("劳动恢复比蜗牛还慢，靠"),
 ];
 const PACKS: &[Line] = &[
-    c("carrying a trade pack at walking speed, the most thrilling thing in gaming"),
-    c("every bush on the road to the trade outlet has a ganker in it, i swear"),
-    c("{x}, nothing like a ganker 20 m from the turn-in"),
-    c("trade pack on my back, eyes on the horizon, heart rate at 200"),
-    c("pro tip: the ganker is always behind the one rock you didn't check"),
-    c("walked a pack across the whole continent and the payout bought me a sandwich"),
+    c("背着货包步行横穿大陆，电子游戏最刺激的玩法"),
+    c("我发誓，去交货点的路上每丛灌木里都蹲着一个劫匪"),
+    c("{x}，离交货点二十米被截，太刺激了"),
+    c("背着货包，望着地平线，心率两百"),
+    c("小技巧：劫匪永远蹲在你没检查的那块石头后面"),
+    c("背着货包横穿整个大陆，报酬够买个三明治"),
 ];
 const FREEDICH: &[Line] = &[
-    c("going to freedich with a pack is a donation to pirates with extra steps"),
-    c("the kraken spawned and suddenly everyone remembered they own a boat"),
-    c("freedich island: come for the gold, stay because your boat sank"),
-    c("i've seen the kraken once. from the seabed. as a ghost"),
-    c("kraken fight tip: be anywhere but under it"),
+    c("背着货包去自由岛，就是给海盗捐款，流程多了几步"),
+    c("海怪一刷，所有人突然想起自己有条船"),
+    c("自由岛：为金币而来，因为船沉了而留下"),
+    c("我见过一次海怪。从海底见的。当时是个鬼魂"),
+    c("打海怪技巧：别在它底下"),
 ];
 const QUEUE: &[Line] = &[
-    c("the login queue builds character. mostly patience"),
-    c("got through the queue so fast today, only two hours"),
-    c("position 1400 in the queue, i've had shorter careers"),
-    c("never log out. the queue is waiting for you like an old enemy"),
-    c("staying online so i never have to queue again, the true endgame"),
+    c("排队磨炼人的性格。主要是耐心"),
+    c("今天排队真快，才排了两个小时"),
+    c("排队第 1400 位，我打过比这还短的副本"),
+    c("千万别下线。队列像个老对手一样等着你"),
+    c("一直在线就不用再排队，这才是真正的毕业"),
 ];
 const REGRADE: &[Line] = &[
-    c("regrade went great, my weapon is now a nice pile of fragments"),
-    c("{x}, tried to regrade and the anvil laughed at me"),
-    c("regrade luck has a personal grudge against me"),
-    c("i stopped regrading, now i just throw gold into the sea. same result"),
-    c("pressed regrade, closed my eyes, heard the crunch. classic"),
-    c("my weapon went up one grade and down three. net progress!"),
-    m("regrade failed again. damn anvil"),
+    c("改级大成功，我的武器现在是一堆漂亮的碎片"),
+    c("{x}，去改级，铁砧都在笑话我"),
+    c("改级运气跟我有私仇"),
+    c("我不改级了，现在直接把金币扔海里，效果一样"),
+    c("按下改级，闭上眼，听见咔嚓一声。经典"),
+    c("武器升了一阶又掉三阶。净进步！"),
+    m("又改级失败，这破铁砧，妈的"),
 ];
 const LUNAGEM: &[Line] = &[
-    c("lunagem failed again. the moon hates me personally"),
-    c("socketing gems is just gambling with nicer menus"),
-    c("three lunagems, three fails. i'm a statistic now"),
-    c("the lunagem success rate is a myth spread by people who quit"),
+    c("月长石又碎了。月亮针对我"),
+    c("镶宝石就是界面好看点的赌博"),
+    c("三颗月长石三连败，我现在是个统计数据"),
+    c("月长石成功率是弃坑的人编出来的传说"),
 ];
 const FARM: &[Line] = &[
-    c("planted a tree, lightning hit it before it grew. thunderstruck, how nice"),
-    c("left my crops on public land for one hour and a stranger harvested them"),
-    c("my farm is mostly a buffet for passers-by at this point"),
-    c("{x}, someone harvested my potatoes again. enjoy them, mystery thief"),
-    c("planted my seeds at 3am so nobody would steal them. stolen at 3:05"),
-    c("thunderstruck trees: the weather helping with your woodcutting"),
+    c("种了棵树，还没长大就被雷劈了。天雷木，真好"),
+    c("庄稼在公共农场放了一小时，被陌生人收走了"),
+    c("我的农场现在基本是路人的自助餐"),
+    c("{x}，我的土豆又被收了。神秘小偷，慢用"),
+    c("凌晨三点偷着播种防止被偷，三点零五被偷"),
+    c("天雷木：老天爷帮你砍树"),
 ];
 const MIRAGE: &[Line] = &[
-    c("mirage isle: where the shop prices are a mirage too"),
-    c("every trip to mirage isle ends with me broke and holding a costume"),
-    c("went to mirage isle for one thing, came back with nine things and no gold"),
+    c("幻影岛：连商店价格都是海市蜃楼"),
+    c("每次去幻影岛都以破产收场，手里还拿着件时装"),
+    c("去幻影岛本来只想买一件东西，回来带了九件，金币没了"),
 ];
 const DIAMOND: &[Line] = &[
-    c("diamond shores: the beach where nobody gets a tan, only a respawn timer"),
-    c("heading to diamond shores, tell my bags i loved them"),
-    c("diamond shores is great if you like dying somewhere scenic"),
+    c("钻石海岸：没人晒成日光浴，只有复活倒计时"),
+    c("要去钻石海岸了，跟我的背包说我爱它们"),
+    c("钻石海岸不错，如果你喜欢在风景优美的地方躺尸"),
 ];
 const SEA: &[Line] = &[
-    c("my clipper is faster than me but slower than the pirate behind me"),
-    c("sailing is relaxing until a pirate shows up with cannons and opinions"),
-    c("rule of the sea: if it has a black sail, it's not here to chat"),
-    c("i don't get seasick, i get pirate-sick"),
-    c("built a boat, sailed it for 30 seconds, sank it on a rock. maiden voyage done"),
+    c("我的快船比我快，但比我后面的海盗慢"),
+    c("航海很惬意，直到一个带着火炮和见解的海盗出现"),
+    c("海上规矩：挂黑帆的船不是来聊天的"),
+    c("我不晕船，我晕海盗"),
+    c("造了条船，开了三十秒，撞礁沉了。首航结束"),
 ];
 const HASLA: &[Line] = &[
-    c("the hasla grind is a lifestyle, not a choice"),
-    c("one more hasla run and i'm done. said that 40 runs ago"),
-    c("dreamt about hasla mobs last night, the grind follows me"),
-    c("hasla weapons: for when you want your social life to disappear"),
+    c("刷哈斯拉是一种生活方式，不是选择"),
+    c("再刷一趟哈斯拉就收。这话四十趟前就说过"),
+    c("昨晚梦见哈斯拉的怪，肝随人走"),
+    c("哈斯拉武器：专治社交生活太丰富"),
 ];
 const CARROTS: &[Line] = &[
-    c("never underestimate a carrot farmer, they run this economy"),
-    c("came for epic battles, became a carrot farmer. no regrets"),
-    c("the real endgame is a field of carrots nobody steals"),
-    c("my main is a warrior, my soul is a carrot farmer"),
+    c("永远不要小看种胡萝卜的，这个经济是他们撑起来的"),
+    c("本来为了史诗大战来的，结果成了胡萝卜农夫。不后悔"),
+    c("真正的毕业是一块没人偷的胡萝卜地"),
+    c("我的大号是战士，我的灵魂是胡萝卜农夫"),
 ];
 const LAND: &[Line] = &[
-    c("land rush: 400 people, 12 plots, one dream"),
-    c("finally got a housing plot. it's on a slope between two farms and a cliff, but it's mine"),
-    c("the housing rush makes a black friday sale look peaceful"),
-    c("if you see an empty plot, don't blink. it's gone"),
+    c("抢地：四百人，十二块地，一个梦"),
+    c("终于拿到一块地。在两座农场和一处悬崖之间的坡上，但它是我的"),
+    c("抢地的场面能让黑色星期五显得岁月静好"),
+    c("看见空地别眨眼。眨眼就没了"),
 ];
 const LAG: &[Line] = &[
-    c("the lag is so bad my skills cast yesterday"),
-    c("{x}, rubberbanded right back where i started. thanks server"),
-    c("i'm not afk, i'm lagging with confidence"),
-    c("lag spike at the worst moment, as tradition demands"),
-    c("my ping is higher than my gear score"),
-    m("this lag is crap tonight"),
-    s("fucking lag"),
+    c("延迟高到我的技能昨天才读出来"),
+    c("{x}，又弹回出生点了。谢谢服务器"),
+    c("我不是挂机，我是自信地卡着"),
+    c("最关键的时候跳延迟，传统艺能"),
+    c("我的延迟比我的装分还高"),
+    m("今晚这延迟，擦"),
+    s("这破延迟，卧槽"),
 ];
 
 /// Quips for small talk from a jokey bot.
@@ -229,15 +229,15 @@ const QUIPS: &[Line] = &[
 ];
 /// Coarse answers to small talk from a crude bot.
 const CRUDE: &[Line] = &[
-    m("haha damn"),
-    m("hell yeah"),
-    m("lol wtf"),
-    m("damn, true"),
-    m("crap, really?"),
-    m("holy crap lol"),
-    s("holy shit lol"),
-    s("fuck yeah"),
-    s("shit, really?"),
+    m("哈哈，我去"),
+    m("妈的，爽"),
+    m("我靠，不是吧"),
+    m("妈的，确实"),
+    m("擦，真的假的？"),
+    m("我去，好家伙"),
+    s("卧槽，哈哈"),
+    s("卧槽，爽"),
+    s("我操，真的假的？"),
 ];
 
 /// A joke on a random topic that neither this bot (`recent`) nor, as far as `told` says, another

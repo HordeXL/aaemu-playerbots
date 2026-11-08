@@ -55,61 +55,49 @@ impl<const N: usize> Recent<N> {
 }
 
 const GREET: &[&str] = &[
-    "hey!",
-    "hello there",
-    "yo",
-    "hi {n}",
-    "hey {n}, how's it going?",
-    "heya",
-    "oh hi!",
-    "sup {n}",
+    "嘿！",
+    "你好呀",
+    "哟",
+    "你好 {n}",
+    "嘿 {n}，最近怎么样？",
+    "嗨",
+    "哟，来了！",
+    "在吗 {n}",
 ];
-const THANKS: &[&str] = &[
-    "np!",
-    "no problem {n}",
-    "anytime",
-    "you're welcome",
-    "all good :)",
-];
-const BYE: &[&str] = &[
-    "cya {n}",
-    "see you around",
-    "take care!",
-    "bye bye",
-    "later {n}",
-];
+const THANKS: &[&str] = &["不客气！", "没事 {n}", "随时帮忙", "不用谢", "小意思 :)"];
+const BYE: &[&str] = &["回见 {n}", "回头见", "保重！", "拜拜", "先走了 {n}"];
 const HELP: &[&str] = &[
-    "sorry {n}, kinda busy with my own stuff",
-    "maybe later, i'm in the middle of something",
-    "can't right now, sorry!",
-    "i'd help but i'm on a mission, sorry",
-    "ask me again in a bit?",
+    "抱歉 {n}，我正忙着自己的事",
+    "等会儿吧，手上还有活",
+    "现在不行，抱歉！",
+    "想帮来着，可我任务没做完，抱歉",
+    "过会儿再问我一次？",
 ];
 const PRAISE: &[&str] = &[
-    "thx!",
-    "thanks {n}!",
-    "haha thanks",
-    "cheers {n}",
-    "appreciate it",
+    "谢啦！",
+    "多谢 {n}！",
+    "哈哈，谢了",
+    "承让承让 {n}",
+    "很感激",
 ];
 const QUESTION: &[&str] = &[
-    "no idea honestly",
-    "hmm, not sure {n}",
-    "good question, i wonder too",
-    "try asking in town?",
-    "hard to say, still figuring it out myself",
-    "wish i knew",
+    "说实话不知道",
+    "嗯，我也不清楚 {n}",
+    "好问题，我也想知道",
+    "去城里问问？",
+    "不好说，我自己还在琢磨",
+    "要知道就好了",
 ];
 const OTHER: &[&str] = &[
-    "haha yeah",
-    "lol true",
-    "ha, nice one",
-    "fair enough",
-    "mhm",
-    "hmm interesting",
-    "ok :)",
-    "yeah same",
-    "fun times",
+    "哈哈是啊",
+    "确实",
+    "哈，不错",
+    "有道理",
+    "嗯嗯",
+    "哦，有点意思",
+    "好 :)",
+    "我也这么觉得",
+    "真有意思",
 ];
 
 // ---- flavour per dominant trait: (intent, lines) ---------------------------------------------
@@ -117,69 +105,42 @@ const OTHER: &[&str] = &[
 const QUESTER: &[(Intent, &[&str])] = &[
     (
         Intent::Greet,
-        &[
-            "hey! off to grab a few more quests",
-            "hi {n}, been questing all morning",
-        ],
+        &["嘿！正要去接几个任务", "你好 {n}，一早上都在做任务"],
     ),
-    (
-        Intent::Question,
-        &["check the quest givers around here, that usually helps"],
-    ),
-    (
-        Intent::Other,
-        &["just chasing the next quest, you know how it goes"],
-    ),
+    (Intent::Question, &["去附近的任务发布者那看看，一般有用"]),
+    (Intent::Other, &["正追着下一个任务呢，你懂的"]),
 ];
 const DUELIST: &[(Intent, &[&str])] = &[
     (
         Intent::Greet,
-        &[
-            "hey {n}, up for a duel later?",
-            "hi! always ready for a good fight",
-        ],
+        &["嘿 {n}，待会儿来场决斗？", "你好！随时准备大干一场"],
     ),
-    (Intent::Question, &["i'd just fight it and see"]),
-    (Intent::Other, &["been itching for a duel all day"]),
+    (Intent::Question, &["打一架就知道了"]),
+    (Intent::Other, &["一整天都想找人切磋"]),
 ];
 const TRADER: &[(Intent, &[&str])] = &[
     (
         Intent::Greet,
-        &[
-            "hi {n}, looking to trade anything?",
-            "hey! got any good deals?",
-        ],
+        &["你好 {n}，有东西要交易吗？", "嘿！有什么好货？"],
     ),
-    (Intent::Question, &["someone at the market probably knows"]),
-    (Intent::Other, &["always up for a fair swap"]),
+    (Intent::Question, &["市场上肯定有人知道"]),
+    (Intent::Other, &["公平买卖随时欢迎"]),
 ];
 const MERCHANT: &[(Intent, &[&str])] = &[
     (
         Intent::Greet,
-        &[
-            "hey {n}, busy hauling trade packs today",
-            "hello! trade runs keep me busy",
-        ],
+        &["嘿 {n}，今天忙着跑商呢", "你好！跑商跑得脚不沾地"],
     ),
-    (
-        Intent::Question,
-        &["ask the specialty vendors, they know everything"],
-    ),
-    (
-        Intent::Other,
-        &["the roads are long with a pack on your back"],
-    ),
+    (Intent::Question, &["问问特产商人，他们什么都懂"]),
+    (Intent::Other, &["背着货包，路都变长了"]),
 ];
 const HOMEBODY: &[(Intent, &[&str])] = &[
     (
         Intent::Greet,
-        &[
-            "hey {n}, just enjoying the view",
-            "hi! nice day to relax around here",
-        ],
+        &["嘿 {n}，就在这看看风景", "你好！今天适合在这歇着"],
     ),
-    (Intent::Question, &["i'd take it slow, no rush"]),
-    (Intent::Other, &["quiet day, i like it"]),
+    (Intent::Question, &["慢慢来，不着急"]),
+    (Intent::Other, &["清静的一天，挺好"]),
 ];
 
 fn flavour(dominant: &str, intent: Intent) -> &'static [&'static str] {
@@ -217,7 +178,12 @@ pub fn classify(text: &str) -> Intent {
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|w| !w.is_empty())
         .collect();
-    let any = |set: &[&str]| words.iter().any(|w| set.contains(w));
+    // Chinese has no spaces: a Chinese keyword matches as a substring of the line, English
+    // keywords keep the whole-word rule.
+    let any = |set: &[&str]| {
+        words.iter().any(|w| set.contains(w))
+            || set.iter().any(|k| !k.is_ascii() && lower.contains(k))
+    };
     if any(&[
         "bye",
         "cya",
@@ -227,12 +193,35 @@ pub fn classify(text: &str) -> Intent {
         "farewell",
         "gn",
         "goodnight",
+        // 中文
+        "拜拜",
+        "再见",
+        "回见",
+        "晚安",
+        "下了",
     ]) {
         Intent::Bye
-    } else if any(&["thx", "thanks", "thank", "ty", "tyvm", "cheers"]) {
+    } else if any(&[
+        "thx", "thanks", "thank", "ty", "tyvm", "cheers", "谢谢", "多谢", "感谢", "3q",
+    ]) {
         Intent::Thanks
     } else if any(&[
-        "lfg", "party", "group", "help", "anyone", "anybody", "invite", "join",
+        "lfg",
+        "party",
+        "group",
+        "help",
+        "anyone",
+        "anybody",
+        "invite",
+        "join",
+        // 中文
+        "帮忙",
+        "帮个忙",
+        "帮我",
+        "组队",
+        "求组",
+        "带上我",
+        "救救",
     ]) {
         Intent::Help
     } else if any(&[
@@ -246,13 +235,38 @@ pub fn classify(text: &str) -> Intent {
         "hail",
         "greetings",
         "howdy",
+        // 中文
+        "你好",
+        "您好",
+        "嗨",
+        "哈喽",
+        "在吗",
+        "在么",
+        "嘿嘿",
+        "哈喽",
     ]) {
         Intent::Greet
     } else if any(&[
-        "gg", "nice", "wp", "grats", "congrats", "gj", "wow", "awesome",
+        "gg",
+        "nice",
+        "wp",
+        "grats",
+        "congrats",
+        "gj",
+        "wow",
+        "awesome",
+        // 中文
+        "厉害",
+        "牛",
+        "牛逼",
+        "漂亮",
+        "恭喜",
+        "666",
+        "打得好",
     ]) {
         Intent::Praise
     } else if lower.contains('?')
+        || lower.contains('？')
         || words.first().is_some_and(|w| {
             [
                 "what", "where", "how", "why", "who", "when", "which", "can", "do", "does", "is",
@@ -260,6 +274,9 @@ pub fn classify(text: &str) -> Intent {
             ]
             .contains(w)
         })
+        || ["什么", "哪里", "怎么", "为什么", "多少", "几级"]
+            .iter()
+            .any(|k| lower.contains(k))
     {
         Intent::Question
     } else {
@@ -408,7 +425,8 @@ mod tests {
         let mut seen_flavour = false;
         for _ in 0..80 {
             let line = reply(Intent::Greet, "duelist", "Bob", &mut recent, &mut rng);
-            seen_flavour |= line.contains("duel") || line.contains("fight");
+            seen_flavour |=
+                line.contains("决斗") || line.contains("切磋") || line.contains("大干一场");
         }
         assert!(seen_flavour);
         // an unknown trait falls back to the generic table

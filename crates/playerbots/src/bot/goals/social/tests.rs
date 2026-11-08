@@ -469,7 +469,7 @@ fn a_duel_is_followed_by_a_gg_most_of_the_time_but_only_with_an_audience() {
     assert!((40..95).contains(&said.len()), "{} of 100", said.len());
     assert!(said
         .iter()
-        .all(|t| { t.contains("gg") || t.contains("well fought") || t.contains("nice one") }));
+        .all(|t| { t.contains("打得好") || t.contains("精彩") || t.contains("领教") }));
     assert!(said.iter().any(|t| t.contains("Bob")), "{said:?}");
     // nobody is near: nothing is said
     assert!((0..100).all(|s| chatter_with(s, |e| e.real_near = false).is_none()));
@@ -1078,7 +1078,7 @@ fn the_chat_notices_what_happened_and_remarks_on_it() {
     t.level = 11;
     social.observe(&t, env.now_ms);
     let out = env.run(&mut social, &svc, 8_000);
-    assert!(only_text(&out).contains("ding"), "{out:?}");
+    assert!(only_text(&out).contains("升到"), "{out:?}");
     // a death to a character: nothing while dead, the remark after the resurrection
     env.advance(60_000);
     t.dead = true;
@@ -1092,9 +1092,7 @@ fn the_chat_notices_what_happened_and_remarks_on_it() {
     let out = env.run(&mut social, &svc, 8_000);
     let text = only_text(&out).to_lowercase();
     assert!(
-        ["gank", "road", "travel", "coming"]
-            .iter()
-            .any(|w| text.contains(w)),
+        ["偷袭", "路", "躺", "劫"].iter().any(|w| text.contains(w)),
         "{text}"
     );
     // a plain death is no gank
