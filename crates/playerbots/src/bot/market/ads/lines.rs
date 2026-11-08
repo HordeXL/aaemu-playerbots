@@ -168,88 +168,70 @@ fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
 }
 
 const AD_SELL: [&str; 4] = [
-    "WTS {item} x{qty} - {unit} ea, PST",
-    "WTS {item} x{qty}, {unit} each. whisper me",
-    "Selling {qty} {item}, {unit} ea - pm me",
-    "WTS {qty}x {item} {unit} ea, msg me",
+    "出售 {item} x{qty}，每个 {unit}，私聊我",
+    "出售 {item} x{qty}，{unit} 一个。密我",
+    "出售 {qty} 个 {item}，每个 {unit}，联系我",
+    "出售 {qty} 个 {item}，{unit} 一个，私信我",
 ];
 const AD_BUY: [&str; 4] = [
-    "WTB {item} x{qty}, paying {unit} ea. PST",
-    "WTB {qty}x {item} - {unit} each, whisper me",
-    "Buying {qty} {item} for {unit} ea, pm me",
-    "LF {item} x{qty} - {unit} ea",
+    "收购 {item} x{qty}，每个 {unit}，私聊我",
+    "收购 {qty} 个 {item}，每个 {unit}，密我",
+    "求购 {qty} 个 {item}，{unit} 一个，联系我",
+    "收 {item} x{qty}，{unit} 一个",
 ];
 const ASK: [&str; 4] = [
-    "how much for the {item}?",
-    "{item}? price?",
-    "hi, how much are the {item}?",
-    "interested in your {item}, what price?",
+    "你这个 {item} 多少钱？",
+    "{item}？什么价？",
+    "你好，{item} 多少钱一个？",
+    "想要你的 {item}，什么价？",
 ];
 const QUOTE: [&str; 3] = [
-    "{unit} each, i have {qty} {item}",
-    "{unit} ea for the {item}, got {qty}",
-    "{item} are {unit} ea, x{qty} available",
+    "{unit} 一个，现货 {qty} 个",
+    "{unit} 一个 {item}，有 {qty} 个",
+    "{item} 每个 {unit}，现货 x{qty}",
 ];
 const OFFER: [&str; 3] = [
-    "i have {qty} {item}, {unit} ea?",
-    "got {qty} {item} for you, {unit} each",
-    "can do x{qty} {item} at {unit} ea",
+    "我有 {qty} 个 {item}，{unit} 一个，要吗？",
+    "有 {qty} 个 {item}，{unit} 一个",
+    "x{qty} {item}，{unit} 一个，怎么样？",
 ];
-const TAKE: [&str; 3] = [
-    "ill take {qty}",
-    "ok, ill take {qty}",
-    "sure, ill take {qty}",
-];
-const TAKE_AT: [&str; 2] = [
-    "ill take {qty} at {unit} ea",
-    "ill take {qty} for {unit} ea",
-];
+const TAKE: [&str; 3] = ["我要 {qty} 个", "好，我要 {qty} 个", "行，我要 {qty} 个"];
+const TAKE_AT: [&str; 2] = ["我要 {qty} 个，{unit} 一个", "{unit} 一个，我要 {qty} 个"];
 const COUNTER_BUYER: [&str; 3] = [
-    "{unit} ea?",
-    "can you do {unit} ea?",
-    "how about {unit} each?",
+    "{unit} 一个？",
+    "{unit} 一个，能卖吗？",
+    "{unit} 一个怎么样？",
 ];
 const COUNTER_SELLER: [&str; 3] = [
-    "best i can do is {unit} ea",
-    "{unit} ea is my best price",
-    "i can do {unit} each",
+    "最低 {unit} 一个",
+    "{unit} 一个，最低了",
+    "{unit} 一个，只能这个价",
 ];
-const LOWEST: [&str; 2] = ["{unit} ea is my lowest", "thats my lowest, {unit} ea"];
-const AGREE: [&str; 4] = ["deal", "ok deal", "sure, deal", "sounds good, deal"];
-const DECLINE_PRICE: [&str; 3] = [
-    "no thanks, too low for me",
-    "sorry, ill pass at that price",
-    "nah, thats too low",
-];
-const DECLINE_SOLD: [&str; 3] = [
-    "sorry, already sold",
-    "sold out, sorry",
-    "sorry, sold out already",
-];
-const DECLINE_PASS: [&str; 3] = ["no thanks", "nah, ill pass", "not interested, thx"];
+const LOWEST: [&str; 2] = ["{unit} 一个是最低价了", "最低 {unit} 一个，不能再低了"];
+const AGREE: [&str; 4] = ["成交", "好的，成交", "行，成交", "没问题，成交"];
+const DECLINE_PRICE: [&str; 3] = ["不了，这个价太低了", "抱歉，这个价我放弃了", "算了，太低了"];
+const DECLINE_SOLD: [&str; 3] = ["抱歉，已经卖完了", "没货了，抱歉", "不了，已经卖完了"];
+const DECLINE_PASS: [&str; 3] = ["不了，谢谢", "算了，我不感兴趣", "不了，没兴趣"];
 const CONFIRM_MIRAGE: [&str; 2] = [
-    "deal! {qty} {item} for {total} total. meet me on Mirage Isle by the mailbox (the portal is next to the auctioneer)",
-    "ok deal, {total} total for {qty} {item}. lets meet on Mirage Isle at the mailbox",
+    "成交！{qty} 个 {item}，一共 {total}。到幻影岛邮箱碰头（传送门就在拍卖行旁边）",
+    "好的，{qty} 个 {item} 一共 {total}。幻影岛邮箱见",
 ];
 const CONFIRM_TOWN: [&str; 2] = [
-    "deal! {qty} {item} for {total} total. meet me at the auctioneer in {place}",
-    "sure, {total} total for {qty} {item}. im at the {place} auctioneer, come find me",
+    "成交！{qty} 个 {item}，一共 {total}。到 {place} 的拍卖行碰头",
+    "好的，一共 {total}，{qty} 个 {item}。我在 {place} 拍卖行等你",
 ];
 const PLACE_MIRAGE: [&str; 2] = [
-    "ill be at the mailbox on Mirage Isle",
-    "Mirage Isle, by the mailbox. the portal is next to any auctioneer",
+    "我在幻影岛的邮箱等你",
+    "幻影岛，邮箱旁边。传送门就在拍卖行旁边",
 ];
-const PLACE_TOWN: [&str; 2] = [
-    "at the auctioneer in {place}",
-    "{place}, next to the auctioneer",
-];
-const ON_MY_WAY: [&str; 3] = ["omw", "ok, on my way", "coming, be there in a minute"];
-const HERE: [&str; 3] = ["im here", "here! waiting for you", "arrived, waiting"];
-const THANKS: [&str; 4] = ["thx, gg", "thanks!", "ty", "thanks, nice doing business"];
+const PLACE_TOWN: [&str; 2] = ["我在 {place} 的拍卖行", "{place}，拍卖行旁边"];
+const ON_MY_WAY: [&str; 3] = ["马上到", "好的，在路上", "就来，稍等"];
+const HERE: [&str; 3] = ["我到了", "到了！等你", "到了，等着你"];
+const THANKS: [&str; 4] = ["谢了，合作愉快", "谢谢！", "多谢", "谢谢，合作愉快"];
 const CANCEL: [&str; 3] = [
-    "sorry, changed my mind. never mind",
-    "sorry, something came up. cancel that",
-    "sorry, cancel that",
+    "抱歉，我改主意了，算了",
+    "抱歉，临时有事，取消吧",
+    "抱歉，取消",
 ];
 
 /// How many wordings [`render_nth`] has for `speech`.

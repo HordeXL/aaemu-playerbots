@@ -151,28 +151,24 @@ pub enum Say {
 /// answer is not always the same words. `arg` replaces `{}`.
 pub fn line(say: Say, pick: usize, arg: &str) -> String {
     let options: &[&str] = match say {
-        Say::Following => &["following you", "right behind you", "on my way"],
-        Say::Staying => &["ok, staying here", "waiting here", "holding position"],
-        Say::Coming => &["coming", "on my way", "be right there"],
-        Say::Assisting => &["attacking your target", "on it", "assisting"],
-        Say::NoTarget => &["i don't see a target", "you have no target"],
-        Say::Leaving => &["ok, leaving the party", "bye, good luck"],
-        Say::Heading => &["heading to {}", "ok, off to {}", "on my way to {}"],
-        Say::AtDoor => &["i'm at the entrance of {}", "waiting at {}"],
-        Say::TooLow => &["i'm too low for {}", "{} is too hard for me"],
-        Say::UnknownDungeon => &["which dungeon? i don't know that one"],
-        Say::WhichDungeon => &["which one? be more exact"],
-        Say::CannotEnter => &["i can't get into {}", "{} won't let me in"],
-        Say::InviteSent => &["sent you an invite", "invite sent"],
-        Say::Sorry => &[
-            "sorry, i'm busy",
-            "sorry, can't right now",
-            "not now, sorry",
-        ],
-        Say::AskLeader => &["i'm in a party already, ask {}", "ask {} to invite you"],
-        Say::NotYours => &["only the leader can ask me that"],
-        Say::LevelGap => &["sorry, our levels are too far apart"],
-        Say::Full => &["sorry, there are enough of us already"],
+        Say::Following => &["跟着你呢", "就在你后面", "马上来"],
+        Say::Staying => &["好，就在这待命", "在这等着", "原地待命"],
+        Say::Coming => &["来了", "在路上", "马上到"],
+        Say::Assisting => &["打你的目标", "这就上", "协助中"],
+        Say::NoTarget => &["我没看见目标", "你没有目标"],
+        Say::Leaving => &["好，我退队了", "拜拜，祝好运"],
+        Say::Heading => &["这就去 {}", "好，这就动身去 {}", "正在去 {} 的路上"],
+        Say::AtDoor => &["我在 {} 的入口了", "在 {} 等着"],
+        Say::TooLow => &["我等级不够打 {}", "{} 对我来说太难了"],
+        Say::UnknownDungeon => &["哪个副本？我不知道这个"],
+        Say::WhichDungeon => &["哪一个？说具体点"],
+        Say::CannotEnter => &["我进不去 {}", "{} 不让我进"],
+        Say::InviteSent => &["邀请已发出", "发了邀请"],
+        Say::Sorry => &["抱歉，我正忙着", "抱歉，现在不行", "现在不行，抱歉"],
+        Say::AskLeader => &["我已经在队里了，问 {}", "让 {} 邀请你"],
+        Say::NotYours => &["只有队长能这么要求我"],
+        Say::LevelGap => &["抱歉，我们等级差太多了"],
+        Say::Full => &["抱歉，我们人已经够了"],
     };
     options[pick % options.len()].replace("{}", arg)
 }
@@ -293,7 +289,7 @@ mod tests {
                 assert!(aa_proto::cs::plain_chat_text(&l).is_some(), "{l}");
             }
         }
-        assert_eq!(line(Say::Heading, 0, "Library"), "heading to Library");
-        assert_eq!(line(Say::Heading, 3, "Library"), "heading to Library");
+        assert_eq!(line(Say::Heading, 0, "Library"), "这就去 Library");
+        assert_eq!(line(Say::Heading, 3, "Library"), "这就去 Library");
     }
 }

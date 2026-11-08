@@ -116,6 +116,12 @@ fn has_word(tokens: &[&str], words: &[&str]) -> bool {
     tokens.iter().any(|t| words.contains(t))
 }
 
+/// Whether the normalized line contains one of the Chinese keywords: Chinese has no spaces, so a
+/// whole sentence is one token and the word lists never match it.
+fn has_cn(norm: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| norm.contains(w))
+}
+
 /// Whether `phrase` (single spaces) occurs in the tokens as whole words.
 fn has_phrase(padded: &str, phrase: &str) -> bool {
     padded.contains(&format!(" {phrase} "))
@@ -127,6 +133,10 @@ fn unit_value(u: &str) -> Option<i64> {
         "g" | "gp" | "gold" => GOLD,
         "s" | "sp" | "sil" | "silver" => SILVER,
         "c" | "cp" | "cu" | "copper" => 1,
+        // Chinese money words
+        "金" | "金币" => GOLD,
+        "银" | "银币" => SILVER,
+        "铜" | "铜币" => 1,
         _ => return None,
     })
 }
@@ -249,16 +259,22 @@ pub fn parse(text: &str) -> Line {
     };
     let first = tokens.first().copied().unwrap_or("");
     l.sell_ad = matches!(first, "wts" | "selling" | "sellin" | "sell" | "wtt")
-        || has_phrase(&padded, "for sale");
-    l.buy_ad = matches!(first, "wtb" | "buying" | "lf" | "wanted")
-        || has_phrase(&padded, "looking for")
-        || has_phrase(&padded, "wtb");
+        || has_phrase(&padded, "for sale")
+        || matches!(first, "出售" | "卖" | "出货" | "甩卖")
+        || has_cn(&norm, &["出售", "出货", "甩卖"]);
+    l.buy_ad = matches!(
+        first,
+        "wtb" | "buying" | "lf" | "wanted" | "收购" | "求购" | "收"
+    ) || has_phrase(&padded, "looking for")
+        || has_phrase(&padded, "wtb")
+        || has_cn(&norm, &["收购", "求购", "重金求购"]);
     l.take = !l.buy_ad
         && (has_word(
             &tokens,
             &["take", "taking", "buy", "gimme", "want", "wants"],
         ) || has_phrase(&padded, "give me")
-            || has_phrase(&padded, "i need"));
+            || has_phrase(&padded, "i need")
+            || has_cn(&norm, &["我要", "要了", "拿下", "我买", "收了"]));
     l.ask = has_phrase(&padded, "how much")
         || has_word(
             &tokens,
@@ -276,7 +292,11 @@ pub fn parse(text: &str) -> Line {
         || has_phrase(&padded, "still available")
         || has_phrase(&padded, "got any")
         || has_phrase(&padded, "have any")
-        || has_phrase(&padded, "what do you want");
+        || has_phrase(&padded, "what do you want")
+        || has_cn(
+            &norm,
+            &["多少钱", "怎么卖", "什么价", "报价", "还有吗", "有货吗"],
+        );
     l.agree = has_word(
         &tokens,
         &[
@@ -285,7 +305,8 @@ pub fn parse(text: &str) -> Line {
         ],
     ) || has_phrase(&padded, "sounds good")
         || has_phrase(&padded, "lets do it")
-        || has_phrase(&padded, "works for me");
+        || has_phrase(&padded, "works for me")
+        || has_cn(&norm, &["成交", "好的", "没问题", "可以", "行"]);
     l.refuse = has_word(
         &tokens,
         &[
@@ -304,7 +325,20 @@ pub fn parse(text: &str) -> Line {
         || has_phrase(&padded, "sold out")
         || has_phrase(&padded, "already sold")
         || has_phrase(&padded, "changed my mind")
-        || has_phrase(&padded, "too late");
+        || has_phrase(&padded, "too late")
+        || has_cn(
+            &norm,
+            &[
+                "不了",
+                "算了",
+                "取消",
+                "卖完了",
+                "没货",
+                "已售",
+                "改主意",
+                "放弃",
+            ],
+        );
     l.haggle = has_word(
         &tokens,
         &[
@@ -326,8 +360,9 @@ pub fn parse(text: &str) -> Line {
         || has_phrase(&padded, "come down")
         || has_phrase(&padded, "best price")
         || has_phrase(&padded, "last price")
-        || has_phrase(&padded, "best i can do");
-    l.mirage = has_word(&tokens, &["mirage"]);
+        || has_phrase(&padded, "best i can do")
+        || has_cn(&norm, &["太贵", "便宜", "最低", "降价"]);
+    l.mirage = has_word(&tokens, &["mirage"]) || has_cn(&norm, &["幻影岛", "交易岛"]);
     l.town = has_word(
         &tokens,
         &[
@@ -338,24 +373,28 @@ pub fn parse(text: &str) -> Line {
             "mailbox",
             "village",
         ],
-    );
-    l.where_q =
-        has_word(&tokens, &["where", "wher", "location"]) || has_phrase(&padded, "which town");
+    ) || has_cn(&norm, &["拍卖行", "邮箱", "城里", "城镇", "村庄"]);
+    l.where_q = has_word(&tokens, &["where", "wher", "location"])
+        || has_phrase(&padded, "which town")
+        || has_cn(&norm, &["在哪", "哪里"]);
     l.meet = l.mirage
         || l.town
         || l.where_q
         || has_word(&tokens, &["meet", "meetup", "come"])
         || has_phrase(&padded, "trade me")
-        || has_phrase(&padded, "find me");
-    l.here = has_word(&tokens, &["here", "arrived", "waiting", "ready"]);
+        || has_phrase(&padded, "find me")
+        || has_cn(&norm, &["见面", "碰头", "找我", "来找我", "等你"]);
+    l.here = has_word(&tokens, &["here", "arrived", "waiting", "ready"])
+        || has_cn(&norm, &["我到了", "到了", "等着", "等你"]);
     l.coming = has_word(&tokens, &["omw", "otw", "coming", "heading"])
         || has_phrase(&padded, "on my way")
         || has_phrase(&padded, "be there")
-        || has_phrase(&padded, "be right there");
+        || has_phrase(&padded, "be right there")
+        || has_cn(&norm, &["马上到", "在路上", "就来", "这就来"]);
     l.thanks = has_word(
         &tokens,
         &["thx", "thanks", "thank", "ty", "tyvm", "thnx", "cheers"],
-    );
+    ) || has_cn(&norm, &["谢谢", "谢了", "多谢", "感谢"]);
 
     // the price and the quantity
     let mut i = 0;
@@ -379,11 +418,14 @@ pub fn parse(text: &str) -> Line {
             || has_phrase(&padded, "for all")
             || has_phrase(&padded, "for the lot")
             || has_phrase(&padded, "all for")
-            || has_phrase(&padded, "in total");
-        let each = near
-            .iter()
-            .any(|t| matches!(*t, "ea" | "each" | "per" | "apiece" | "/ea" | "pe"))
-            || lead.is_some_and(|t| t.ends_with("/ea"));
+            || has_phrase(&padded, "in total")
+            || has_cn(&norm, &["一共", "总共", "全要"]);
+        let each = near.iter().any(|t| {
+            matches!(
+                *t,
+                "ea" | "each" | "per" | "apiece" | "/ea" | "pe" | "每个" | "一个" | "一只"
+            )
+        }) || lead.is_some_and(|t| t.ends_with("/ea"));
         l.price = Some(Price {
             copper,
             per_unit: each || !total,
@@ -418,6 +460,14 @@ pub fn parse(text: &str) -> Line {
                         | "of"
                         | "x"
                         | "me"
+                        | "出售"
+                        | "收购"
+                        | "求购"
+                        | "收"
+                        | "有"
+                        | "现货"
+                        | "我要"
+                        | "我有"
                 );
             if after_verb {
                 l.qty = tok.parse().ok().filter(|n| *n > 0);
