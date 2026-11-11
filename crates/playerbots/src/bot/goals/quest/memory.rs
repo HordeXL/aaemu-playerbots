@@ -5,9 +5,10 @@
 //! created afresh every time the brain picks it) and is dropped with the state on a reconnect.
 //! The failure policy follows the original bots' lifecycle controller:
 //!
-//! * every failure backs the quest off for [`BACKOFF_MS`],
-//! * [`FAILS_TO_QUARANTINE`] failures in a row quarantine it for [`QUARANTINE_MS`] (a story quest
-//!   cools down for [`STORY_COOLDOWN_MS`] instead and is never dropped from the journal),
+//! * every failure backs the quest off longer: [`BACKOFF_STEPS_MS`] is 30 s, 2 min, 8 min,
+//! * [`FAILS_TO_QUARANTINE`] failures in a row quarantine it for the rest of the session
+//!   ([`QUARANTINE_MS`]; a story quest cools down for [`STORY_COOLDOWN_MS`] instead and is never
+//!   dropped from the journal),
 //! * a quest the bot cannot do at all ([`Failure::Unsupported`]) is quarantined for
 //!   [`UNSUPPORTED_MS`],
 //! * any success clears the record of that quest.
@@ -20,12 +21,13 @@ use smallvec::SmallVec;
 
 use super::progress::Progress;
 
-/// A quest that failed is not tried again for this long.
-pub const BACKOFF_MS: u64 = 30_000;
-/// Failures in a row after which a side quest is quarantined.
-pub const FAILS_TO_QUARANTINE: u8 = 3;
-/// How long a side quest stays quarantined.
-pub const QUARANTINE_MS: u64 = 300_000;
+/// The wait after the 1st, 2nd, ... failure in a row: 30 s, 2 min, 8 min.
+pub const BACKOFF_STEPS_MS: [u64; 3] = [30_000, 120_000, 480_000];
+/// Failures in a row after which a side quest is quarantined (after the three waits above).
+pub const FAILS_TO_QUARANTINE: u8 = BACKOFF_STEPS_MS.len() as u8 + 1;
+/// How long a side quest stays quarantined: for the rest of the session (the memory lives in the
+/// bot state and is dropped on a reconnect).
+pub const QUARANTINE_MS: u64 = u64::MAX;
 /// How long a story quest rests after [`FAILS_TO_QUARANTINE`] failures.
 pub const STORY_COOLDOWN_MS: u64 = 300_000;
 /// How long a quest stays out that the bot cannot do (an objective kind without support).
@@ -168,18 +170,17 @@ impl Memory {
         e.fails = e.fails.saturating_add(1);
         if why.permanent() {
             e.quarantined = true;
-            e.until_ms = now_ms + UNSUPPORTED_MS;
+            e.until_ms = now_ms.saturating_add(UNSUPPORTED_MS);
             return Verdict::Quarantine(e.until_ms);
         }
         if e.fails >= FAILS_TO_QUARANTINE {
             e.fails = 0;
             e.quarantined = !story;
-            e.until_ms = now_ms
-                + if story {
-                    STORY_COOLDOWN_MS
-                } else {
-                    QUARANTINE_MS
-                };
+            e.until_ms = now_ms.saturating_add(if story {
+                STORY_COOLDOWN_MS
+            } else {
+                QUARANTINE_MS
+            });
             return if story {
                 Verdict::Backoff(e.until_ms)
             } else {
@@ -187,7 +188,8 @@ impl Memory {
             };
         }
         e.quarantined = false;
-        e.until_ms = now_ms + BACKOFF_MS;
+        let step = BACKOFF_STEPS_MS[usize::from(e.fails - 1).min(BACKOFF_STEPS_MS.len() - 1)];
+        e.until_ms = now_ms.saturating_add(step);
         Verdict::Backoff(e.until_ms)
     }
 
@@ -280,30 +282,31 @@ mod tests {
         let mut m = Memory::default();
         assert!(m.usable(7, 0));
         let v = m.fail(7, Failure::NoProgress, false, 1_000);
-        assert_eq!(v, Verdict::Backoff(1_000 + BACKOFF_MS));
-        assert!(!m.usable(7, 1_000 + BACKOFF_MS - 1));
-        assert!(m.usable(7, 1_000 + BACKOFF_MS));
+        assert_eq!(v, Verdict::Backoff(1_000 + BACKOFF_STEPS_MS[0]));
+        assert!(!m.usable(7, 1_000 + BACKOFF_STEPS_MS[0] - 1));
+        assert!(m.usable(7, 1_000 + BACKOFF_STEPS_MS[0]));
         assert!(!m.quarantined(7, 2_000));
         assert!(m.usable(8, 2_000));
     }
 
     #[test]
-    fn three_failures_quarantine_a_side_quest() {
+    fn repeated_failures_back_off_exponentially_then_quarantine() {
         let mut m = Memory::default();
         let mut now = 0;
-        for _ in 0..FAILS_TO_QUARANTINE - 1 {
-            assert!(matches!(
-                m.fail(7, Failure::AcceptRefused, false, now),
-                Verdict::Backoff(_)
-            ));
-            now += BACKOFF_MS;
+        for (i, &wait) in BACKOFF_STEPS_MS.iter().enumerate() {
+            let v = m.fail(7, Failure::AcceptRefused, false, now);
+            assert_eq!(v, Verdict::Backoff(now + wait), "failure {}", i + 1);
+            assert!(!m.usable(7, now + wait - 1));
+            assert!(m.usable(7, now + wait));
+            now += wait;
         }
+        assert_eq!(BACKOFF_STEPS_MS, [30_000, 120_000, 480_000]);
         let v = m.fail(7, Failure::AcceptRefused, false, now);
-        assert_eq!(v, Verdict::Quarantine(now + QUARANTINE_MS));
+        assert_eq!(v, Verdict::Quarantine(u64::MAX), "the rest of the session");
         assert!(m.quarantined(7, now + 1));
-        assert!(!m.usable(7, now + QUARANTINE_MS - 1));
-        assert!(m.usable(7, now + QUARANTINE_MS));
-        assert!(!m.quarantined(7, now + QUARANTINE_MS));
+        assert!(!m.usable(7, now + 1));
+        assert!(!m.usable(7, u64::MAX - 1));
+        assert!(!m.quarantined(7, u64::MAX));
     }
 
     #[test]
@@ -333,13 +336,14 @@ mod tests {
         let mut m = Memory::default();
         assert_eq!(m.retry_in(7, 0), None);
         m.fail(7, Failure::NoProgress, false, 1_000);
-        assert_eq!(m.retry_in(7, 11_000), Some(BACKOFF_MS - 10_000));
-        assert_eq!(m.retry_in(7, 1_000 + BACKOFF_MS), None);
-        // a quarantined quest is out, not about to come back
+        assert_eq!(m.retry_in(7, 11_000), Some(BACKOFF_STEPS_MS[0] - 10_000));
+        assert_eq!(m.retry_in(7, 1_000 + BACKOFF_STEPS_MS[0]), None);
+        // a quarantined quest is out for the session, not about to come back
         for _ in 0..FAILS_TO_QUARANTINE {
             m.fail(8, Failure::NoProgress, false, 0);
         }
         assert!(m.quarantined(8, 1));
+        assert_eq!(FAILS_TO_QUARANTINE, 4, "three waits and then the drop");
         assert_eq!(m.retry_in(8, 1), None);
         // a story quest rests instead
         for _ in 0..FAILS_TO_QUARANTINE {
@@ -388,7 +392,7 @@ mod tests {
         // a real failure after them is still only the first strike
         assert!(matches!(
             m.fail(251, Failure::NoProgress, false, now),
-            Verdict::Backoff(t) if t == now + BACKOFF_MS
+            Verdict::Backoff(t) if t == now + BACKOFF_STEPS_MS[0]
         ));
         assert!(!m.quarantined(251, now + 1));
         assert_eq!(
