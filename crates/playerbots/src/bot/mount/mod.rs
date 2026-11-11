@@ -303,9 +303,15 @@ pub fn duty(ctx: &mut Ctx<'_>) {
 pub fn on_gone(
     state: &mut crate::bot::state::BotState,
     motion: &mut crate::bot::motion::Motion,
+    out: &mut Vec<cs::Out>,
     base: (f32, f32),
 ) {
     let mut mem = std::mem::take(state.travel.mount_mut());
+    if mem.mate_tl != 0 {
+        // A teleport, a death or an instance load may leave the mate behind; the server removes
+        // an active mate by its timeline id (and unmounts the rider first).
+        out.push(cs::remove_mate(mem.mate_tl));
+    }
     mem.on_gone();
     *state.travel.mount_mut() = mem;
     motion.end_glide();

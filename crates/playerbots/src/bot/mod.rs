@@ -1064,7 +1064,7 @@ impl Bot {
             self.shared.cfg.bots.move_speed,
             self.shared.cfg.bots.walk_speed,
         );
-        mount::on_gone(&mut self.state, &mut self.motion, base);
+        mount::on_gone(&mut self.state, &mut self.motion, &mut self.out, base);
     }
 
     /// Answers what the state noticed: teleports, instance loads, death, resurrection, kicks.

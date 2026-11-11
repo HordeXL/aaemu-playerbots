@@ -398,7 +398,7 @@ impl Brain {
         self.chat(&mut *ctx.rng, interval).social.tick(ctx);
         if ctx.state.me.dead {
             let base = (ctx.cfg.bots.move_speed, ctx.cfg.bots.walk_speed);
-            super::mount::on_gone(ctx.state, ctx.motion, base);
+            super::mount::on_gone(ctx.state, ctx.motion, ctx.out, base);
             self.director_wake(ctx, Trigger::Died);
             // Dead bots drop their goal (a dungeon run goes on inside the dungeon); the bot task
             // asks for the resurrection.

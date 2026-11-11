@@ -4,6 +4,7 @@ use aa_proto::cs;
 use aa_proto::sc_travel::MateInfo;
 use aa_proto::sc_world::WorldEvent;
 
+use super::on_gone;
 use super::plan::*;
 use crate::bot::motion::{Ground, Motion, MotionCfg, MotionEnv, MotionStatus, Pace};
 use crate::bot::travel::journey::SkillNote;
@@ -578,6 +579,25 @@ fn a_new_trip_or_a_stop_ends_a_glide() {
     m.stop();
     assert!(!m.gliding());
     assert!(!m.begin_glide((0.0, 1.0), 9.0, 3.0, 1_001));
+}
+
+#[test]
+fn going_away_dismisses_the_mate_once() {
+    let mut state = crate::bot::state::BotState::new();
+    let mut motion = Motion::new(MotionCfg::default());
+    {
+        let mem = state.travel.mount_mut();
+        mem.mate_tl = 5;
+        mem.phase = Phase::Mounted { since_ms: T0 };
+    }
+    let mut out = Vec::new();
+    on_gone(&mut state, &mut motion, &mut out, (5.4, 1.8));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].opcode, aa_proto::opcodes::cs::CSRemoveMatePacket);
+    assert_eq!(state.travel.mount_ref().unwrap().mate_tl, 0);
+    out.clear();
+    on_gone(&mut state, &mut motion, &mut out, (5.4, 1.8));
+    assert!(out.is_empty(), "the mate is only dismissed once");
 }
 
 #[test]
