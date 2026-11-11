@@ -1817,6 +1817,7 @@ mod tests {
             faction: 0,
             level: 5,
             flags: 0,
+            target: 0,
             name: None,
         }
     }

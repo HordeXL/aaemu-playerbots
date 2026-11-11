@@ -327,6 +327,7 @@ fn race_chains(world: &World) -> Vec<Chain> {
                         gender,
                         mother_faction: mother,
                         done: &all,
+                        in_journal: &all,
                         owns: &all,
                     },
                 )

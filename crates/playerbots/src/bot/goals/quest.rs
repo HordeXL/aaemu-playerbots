@@ -46,7 +46,7 @@ use crate::bot::avoid::UNREACHABLE_MS;
 use crate::bot::combat::{CombatStatus, Loss};
 use crate::bot::ctx::Ctx;
 use crate::bot::motion::{MotionStatus, MoveFailure, Pace};
-use crate::bot::state::{dist2d, BotState, StateError, UnitKind};
+use crate::bot::state::{dist2d, dist3d, BotState, StateError, TagOwner, UnitKind};
 use crate::bot::watch::classify::{CreditNote, CreditStep};
 use crate::bot::watch::{Finding, Role};
 use crate::contest::{doodad_key, spot_key, unit_key};
@@ -83,6 +83,11 @@ const READY_WAIT_MS: u64 = 8_000;
 const AUTO_WAIT_MS: u64 = 6_000;
 /// Distance at which an NPC can be talked to / handed a quest.
 const NPC_RANGE: f32 = 4.5;
+/// The server's reach for a quest request at an NPC: 3 m interaction + 2 m tolerance + 10 m
+/// slack (`npc_out_of_quest_reach`). Measured in 3D, so a bot under a floor is out of reach.
+const QUEST_NPC_REACH: f32 = 15.0;
+/// The server's reach for a quest request at a doodad (5 m use range + 15 m allowance).
+const QUEST_DOODAD_REACH: f32 = 20.0;
 /// The bot stops this far from an NPC.
 const NPC_STOP: f32 = 3.0;
 /// Distance at which a doodad is used.
@@ -496,6 +501,7 @@ fn with_eligibility<R>(
             gender: state.me.gender,
             mother_faction: world.mother_faction(faction),
             done: &done,
+            in_journal: &active,
             owns: &owns,
         },
         judge: Judge {
@@ -1135,6 +1141,16 @@ impl Inner {
                     });
                     return self.fail(ctx, Failure::Server(err));
                 }
+                if let Some((kind, value)) = server_unit_req(ctx.state, q, self.sent_ms) {
+                    // (kind 0x25 is "this quest must be in progress first": the picker takes the
+                    // prerequisite once the start gate below lets it through)
+                    ctx.find(Finding::QuestUnitReq {
+                        quest: q,
+                        kind,
+                        value,
+                    });
+                    return self.fail(ctx, Failure::UnitReq { kind, value });
+                }
                 if now.saturating_sub(self.sent_ms) > ACK_MS {
                     self.tries += 1;
                     if self.tries >= 2 {
@@ -1226,11 +1242,12 @@ impl Inner {
         if !state.kills.iter().any(|k| k.0 == obj) {
             return;
         }
-        // The server credits a kill to whoever tagged the monster first (and their team): another
-        // character at the fight may have, and the bot cannot see the tag. Judged only when the
-        // bot fought alone. (Seen live: two bots on the same boss, the one that struck last got
-        // no credit and the report was a false alarm.)
-        if characters_near(state, TAG_SHARE_RADIUS_M) {
+        // The server credits a kill to whoever tagged the monster first (the tag team when the
+        // party did more than half the damage). A killing blow on a monster somebody else tagged
+        // gets nothing, so it is not a credit that can go missing. (Seen live: two bots on the
+        // same boss, the one that struck last got no credit and the report was a false alarm.)
+        let tag = state.units.get(&obj).and_then(|u| u.tag());
+        if !credit_expected(tag, characters_near(state, TAG_SHARE_RADIUS_M)) {
             return;
         }
         let (Some(quest), Some(row)) = (ctx.world.quest(self.quest), state.quests.row(self.quest))
@@ -1305,6 +1322,26 @@ impl Inner {
                 });
             }
         }
+    }
+
+    /// The NPC or doodad is there but the bot could not get close enough for the server: a
+    /// house floor or a cave the navigation mesh has no way to, reported once per target.
+    fn role_unreachable(&self, ctx: &mut Ctx<'_>, target: Target, dist_m: f32) {
+        let (template, doodad) = match target {
+            Target::Npc(t) => (t, false),
+            Target::Doodad(t) => (t, true),
+        };
+        let role = match self.mode {
+            Mode::Accept => Role::Giver,
+            Mode::TurnIn => Role::TurnIn,
+            _ => Role::Objective,
+        };
+        ctx.find(Finding::RoleUnreachable {
+            template,
+            doodad,
+            role,
+            dist_m,
+        });
     }
 
     /// The giver, turn-in NPC or doodad of the quest is not at any of its spawns that the bot
@@ -1497,7 +1534,7 @@ impl Inner {
             if !templates.contains(&d.template) {
                 continue;
             }
-            let dist = dist2d(me, d.pos);
+            let dist = dist3d(me, d.pos);
             let taken = ctx.hub.contest.others(doodad_key(obj), bot) > 0;
             if best.is_none_or(|b| better_target(taken, dist, b.4, b.3)) {
                 best = Some((obj, d.template, d.pos, dist, taken));
@@ -1515,7 +1552,7 @@ impl Inner {
         };
         self.renew_claim(ctx, doodad_key(obj));
         if dist > DOODAD_RANGE {
-            return match self.walk(ctx, pos[0], pos[1], DOODAD_STOP) {
+            return match self.walk_at(ctx, pos[0], pos[1], Some(pos[2]), DOODAD_STOP) {
                 Walk::Failed => self.fail(ctx, Failure::Unreachable),
                 _ => GoalStatus::Running,
             };
@@ -1660,7 +1697,7 @@ impl Inner {
     ) -> Result<Option<u32>, GoalStatus> {
         let world = ctx.world;
         let me = ctx.state.me.pos;
-        // (x, y), how close the bot has to be, how close it walks.
+        // (x, y, z), how close the bot has to be, how close it walks.
         let (spot, reach, stop, obj) = match need {
             SkillNeed::Npc(t) => {
                 let bot = ctx.persona.id;
@@ -1677,7 +1714,12 @@ impl Inner {
                 let reach = world.skill(skill).map_or(NPC_RANGE, |s| {
                     (f32::from(s.max_range) - 1.0).clamp(NPC_STOP, 20.0)
                 });
-                ((pos[0], pos[1]), reach, (reach - 1.5).max(1.0), Some(obj))
+                (
+                    [pos[0], pos[1], pos[2]],
+                    reach,
+                    (reach - 1.5).max(1.0),
+                    Some(obj),
+                )
             }
             SkillNeed::NpcGroup(group, negate) => {
                 let members = world.quest_monster_group(group);
@@ -1709,20 +1751,25 @@ impl Inner {
                 let reach = world.skill(skill).map_or(NPC_RANGE, |s| {
                     (f32::from(s.max_range) - 1.0).clamp(NPC_STOP, 20.0)
                 });
-                ((pos[0], pos[1]), reach, (reach - 1.5).max(1.0), Some(obj))
+                (
+                    [pos[0], pos[1], pos[2]],
+                    reach,
+                    (reach - 1.5).max(1.0),
+                    Some(obj),
+                )
             }
             SkillNeed::Doodad(t, range) => {
                 let nearest = world
                     .doodad_spawns(t)
                     .iter()
-                    .map(|p| (p, dist2d(me, [p.x, p.y, 0.0])))
+                    .map(|p| (p, dist3d(me, [p.x, p.y, p.z])))
                     .filter(|(_, d)| *d <= SEARCH_RADIUS_M)
                     .min_by(|a, b| a.1.total_cmp(&b.1));
                 let Some((p, _)) = nearest else {
                     return Err(self.fail(ctx, Failure::TargetMissing));
                 };
                 let reach = (range * 0.7).clamp(2.0, 30.0);
-                ((p.x, p.y), reach, (reach - 2.0).max(1.0), None)
+                ([p.x, p.y, p.z], reach, (reach - 2.0).max(1.0), None)
             }
             SkillNeed::Sphere => {
                 let sphere = quest
@@ -1734,11 +1781,17 @@ impl Inner {
                 // Without a known area the cast is tried where the bot stands.
                 let Some(s) = sphere else { return Ok(None) };
                 let reach = (s.radius * 0.6).max(2.0);
-                ((s.x, s.y), reach, (s.radius * 0.4).clamp(1.0, 4.0), None)
+                (
+                    [s.x, s.y, me[2]],
+                    reach,
+                    (s.radius * 0.4).clamp(1.0, 4.0),
+                    None,
+                )
             }
         };
-        if dist2d(me, [spot.0, spot.1, 0.0]) > reach {
-            return Err(match self.walk(ctx, spot.0, spot.1, stop) {
+        if dist3d(me, spot) > reach {
+            let z = (!matches!(need, SkillNeed::Sphere)).then_some(spot[2]);
+            return Err(match self.walk_at(ctx, spot[0], spot[1], z, stop) {
                 Walk::Failed => self.fail(ctx, Failure::Unreachable),
                 _ => GoalStatus::Running,
             });
@@ -1747,7 +1800,7 @@ impl Inner {
             ctx.motion.stop();
         }
         if obj.is_some() {
-            ctx.motion.face(spot.0, spot.1);
+            ctx.motion.face(spot[0], spot[1]);
         }
         Ok(obj)
     }
@@ -1893,9 +1946,19 @@ impl Inner {
     /// Walks to (x, y), stopping `radius` metres short. The command is re-issued when something
     /// else (a fight) took the controller over; a trip that failed is reported once.
     fn walk(&mut self, ctx: &mut Ctx<'_>, x: f32, y: f32, radius: f32) -> Walk {
+        self.walk_at(ctx, x, y, None, radius)
+    }
+
+    /// Like [`Inner::walk`], for a target on a known floor: the distance that must fall within
+    /// `radius` is the 3D one, and the navmesh search is asked for that floor (a house storey, a
+    /// cave under the terrain). A controller that reports "arrived" while the bot is still 30 m
+    /// below the target means the mesh has no way up: the walk fails and the caller reports it.
+    fn walk_at(&mut self, ctx: &mut Ctx<'_>, x: f32, y: f32, z: Option<f32>, radius: f32) -> Walk {
         let now = ctx.now_ms;
         let me = ctx.state.me.pos;
-        if dist2d(me, [x, y, 0.0]) <= radius + 0.6 {
+        let at = |p: [f32; 3]| z.map_or_else(|| dist2d(me, p), |z| dist3d(me, [p[0], p[1], z]));
+        let here = [x, y, z.unwrap_or(me[2])];
+        if at(here) <= radius + 0.6 {
             if ctx.motion.is_moving() {
                 ctx.motion.stop();
             }
@@ -1906,15 +1969,19 @@ impl Inner {
             .is_some_and(|s| dist2d([s.0, s.1, 0.0], [x, y, 0.0]) < 2.0);
         match ctx.motion.status() {
             MotionStatus::Moving if same => return Walk::Moving,
+            // The controller reached the horizontal goal but not the floor: the route ended
+            // under/above the target and there is no way up.
+            MotionStatus::Arrived if same && at(here) > radius + 0.6 => {
+                self.spot = None;
+                return Walk::Failed;
+            }
             // The controller cuts a trip off after its time limit; a long way is walked in legs as
             // long as every leg gets closer.
             MotionStatus::Failed(MoveFailure::Timeout)
-                if same
-                    && self.legs < MAX_LEGS
-                    && self.leg_from - dist2d(me, [x, y, 0.0]) >= LEG_MIN_GAIN_M =>
+                if same && self.legs < MAX_LEGS && self.leg_from - at(here) >= LEG_MIN_GAIN_M =>
             {
                 self.legs += 1;
-                self.leg_from = dist2d(me, [x, y, 0.0]);
+                self.leg_from = at(here);
                 self.go_ms = 0;
             }
             MotionStatus::Failed(_) if same => {
@@ -1928,9 +1995,12 @@ impl Inner {
         }
         if !same {
             self.legs = 0;
-            self.leg_from = dist2d(me, [x, y, 0.0]);
+            self.leg_from = at(here);
         }
-        ctx.travel(x, y, radius, Pace::Run);
+        match z {
+            Some(z) => ctx.travel_to_floor(x, y, z, radius, Pace::Run),
+            None => ctx.travel(x, y, radius, Pace::Run),
+        }
         self.spot = Some((x, y));
         self.go_ms = now;
         Walk::Moving
@@ -1946,16 +2016,34 @@ impl Inner {
             Target::Doodad(t) => nearest_doodad(ctx.state, t, me),
         };
         if let Some((obj, pos)) = seen {
-            let d = dist2d(me, pos);
-            if d <= near {
+            let d = dist3d(me, pos);
+            // The server measures a quest request in 3D (`npc_out_of_quest_reach`, 15 m with the
+            // slack; a doodad's func reach is 20 m) and refuses it from the floor above/below.
+            let server_reach = match target {
+                Target::Npc(_) => QUEST_NPC_REACH,
+                Target::Doodad(_) => QUEST_DOODAD_REACH,
+            };
+            if d <= near || d <= server_reach {
                 if ctx.motion.is_moving() {
                     ctx.motion.stop();
                 }
                 self.spot = None;
                 return Reach::Here(obj);
             }
-            return match self.walk(ctx, pos[0], pos[1], (near - 1.5).max(1.0)) {
-                Walk::Failed => Reach::Blocked,
+            return match self.walk_at(ctx, pos[0], pos[1], Some(pos[2]), (near - 1.5).max(1.0)) {
+                Walk::Failed => {
+                    if d <= server_reach {
+                        // (the pad is out of the mesh but close enough for the server)
+                        if ctx.motion.is_moving() {
+                            ctx.motion.stop();
+                        }
+                        self.spot = None;
+                        Reach::Here(obj)
+                    } else {
+                        self.role_unreachable(ctx, target, d);
+                        Reach::Blocked
+                    }
+                }
                 _ => Reach::Walking,
             };
         }
@@ -1975,10 +2063,14 @@ impl Inner {
                     self.role_missing(ctx, target);
                     return Reach::Missing;
                 };
-                (p.0, p.1)
+                (p.x, p.y)
             }
         };
-        match self.walk(ctx, spot.0, spot.1, NPC_STOP) {
+        let spot_z = spawns
+            .iter()
+            .find(|p| p.x == spot.0 && p.y == spot.1)
+            .map(|p| p.z);
+        match self.walk_at(ctx, spot.0, spot.1, spot_z, NPC_STOP) {
             Walk::Moving => {
                 self.arrived_ms = 0;
                 Reach::Walking
@@ -2102,19 +2194,19 @@ impl Inner {
         GoalStatus::Running
     }
 
-    fn nearest_unvisited(&self, spawns: &[Vec3], me: [f32; 3], min_m: f32) -> Option<(f32, f32)> {
-        let mut best: Option<(f32, f32, f32)> = None;
+    fn nearest_unvisited(&self, spawns: &[Vec3], me: [f32; 3], min_m: f32) -> Option<Vec3> {
+        let mut best: Option<(Vec3, f32)> = None;
         for p in spawns {
             let d2 = (p.x - me[0]).powi(2) + (p.y - me[1]).powi(2);
             if d2 < min_m * min_m
                 || self.visited.contains(&cell(p.x, p.y))
-                || best.is_some_and(|b| d2 >= b.2)
+                || best.is_some_and(|b| d2 >= b.1)
             {
                 continue;
             }
-            best = Some((p.x, p.y, d2));
+            best = Some((*p, d2));
         }
-        best.map(|b| (b.0, b.1))
+        best.map(|b| b.0)
     }
 
     fn mark_visited(&mut self, x: f32, y: f32) {
@@ -2195,7 +2287,10 @@ impl Inner {
             if d > VIEW_RADIUS {
                 continue;
             }
-            let taken = ctx.hub.contest.others(unit_key(obj), bot) > 0;
+            // A monster another character tagged, or one that is fighting one, gives no quest
+            // credit to the bot; it comes after every free monster in view.
+            let taken =
+                ctx.hub.contest.others(unit_key(obj), bot) > 0 || ctx.state.taken_by_other(obj);
             if best.is_none_or(|b| better_target(taken, d, b.1, b.2)) {
                 best = Some((obj, taken, d));
             }
@@ -2324,6 +2419,16 @@ fn server_error(state: &BotState, quest: u32, since_ms: u64) -> Option<u8> {
     })
 }
 
+/// A unit requirement refusal the server sent for `quest` since `since_ms`: `kind`, `value`.
+fn server_unit_req(state: &BotState, quest: u32, since_ms: u64) -> Option<(u8, u32)> {
+    state
+        .quest_mem
+        .as_deref()
+        .and_then(|m| m.unit_req)
+        .filter(|(q, _, _, at)| *q == quest && *at >= since_ms)
+        .map(|(_, kind, value, _)| (kind, value))
+}
+
 /// Wait between two casts of `skill`.
 fn cast_gap_ms(world: &World, skill: u32) -> u64 {
     let cast = world.skill(skill).map_or(0, |s| u64::from(s.casting_time));
@@ -2353,7 +2458,7 @@ fn nearest_unit_in(
         if u.kind != UnitKind::Npc || !templates.contains(&u.id) || u.dead() {
             continue;
         }
-        let d = u.dist2d(me);
+        let d = dist3d(me, u.pos);
         let held = taken(obj);
         if best
             .as_ref()
@@ -2375,7 +2480,7 @@ fn nearest_unit_excluding(
         .units
         .iter()
         .filter(|(_, u)| u.kind == UnitKind::Npc && !u.dead() && !excluded.contains(&u.id))
-        .map(|(&obj, u)| (obj, u.pos, u.dist2d(me)))
+        .map(|(&obj, u)| (obj, u.pos, dist3d(me, u.pos)))
         .min_by(|a, b| a.2.total_cmp(&b.2))
         .map(|(obj, pos, _)| (obj, pos))
 }
@@ -2405,6 +2510,18 @@ fn better_target(taken: bool, d: f32, best_taken: bool, best_d: f32) -> bool {
         (false, true) => true,
         (true, false) => false,
         _ => d < best_d,
+    }
+}
+
+/// Whether the bot may expect the server to credit a kill it landed: when it saw itself or a
+/// party member hit the monster first, yes; when another character tagged it, no. With no hit
+/// seen (the monster was already in view before the bot arrived), it is judged as before: an
+/// unobserved tagger is assumed only when the bot fights alone.
+fn credit_expected(tag: Option<TagOwner>, other_character_near: bool) -> bool {
+    match tag {
+        Some(TagOwner::Me | TagOwner::Party) => true,
+        Some(TagOwner::Other) => false,
+        None => !other_character_near,
     }
 }
 
@@ -2532,10 +2649,19 @@ mod tests {
         ];
         let me = [0.0, 0.0, 0.0];
         // the spawn under the bot's feet is skipped when a minimum distance is asked for
-        assert_eq!(g.nearest_unvisited(&spawns, me, 10.0), Some((30.0, 0.0)));
-        assert_eq!(g.nearest_unvisited(&spawns, me, 0.0), Some((5.0, 0.0)));
+        assert_eq!(
+            g.nearest_unvisited(&spawns, me, 10.0),
+            Some(Vec3::new(30.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            g.nearest_unvisited(&spawns, me, 0.0),
+            Some(Vec3::new(5.0, 0.0, 0.0))
+        );
         g.mark_visited(5.0, 0.0);
-        assert_eq!(g.nearest_unvisited(&spawns, me, 0.0), Some((30.0, 0.0)));
+        assert_eq!(
+            g.nearest_unvisited(&spawns, me, 0.0),
+            Some(Vec3::new(30.0, 0.0, 0.0))
+        );
         g.mark_visited(30.0, 0.0);
         g.mark_visited(100.0, 0.0);
         assert_eq!(g.nearest_unvisited(&spawns, me, 0.0), None);
@@ -2551,6 +2677,15 @@ mod tests {
         assert_eq!(server_error(&s, 7, 4_000), Some(12));
         assert_eq!(server_error(&s, 7, 5_001), None);
         assert_eq!(server_error(&s, 8, 0), None);
+    }
+
+    #[test]
+    fn unit_requirement_refusals_are_matched_by_quest_and_time() {
+        let mut s = BotState::new();
+        mem(&mut s).unit_req = Some((1137, 0x25, 1136, 5_000));
+        assert_eq!(server_unit_req(&s, 1137, 4_000), Some((0x25, 1136)));
+        assert_eq!(server_unit_req(&s, 1137, 5_001), None);
+        assert_eq!(server_unit_req(&s, 1138, 0), None);
     }
 
     #[test]
@@ -2591,6 +2726,30 @@ mod tests {
     }
 
     #[test]
+    fn credit_follows_the_tag_the_bot_saw() {
+        // the bot's own or its party's tag: the server credits it
+        assert!(credit_expected(Some(TagOwner::Me), true));
+        assert!(credit_expected(Some(TagOwner::Party), true));
+        // another character tagged it: the killing blow brings no quest credit
+        assert!(!credit_expected(Some(TagOwner::Other), false));
+        // no hit seen: an unobserved tagger is assumed only when the bot fights alone
+        assert!(credit_expected(None, false));
+        assert!(!credit_expected(None, true));
+    }
+
+    #[test]
+    fn the_server_reaches_are_the_3d_ones() {
+        // `npc_out_of_quest_reach`: 3 m + 2 m tolerance + 10 m slack; doodad func reach: 5 + 15
+        assert_eq!(QUEST_NPC_REACH, 15.0);
+        assert_eq!(QUEST_DOODAD_REACH, 20.0);
+        // a target 30 m above the spot below it is not "here" even at 2D distance 0
+        let me = [0.0, 0.0, 100.0];
+        let below = [0.0, 0.0, 130.0];
+        assert!(dist2d(me, below) < 1.0);
+        assert!(dist3d(me, below) > QUEST_NPC_REACH);
+    }
+
+    #[test]
     fn characters_near_ignores_monsters_and_the_far() {
         let mut s = BotState::new();
         s.me.pos = [0.0, 0.0, 0.0];
@@ -2602,6 +2761,7 @@ mod tests {
             faction: 0,
             level: 1,
             flags: 0,
+            target: 0,
             name: None,
         };
         s.units.insert(1, unit(UnitKind::Npc, 3.0));
@@ -2659,6 +2819,7 @@ mod tests {
                 gender: 1,
                 mother_faction: 0,
                 done: &all,
+                in_journal: &no,
                 owns: &all,
             },
             judge: Judge {

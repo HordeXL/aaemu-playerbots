@@ -1089,6 +1089,7 @@ mod tests {
             faction: 0,
             level: 20,
             flags: 0,
+            target: 0,
             name: None,
         }
     }
@@ -1102,6 +1103,7 @@ mod tests {
             faction: 0,
             level: 20,
             flags: 0,
+            target: 0,
             name: Some("x".into()),
         }
     }

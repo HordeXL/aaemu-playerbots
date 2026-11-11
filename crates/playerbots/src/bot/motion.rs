@@ -375,7 +375,7 @@ impl Motion {
                 let flat = matches!((here, there), (Some(h), Some(t))
                     if h >= SWIM_THRESHOLD && t >= SWIM_THRESHOLD && (t - h).abs() <= 0.25);
                 if flat {
-                    self.go_via_counted(&[(x, y)], 0.0, Pace::Walk, now_ms, false);
+                    self.go_via_counted(&[(x, y)], None, 0.0, Pace::Walk, now_ms, false);
                     // (a shuffle ends the mannerisms until the next command)
                     if let Some(l) = self.life.as_deref_mut() {
                         l.fidget = manner::Fidget::finished();
@@ -515,12 +515,19 @@ impl Motion {
 
     /// Starts a trip to (x, y); the bot stops `radius` metres short of it.
     pub fn go_to(&mut self, x: f32, y: f32, radius: f32, pace: Pace, now_ms: u64) {
-        self.go_via(&[(x, y)], radius, pace, now_ms);
+        self.go_via_counted(&[(x, y)], None, radius, pace, now_ms, true);
+    }
+
+    /// Like [`Motion::go_to`], for a goal on a named floor: the navmesh search uses `z` to find
+    /// the floor (a house's upper storey, a cave under the terrain) and the trip is not over
+    /// until the bot is within `radius` of it in three dimensions.
+    pub fn go_to_z(&mut self, x: f32, y: f32, z: f32, radius: f32, pace: Pace, now_ms: u64) {
+        self.go_via_counted(&[(x, y)], Some(z), radius, pace, now_ms, true);
     }
 
     /// Starts a trip through `points` (the last one is the destination).
     pub fn go_via(&mut self, points: &[(f32, f32)], radius: f32, pace: Pace, now_ms: u64) {
-        self.go_via_counted(points, radius, pace, now_ms, true);
+        self.go_via_counted(points, None, radius, pace, now_ms, true);
     }
 
     /// Like [`Motion::go_to`] for the combat controller's movements (the chase of a monster, a
@@ -529,12 +536,14 @@ impl Motion {
     /// monster moves and ends whenever the bot is in range, which is not a walk that fails to
     /// arrive.
     pub fn chase_to(&mut self, x: f32, y: f32, radius: f32, pace: Pace, now_ms: u64) {
-        self.go_via_counted(&[(x, y)], radius, pace, now_ms, false);
+        self.go_via_counted(&[(x, y)], None, radius, pace, now_ms, false);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn go_via_counted(
         &mut self,
         points: &[(f32, f32)],
+        goal_z: Option<f32>,
         radius: f32,
         pace: Pace,
         now_ms: u64,
@@ -570,7 +579,14 @@ impl Motion {
         let single = (self.path.len() == 1).then(|| self.path[0]);
         if let Some(n) = self.nav.as_deref_mut() {
             match single {
-                Some((x, y)) => n.begin(pos, [x, y], self.radius, now_ms, counted),
+                Some((x, y)) => n.begin(
+                    pos,
+                    [x, y],
+                    goal_z.filter(|z| z.is_finite()),
+                    self.radius,
+                    now_ms,
+                    counted,
+                ),
                 None => n.end(TripEnd::Cancelled),
             }
         }

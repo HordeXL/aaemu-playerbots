@@ -334,6 +334,7 @@ impl Rig {
                 faction: 0,
                 level: world.npc(t).map_or(1, |n| n.level),
                 flags: 0,
+                target: 0,
                 name: None,
             });
         }

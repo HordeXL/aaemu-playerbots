@@ -51,6 +51,14 @@ pub enum Failure {
     AcceptRefused,
     /// The server answered with `SCQuestContextFailed` and this reason byte.
     Server(u8),
+    /// A start component's unit requirement refused the start (`SCQuestUnitReqFailed`): `kind`
+    /// and its value (kind 0x25 names the quest that must be in progress).
+    UnitReq {
+        /// `unit_reqs.kind_id`.
+        kind: u8,
+        /// Requirement value.
+        value: u32,
+    },
     /// The turn-in did not complete the quest.
     TurnInRefused,
     /// No monster, NPC or doodad the objective needs could be found.
@@ -83,6 +91,12 @@ impl fmt::Display for Failure {
             Failure::GiverMissing => f.write_str("giver not found"),
             Failure::AcceptRefused => f.write_str("accept refused"),
             Failure::Server(err) => write!(f, "server refused (code {err})"),
+            Failure::UnitReq { kind, value } => {
+                write!(
+                    f,
+                    "server unit requirement refused (kind {kind}, value {value})"
+                )
+            }
             Failure::TurnInRefused => f.write_str("turn-in refused"),
             Failure::TargetMissing => f.write_str("no target found"),
             Failure::NoProgress => f.write_str("no progress"),
@@ -133,6 +147,8 @@ pub struct Memory {
     pub failed: u32,
     /// Bot-clock time before which the goal does not scan for a new quest again.
     pub next_scan_ms: u64,
+    /// The last `SCQuestUnitReqFailed`: quest, `kind`, value and bot clock.
+    pub unit_req: Option<(u32, u8, u32, u64)>,
     /// Trips to places with quests when nothing is near, see [`super::progress`]. Allocated by the
     /// first empty scan.
     pub progress: Option<Box<Progress>>,
