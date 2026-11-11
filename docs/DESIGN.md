@@ -835,7 +835,8 @@ told to `stay`, `publish` fills `BotSnapshot.party`.
 * A character that logs in again is still a member of its team (the server keeps the offline
   member), and gets the join packet again: a restarted bot follows its party at once.
 * A team member that casts the entrance of a dungeon its team has opened joins the team's
-  instance; the entry limit (`enter_count` per four hours and character) still counts.
+  instance; the entry limit (`enter_count` per four hours and character) still counts when
+  `[dungeons] entry_limit` is on (off by default: the 1.2 server has no dungeon entry limit).
 * The `0xe4` record carries the zone *key* (the instance's key inside a dungeon), not `zones.id`.
 * The server announces a target change only: a fight that began before a bot joined, or that goes
   on for minutes, is invisible to an event-driven assist, so the goal looks at the leader's last
