@@ -397,7 +397,7 @@ fn facing_a_target_writes_the_direction_into_rotation_z() {
 
 #[test]
 fn gliding_is_an_air_update_in_the_glide_stance() {
-    // The 1.2 gliding stance is 4 (`skills/glider.rs:99`); the flight is an airborne update
+    // The 1.2 gliding stance is 4 (`skills/glider.rs:71`); the flight is an airborne update
     // (`JumpPhase::Air`: no ground actor flag) with the descent in vel.z. The server reads and
     // relays the stance byte unchanged (`models/movement.rs:417`, `packets/c2g_world.rs:224`).
     let m = MoveUnit {

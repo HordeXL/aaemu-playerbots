@@ -248,7 +248,7 @@ pub const STANCE_RELAXED: u8 = 1;
 /// `GameStanceType` Swim (in the water).
 pub const STANCE_SWIM: u8 = 2;
 /// The 1.2 client's gliding stance (4): while a gliding buff is active and the unit is airborne
-/// (AAEmu-1.2-Rust `systems/skills/glider.rs:99`, `FUN_39357bc0`). A glider's movement updates
+/// (AAEmu-1.2-Rust `systems/skills/glider.rs:71`, `FUN_39357bc0`). A glider's movement updates
 /// carry it with no ground actor flag; the client plays the glide animation from it.
 pub const STANCE_GLIDE: u8 = 4;
 /// `MoveTypeAlertness` Idle.
@@ -1696,14 +1696,14 @@ pub fn notify_sub_zone(sub_zone_id: u32) -> Out {
 
 /// `AttachUnitReason.MountMateForward` of the 1.2 client (`12` values; `MountMateForward = 4` in
 /// the C# enum removed with the C# tree). The server only stores and echoes the reason in
-/// `SCUnitAttached` / `SCUnitDetached` (G/systems/vehicles/mates.rs:444, :539), so a bot sends the
+/// `SCUnitAttached` / `SCUnitDetached` (G/systems/vehicles/mates.rs:445, :540), so a bot sends the
 /// client's forward value.
 pub const MOUNT_REASON_FORWARD: u8 = 4;
 
 /// `CSMountMatePacket` (0x0a7): takes the driver's seat (`ap` [`crate::sc_travel::attach_point::DRIVER`])
 /// on the mate with timeline id `tl` (from `SCMateSpawned`). The server needs the mate within 6 m
-/// and sends `SCUnitAttached` (point 1) back. Server read: `systems/vehicles/packets.rs:221`,
-/// handler `mates.rs:333` (`MountMate`).
+/// and sends `SCUnitAttached` (point 1) back. Server read: `systems/vehicles/packets.rs:222`,
+/// handler `mates.rs:334` (`MountMate`).
 ///
 /// Body: `u16 tl, u8 ap, u8 reason`.
 pub fn mount_mate(tl: u16, ap: u8, reason: u8) -> Out {
@@ -1714,7 +1714,7 @@ pub fn mount_mate(tl: u16, ap: u8, reason: u8) -> Out {
 
 /// `CSUnMountMatePacket` (0x0a8): leaves the seat `ap` of the mate with timeline id `tl`. The
 /// server only leaves the sender's own seat and answers `SCUnitDetached`. Server read:
-/// `systems/vehicles/packets.rs:231`, handler `mates.rs:454` (`UnMountMate`).
+/// `systems/vehicles/packets.rs:233`, handler `mates.rs:455` (`UnMountMate`).
 ///
 /// Body: `u16 tl, u8 ap, u8 reason`.
 pub fn unmount_mate(tl: u16, ap: u8, reason: u8) -> Out {
@@ -1725,7 +1725,7 @@ pub fn unmount_mate(tl: u16, ap: u8, reason: u8) -> Out {
 
 /// `CSRemoveMatePacket` (0x0a4): dismisses and despawns the active mate with timeline id `tl`
 /// (`RemoveActiveMateAndDespawn`, which saves the `mates` row first). Server read:
-/// `systems/vehicles/packets.rs:276`, handler `mates.rs:1083` (`despawn_mate`).
+/// `systems/vehicles/packets.rs:277`, handler `mates.rs:1127` (`despawn_mate`).
 ///
 /// Body: `u16 tl`.
 pub fn remove_mate(tl: u16) -> Out {

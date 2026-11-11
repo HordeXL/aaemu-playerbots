@@ -415,8 +415,8 @@ fn ship_request_is_a_type_4_move_with_throttle_before_steering() {
 
 #[test]
 fn mate_requests_name_a_timeline_id_and_a_seat() {
-    // systems/vehicles/packets.rs:221 (mount), :231 (unmount): u16 tl, u8 ap, u8 reason;
-    // :276 (remove mate): u16 tl. The reason is the client's AttachUnitReason.MountMateForward.
+    // systems/vehicles/packets.rs:222 (mount), :233 (unmount): u16 tl, u8 ap, u8 reason;
+    // :277 (remove mate): u16 tl. The reason is the client's AttachUnitReason.MountMateForward.
     game(
         cs::mount_mate(0x0102, 1, cs::MOUNT_REASON_FORWARD),
         op::CSMountMatePacket,

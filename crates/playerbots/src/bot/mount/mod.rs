@@ -11,14 +11,14 @@
 //! # What the server answers
 //!
 //! * A mount is the `SummonMate` item's use skill (special effect `SpawnPet`, type 24,
-//!   `systems/skills/effects/special/misc.rs:642` -> `systems/vehicles/mates.rs:919`
+//!   `systems/skills/effects/special/misc.rs:643` -> `systems/vehicles/mates.rs:920`
 //!   `spawn_mount`), then `CSMountMatePacket` (0x0a7) and `SCUnitAttached` (point 1). The mate
 //!   appears 3 m in front of the owner and its unit state names its object id and `tl`.
 //! * A glider is a back-slot item (`item_backpacks.backpack_type_id = 2`) whose use skill the
 //!   client starts with the item as caster; the server checks the back slot and the item's own
-//!   skill (`systems/skills/glider.rs:33`, `handlers.rs:183`). The flight itself is client
+//!   skill (`systems/skills/glider.rs:34`, `handlers.rs:183`). The flight itself is client
 //!   physics; the bot moves itself and sends the glide stance (4) in its `CSMoveUnit` updates.
-//! * A refusal is silent in most mount paths (`mates.rs:333` only logs). The feature therefore
+//! * A refusal is silent in most mount paths (`mates.rs:334` only logs). The feature therefore
 //!   has a deadline for every request and a back-off after a timeout or an `SCErrorMsg`, and
 //!   never sends the same request every tick.
 //!

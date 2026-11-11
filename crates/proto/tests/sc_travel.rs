@@ -555,7 +555,7 @@ fn unit_movement_batches_are_not_parsed() {
 
 #[test]
 fn mate_spawned_has_ten_skill_slots() {
-    // SCMateSpawnedPacket writer, G/systems/vehicles/packets.rs:577-592: tl u16, id u32,
+    // SCMateSpawnedPacket writer, G/systems/vehicles/packets.rs:579-592: tl u16, id u32,
     // item id u64, user state u8, experience i32, mileage i32, spawn delay u32, then the skills
     // and 10 - skills zero i32 slots.
     let mut s = PacketStream::new();

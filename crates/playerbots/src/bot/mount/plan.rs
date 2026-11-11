@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use crate::bot::travel::journey::SkillNote;
 
 /// How close the bot must be to its mate to mount it: the server refuses a mount further than
-/// 6 m (`systems/vehicles/mates.rs:143`, `MOUNT_REACH`); the bot stays a metre inside that.
+/// 6 m (`systems/vehicles/mates.rs:331`, `MOUNT_REACH`); the bot stays a metre inside that.
 pub const MOUNT_REACH_M: f32 = 5.0;
 /// How long the mate's unit state may take after `SCMateSpawned` before it is considered lost.
 pub const MATE_OBJ_WAIT_MS: u64 = 3_000;

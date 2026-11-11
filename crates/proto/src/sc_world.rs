@@ -771,7 +771,7 @@ pub enum WorldEvent {
     },
 
     // ---- mates (mounts and pets) -----------------------------------------------------------
-    /// `SCMateSpawnedPacket` (systems/vehicles/packets.rs:69, writer :577): a mate was summoned;
+    /// `SCMateSpawnedPacket` (systems/vehicles/packets.rs:69, writer :579): a mate was summoned;
     /// its unit state follows.
     MateSpawned(Box<MateInfo>),
 

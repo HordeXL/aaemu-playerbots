@@ -1205,7 +1205,7 @@ the bot sends its movement updates with the mate's object id (the server accepts
 the moved target and guards its speed) and the character follows the attachment. `SCUnMountMate`
 0x0a8 and `CSRemoveMate` 0x0a4 end the ride. A glider is a back-slot item whose use skill the
 server accepts only with that item as caster (`systems/skills/glider.rs`); the flight itself is
-client physics, so the bot integrates it and sends the glide stance (4, `skills/glider.rs:99`) in
+client physics, so the bot integrates it and sends the glide stance (4, `skills/glider.rs:71`) in
 its updates. The 1.2 client's exact mount speed and glider descent are not captured: `[mounts]
 speed`, `glide_speed` and `glide_descent` are operator settings, defaults conservative.
 

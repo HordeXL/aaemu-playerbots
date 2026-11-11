@@ -168,7 +168,7 @@ pub struct MySlaveInfo {
     pub pos: Pos,
 }
 
-/// `SCMateSpawnedPacket` (G/systems/vehicles/packets.rs:69, writer :577-592): the owner's
+/// `SCMateSpawnedPacket` (G/systems/vehicles/packets.rs:69, writer :579-592): the owner's
 /// client creates its record of a summoned mate from it. The mate's unit state follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MateInfo {
@@ -310,9 +310,9 @@ pub(crate) fn read_processing_instance(s: &mut PacketStream) -> Res<Option<World
 
 // ---- readers: boats ------------------------------------------------------------------------
 
-/// `SCMateSpawnedPacket` (G/systems/vehicles/packets.rs:69, writer :577): `u16 tl, u32 id,
+/// `SCMateSpawnedPacket` (G/systems/vehicles/packets.rs:69, writer :579): `u16 tl, u32 id,
 /// u64 item id, u8 user state, i32 experience, i32 mileage, u32 spawn delay`, then ten `u32`
-/// skill slots (the writer pads `10 - skills` zeros, G/systems/vehicles/packets.rs:586-591).
+/// skill slots (the writer pads `10 - skills` zeros, G/systems/vehicles/packets.rs:90-92).
 pub(crate) fn read_mate_spawned(s: &mut PacketStream) -> Res<Option<WorldEvent>> {
     let tl = s.read_u16()?;
     let id = s.read_u32()?;
