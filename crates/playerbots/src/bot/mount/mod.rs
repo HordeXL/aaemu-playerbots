@@ -10,7 +10,7 @@
 //!
 //! # What the server answers
 //!
-//! * A mount is the `SummonMate` item's use skill (special effect `SpawnPet`, type 13,
+//! * A mount is the `SummonMate` item's use skill (special effect `SpawnPet`, type 24,
 //!   `systems/skills/effects/special/misc.rs:642` -> `systems/vehicles/mates.rs:919`
 //!   `spawn_mount`), then `CSMountMatePacket` (0x0a7) and `SCUnitAttached` (point 1). The mate
 //!   appears 3 m in front of the owner and its unit state names its object id and `tl`.
@@ -23,8 +23,8 @@
 //!   never sends the same request every tick.
 //!
 //! Memory: [`Mem`] lives in [`crate::bot::travel::Inner`], so `size_of::<Bot>()` does not grow.
-//! A bot allocates the travel state on its first tick anyway (the portal duty), and a bot that
-//! never mounts pays only the ~300 bytes of that state.
+//! A bot allocates the travel state on its first tick anyway (the portal duty), so the mount
+//! feature adds no fixed cost to a bot that never rides.
 
 pub mod plan;
 
