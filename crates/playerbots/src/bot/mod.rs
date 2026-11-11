@@ -1088,7 +1088,14 @@ impl Bot {
             self.motion.stop();
             self.combat.reset();
             self.log.say("died");
-            if r.pack_dropped {
+            // (the back slot also holds a glider, which is no loss)
+            if r.pack_dropped
+                && self
+                    .state
+                    .econ
+                    .lost_pack()
+                    .is_some_and(|p| !self.shared.world.specialty_buyers(p.item).is_empty())
+            {
                 self.log
                     .say("died carrying a trade pack; it is on the ground where the bot died");
             }
