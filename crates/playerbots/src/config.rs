@@ -296,7 +296,8 @@ pub struct DungeonsCfg {
     /// entry limit (`Dungeons.EntryLimit`). A refusal for the limit is answered either way.
     pub entry_limit: bool,
     /// Seconds a bot waits for a full party (the dungeon's `max_players`, at most five) before it
-    /// goes with a smaller one. At most 150, the longest a bot waits for a party order.
+    /// goes with a smaller one. At most 140: the coordinator drops a wish after 150 s, so a longer
+    /// wait would never form the smaller party.
     pub relax_after_secs: u64,
 }
 
@@ -1246,9 +1247,11 @@ impl Config {
             "behavior.jump_rate must be a number >= 0"
         );
         ensure!(
-            self.dungeons.relax_after_secs <= 150,
-            "dungeons.relax_after_secs {} is above 150, the longest a bot waits for a party order",
-            self.dungeons.relax_after_secs
+            self.dungeons.relax_after_secs <= crate::bot::coordinator::MAX_RELAX_SECS,
+            "dungeons.relax_after_secs {} is above {}: the coordinator drops a party wish after \
+             150 s, so a longer wait would never form the smaller party",
+            self.dungeons.relax_after_secs,
+            crate::bot::coordinator::MAX_RELAX_SECS
         );
         ensure!(
             self.market.ad_interval_secs >= 60,
@@ -1717,8 +1720,10 @@ relax_after_secs = 45
         .unwrap();
         assert!(cfg.dungeons.entry_limit);
         assert_eq!(cfg.dungeons.relax_after_secs, 45);
-        // 151 s is longer than the bot waits for an order
-        assert!(Config::parse("[dungeons]\nrelax_after_secs = 151\n").is_err());
+        // a wish is dropped after 150 s: the longest wait that can still form a party is 140 s
+        assert!(Config::parse("[dungeons]\nrelax_after_secs = 140\n").is_ok());
+        assert!(Config::parse("[dungeons]\nrelax_after_secs = 141\n").is_err());
+        assert!(Config::parse("[dungeons]\nrelax_after_secs = 150\n").is_err());
         assert!(Config::parse("[dungeons]\nentry_limit = 1\n").is_err());
         assert!(Config::parse("[dungeons]\nentry_limits = true\n").is_err());
     }

@@ -107,6 +107,10 @@ pub const LEVEL_GROWTH_SECS: u64 = 8;
 const LEVEL_WEIGHT_M: f32 = 25.0;
 /// Seconds between two sweeps (expiry and another look for pairs).
 const SWEEP_SECS: u64 = 3;
+/// The longest `[dungeons] relax_after_secs` that can still form a smaller party: a wish is dropped
+/// at [`WISH_TTL`] before the sweep plans, so the wait has to end with a sweep or two to spare.
+pub const MAX_RELAX_SECS: u64 = 140;
+const _: () = assert!(MAX_RELAX_SECS + 2 * SWEEP_SECS < WISH_TTL.as_secs());
 /// Most remembered pairings.
 const RECENT_MAX: usize = 64;
 /// Capacity of the coordinator's inbox.

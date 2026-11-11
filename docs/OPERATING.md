@@ -142,8 +142,8 @@ Safety of the GM lines:
   dungeon's level range raise its level to the range's minimum with the GM `/level` command
   (logged); `false` keeps dungeons to the bots whose level fits.
 * `[dungeons] relax_after_secs = 120` (default): how long a bot waits for the dungeon's full party
-  (its `max_players`, at most five) before it goes with a smaller one; at most 150, the longest a
-  bot waits for a party order.
+  (its `max_players`, at most five) before it goes with a smaller one; at most 140, because the
+  coordinator drops a party wish after 150 s.
 * `[dungeons] entry_limit = false` (default): the bots do not count the server's entry limit (three
   entries per zone group and four hours) and never skip a dungeon for the count, as on the 1.2
   server (`Dungeons.EntryLimit` is off there). A refusal for the limit is still answered. `true`
