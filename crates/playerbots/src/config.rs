@@ -1332,8 +1332,8 @@ impl Config {
             "mounts.glide_drop_m must be a number > 0"
         );
         ensure!(
-            m.glide_lookahead_m.is_finite() && m.glide_lookahead_m >= 4.0,
-            "mounts.glide_lookahead_m must be at least 4 m"
+            m.glide_lookahead_m.is_finite() && (4.0..=200.0).contains(&m.glide_lookahead_m),
+            "mounts.glide_lookahead_m must be between 4 and 200 m"
         );
         ensure!(
             m.glide_speed.is_finite() && m.glide_speed > 0.0 && m.glide_speed <= 25.0,
@@ -1864,6 +1864,13 @@ glide_drop_m = 0.0
 ",
             "[mounts]
 glide_speed = 30.0
+",
+            // the ledge search samples the ground every tick: a huge look-ahead would stall a bot
+            "[mounts]
+glide_lookahead_m = 1000000.0
+",
+            "[mounts]
+glide_lookahead_m = 3.0
 ",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
