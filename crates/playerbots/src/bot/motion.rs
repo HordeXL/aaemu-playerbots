@@ -396,6 +396,12 @@ impl Motion {
         self.nav = Some(Box::new(NavState::new(link)));
     }
 
+    /// Whether this bot walks on the navigation mesh (so a quest target off the mesh cannot be
+    /// reached; without it the bot walks the straight line and tries).
+    pub fn uses_navmesh(&self) -> bool {
+        self.nav.is_some()
+    }
+
     /// Tells the controller which world the bot is in (the main world's mesh, an instance
     /// world's, or none). Call once per tick before the goals run; cheap.
     pub fn sync_place(&mut self, place: &Place) {

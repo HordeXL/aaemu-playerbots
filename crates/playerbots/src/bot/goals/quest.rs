@@ -21,8 +21,9 @@
 //!   its level, and walks there until quests come within reach. Trivial side quests (far below the
 //!   bot's level) give way to such a trip.
 //! * **Failures** are typed ([`Failure`]) and remembered in [`Memory`]: a failed quest backs off
-//!   for 30 s, three failures quarantine a side quest for 5 minutes (a story quest rests
-//!   instead), an objective without progress for 4 minutes is skipped or fails its quest.
+//!   for 30 s, 2 min and then 8 min, and the fourth failure in a row quarantines a side quest
+//!   for the session (a story quest rests instead), an objective without progress for 4 minutes
+//!   is skipped or fails its quest.
 //!
 //! The goal owns the combat controller: while a fight or a loot job is on, the goal waits and
 //! re-issues its walk afterwards. All state of a run is boxed so the goal enum stays small.
@@ -49,6 +50,7 @@ use crate::bot::state::{dist2d, BotState, StateError, UnitKind};
 use crate::bot::watch::classify::{CreditNote, CreditStep};
 use crate::bot::watch::{Finding, Role};
 use crate::contest::{doodad_key, spot_key, unit_key};
+use crate::events::EventBoard;
 
 use objective::{Env, Plan, Slot};
 use progress::{Dest, Outcome, Progress, Trip, Why};
@@ -112,6 +114,9 @@ const CROWD_ROUND_GAP_MS: u64 = 30_000;
 const CROWD_ROUNDS: u8 = 5;
 /// A claim on a target or spot is renewed this often.
 const CLAIM_RENEW_MS: u64 = 10_000;
+/// How long a bot queues for a single item-use target another bot holds before it rests the
+/// quest (the server's duel dummy, quest 2396).
+const CROWD_WAIT_MS: u64 = 30_000;
 /// The same item cast this many times with nothing changing (not the objective counter, not the
 /// stack) is not in the server's bag any more: the bot's picture is out of date.
 const STALE_CASTS: u8 = 2;
@@ -266,6 +271,9 @@ struct Inner {
     stale: SmallVec<[u64; 2]>,
     /// The last item cast `(instance, stack count, objective counter, casts in a row)`.
     use_note: (u64, i32, i32, u8),
+    /// Bot clock at which the bot started waiting for a single item-use target another bot
+    /// holds, 0 when it is not waiting.
+    use_wait_ms: u64,
     /// The kill or cast the server confirmed that has not been credited yet.
     credit: Option<CreditNote>,
     /// The skill of the cast that is the objective itself (an item or a doodad use), 0 for none;
@@ -311,6 +319,7 @@ impl Default for Inner {
             claim_ms: 0,
             stale: SmallVec::new(),
             use_note: (0, 0, 0, 0),
+            use_wait_ms: 0,
             credit: None,
             cast_skill: 0,
             stood: 0,
@@ -356,7 +365,18 @@ fn current_trip(state: &BotState) -> Option<Trip> {
 /// ones a bot can do at all (every objective and the turn-in have a plan); whether a bot may do
 /// one now is judged per bot by [`Eligibility`].
 pub fn atlas(world: &World) -> &QuestAtlas {
-    world.quest_atlas(&|q| objective::supported(&Env { world }, q, u8::MAX).is_ok())
+    world.quest_atlas(&|q| {
+        objective::supported(
+            &Env {
+                world,
+                from: None,
+                navmesh: false,
+            },
+            q,
+            u8::MAX,
+        )
+        .is_ok()
+    })
 }
 
 /// What the bot's data says about a quest, in one place for the picker (`find_candidate`) and for
@@ -368,6 +388,8 @@ struct Eligibility<'a> {
     faction: u32,
     who: aa_world::Who<'a>,
     judge: Judge<'a>,
+    /// The running world events: a quest whose targets only exist during an event waits.
+    events: &'a EventBoard,
 }
 
 impl Eligibility<'_> {
@@ -389,6 +411,13 @@ impl Eligibility<'_> {
             Err(select::Skip::Resting) => return Err("resting after a failure"),
             Err(select::Skip::NoGiver) => return Err("no giver"),
         }
+        if self
+            .world
+            .zone_key_for_id(quest.zone_id)
+            .is_some_and(|z| self.world.zone_closed(z))
+        {
+            return Err("closed zone");
+        }
         if !self.world.start_gates().open(quest.id, &self.who) {
             return Err("start requirements not met");
         }
@@ -400,6 +429,12 @@ impl Eligibility<'_> {
                 return Err("giver is hostile");
             }
         }
+        if let Some(targets) = event_targets(self.world, quest) {
+            // An event quest is only taken while the event that spawns its targets runs.
+            if !targets.iter().any(|t| self.events.runs_kill_target(*t)) {
+                return Err("event not running");
+            }
+        }
         if objective::supported(&self.facts, quest, self.level).is_err() {
             return Err("objectives not supported");
         }
@@ -407,21 +442,52 @@ impl Eligibility<'_> {
     }
 }
 
+/// The NPC templates that make `quest` event-gated, or `None` when its targets exist all the
+/// time. A seasonal event quest (category 55) is always gated, and so is a hunt that names a
+/// wave NPC of a tower defence (the Rift quests 6209/6211: their groups mix wave kills with
+/// mobs the event spawns).
+fn event_targets(world: &World, quest: &QuestData) -> Option<Vec<u32>> {
+    let mut targets: Vec<u32> = Vec::new();
+    let mut hunts = 0usize;
+    for step in quest.progress.iter() {
+        for obj in step.objectives.iter() {
+            if let ObjKind::Hunt { npcs, .. } = &obj.kind {
+                hunts += 1;
+                targets.extend_from_slice(npcs);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    if quest.category == select::EVENT_CATEGORY {
+        return Some(targets);
+    }
+    let any_event = hunts > 0 && targets.iter().any(|t| world.events().is_wave_npc(*t));
+    any_event.then_some(targets)
+}
+
 /// Runs `f` with the [`Eligibility`] of the bot at bot-clock `now_ms`.
 fn with_eligibility<R>(
     world: &World,
     state: &BotState,
     now_ms: u64,
+    navmesh: bool,
+    events: &EventBoard,
     f: impl FnOnce(&Eligibility<'_>) -> R,
 ) -> R {
     let (level, faction) = (state.me.level, state.me.faction);
+    let from = Vec3::new(state.me.pos[0], state.me.pos[1], state.me.pos[2]);
     let done = |q: u32| state.quests.is_done(q);
     let owns = |item: u32| state.find_item(item).is_some();
     let active = |q: u32| state.quests.row(q).is_some();
     let usable_now = |q: u32| usable(state, q, now_ms);
     f(&Eligibility {
         world,
-        facts: Env { world },
+        facts: Env {
+            world,
+            from: Some(from),
+            navmesh,
+        },
         level,
         faction,
         who: aa_world::Who {
@@ -438,6 +504,7 @@ fn with_eligibility<R>(
             active: &active,
             usable: &usable_now,
         },
+        events,
     })
 }
 
@@ -458,61 +525,69 @@ fn plan_target(ctx: &Ctx<'_>) -> Option<Dest> {
         progress::deadly(world, faction, level, from, to) || progress::cut_off(world, from, to)
     };
     let settled = memory.is_some_and(|p| p.settled(now));
-    with_eligibility(world, state, now, |elig| {
-        let eligible = |pt: &AtlasPoint| {
-            pt.level <= level.saturating_add(select::LEVEL_SLACK)
-                && world.quest(pt.quest).is_some_and(|q| {
-                    let giver = if pt.doodad {
-                        Giver::Doodad(pt.giver)
-                    } else {
-                        Giver::Npc(pt.giver)
-                    };
-                    elig.check(q, giver)
-                })
-        };
-        let weight = |pt: &AtlasPoint| {
-            if eligible(pt) {
-                progress::level_weight(level, pt.level)
-            } else {
-                0.0
-            }
-        };
-        if let Some(chain) = atlas.chain(race) {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                // the first quest of the story line that is not done, and what is wrong with it
-                if let Some(q) = chain.quests.iter().find(|q| !state.quests.is_done(**q)) {
-                    let verdict = world.quest(*q).map(|quest| {
-                        let giver = quest
-                            .starts
-                            .iter()
-                            .find_map(|s| match s {
-                                aa_world::QuestStart::Npc(t) => Some(Giver::Npc(*t)),
-                                aa_world::QuestStart::Doodad(t) => Some(Giver::Doodad(*t)),
-                                _ => None,
-                            })
-                            .unwrap_or(Giver::Npc(0));
-                        elig.explain(quest, giver)
-                    });
-                    ctx.log
-                        .debug(format!("progress: next story quest {q}: {verdict:?}"));
+    with_eligibility(
+        world,
+        state,
+        now,
+        ctx.motion.uses_navmesh(),
+        &ctx.hub.events,
+        |elig| {
+            let eligible = |pt: &AtlasPoint| {
+                pt.level <= level.saturating_add(select::LEVEL_SLACK)
+                    && !world.zone_closed(pt.zone)
+                    && world.quest(pt.quest).is_some_and(|q| {
+                        let giver = if pt.doodad {
+                            Giver::Doodad(pt.giver)
+                        } else {
+                            Giver::Npc(pt.giver)
+                        };
+                        elig.check(q, giver)
+                    })
+            };
+            let weight = |pt: &AtlasPoint| {
+                if eligible(pt) {
+                    progress::level_weight(level, pt.level)
+                } else {
+                    0.0
+                }
+            };
+            if let Some(chain) = atlas.chain(race) {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    // the first quest of the story line that is not done, and what is wrong with it
+                    if let Some(q) = chain.quests.iter().find(|q| !state.quests.is_done(**q)) {
+                        let verdict = world.quest(*q).map(|quest| {
+                            let giver = quest
+                                .starts
+                                .iter()
+                                .find_map(|s| match s {
+                                    aa_world::QuestStart::Npc(t) => Some(Giver::Npc(*t)),
+                                    aa_world::QuestStart::Doodad(t) => Some(Giver::Doodad(*t)),
+                                    _ => None,
+                                })
+                                .unwrap_or(Giver::Npc(0));
+                            elig.explain(quest, giver)
+                        });
+                        ctx.log
+                            .debug(format!("progress: next story quest {q}: {verdict:?}"));
+                    }
+                }
+                if let Some(t) =
+                    progress::story_target(atlas, &chain.quests, me, &eligible, &blocked, &risky)
+                {
+                    return Some(t);
                 }
             }
-            if let Some(t) =
-                progress::story_target(atlas, &chain.quests, me, &eligible, &blocked, &risky)
-            {
+            if let Some(t) = progress::zone_target(atlas, me, &weight, &blocked, &risky) {
                 return Some(t);
             }
-        }
-        if let Some(t) = progress::zone_target(atlas, me, &weight, &blocked, &risky) {
-            return Some(t);
-        }
-        if settled {
-            return None;
-        }
-        progress::grind_target(atlas, me, level, &blocked, &risky, &|hub| {
-            progress::grind_spot(world, faction, level, hub)
-        })
-    })
+            if settled {
+                return None;
+            }
+            progress::grind_target(atlas, me, level, &blocked, &risky, &|hub| {
+                progress::grind_spot(world, faction, level, hub)
+            })
+        },
+    )
 }
 
 /// "Zone name (x, y)" for the logs.
@@ -845,7 +920,12 @@ impl Inner {
     fn best_active(&mut self, ctx: &mut Ctx<'_>) -> Option<(u32, Mode)> {
         let now = ctx.now_ms;
         let world = ctx.world;
-        let facts = Env { world };
+        let me = ctx.state.me.pos;
+        let facts = Env {
+            world,
+            from: Some(Vec3::new(me[0], me[1], me[2])),
+            navmesh: ctx.motion.uses_navmesh(),
+        };
         let level = ctx.state.me.level;
         // (rank, chapter, idx, quest) of the best so far; rank 0 = focus, 1 = ready, 2 = other.
         let mut best: Option<((u8, u16, u16, u32), Mode)> = None;
@@ -914,50 +994,57 @@ impl Inner {
         let level = state.me.level;
         let me = state.me.pos;
         let center = Vec3::new(me[0], me[1], me[2]);
-        with_eligibility(world, state, ctx.now_ms, |elig| {
-            let mut best: Option<Candidate> = None;
-            let mut consider = |quest_id: u32, giver: Giver, p: Vec3| {
-                let Some(quest) = world.quest(quest_id) else {
-                    return;
+        with_eligibility(
+            world,
+            state,
+            ctx.now_ms,
+            ctx.motion.uses_navmesh(),
+            &ctx.hub.events,
+            |elig| {
+                let mut best: Option<Candidate> = None;
+                let mut consider = |quest_id: u32, giver: Giver, p: Vec3| {
+                    let Some(quest) = world.quest(quest_id) else {
+                        return;
+                    };
+                    if ctx.in_war_zone(p.x, p.y) || world.zone_closed_at(p.x, p.y) {
+                        return;
+                    }
+                    let dist = ((p.x - me[0]).powi(2) + (p.y - me[1]).powi(2)).sqrt();
+                    // Cheap checks first; the data checks run only for a quest that would win.
+                    let cand = Candidate {
+                        quest: quest_id,
+                        giver,
+                        at: (p.x, p.y),
+                        dist,
+                        event: quest.category == select::EVENT_CATEGORY,
+                        story: quest.story,
+                        trivial: progress::trivial(level, quest.level, quest.story),
+                        chapter: quest.chapter_idx,
+                        idx: quest.quest_idx,
+                    };
+                    if best
+                        .as_ref()
+                        .is_some_and(|b| select::order(&cand, b) != std::cmp::Ordering::Less)
+                    {
+                        return;
+                    }
+                    if elig.check(quest, giver) {
+                        best = Some(cand);
+                    }
                 };
-                if ctx.in_war_zone(p.x, p.y) {
-                    return;
-                }
-                let dist = ((p.x - me[0]).powi(2) + (p.y - me[1]).powi(2)).sqrt();
-                // Cheap checks first; the data checks run only for a quest that would win.
-                let cand = Candidate {
-                    quest: quest_id,
-                    giver,
-                    at: (p.x, p.y),
-                    dist,
-                    event: quest.category == select::EVENT_CATEGORY,
-                    story: quest.story,
-                    trivial: progress::trivial(level, quest.level, quest.story),
-                    chapter: quest.chapter_idx,
-                    idx: quest.quest_idx,
-                };
-                if best
-                    .as_ref()
-                    .is_some_and(|b| select::order(&cand, b) != std::cmp::Ordering::Less)
-                {
-                    return;
-                }
-                if elig.check(quest, giver) {
-                    best = Some(cand);
-                }
-            };
-            world.npc_spawns_within(center, radius, |t, p| {
-                for &q in world.quests_from_npc(t) {
-                    consider(q, Giver::Npc(t), p);
-                }
-            });
-            world.doodad_spawns_within(center, radius, |t, p| {
-                for &q in world.quests_from_doodad(t) {
-                    consider(q, Giver::Doodad(t), p);
-                }
-            });
-            best
-        })
+                world.npc_spawns_within(center, radius, |t, p| {
+                    for &q in world.quests_from_npc(t) {
+                        consider(q, Giver::Npc(t), p);
+                    }
+                });
+                world.doodad_spawns_within(center, radius, |t, p| {
+                    for &q in world.quests_from_doodad(t) {
+                        consider(q, Giver::Doodad(t), p);
+                    }
+                });
+                best
+            },
+        )
     }
 
     /// Starts working on `quest`.
@@ -990,6 +1077,7 @@ impl Inner {
         self.visited.clear();
         self.credit = None;
         self.cast_skill = 0;
+        self.use_wait_ms = 0;
         self.stood = 0;
     }
 
@@ -1102,11 +1190,22 @@ impl Inner {
             self.progress_ms = now;
             self.tries = 0;
             self.sent_ms = 0;
+            // The objective advanced: a target or spot this objective claimed is free again.
+            if self.claim_key != 0 {
+                ctx.hub.contest.release(self.claim_key, ctx.persona.id);
+                self.claim_key = 0;
+                self.claim_ms = 0;
+            }
         } else if now.saturating_sub(self.progress_ms) > NO_PROGRESS_MS {
             return self.stall(ctx, quest, &row, &slot);
         }
         self.track_credit(ctx, &slot);
-        let facts = Env { world };
+        let me = ctx.state.me.pos;
+        let facts = Env {
+            world,
+            from: Some(Vec3::new(me[0], me[1], me[2])),
+            navmesh: ctx.motion.uses_navmesh(),
+        };
         match objective::plan(&facts, quest, slot.obj, ctx.state.me.level) {
             Ok(plan) => self.exec(ctx, quest, &slot, plan),
             Err(why) => self.fail(ctx, why),
@@ -1142,7 +1241,12 @@ impl Inner {
         else {
             return;
         };
-        let facts = Env { world: ctx.world };
+        let me = state.me.pos;
+        let facts = Env {
+            world: ctx.world,
+            from: Some(Vec3::new(me[0], me[1], me[2])),
+            navmesh: ctx.motion.uses_navmesh(),
+        };
         if let Ok(Plan::Kill { templates }) =
             objective::plan(&facts, quest, slot.obj, state.me.level)
         {
@@ -1492,6 +1596,35 @@ impl Inner {
                 Err(status) => return status,
             }
         }
+        // A single target shared by many bots (the tournament dummy of quest 2396): each bot
+        // claims it, the lowest bot id goes first and the others wait their turn instead of all
+        // casting at it.
+        if target != me_obj {
+            let bot = ctx.persona.id;
+            let key = unit_key(target);
+            // Someone already holds it: wait without joining (the holder goes first). Otherwise
+            // claim it; when several bots do so in the same tick, the lowest id goes first.
+            let queued = if ctx.hub.contest.others(key, bot) > 0 {
+                true
+            } else {
+                self.renew_claim(ctx, key);
+                ctx.hub.contest.first_holder(key).is_some_and(|h| h != bot)
+            };
+            if queued {
+                if self.use_wait_ms == 0 {
+                    self.use_wait_ms = now;
+                }
+                if now.saturating_sub(self.use_wait_ms) >= CROWD_WAIT_MS {
+                    ctx.hub.contest.release(key, bot);
+                    self.use_wait_ms = 0;
+                    return self.fail(ctx, Failure::Crowded);
+                }
+                return GoalStatus::Running;
+            }
+            self.use_wait_ms = 0;
+        } else {
+            self.use_wait_ms = 0;
+        }
         let gap = cast_gap_ms(ctx.world, skill).max(ITEM_CAST_GAP_MS);
         if self.sent_ms == 0 || now.saturating_sub(self.sent_ms) >= gap {
             if self.tries >= MAX_TRIES {
@@ -1530,10 +1663,46 @@ impl Inner {
         // (x, y), how close the bot has to be, how close it walks.
         let (spot, reach, stop, obj) = match need {
             SkillNeed::Npc(t) => {
-                let Some((obj, pos)) = nearest_unit(ctx.state, t, me) else {
+                let bot = ctx.persona.id;
+                let taken = |obj: u32| ctx.hub.contest.others(unit_key(obj), bot) > 0;
+                let Some((obj, pos)) =
+                    nearest_unit_in(ctx.state, std::slice::from_ref(&t), me, &taken)
+                else {
                     return Err(self.search(ctx, |f: &mut dyn FnMut(Vec3)| {
                         for &p in world.npc_spawns(t) {
                             f(p);
+                        }
+                    }));
+                };
+                let reach = world.skill(skill).map_or(NPC_RANGE, |s| {
+                    (f32::from(s.max_range) - 1.0).clamp(NPC_STOP, 20.0)
+                });
+                ((pos[0], pos[1]), reach, (reach - 1.5).max(1.0), Some(obj))
+            }
+            SkillNeed::NpcGroup(group, negate) => {
+                let members = world.quest_monster_group(group);
+                let bot = ctx.persona.id;
+                let taken = |obj: u32| ctx.hub.contest.others(unit_key(obj), bot) > 0;
+                let found = if negate {
+                    nearest_unit_excluding(ctx.state, members, me)
+                } else {
+                    nearest_unit_in(ctx.state, members, me, &taken)
+                };
+                let Some((obj, pos)) = found else {
+                    let center = Vec3::new(me[0], me[1], me[2]);
+                    return Err(self.search(ctx, |f: &mut dyn FnMut(Vec3)| {
+                        if negate {
+                            world.npc_spawns_within(center, SEARCH_RADIUS_M, |t, p| {
+                                if !members.contains(&t) {
+                                    f(p);
+                                }
+                            });
+                        } else {
+                            for &t in members {
+                                for &p in world.npc_spawns(t) {
+                                    f(p);
+                                }
+                            }
                         }
                     }));
                 };
@@ -1705,6 +1874,9 @@ impl Inner {
         let until = (verdict.until().saturating_sub(now)) / 1000;
         ctx.log.say(match verdict {
             Verdict::Backoff(_) => format!("quest {q} {name}: {why}; backing off {until} s"),
+            Verdict::Quarantine(_) if verdict.until() == u64::MAX => {
+                format!("quest {q} {name}: {why}; quarantined for the session")
+            }
             Verdict::Quarantine(_) => {
                 format!("quest {q} {name}: {why}; quarantined for {until} s")
             }
@@ -2169,6 +2341,45 @@ fn nearest_unit(state: &BotState, template: u32, me: [f32; 3]) -> Option<(u32, [
         .map(|(obj, pos, _)| (obj, pos))
 }
 
+/// The nearest living NPC of any of `templates`, a target nobody else holds first.
+fn nearest_unit_in(
+    state: &BotState,
+    templates: &[u32],
+    me: [f32; 3],
+    taken: &dyn Fn(u32) -> bool,
+) -> Option<(u32, [f32; 3])> {
+    let mut best: Option<(u32, bool, f32, [f32; 3])> = None;
+    for (&obj, u) in &state.units {
+        if u.kind != UnitKind::Npc || !templates.contains(&u.id) || u.dead() {
+            continue;
+        }
+        let d = u.dist2d(me);
+        let held = taken(obj);
+        if best
+            .as_ref()
+            .is_none_or(|b| better_target(held, d, b.1, b.2))
+        {
+            best = Some((obj, held, d, u.pos));
+        }
+    }
+    best.map(|b| (b.0, b.3))
+}
+
+/// The nearest living NPC whose template is not in `excluded` (a negated target group).
+fn nearest_unit_excluding(
+    state: &BotState,
+    excluded: &[u32],
+    me: [f32; 3],
+) -> Option<(u32, [f32; 3])> {
+    state
+        .units
+        .iter()
+        .filter(|(_, u)| u.kind == UnitKind::Npc && !u.dead() && !excluded.contains(&u.id))
+        .map(|(&obj, u)| (obj, u.pos, u.dist2d(me)))
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(obj, pos, _)| (obj, pos))
+}
+
 /// The nearest doodad of `template` in view, with its position.
 fn nearest_doodad(state: &BotState, template: u32, me: [f32; 3]) -> Option<(u32, [f32; 3])> {
     state
@@ -2404,10 +2615,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs AA_COMPACT and AA_SERVER_DATA (real server data)"]
+    fn event_quests_wait_for_their_event() {
+        use aa_world::WorldPaths;
+        use std::path::PathBuf;
+        let (Some(compact), Some(server_data)) = (
+            std::env::var_os("AA_COMPACT"),
+            std::env::var_os("AA_SERVER_DATA"),
+        ) else {
+            eprintln!("AA_COMPACT / AA_SERVER_DATA not set; skipping");
+            return;
+        };
+        let world = World::load(&WorldPaths {
+            compact: PathBuf::from(compact),
+            server_data: PathBuf::from(server_data),
+            baked: std::env::var_os("AA_BAKED").map(PathBuf::from),
+            world: "main_world".into(),
+        })
+        .unwrap();
+        // 6209 "Armies of Castigant" and 6211 "Clockwork Rebellion" hunt Rift wave NPCs;
+        // 8000004 is a seasonal event quest. None may be taken while its event is down.
+        let event_quest = world.quest(6209).unwrap();
+        let targets = event_targets(&world, event_quest).expect("6209 is event-gated");
+        assert!(targets.contains(&14580) && targets.contains(&14581));
+        assert!(event_targets(&world, world.quest(8000004).unwrap()).is_some());
+        assert!(event_targets(&world, world.quest(2261).unwrap()).is_none());
+
+        let events = EventBoard::manual();
+        let no = |_: u32| false;
+        let all = |_: u32| true;
+        let elig = Eligibility {
+            world: &world,
+            facts: Env {
+                world: &world,
+                from: None,
+                navmesh: false,
+            },
+            level: 80,
+            faction: 0,
+            who: aa_world::Who {
+                level: 80,
+                race: 1,
+                gender: 1,
+                mother_faction: 0,
+                done: &all,
+                owns: &all,
+            },
+            judge: Judge {
+                level: 80,
+                done: &no,
+                active: &no,
+                usable: &all,
+            },
+            events: &events,
+        };
+        assert_eq!(
+            elig.explain(event_quest, Giver::Npc(0)),
+            Err("event not running")
+        );
+    }
+
+    #[test]
     fn crowded_spawns_get_more_patience_than_empty_ones() {
         // the waits are what the module docs promise
         const { assert!(CROWD_ROUNDS > 2) };
         const { assert!(CROWD_ROUND_GAP_MS > ROUND_GAP_MS) };
-        const { assert!(memory::CROWD_BACKOFF_MS >= memory::BACKOFF_MS) };
+        const { assert!(memory::CROWD_BACKOFF_MS >= memory::BACKOFF_STEPS_MS[0]) };
     }
 }
