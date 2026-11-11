@@ -30,6 +30,8 @@ pub struct Config {
     pub bots: BotsCfg,
     /// Goal weights.
     pub behavior: BehaviorCfg,
+    /// Instance dungeons: the party size aim and the server's entry limit.
+    pub dungeons: DungeonsCfg,
     /// Sailing: which boat the bots sail.
     pub sail: SailCfg,
     /// Selling: the auction house, trade-chat advertisements, buyers.
@@ -281,6 +283,28 @@ impl Default for BehaviorCfg {
             lifelike: true,
             jump_rate: 1.0,
             emotes: true,
+        }
+    }
+}
+
+/// `[dungeons]`: how dungeon parties are formed and whether the server's entry limit is counted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DungeonsCfg {
+    /// Count the server's entry limit (`enter_count` entries per zone group and four hours) and
+    /// skip a dungeon whose entries are used up. Off by default: the 1.2 server has no dungeon
+    /// entry limit (`Dungeons.EntryLimit`). A refusal for the limit is answered either way.
+    pub entry_limit: bool,
+    /// Seconds a bot waits for a full party (the dungeon's `max_players`, at most five) before it
+    /// goes with a smaller one. At most 150, the longest a bot waits for a party order.
+    pub relax_after_secs: u64,
+}
+
+impl Default for DungeonsCfg {
+    fn default() -> Self {
+        Self {
+            entry_limit: false,
+            relax_after_secs: crate::bot::party::RELAX_AFTER_SECS,
         }
     }
 }
@@ -1222,6 +1246,11 @@ impl Config {
             "behavior.jump_rate must be a number >= 0"
         );
         ensure!(
+            self.dungeons.relax_after_secs <= 150,
+            "dungeons.relax_after_secs {} is above 150, the longest a bot waits for a party order",
+            self.dungeons.relax_after_secs
+        );
+        ensure!(
             self.market.ad_interval_secs >= 60,
             "market.ad_interval_secs must be at least 60"
         );
@@ -1662,6 +1691,36 @@ trade_with_players = true
         let cfg = Config::parse("[behavior]\ndungeon_level_up = true\n").unwrap();
         assert!(cfg.behavior.dungeons && cfg.behavior.dungeon_level_up);
         assert!(Config::parse("[behavior]\ndungeon_level_up = 1\n").is_err());
+    }
+
+    #[test]
+    fn the_dungeon_keys_default_to_no_entry_limit_and_a_long_wait() {
+        let d = Config::default().dungeons;
+        assert!(!d.entry_limit, "the 1.2 server has no entry limit");
+        assert_eq!(d.relax_after_secs, crate::bot::party::RELAX_AFTER_SECS);
+        assert_eq!(d.relax_after_secs, 120);
+        // the example file documents both keys with the defaults
+        let ex = Config::parse(Config::example()).unwrap().dungeons;
+        assert!(!ex.entry_limit);
+        assert_eq!(ex.relax_after_secs, 120);
+        assert_documented(
+            "dungeons",
+            &["entry_limit = false", "relax_after_secs = 120"],
+        );
+        // each key can be set on its own
+        let cfg = Config::parse(
+            "[dungeons]
+entry_limit = true
+relax_after_secs = 45
+",
+        )
+        .unwrap();
+        assert!(cfg.dungeons.entry_limit);
+        assert_eq!(cfg.dungeons.relax_after_secs, 45);
+        // 151 s is longer than the bot waits for an order
+        assert!(Config::parse("[dungeons]\nrelax_after_secs = 151\n").is_err());
+        assert!(Config::parse("[dungeons]\nentry_limit = 1\n").is_err());
+        assert!(Config::parse("[dungeons]\nentry_limits = true\n").is_err());
     }
 
     #[test]

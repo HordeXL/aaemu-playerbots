@@ -87,11 +87,13 @@ rounded routes and berth out at sea.
 
 ### Group content
 
-**Dungeon parties.** Bots that like a fight ask the coordinator for a party of three (same alliance, a
-level the dungeon accepts). The leader invites, the party walks to the entrance, goes in one by one
-and clears the dungeon along a route of its hostile spawns: the leader picks targets, the members
-follow and assist, everybody rests when low. Then they use the exit and disband. The server's
-refusals are answered by kind and the entry limit is counted like the server counts it.
+**Dungeon parties.** Bots that like a fight ask the coordinator for a party of up to five (the
+dungeon's player limit, never more than five; same alliance, a level the dungeon accepts), and wait
+`[dungeons] relax_after_secs` for it to fill before going with a smaller one. The leader invites,
+the party walks to the entrance, goes in one by one and clears the dungeon along a route of its
+hostile spawns: the leader picks targets, the members follow and assist, everybody rests when low.
+Then they use the exit and disband. The server's refusals are answered by kind; the entry limit is
+counted only with `[dungeons] entry_limit` (off by default: the 1.2 server has none).
 
 **Parties of real players.** With `[party]` on, a bot joins the party a real player invites it to (or
 invites the player who whispers `inv`), follows the leader across the map, helps in the fights, obeys
